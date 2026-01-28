@@ -2,7 +2,7 @@
 
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use blake2::digest::{Mac, KeyInit};
-use ring::aead::{self, LessSafeKey, UnboundKey, Nonce, Aad, CHACHA20_POLY1305};
+use ring::aead::{LessSafeKey, UnboundKey, Nonce, Aad, CHACHA20_POLY1305};
 use crate::keypair::Key;
 
 /// Hash output size (BLAKE2s-256).
@@ -46,7 +46,7 @@ pub fn hmac(key: &Hash, data: &[&[u8]]) -> Hash {
     
     // Inner hash
     let mut inner = Blake2s256::new();
-    inner.update(&ipad);
+    inner.update(ipad);
     for d in data {
         inner.update(d);
     }
@@ -54,15 +54,15 @@ pub fn hmac(key: &Hash, data: &[&[u8]]) -> Hash {
     
     // Outer hash
     let mut outer = Blake2s256::new();
-    outer.update(&opad);
-    outer.update(&inner_result);
+    outer.update(opad);
+    outer.update(inner_result);
     outer.finalize().into()
 }
 
 /// HKDF with BLAKE2s.
 /// Derives `num_outputs` keys (1-3) from chaining key and input.
 pub fn hkdf(chaining_key: &Key, input: &[u8], num_outputs: usize) -> Vec<Key> {
-    assert!(num_outputs >= 1 && num_outputs <= 3, "num_outputs must be 1-3");
+    assert!((1..=3).contains(&num_outputs), "num_outputs must be 1-3");
     
     // Extract: secret = HMAC(ck, input)
     let secret = hmac(chaining_key.as_bytes(), &[input]);

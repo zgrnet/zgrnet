@@ -116,7 +116,7 @@ func BenchmarkTransport1KB(b *testing.B) {
 	msg2, _ := responder.WriteMessage(nil)
 	initiator.ReadMessage(msg2)
 
-	sendI, _ , _ := initiator.Split()
+	sendI, _, _ := initiator.Split()
 	_, recvR, _ := responder.Split()
 
 	plaintext := make([]byte, 1024)

@@ -496,4 +496,3 @@ func TestHandshakeHash(t *testing.T) {
 		t.Error("handshake hash should not be zero")
 	}
 }
-
