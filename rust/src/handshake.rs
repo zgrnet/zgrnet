@@ -195,8 +195,9 @@ impl HandshakeState {
             return Err(Error::Finished);
         }
 
-        let my_turn = (self.initiator && self.msg_index.is_multiple_of(2))
-            || (!self.initiator && !self.msg_index.is_multiple_of(2));
+        #[allow(clippy::manual_is_multiple_of)]
+        let my_turn = (self.initiator && self.msg_index % 2 == 0)
+            || (!self.initiator && self.msg_index % 2 == 1);
         if !my_turn {
             return Err(Error::NotOurTurn);
         }
@@ -280,8 +281,9 @@ impl HandshakeState {
             return Err(Error::Finished);
         }
 
-        let my_turn = (self.initiator && self.msg_index.is_multiple_of(2))
-            || (!self.initiator && !self.msg_index.is_multiple_of(2));
+        #[allow(clippy::manual_is_multiple_of)]
+        let my_turn = (self.initiator && self.msg_index % 2 == 0)
+            || (!self.initiator && self.msg_index % 2 == 1);
         if my_turn {
             return Err(Error::NotOurTurn);
         }
