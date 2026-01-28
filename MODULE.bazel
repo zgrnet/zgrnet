@@ -30,6 +30,13 @@ bazel_dep(name = "gazelle", version = "0.40.0")
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.download(version = "1.23.4")
 
+go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
+go_deps.from_file(go_mod = "//go:go.mod")
+use_repo(
+    go_deps,
+    "org_golang_x_crypto",
+)
+
 # Zig toolchain - disabled, rules_zig 0.6.0 incompatible with Bazel 9.0
 # Use native zig build instead: cd zig && zig build
 # bazel_dep(name = "rules_zig", version = "0.6.0")
