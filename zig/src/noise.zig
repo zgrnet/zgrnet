@@ -14,6 +14,9 @@ pub const cipher = @import("cipher.zig");
 pub const crypto = @import("crypto.zig");
 pub const state = @import("state.zig");
 pub const handshake = @import("handshake.zig");
+pub const replay = @import("replay.zig");
+pub const session = @import("session.zig");
+pub const manager = @import("manager.zig");
 
 // Re-export main types
 pub const Key = keypair.Key;
@@ -24,6 +27,15 @@ pub const HandshakeState = handshake.HandshakeState;
 pub const Config = handshake.Config;
 pub const Pattern = handshake.Pattern;
 pub const Error = handshake.Error;
+
+// Session management types
+pub const ReplayFilter = replay.ReplayFilter;
+pub const Session = session.Session;
+pub const SessionConfig = session.SessionConfig;
+pub const SessionState = session.SessionState;
+pub const SessionError = session.SessionError;
+pub const SessionManager = manager.SessionManager;
+pub const ManagerError = manager.ManagerError;
 
 // Re-export constants
 pub const key_size = keypair.key_size;
@@ -42,4 +54,7 @@ test {
     _ = crypto;
     _ = state;
     _ = handshake;
+    _ = replay;
+    _ = session;
+    _ = manager;
 }

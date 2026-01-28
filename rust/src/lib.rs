@@ -26,8 +26,14 @@ mod keypair;
 pub mod cipher;
 mod state;
 mod handshake;
+mod replay;
+mod session;
+mod manager;
 
 pub use keypair::{Key, KeyPair};
 pub use cipher::{Hash, HASH_SIZE, TAG_SIZE};
 pub use state::{CipherState, SymmetricState};
 pub use handshake::{HandshakeState, Config, Pattern, Error};
+pub use replay::ReplayFilter;
+pub use session::{Session, SessionConfig, SessionState, SessionError, generate_index};
+pub use manager::{SessionManager, ManagerError};
