@@ -7,6 +7,7 @@ const time = std.time;
 const noise = @import("noise.zig");
 const keypair = noise.keypair;
 const cipher = noise.cipher;
+const crypto = noise.crypto;
 const state = noise.state;
 const handshake = noise.handshake;
 
@@ -79,13 +80,13 @@ pub fn main() !void {
         const data = [_]u8{0} ** 64;
 
         for (0..warmup) |_| {
-            const h = cipher.hash(&.{&data});
+            const h = crypto.hash(&.{&data});
             doNotOptimize(&h);
         }
 
         const start = time.nanoTimestamp();
         for (0..iterations) |_| {
-            const h = cipher.hash(&.{&data});
+            const h = crypto.hash(&.{&data});
             doNotOptimize(&h);
         }
         const end = time.nanoTimestamp();

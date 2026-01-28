@@ -78,10 +78,8 @@ jobs:
         working-directory: zig/src
         run: |
           echo "=== Zig Noise Protocol Benchmarks ==="
-          # Run tests (includes timing info)
-          zig test noise.zig 2>&1 | tee ../../benchmark-zig.txt
-          echo "" >> ../../benchmark-zig.txt
-          echo "All 33 tests passed - Zig SDK verified on x86_64 Linux" >> ../../benchmark-zig.txt
+          zig build-exe bench.zig -OReleaseFast -femit-bin=bench
+          ./bench 2>&1 | tee ../../benchmark-zig.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
