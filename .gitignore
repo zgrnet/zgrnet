@@ -30,3 +30,6 @@ Thumbs.db
 *.a
 *.so
 *.dylib
+
+# Design docs (local only)
+docs/design/
