@@ -290,6 +290,3 @@ func TestEncryptWithADEmptyPlaintext(t *testing.T) {
 		t.Errorf("decrypted should be empty, got %q", decrypted)
 	}
 }
-
-
-

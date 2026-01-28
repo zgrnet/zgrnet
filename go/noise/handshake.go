@@ -17,10 +17,10 @@ const (
 
 // Pattern defines a Noise handshake pattern.
 type Pattern struct {
-	Name             string     // e.g., "IK"
-	InitiatorPreMsg  []string   // pre-message tokens for initiator (e.g., ["s"] for IK)
-	ResponderPreMsg  []string   // pre-message tokens for responder
-	MessagePatterns  [][]string // message patterns
+	Name            string     // e.g., "IK"
+	InitiatorPreMsg []string   // pre-message tokens for initiator (e.g., ["s"] for IK)
+	ResponderPreMsg []string   // pre-message tokens for responder
+	MessagePatterns [][]string // message patterns
 }
 
 // Predefined patterns
@@ -66,12 +66,12 @@ var (
 
 // Config holds the configuration for a handshake.
 type Config struct {
-	Pattern      Pattern   // Handshake pattern
-	Initiator    bool      // true if this side initiates
-	LocalStatic  *KeyPair  // Local static key pair (required for patterns with 's')
-	RemoteStatic *Key      // Remote static public key (required for IK initiator)
-	Prologue     []byte    // Optional prologue data
-	PresharedKey *Key      // Optional PSK (for psk patterns)
+	Pattern      Pattern  // Handshake pattern
+	Initiator    bool     // true if this side initiates
+	LocalStatic  *KeyPair // Local static key pair (required for patterns with 's')
+	RemoteStatic *Key     // Remote static public key (required for IK initiator)
+	Prologue     []byte   // Optional prologue data
+	PresharedKey *Key     // Optional PSK (for psk patterns)
 }
 
 // HandshakeState manages the state of a Noise handshake.
@@ -79,9 +79,9 @@ type HandshakeState struct {
 	config Config
 	ss     *SymmetricState
 
-	localEphemeral   *KeyPair // Generated during handshake
-	remoteEphemeral  Key      // Received from peer
-	remoteStatic     Key      // Received from peer (for XX pattern)
+	localEphemeral  *KeyPair // Generated during handshake
+	remoteEphemeral Key      // Received from peer
+	remoteStatic    Key      // Received from peer (for XX pattern)
 
 	msgIndex int  // Current message index
 	finished bool // Handshake complete
@@ -89,10 +89,10 @@ type HandshakeState struct {
 
 // Errors
 var (
-	ErrHandshakeFinished  = errors.New("noise: handshake already finished")
-	ErrHandshakeNotReady  = errors.New("noise: handshake not ready to split")
-	ErrInvalidMessage     = errors.New("noise: invalid handshake message")
-	ErrMissingLocalStatic = errors.New("noise: missing local static key")
+	ErrHandshakeFinished   = errors.New("noise: handshake already finished")
+	ErrHandshakeNotReady   = errors.New("noise: handshake not ready to split")
+	ErrInvalidMessage      = errors.New("noise: invalid handshake message")
+	ErrMissingLocalStatic  = errors.New("noise: missing local static key")
 	ErrMissingRemoteStatic = errors.New("noise: missing remote static key")
 )
 
