@@ -56,7 +56,7 @@ jobs:
         working-directory: rust
         run: |
           echo "=== Rust Noise Protocol Benchmarks ==="
-          cargo bench -- --noplot 2>&1 | tee benchmark-rust.txt
+          cargo bench 2>&1 | tee benchmark-rust.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
