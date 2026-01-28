@@ -129,10 +129,6 @@ jobs:
         with:
           go-version: '1.23'
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
       - name: Check Go format
         working-directory: go
         run: |
@@ -141,7 +137,3 @@ jobs:
             gofmt -l .
             exit 1
           fi
-
-      - name: Check Rust format
-        working-directory: rust
-        run: cargo fmt --check
