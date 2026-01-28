@@ -1,0 +1,9 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+# BoringSSL benchmark (C)
+cc_binary(
+    name = "bench_boringssl_c",
+    srcs = ["bench_boringssl.c"],
+    deps = ["@boringssl//:crypto"],
+    copts = ["-O3"],
+)

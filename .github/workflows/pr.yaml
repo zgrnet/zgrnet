@@ -1,0 +1,173 @@
+name: PR
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Detect affected targets
+  affected:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.affected.outputs.targets }}
+      has_go: ${{ steps.affected.outputs.has_go }}
+      has_rust: ${{ steps.affected.outputs.has_rust }}
+      has_zig: ${{ steps.affected.outputs.has_zig }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for git diff
+
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.14.0
+        with:
+          bazelisk-cache: true
+
+      - name: Detect affected targets
+        id: affected
+        run: |
+          # Get base ref
+          BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+          
+          # Get changed files
+          changed=$(git diff --name-only "$BASE_REF" HEAD)
+          echo "Changed files:"
+          echo "$changed"
+          
+          # Detect language changes
+          has_go=$(echo "$changed" | grep -q '^go/' && echo "true" || echo "false")
+          has_rust=$(echo "$changed" | grep -q '^rust/' && echo "true" || echo "false")
+          has_zig=$(echo "$changed" | grep -q '^zig/' && echo "true" || echo "false")
+          
+          echo "has_go=$has_go" >> "$GITHUB_OUTPUT"
+          echo "has_rust=$has_rust" >> "$GITHUB_OUTPUT"
+          echo "has_zig=$has_zig" >> "$GITHUB_OUTPUT"
+          
+          # Query affected Bazel targets
+          targets=""
+          for dir in $(echo "$changed" | xargs -I {} dirname {} | sort -u); do
+            if [[ -f "$dir/BUILD.bazel" ]] || [[ -f "$dir/BUILD" ]]; then
+              result=$(bazel query "//${dir}/..." 2>/dev/null || true)
+              if [[ -n "$result" ]]; then
+                targets="$targets $result"
+              fi
+            fi
+          done
+          
+          # Dedupe and output
+          targets=$(echo "$targets" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          echo "Affected targets: $targets"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  # Build affected targets
+  build:
+    needs: affected
+    if: needs.affected.outputs.targets != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.14.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      - name: Build affected targets
+        run: |
+          targets="${{ needs.affected.outputs.targets }}"
+          if [[ -n "$targets" ]]; then
+            bazel build $targets
+          fi
+
+  # Test affected targets
+  test:
+    needs: affected
+    if: needs.affected.outputs.targets != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.14.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      - name: Test affected targets
+        run: |
+          targets="${{ needs.affected.outputs.targets }}"
+          if [[ -n "$targets" ]]; then
+            # Filter to only test targets
+            test_targets=$(bazel query "kind(test, $targets)" 2>/dev/null || true)
+            if [[ -n "$test_targets" ]]; then
+              bazel test $test_targets --test_output=errors
+            fi
+          fi
+
+  # Go native tests (faster than Bazel for simple cases)
+  go-test:
+    needs: affected
+    if: needs.affected.outputs.has_go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go/go.sum
+
+      - name: Test
+        working-directory: go
+        run: go test -v -race ./...
+
+  # Rust native tests
+  rust-test:
+    needs: affected
+    if: needs.affected.outputs.has_rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+
+      - name: Test
+        working-directory: rust
+        run: cargo test --all-features
+
+      - name: Clippy
+        working-directory: rust
+        run: cargo clippy --all-features -- -D warnings
+
+  # Zig native tests
+  zig-test:
+    needs: affected
+    if: needs.affected.outputs.has_zig == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Test
+        working-directory: zig/src
+        run: zig test noise.zig
