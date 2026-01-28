@@ -8,7 +8,7 @@ use zeroize::Zeroize;
 pub const KEY_SIZE: usize = 32;
 
 /// A 32-byte cryptographic key.
-#[derive(Clone, Copy, PartialEq, Eq, Zeroize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Zeroize)]
 pub struct Key(pub [u8; KEY_SIZE]);
 
 impl Key {

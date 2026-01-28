@@ -103,7 +103,8 @@ impl SessionManager {
     pub fn remove_by_pubkey(&self, pk: &Key) {
         let mut inner = self.inner.write().unwrap();
         if let Some(session) = inner.by_pubkey.remove(pk) {
-            inner.by_index.remove(&session.local_index());
+            let idx = session.local_index();
+            inner.by_index.remove(&idx);
         }
     }
 
