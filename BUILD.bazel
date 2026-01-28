@@ -1,0 +1,9 @@
+# Root BUILD file for zgrnet
+
+package(default_visibility = ["//visibility:public"])
+
+# Filegroup for all documentation
+filegroup(
+    name = "docs",
+    srcs = glob(["docs/**/*.md"]),
+)

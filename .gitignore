@@ -1,0 +1,32 @@
+# Bazel
+/bazel-*
+/.bazel-*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rust
+**/target/
+
+# Go
+**/bin/
+**/pkg/
+
+# Zig
+**/.zig-cache/
+**/zig-cache/
+**/zig-out/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib

@@ -1,0 +1,17 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+# Go SDK - Noise Protocol implementation
+go_library(
+    name = "noise",
+    srcs = glob(["noise/*.go"], exclude = ["noise/*_test.go"]),
+    importpath = "github.com/vibing/zgrnet/noise",
+    visibility = ["//visibility:public"],
+    deps = ["@org_golang_x_crypto//chacha20poly1305"],
+)
+
+go_test(
+    name = "noise_test",
+    srcs = glob(["noise/*_test.go"]),
+    embed = [":noise"],
+    deps = ["@org_golang_x_crypto//chacha20poly1305"],
+)
