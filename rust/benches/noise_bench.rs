@@ -1,19 +1,15 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use noise::{KeyPair, HandshakeState, Config, Pattern};
+use noise::{Config, HandshakeState, KeyPair, Pattern};
 
 fn bench_key_generation(c: &mut Criterion) {
-    c.bench_function("key_generation", |b| {
-        b.iter(|| KeyPair::generate())
-    });
+    c.bench_function("key_generation", |b| b.iter(|| KeyPair::generate()));
 }
 
 fn bench_dh(c: &mut Criterion) {
     let alice = KeyPair::generate();
     let bob = KeyPair::generate();
 
-    c.bench_function("dh", |b| {
-        b.iter(|| alice.dh(black_box(&bob.public)))
-    });
+    c.bench_function("dh", |b| b.iter(|| alice.dh(black_box(&bob.public))));
 }
 
 fn bench_hash(c: &mut Criterion) {
@@ -33,7 +29,8 @@ fn bench_encrypt_1kb(c: &mut Criterion) {
     group.bench_function("1kb", |b| {
         let mut nonce = 0u64;
         b.iter(|| {
-            let result = noise::cipher::encrypt(black_box(&key), nonce, black_box(&plaintext), &[]);
+            let result =
+                noise::cipher::encrypt(black_box(&key), nonce, black_box(&plaintext), &[]);
             nonce = nonce.wrapping_add(1);
             black_box(result);
         })
@@ -49,9 +46,7 @@ fn bench_decrypt_1kb(c: &mut Criterion) {
     let mut group = c.benchmark_group("decrypt");
     group.throughput(Throughput::Bytes(1024));
     group.bench_function("1kb", |b| {
-        b.iter(|| {
-            noise::cipher::decrypt(black_box(&key), 0, black_box(&ciphertext), &[]).unwrap()
-        })
+        b.iter(|| noise::cipher::decrypt(black_box(&key), 0, black_box(&ciphertext), &[]).unwrap())
     });
     group.finish();
 }
@@ -68,14 +63,16 @@ fn bench_handshake_ik(c: &mut Criterion) {
                 local_static: Some(initiator_static.clone()),
                 remote_static: Some(responder_static.public.clone()),
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
 
             let mut responder = HandshakeState::new(Config {
                 pattern: Some(Pattern::IK),
                 initiator: false,
                 local_static: Some(responder_static.clone()),
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
 
             let msg1 = initiator.write_message(&[]).unwrap();
             responder.read_message(&msg1).unwrap();
@@ -98,14 +95,16 @@ fn bench_transport_1kb(c: &mut Criterion) {
         local_static: Some(initiator_static),
         remote_static: Some(responder_static.public.clone()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let mut responder = HandshakeState::new(Config {
         pattern: Some(Pattern::IK),
         initiator: false,
         local_static: Some(responder_static),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
     let msg1 = initiator.write_message(&[]).unwrap();
     responder.read_message(&msg1).unwrap();
