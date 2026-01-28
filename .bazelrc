@@ -1,0 +1,20 @@
+# Build options
+build --enable_bzlmod
+
+# Use C++17 for any C++ code
+build --cxxopt=-std=c++17
+
+# Rust options (edition set in MODULE.bazel)
+
+# Platform configurations
+build:macos --apple_platform_type=macos
+build:linux --platforms=@rules_rust//rust/platform:linux
+
+# Test options
+test --test_output=errors
+
+# Debug build
+build:debug --compilation_mode=dbg
+
+# Release build
+build:release --compilation_mode=opt

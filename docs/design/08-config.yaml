@@ -1,0 +1,277 @@
+# ZigNet 规则配置示例
+#
+# 本文件定义了 zignet 的完整规则配置，包括：
+# - zignet: 全局配置
+# - ziglans: ziglan 托管（可选，托管后自动获取 peers/route 等配置）
+# - peers: peer 定义（手动配置）
+# - inbound_policy: 入站策略（谁能连接我）
+# - route: 出站路由（哪些域名走 zignet）
+
+# =============================================================================
+# 全局配置
+# =============================================================================
+zignet:
+  # 本机私钥路径
+  private_key: "/etc/zignet/private.key"
+
+  # utun 的 IPv4 地址
+  # 用于本地服务：Magic DNS (:53)、Admin API (:80)
+  # 系统会配置这个地址的 DNS 策略，仅解析匹配的域名
+  utun_ipv4: "100.100.100.1"
+
+  # TUN MTU
+  #
+  # ZigNet 传输时去掉 IP header（对于 TCP/UDP/ICMP），所以可以"节省"这部分开销
+  #
+  # 计算：
+  #   物理层 (UDP over IPv4): 1500 - 20(IP) - 8(UDP) = 1472
+  #   - 混淆层:                ~16 bytes
+  #   - ZigNet header:          61 bytes (type + dst_pubkey + receiver_idx + counter + tag)
+  #   - protocol:               1 byte
+  #   = 可用 payload:         1394 bytes（这是去掉 IP header 后的内容）
+  #
+  #   TUN 包含 IP header，所以：
+  #   TUN MTU = 1394 + 40 (IPv6 header) = 1434
+  #   TUN MTU = 1394 + 20 (IPv4 header) = 1414
+  #
+  # 推荐使用 1400，保守且兼容大多数网络
+  tun_mtu: 1400
+
+  # IPv6 前缀是固定的：fd00:zignet::/32
+  # 系统路由会将这个前缀的流量都发给 zigtun
+
+# =============================================================================
+# ziglan 托管
+#
+# 连接到 ziglan 服务，自动获取：
+#   - 可访问的 peers 列表
+#   - relay 配置
+#   - route 规则（可选）
+#   - inbound_policy（可选）
+#
+# ziglan 节点列表获取方式：
+#   - HTTP API: GET https://{domain}/zignet/nodes
+#   - DNS TXT:  _zignet.{domain} TXT record
+# =============================================================================
+ziglans:
+  # 公司 ziglan
+  - domain: "zignet.company.com"
+    # 获取方式：http | dns
+    method: http
+    # 认证（可选）
+    auth:
+      type: bearer
+      token: "your-api-token"
+    # 自动同步间隔
+    sync_interval: 5m
+
+  # 朋友圈 ziglan（通过 DNS TXT 获取节点）
+  - domain: "zignet.friends.net"
+    method: dns
+    sync_interval: 10m
+
+  # Haivivi 公共 ziglan
+  - domain: "zignet.haivivi.com"
+    method: http
+    # 使用本机 pubkey 自动注册
+    auto_register: true
+
+# =============================================================================
+# Peer 定义（手动配置）
+#
+# 以 {pubkey}.zignet 域名作为 key
+#
+# ziglan 节点的两种用法：
+#   1. 完全托管 → 通过 ziglans 配置，自动获取所有节点
+#   2. 仅加速/中继 → 在 relay 中引用 ziglan 节点
+# =============================================================================
+peers:
+  # 美国节点（用于翻墙）
+  # 这个节点有公网地址，可以直连
+  "abc123xxxx.zignet":
+    alias: peer_us
+    # 公网地址（可直连）
+    direct:
+      - "us.example.com:51820"
+      - "1.2.3.4:51820"
+
+  # 日本节点
+  # 这个节点没有公网，需要通过 relay 中继访问
+  "def456xxxx.zignet":
+    alias: peer_jp
+    # 通过哪些 peer 可以中继到达
+    relay:
+      - "abc123xxxx.zignet" # 通过 peer_us 中继
+
+  # 朋友的电脑
+  # 既有公网地址，也可以通过多个 relay 中继
+  "jkl012xxxx.zignet":
+    alias: friend_pc
+    direct:
+      - "friend.ddns.net:51820"
+    relay:
+      - "abc123xxxx.zignet" # 通过 peer_us 中继
+      - "speedup.node1xxxx.zignet" # 通过加速 ziglan 的节点中继
+
+# =============================================================================
+# 入站策略 (Inbound Policy)
+#
+# 控制谁能连接我、能访问我的什么服务
+#
+# ⚠️ 两层验证：
+#   Layer 1 - Connect: 谁能和我建立 Noise 握手（握手成功 = 知道我在线）
+#   Layer 2 - Services: 连接后能访问什么服务
+#
+# 规则按顺序匹配，首条命中生效
+# =============================================================================
+inbound_policy:
+  # 默认策略：deny 表示不匹配任何规则的连接将被拒绝
+  default: deny
+
+  # 每 5 分钟重新验证现有连接
+  revalidate_interval: 5m
+
+  rules:
+    # -------------------------------------------------------------------------
+    # 规则 1：白名单用户 - 完全访问
+    # -------------------------------------------------------------------------
+    - name: "trusted-users"
+      match:
+        pubkey:
+          type: whitelist
+          source: file
+          path: "/etc/zignet/trusted.txt" # 每行一个公钥
+      services:
+        - proto: "*"
+          port: "*"
+      action: allow
+
+    # -------------------------------------------------------------------------
+    # 规则 2：Solana Token 持有者 - 只能访问 Web 服务
+    #
+    # pubkey 作为 Solana 钱包地址，检查是否持有指定 Token
+    # -------------------------------------------------------------------------
+    - name: "token-holders"
+      match:
+        pubkey:
+          type: solana
+          token: "ZIGNETxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          min_balance: 100
+          rpc: "https://api.mainnet-beta.solana.com"
+      services:
+        - proto: tcp
+          port: "80,443"
+      action: allow
+
+    # -------------------------------------------------------------------------
+    # 规则 3：数据库验证
+    # -------------------------------------------------------------------------
+    - name: "database-users"
+      match:
+        pubkey:
+          type: database
+          driver: postgres
+          dsn: "postgres://user:pass@localhost/zignet"
+          query: "SELECT 1 FROM allowed_peers WHERE pubkey = $1"
+      services:
+        - proto: tcp
+          port: "22,80,443"
+      action: allow
+
+    # -------------------------------------------------------------------------
+    # 规则 4：HTTP API 验证
+    # -------------------------------------------------------------------------
+    - name: "api-verified"
+      match:
+        pubkey:
+          type: http
+          url: "https://api.example.com/verify"
+          method: POST
+          body: '{"pubkey": "{{pubkey}}"}'
+          expect:
+            status: 200
+            json_path: "$.allowed"
+            value: true
+      services:
+        - proto: tcp
+          port: 8080
+      action: allow
+
+    # -------------------------------------------------------------------------
+    # ⚠️ 不建议使用 type: any
+    # 会允许任何人建立连接，暴露节点存在，消耗资源
+    # -------------------------------------------------------------------------
+    # - name: "public-ping"
+    #   match:
+    #     pubkey:
+    #       type: any
+    #   services:
+    #     - proto: icmp
+    #   action: allow
+
+# =============================================================================
+# 出站路由 (Route)
+#
+# 控制哪些域名进入 ZigNet，以及向哪个 peer 请求 DNS 解析
+#
+# peer 可以用 alias（如 peer_us）或域名（如 abc123xxxx.zignet）
+#
+# 工作流程：
+#   1. Magic DNS 收到查询 google.com
+#   2. 匹配 route 规则，找到对应 peer
+#   3. 向该 peer 发送 DNS 请求
+#   4. peer 分配 Fake IP，返回给本机
+#   5. 本机记录 Fake IP → peer 映射
+#   6. 应用程序向 Fake IP 发起连接
+#   7. zignet 将流量转发给该 peer
+#
+# 不匹配任何规则的域名 → 走正常网络（系统 DNS）
+# =============================================================================
+route:
+  rules:
+    # -------------------------------------------------------------------------
+    # GFW 列表 → 美国节点
+    # -------------------------------------------------------------------------
+    - domain_list: "/etc/zignet/gfwlist.txt"
+      peer: peer_us
+
+    # -------------------------------------------------------------------------
+    # Google 系列 → 美国节点
+    # -------------------------------------------------------------------------
+    - domain: "*.google.com"
+      peer: peer_us
+    - domain: "*.googleapis.com"
+      peer: peer_us
+    - domain: "*.youtube.com"
+      peer: peer_us
+    - domain: "*.ytimg.com"
+      peer: peer_us
+
+    # -------------------------------------------------------------------------
+    # 社交媒体 → 美国节点
+    # -------------------------------------------------------------------------
+    - domain: "*.twitter.com"
+      peer: peer_us
+    - domain: "*.x.com"
+      peer: peer_us
+    - domain: "*.facebook.com"
+      peer: peer_us
+    - domain: "*.instagram.com"
+      peer: peer_us
+
+    # -------------------------------------------------------------------------
+    # 日本网站 → 日本节点
+    # -------------------------------------------------------------------------
+    - domain: "*.nicovideo.jp"
+      peer: peer_jp
+    - domain: "*.dmm.co.jp"
+      peer: peer_jp
+
+    # -------------------------------------------------------------------------
+    # ziglan 托管的 route 规则由 ziglan API 自动下发，不在这里配置
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # 不匹配的域名 → 自动走正常网络（无需定义 direct 规则）
+    # -------------------------------------------------------------------------
+
