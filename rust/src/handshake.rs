@@ -147,7 +147,7 @@ impl HandshakeState {
                 if *token == Token::S {
                     let rs = config.remote_static.as_ref().ok_or(Error::MissingRemoteStatic)?;
                     ss.mix_hash(rs.as_bytes());
-                    remote_static = rs.clone();
+                    remote_static = *rs;
                 }
             }
         } else {
@@ -195,8 +195,8 @@ impl HandshakeState {
             return Err(Error::Finished);
         }
 
-        let my_turn = (self.initiator && self.msg_index % 2 == 0)
-            || (!self.initiator && self.msg_index % 2 == 1);
+        let my_turn = (self.initiator && self.msg_index.is_multiple_of(2))
+            || (!self.initiator && !self.msg_index.is_multiple_of(2));
         if !my_turn {
             return Err(Error::NotOurTurn);
         }
@@ -280,8 +280,8 @@ impl HandshakeState {
             return Err(Error::Finished);
         }
 
-        let my_turn = (self.initiator && self.msg_index % 2 == 0)
-            || (!self.initiator && self.msg_index % 2 == 1);
+        let my_turn = (self.initiator && self.msg_index.is_multiple_of(2))
+            || (!self.initiator && !self.msg_index.is_multiple_of(2));
         if my_turn {
             return Err(Error::NotOurTurn);
         }

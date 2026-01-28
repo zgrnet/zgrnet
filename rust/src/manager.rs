@@ -4,7 +4,6 @@ use crate::keypair::Key;
 use crate::session::{Session, SessionConfig};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 /// Manages multiple sessions with different peers.
 pub struct SessionManager {
@@ -45,7 +44,7 @@ impl SessionManager {
             remote_index: 0,
             send_key,
             recv_key,
-            remote_pk: remote_pk.clone(),
+            remote_pk,
         }));
 
         // Remove existing session for this peer
@@ -64,7 +63,7 @@ impl SessionManager {
         let mut inner = self.inner.write().unwrap();
 
         let local_index = session.local_index();
-        let remote_pk = session.remote_pk().clone();
+        let remote_pk = *session.remote_pk();
 
         if inner.by_index.contains_key(&local_index) {
             return Err(ManagerError::IndexInUse);
@@ -170,8 +169,7 @@ impl SessionManager {
 
     /// Starts a background task to expire sessions.
     /// Returns a handle that stops the task when dropped.
-    #[cfg(feature = "tokio")]
-    pub fn start_expiry_task(self: &Arc<Self>, interval: Duration) -> ExpiryTaskHandle {
+    pub fn start_expiry_task(self: &Arc<Self>, interval: std::time::Duration) -> ExpiryTaskHandle {
         use std::sync::atomic::{AtomicBool, Ordering};
         
         let running = Arc::new(AtomicBool::new(true));
@@ -198,12 +196,10 @@ impl Default for SessionManager {
 }
 
 /// Handle for the expiry background task.
-#[cfg(feature = "tokio")]
 pub struct ExpiryTaskHandle {
     running: Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[cfg(feature = "tokio")]
 impl Drop for ExpiryTaskHandle {
     fn drop(&mut self) {
         self.running.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -260,7 +256,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk = Key::new([1u8; KEY_SIZE]);
-        let session = m.create_session(pk.clone(), Key::default(), Key::default());
+        let _session = m.create_session(pk, Key::default(), Key::default());
         
         assert!(m.get_by_pubkey(&pk).is_some());
         assert!(m.get_by_pubkey(&Key::new([9u8; KEY_SIZE])).is_none());
@@ -271,7 +267,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk = Key::new([1u8; KEY_SIZE]);
-        let session = m.create_session(pk.clone(), Key::default(), Key::default());
+        let session = m.create_session(pk, Key::default(), Key::default());
         let index = session.local_index();
         
         m.remove_session(index);
@@ -286,7 +282,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk = Key::new([1u8; KEY_SIZE]);
-        let session = m.create_session(pk.clone(), Key::default(), Key::default());
+        let session = m.create_session(pk, Key::default(), Key::default());
         let index = session.local_index();
         
         m.remove_by_pubkey(&pk);
@@ -301,10 +297,10 @@ mod tests {
         
         let pk = Key::new([1u8; KEY_SIZE]);
         
-        let s1 = m.create_session(pk.clone(), Key::default(), Key::default());
+        let s1 = m.create_session(pk, Key::default(), Key::default());
         let i1 = s1.local_index();
         
-        let s2 = m.create_session(pk.clone(), Key::new([1u8; KEY_SIZE]), Key::default());
+        let s2 = m.create_session(pk, Key::new([1u8; KEY_SIZE]), Key::default());
         let i2 = s2.local_index();
         
         assert!(m.get_by_index(i1).is_none());
@@ -319,7 +315,7 @@ mod tests {
         let peers: Vec<Key> = (0..5).map(|i| Key::new([i; KEY_SIZE])).collect();
         let sessions: Vec<_> = peers
             .iter()
-            .map(|pk| m.create_session(pk.clone(), Key::default(), Key::default()))
+            .map(|pk| m.create_session(*pk, Key::default(), Key::default()))
             .collect();
         
         assert_eq!(m.count(), 5);
@@ -337,8 +333,8 @@ mod tests {
         let pk1 = Key::new([1u8; KEY_SIZE]);
         let pk2 = Key::new([2u8; KEY_SIZE]);
         
-        let s1 = m.create_session(pk1.clone(), Key::default(), Key::default());
-        let s2 = m.create_session(pk2.clone(), Key::default(), Key::default());
+        let s1 = m.create_session(pk1, Key::default(), Key::default());
+        let _s2 = m.create_session(pk2, Key::default(), Key::default());
         
         s1.expire();
         

@@ -1,7 +1,7 @@
 //! Session management for transport phase.
 
-use crate::cipher::{DecryptError, TAG_SIZE};
-use crate::keypair::{Key, KEY_SIZE};
+use crate::cipher::TAG_SIZE;
+use crate::keypair::Key;
 use crate::replay::ReplayFilter;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,8 +49,6 @@ pub struct Session {
     local_index: u32,
     remote_index: RwLock<u32>,
     
-    send_key: Key,
-    recv_key: Key,
     send_cipher: LessSafeKey,
     recv_cipher: LessSafeKey,
     
@@ -81,8 +79,6 @@ impl Session {
         Self {
             local_index: cfg.local_index,
             remote_index: RwLock::new(cfg.remote_index),
-            send_key: cfg.send_key,
-            recv_key: cfg.recv_key,
             send_cipher,
             recv_cipher,
             send_nonce: AtomicU64::new(0),
@@ -315,6 +311,7 @@ pub fn generate_index() -> u32 {
 mod tests {
     use super::*;
     use crate::cipher;
+    use crate::keypair::KEY_SIZE;
 
     fn create_test_sessions() -> (Session, Session) {
         let send_key = Key::new(cipher::hash(&[b"send key"]));
