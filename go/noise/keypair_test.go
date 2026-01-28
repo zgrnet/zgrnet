@@ -190,5 +190,3 @@ func TestDHWithKnownVectors(t *testing.T) {
 		t.Errorf("DH result mismatch\ngot:  %s\nwant: %s", shared.String(), expected.String())
 	}
 }
-
-

@@ -295,5 +295,3 @@ func TestSymmetricStateConsistency(t *testing.T) {
 		t.Error("chaining keys should be equal")
 	}
 }
-
-
