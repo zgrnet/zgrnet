@@ -74,16 +74,19 @@ pub const Session = struct {
     send_nonce: Atomic(u64) = Atomic(u64).init(0),
     recv_filter: ReplayFilter = ReplayFilter.init(),
 
-    state: SessionState = .established,
+    // Use atomic for state to allow lock-free reads
+    state_atomic: Atomic(u8) = Atomic(u8).init(@intFromEnum(SessionState.established)),
     remote_pk: Key,
 
     created_at: i128,
-    last_received: i128,
-    last_sent: i128,
+    // Use atomic timestamps to avoid lock contention
+    last_received_nanos: Atomic(i64) = Atomic(i64).init(0),
+    last_sent_nanos: Atomic(i64) = Atomic(i64).init(0),
 
     /// Creates a new session.
     pub fn init(cfg: SessionConfig) Session {
         const now = time.nanoTimestamp();
+        const now_i64: i64 = @intCast(@mod(now, std.math.maxInt(i64)));
         return .{
             .local_index = cfg.local_index,
             .remote_index = cfg.remote_index,
@@ -91,8 +94,8 @@ pub const Session = struct {
             .recv_key = cfg.recv_key,
             .remote_pk = cfg.remote_pk,
             .created_at = now,
-            .last_received = now,
-            .last_sent = now,
+            .last_received_nanos = Atomic(i64).init(now_i64),
+            .last_sent_nanos = Atomic(i64).init(now_i64),
         };
     }
 
@@ -120,54 +123,51 @@ pub const Session = struct {
         return self.remote_pk;
     }
 
-    /// Returns the current state.
-    pub fn getState(self: *Session) SessionState {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.state;
+    /// Returns the current state (lock-free).
+    pub fn getState(self: *const Session) SessionState {
+        return @enumFromInt(self.state_atomic.load(.acquire));
     }
 
-    /// Sets the state.
+    /// Sets the state (lock-free).
     pub fn setState(self: *Session, new_state: SessionState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.state = new_state;
+        self.state_atomic.store(@intFromEnum(new_state), .release);
     }
 
     /// Encrypts a message.
     /// Returns the nonce used. Output buffer must be at least plaintext.len + tag_size.
+    /// Lock-free for concurrent encryption.
     pub fn encrypt(self: *Session, plaintext: []const u8, out: []u8) SessionError!u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.state != .established) {
+        // Lock-free state check
+        if (self.getState() != .established) {
             return SessionError.NotEstablished;
         }
 
+        // Atomic nonce increment
         const nonce = self.send_nonce.fetchAdd(1, .seq_cst);
         if (nonce >= max_nonce) {
             return SessionError.NonceExhausted;
         }
 
+        // Encryption is thread-safe (read-only key)
         cipher_mod.encrypt(&self.send_key.data, nonce, plaintext, "", out);
 
-        self.last_sent = time.nanoTimestamp();
+        // Atomic timestamp update
+        const now: i64 = @intCast(@mod(time.nanoTimestamp(), std.math.maxInt(i64)));
+        self.last_sent_nanos.store(now, .release);
 
         return nonce;
     }
 
     /// Decrypts a message.
     /// Output buffer must be at least ciphertext.len - tag_size.
+    /// Lock-free for concurrent decryption.
     pub fn decrypt(self: *Session, ciphertext: []const u8, nonce: u64, out: []u8) SessionError!usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.state != .established) {
+        // Lock-free state check
+        if (self.getState() != .established) {
             return SessionError.NotEstablished;
         }
 
-        // Atomically check and update replay filter to prevent race conditions
-        // Note: recv_filter has its own mutex, safe to call while holding session mutex
+        // Atomically check and update replay filter (has its own lock)
         if (!self.recv_filter.checkAndUpdate(nonce)) {
             return SessionError.ReplayDetected;
         }
@@ -176,27 +176,28 @@ pub const Session = struct {
             return SessionError.DecryptFailed;
         }
 
+        // Decryption is thread-safe (read-only key)
         cipher_mod.decrypt(&self.recv_key.data, nonce, ciphertext, "", out) catch {
             return SessionError.AuthenticationFailed;
         };
 
-        self.last_received = time.nanoTimestamp();
+        // Atomic timestamp update
+        const now: i64 = @intCast(@mod(time.nanoTimestamp(), std.math.maxInt(i64)));
+        self.last_received_nanos.store(now, .release);
 
         return ciphertext.len - tag_size;
     }
 
-    /// Checks if the session has expired.
-    pub fn isExpired(self: *Session) bool {
+    /// Checks if the session has expired (lock-free).
+    pub fn isExpired(self: *const Session) bool {
         if (self.getState() == .expired) {
             return true;
         }
 
-        self.mutex.lock();
-        const last = self.last_received;
-        self.mutex.unlock();
-
-        const now = time.nanoTimestamp();
-        return (now - last) > session_timeout_ns;
+        const last = self.last_received_nanos.load(.acquire);
+        const now: i64 = @intCast(@mod(time.nanoTimestamp(), std.math.maxInt(i64)));
+        const elapsed = now - last;
+        return elapsed > @as(i64, @intCast(@mod(session_timeout_ns, std.math.maxInt(i64))));
     }
 
     /// Marks the session as expired.
@@ -204,8 +205,8 @@ pub const Session = struct {
         self.setState(.expired);
     }
 
-    /// Returns current send nonce.
-    pub fn sendNonce(self: *Session) u64 {
+    /// Returns current send nonce (lock-free).
+    pub fn sendNonce(self: *const Session) u64 {
         return self.send_nonce.load(.seq_cst);
     }
 
@@ -215,22 +216,18 @@ pub const Session = struct {
     }
 
     /// Returns when session was created.
-    pub fn createdAt(self: *Session) i128 {
+    pub fn createdAt(self: *const Session) i128 {
         return self.created_at;
     }
 
-    /// Returns when last message was received.
-    pub fn lastReceived(self: *Session) i128 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.last_received;
+    /// Returns when last message was received (as nanos, lock-free).
+    pub fn lastReceivedNanos(self: *const Session) i64 {
+        return self.last_received_nanos.load(.acquire);
     }
 
-    /// Returns when last message was sent.
-    pub fn lastSent(self: *Session) i128 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.last_sent;
+    /// Returns when last message was sent (as nanos, lock-free).
+    pub fn lastSentNanos(self: *const Session) i64 {
+        return self.last_sent_nanos.load(.acquire);
     }
 };
 
