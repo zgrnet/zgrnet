@@ -118,14 +118,8 @@ jobs:
         run: |
           echo "=== Zig Noise Protocol Benchmarks (${{ runner.os }}) ==="
           mkdir -p ../results
-          
-          # Use ASM backend on ARM64 (macOS), pure Zig on x86 (Ubuntu)
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            zig build bench -Dbackend=asm 2>&1 | tee ../results/benchmark-zig-${{ runner.os }}.txt
-          else
-            # x86 doesn't have ARM64 ASM, use pure Zig
-            zig build bench 2>&1 | tee ../results/benchmark-zig-${{ runner.os }}.txt
-          fi
+          # Auto-selects ARM64 ASM on macOS, pure Zig on Linux x86
+          zig build bench 2>&1 | tee ../results/benchmark-zig-${{ runner.os }}.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4

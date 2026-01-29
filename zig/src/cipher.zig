@@ -1,10 +1,11 @@
 //! ChaCha20-Poly1305 AEAD cipher.
 //!
-//! Backend selection via build option `-Dbackend=`:
-//! - "zig" (default): Pure Zig implementation (portable, ~6 Gbps)
-//! - "asm": BoringSSL ARM64 assembly (fastest, ~13 Gbps on ARM64)
+//! Backend auto-selection based on architecture:
+//! - ARM64: BoringSSL assembly (~13 Gbps)
+//! - x86_64: SIMD-optimized Zig (~10 Gbps)
+//! - Other: Pure Zig std.crypto (~6 Gbps)
 //!
-//! This module provides a unified API for encrypt/decrypt operations.
+//! Override via `-Dbackend=asm|simd|zig`
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -21,17 +22,16 @@ pub const tag_size: usize = 16;
 
 /// Backend selection.
 pub const Backend = enum {
-    /// BoringSSL ARM64 assembly - fastest (~13 Gbps on Apple Silicon)
+    /// BoringSSL ARM64 assembly - fastest on ARM64 (~13 Gbps)
     boringssl_asm,
+    /// SIMD-optimized Zig - fast on x86_64 (~10 Gbps)
+    simd_zig,
     /// Pure Zig using std.crypto - portable (~6 Gbps)
     native_zig,
 };
 
-/// Whether ASM backend is enabled via build option.
-pub const use_asm: bool = build_options.use_asm;
-
-/// Active backend selection.
-pub const backend: Backend = if (use_asm) .boringssl_asm else .native_zig;
+/// Backend selection from build options
+pub const backend: Backend = @enumFromInt(@intFromEnum(build_options.backend));
 
 // =============================================================================
 // BoringSSL ARM64 ASM Backend (no external dependencies)
@@ -52,6 +52,22 @@ const boringssl = struct {
         if (ciphertext.len < tag_size) return error.InvalidCiphertext;
         const ret = aead_open(out.ptr, key, nonce, ciphertext.ptr, ciphertext.len);
         if (ret != 0) return error.DecryptionFailed;
+    }
+};
+
+// =============================================================================
+// SIMD-optimized Zig Backend (for x86_64)
+// =============================================================================
+
+const simd = @import("simd/chacha20_simd.zig");
+
+const simd_backend = struct {
+    fn encrypt(key: *const [key_size]u8, nonce: u64, plaintext: []const u8, ad: []const u8, out: []u8) void {
+        simd.encrypt(key, nonce, plaintext, ad, out);
+    }
+
+    fn decrypt(key: *const [key_size]u8, nonce: u64, ciphertext: []const u8, ad: []const u8, out: []u8) !void {
+        try simd.decrypt(key, nonce, ciphertext, ad, out);
     }
 };
 
@@ -104,6 +120,7 @@ pub fn encrypt(
 ) void {
     switch (backend) {
         .boringssl_asm => boringssl.encrypt(key, nonce, plaintext, ad, out),
+        .simd_zig => simd_backend.encrypt(key, nonce, plaintext, ad, out),
         .native_zig => native.encrypt(key, nonce, plaintext, ad, out),
     }
 }
@@ -119,6 +136,7 @@ pub fn decrypt(
 ) !void {
     switch (backend) {
         .boringssl_asm => try boringssl.decrypt(key, nonce, ciphertext, ad, out),
+        .simd_zig => try simd_backend.decrypt(key, nonce, ciphertext, ad, out),
         .native_zig => try native.decrypt(key, nonce, ciphertext, ad, out),
     }
 }
@@ -137,6 +155,7 @@ pub fn decryptWithAd(key: *const Key, ad: []const u8, ciphertext: []const u8, ou
 pub fn backendName() []const u8 {
     return switch (backend) {
         .boringssl_asm => "BoringSSL ARM64 ASM",
+        .simd_zig => "SIMD Zig (AVX2/NEON)",
         .native_zig => "Native Zig (std.crypto)",
     };
 }
