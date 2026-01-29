@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::kcp::{Cmd, Frame, Kcp};
+use crate::kcp::{Cmd, Frame, Kcp, FRAME_HEADER_SIZE};
 
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +54,7 @@ pub struct Stream {
 
 impl Stream {
     /// Create a new stream.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn new(id: u32, output: Box<dyn Fn(&[u8]) + Send + Sync>) -> Self {
+    pub(crate) fn new(id: u32, output: crate::kcp::OutputFn) -> Self {
         let mut kcp = Kcp::new(id, output);
         kcp.set_default_config();
 
@@ -295,6 +294,21 @@ impl Mux {
         }
     }
 
+    /// Create a stream with given ID (helper to reduce duplication).
+    fn create_stream(&self, id: u32) -> Arc<Stream> {
+        let output = self.output.clone();
+        Arc::new(Stream::new(
+            id,
+            Box::new(move |data| {
+                // Use encode_with_payload to avoid intermediate allocations
+                let encoded = Frame::encode_with_payload(Cmd::Psh, id, data);
+                if let Err(e) = output(&encoded) {
+                    eprintln!("Mux output error: {}", e);
+                }
+            }),
+        ))
+    }
+
     /// Open a new stream.
     pub fn open_stream(&self) -> Result<Arc<Stream>, MuxError> {
         if self.is_closed() {
@@ -308,18 +322,7 @@ impl Mux {
             id
         };
 
-        let output = self.output.clone();
-        let stream = Arc::new(Stream::new(
-            id,
-            Box::new(move |data| {
-                // Use encode_with_payload to avoid intermediate allocations
-                let encoded = Frame::encode_with_payload(Cmd::Psh, id, data);
-                if let Err(e) = output(&encoded) {
-                    eprintln!("Mux output error: {}", e);
-                }
-            }),
-        ));
-
+        let stream = self.create_stream(id);
         self.streams.write().unwrap().insert(id, stream.clone());
 
         // Send SYN
@@ -381,18 +384,7 @@ impl Mux {
             return Ok(()); // Duplicate SYN
         }
 
-        let output = self.output.clone();
-        let stream = Arc::new(Stream::new(
-            id,
-            Box::new(move |data| {
-                // Use encode_with_payload to avoid intermediate allocations
-                let encoded = Frame::encode_with_payload(Cmd::Psh, id, data);
-                if let Err(e) = output(&encoded) {
-                    eprintln!("Mux output error: {}", e);
-                }
-            }),
-        ));
-
+        let stream = self.create_stream(id);
         self.streams.write().unwrap().insert(id, stream.clone());
         self.accept_queue.lock().unwrap().push(stream);
 
@@ -425,7 +417,18 @@ impl Mux {
             return Err(MuxError::MuxClosed);
         }
 
-        (self.output)(&frame.encode()).map_err(|_| MuxError::OutputFailed)?;
+        const MTU_SIZE: usize = 1500;
+        let required_size = FRAME_HEADER_SIZE + frame.payload.len();
+
+        if required_size <= MTU_SIZE {
+            // Use stack buffer for typical small frames
+            let mut buf = [0u8; MTU_SIZE];
+            let len = frame.encode_to(&mut buf).map_err(|_| MuxError::InvalidFrame)?;
+            (self.output)(&buf[..len]).map_err(|_| MuxError::OutputFailed)?;
+        } else {
+            // Fallback to heap allocation for large frames
+            (self.output)(&frame.encode()).map_err(|_| MuxError::OutputFailed)?;
+        }
         Ok(())
     }
 
