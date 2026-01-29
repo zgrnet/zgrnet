@@ -398,6 +398,12 @@ impl HandshakeState {
         &self.remote_static
     }
 
+    /// Returns the local ephemeral public key.
+    /// Only valid after write_message has been called with 'e' token.
+    pub fn local_ephemeral(&self) -> Option<Key> {
+        self.local_ephemeral.as_ref().map(|kp| kp.public)
+    }
+
     /// Returns the handshake hash.
     pub fn hash(&self) -> &[u8; HASH_SIZE] {
         self.ss.hash()

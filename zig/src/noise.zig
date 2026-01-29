@@ -18,6 +18,11 @@ pub const replay = @import("replay.zig");
 pub const session = @import("session.zig");
 pub const manager = @import("manager.zig");
 
+// Conn layer
+pub const message = @import("message.zig");
+pub const transport = @import("transport.zig");
+pub const conn = @import("conn.zig");
+
 // Re-export main types
 pub const Key = keypair.Key;
 pub const KeyPair = keypair.KeyPair;
@@ -36,6 +41,21 @@ pub const SessionState = session.SessionState;
 pub const SessionError = session.SessionError;
 pub const SessionManager = manager.SessionManager;
 pub const ManagerError = manager.ManagerError;
+
+// Conn layer types
+pub const MessageType = message.MessageType;
+pub const Protocol = message.Protocol;
+pub const HandshakeInit = message.HandshakeInit;
+pub const HandshakeResp = message.HandshakeResp;
+pub const TransportMessage = message.TransportMessage;
+pub const Transport = transport.Transport;
+pub const Addr = transport.Addr;
+pub const MockTransport = transport.MockTransport;
+pub const MockAddr = transport.MockAddr;
+pub const Conn = conn.Conn;
+pub const ConnConfig = conn.ConnConfig;
+pub const ConnState = conn.ConnState;
+pub const ConnError = conn.ConnError;
 
 // Re-export constants
 pub const key_size = keypair.key_size;
@@ -57,4 +77,7 @@ test {
     _ = replay;
     _ = session;
     _ = manager;
+    _ = message;
+    _ = transport;
+    _ = conn;
 }
