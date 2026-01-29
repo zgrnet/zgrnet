@@ -8,9 +8,8 @@ use std::sync::RwLock;
 use crate::handshake::{Config, HandshakeState, Pattern};
 use crate::keypair::{Key, KeyPair};
 use crate::message::{
-    build_handshake_init, build_handshake_resp, build_transport_message, decode_payload,
-    encode_payload, parse_handshake_resp, parse_transport_message, HandshakeInit,
-    KEY_SIZE, MAX_PACKET_SIZE,
+    build_handshake_init, build_handshake_resp, build_transport_message, encode_payload,
+    parse_handshake_resp, parse_transport_message, HandshakeInit, KEY_SIZE, MAX_PACKET_SIZE,
 };
 use crate::session::{generate_index, Session, SessionConfig};
 use crate::transport::{Addr, Transport, TransportError};
