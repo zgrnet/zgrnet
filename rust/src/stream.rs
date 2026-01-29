@@ -105,13 +105,20 @@ impl Stream {
             return Ok(0); // No data available
         }
 
-        let n = std::cmp::min(buf.len(), recv_buf.len());
-        // VecDeque drain returns an iterator - O(1) for front removal
-        for (i, byte) in recv_buf.drain(..n).enumerate() {
-            buf[i] = byte;
+        // Use as_slices() for efficient bulk copy instead of byte-by-byte
+        let (s1, s2) = recv_buf.as_slices();
+        let n1 = std::cmp::min(buf.len(), s1.len());
+        buf[..n1].copy_from_slice(&s1[..n1]);
+
+        let n2 = std::cmp::min(buf.len().saturating_sub(n1), s2.len());
+        if n2 > 0 {
+            buf[n1..n1 + n2].copy_from_slice(&s2[..n2]);
         }
 
-        Ok(n)
+        let total_read = n1 + n2;
+        recv_buf.drain(..total_read);
+
+        Ok(total_read)
     }
 
     /// Close the stream.

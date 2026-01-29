@@ -421,9 +421,20 @@ pub const Mux = struct {
     fn sendFrame(self: *Mux, frame: kcp.Frame) !void {
         if (self.closed) return error.MuxClosed;
 
-        var buf: [kcp.FrameHeaderSize + kcp.MaxPayloadSize]u8 = undefined;
-        const encoded = try frame.encode(&buf);
-        try self.output_fn(encoded);
+        const required_size = kcp.FrameHeaderSize + frame.payload.len;
+        var stack_buf: [1500]u8 = undefined; // MTU-sized stack buffer
+
+        if (required_size <= stack_buf.len) {
+            // Use stack buffer for typical small frames
+            const encoded = try frame.encode(&stack_buf);
+            try self.output_fn(encoded);
+        } else {
+            // Heap allocate for oversized frames
+            const buf = try self.allocator.alloc(u8, required_size);
+            defer self.allocator.free(buf);
+            const encoded = try frame.encode(buf);
+            try self.output_fn(encoded);
+        }
     }
 
     /// Remove a stream from the Mux.
