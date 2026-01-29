@@ -4,7 +4,6 @@
 //! regardless of the underlying protocol (UDP, QUIC, etc.).
 
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -103,97 +102,6 @@ impl<T: Transport> Transport for Arc<T> {
 
     fn local_addr(&self) -> Box<dyn Addr> {
         (**self).local_addr()
-    }
-}
-
-// =============================================================================
-// UDP Transport
-// =============================================================================
-
-/// UDP address wrapper.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UdpAddr(pub SocketAddr);
-
-impl UdpAddr {
-    /// Creates a new UDP address.
-    pub fn new(addr: SocketAddr) -> Self {
-        Self(addr)
-    }
-}
-
-impl Addr for UdpAddr {
-    fn network(&self) -> &str {
-        "udp"
-    }
-
-    fn addr_string(&self) -> String {
-        self.0.to_string()
-    }
-
-    fn clone_box(&self) -> Box<dyn Addr> {
-        Box::new(self.clone())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-/// UDP transport implementation.
-pub struct UdpTransport {
-    socket: UdpSocket,
-    closed: Mutex<bool>,
-}
-
-impl UdpTransport {
-    /// Creates a new UDP transport bound to the specified address.
-    pub fn bind(addr: SocketAddr) -> Result<Self> {
-        let socket = UdpSocket::bind(addr)?;
-        Ok(Self {
-            socket,
-            closed: Mutex::new(false),
-        })
-    }
-
-    /// Creates a UDP transport from an existing socket.
-    pub fn from_socket(socket: UdpSocket) -> Self {
-        Self {
-            socket,
-            closed: Mutex::new(false),
-        }
-    }
-
-}
-
-impl Transport for UdpTransport {
-    fn send_to(&self, data: &[u8], addr: &dyn Addr) -> Result<()> {
-        if *self.closed.lock().unwrap() {
-            return Err(TransportError::Closed);
-        }
-        let udp_addr = addr
-            .as_any()
-            .downcast_ref::<UdpAddr>()
-            .ok_or(TransportError::InvalidAddress)?;
-        self.socket.send_to(data, udp_addr.0)?;
-        Ok(())
-    }
-
-    fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, Box<dyn Addr>)> {
-        if *self.closed.lock().unwrap() {
-            return Err(TransportError::Closed);
-        }
-        let (n, addr) = self.socket.recv_from(buf)?;
-        Ok((n, Box::new(UdpAddr(addr))))
-    }
-
-    fn close(&self) -> Result<()> {
-        let mut closed = self.closed.lock().unwrap();
-        *closed = true;
-        Ok(())
-    }
-
-    fn local_addr(&self) -> Box<dyn Addr> {
-        Box::new(UdpAddr(self.socket.local_addr().unwrap()))
     }
 }
 
@@ -373,10 +281,4 @@ mod tests {
         assert_eq!(from.addr_string(), "sender");
     }
 
-    #[test]
-    fn test_udp_addr() {
-        let addr = UdpAddr::new("127.0.0.1:8080".parse().unwrap());
-        assert_eq!(addr.network(), "udp");
-        assert_eq!(addr.addr_string(), "127.0.0.1:8080");
-    }
 }

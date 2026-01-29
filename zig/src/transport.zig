@@ -4,7 +4,6 @@
 //! regardless of the underlying protocol (UDP, QUIC, etc.).
 
 const std = @import("std");
-const posix = std.posix;
 
 /// Transport errors.
 pub const TransportError = error{
@@ -46,14 +45,11 @@ pub const RecvResult = struct {
 
 /// Abstract address interface.
 pub const Addr = union(enum) {
-    /// UDP socket address.
-    udp: UdpAddr,
     /// Mock address for testing.
     mock: MockAddr,
 
     pub fn network(self: Addr) []const u8 {
         return switch (self) {
-            .udp => "udp",
             .mock => |m| m.network(),
         };
     }
@@ -67,23 +63,8 @@ pub const Addr = union(enum) {
         _ = fmt;
         _ = options;
         switch (self) {
-            .udp => |a| try writer.print("{any}", .{a.addr}),
             .mock => |m| try writer.print("{s}", .{m.name}),
         }
-    }
-};
-
-/// UDP address wrapper.
-pub const UdpAddr = struct {
-    addr: std.net.Address,
-
-    pub fn init(addr: std.net.Address) UdpAddr {
-        return UdpAddr{ .addr = addr };
-    }
-
-    pub fn fromString(host: []const u8, port: u16) !UdpAddr {
-        const addr = try std.net.Address.parseIp(host, port);
-        return UdpAddr{ .addr = addr };
     }
 };
 
@@ -107,142 +88,31 @@ pub const MockAddr = struct {
 
 /// Abstract transport interface.
 pub const Transport = union(enum) {
-    /// UDP transport.
-    udp: *UdpTransport,
     /// Mock transport for testing.
     mock: *MockTransport,
 
     pub fn sendTo(self: Transport, data: []const u8, addr: Addr) TransportError!void {
         switch (self) {
-            .udp => |t| try t.sendTo(data, addr),
             .mock => |t| try t.sendTo(data, addr),
         }
     }
 
     pub fn recvFrom(self: Transport, buf: []u8) TransportError!RecvResult {
         return switch (self) {
-            .udp => |t| try t.recvFrom(buf),
             .mock => |t| try t.recvFrom(buf),
         };
     }
 
     pub fn close(self: Transport) void {
         switch (self) {
-            .udp => |t| t.close(),
             .mock => |t| t.close(),
         }
     }
 
     pub fn localAddr(self: Transport) Addr {
         return switch (self) {
-            .udp => |t| t.localAddr(),
             .mock => |t| t.localAddr(),
         };
-    }
-};
-
-// =============================================================================
-// UDP Transport
-// =============================================================================
-
-/// UDP transport implementation.
-pub const UdpTransport = struct {
-    socket: posix.socket_t,
-    local_address: std.net.Address,
-    closed: bool = false,
-
-    /// Creates a new UDP transport bound to the specified address.
-    pub fn bind(address: std.net.Address) !*UdpTransport {
-        const sock = try posix.socket(
-            @intFromEnum(address.any.family),
-            posix.SOCK.DGRAM,
-            0,
-        );
-        errdefer posix.close(sock);
-
-        try posix.bind(sock, &address.any, address.getOsSockLen());
-
-        const self = try std.heap.page_allocator.create(UdpTransport);
-        self.* = UdpTransport{
-            .socket = sock,
-            .local_address = address,
-        };
-        return self;
-    }
-
-    /// Sends data to the specified address.
-    pub fn sendTo(self: *UdpTransport, data: []const u8, addr: Addr) TransportError!void {
-        if (self.closed) {
-            return TransportError.Closed;
-        }
-
-        const udp_addr = switch (addr) {
-            .udp => |a| a,
-            else => return TransportError.InvalidAddress,
-        };
-
-        _ = posix.sendto(
-            self.socket,
-            data,
-            0,
-            &udp_addr.addr.any,
-            udp_addr.addr.getOsSockLen(),
-        ) catch |err| {
-            return switch (err) {
-                error.ConnectionResetByPeer => TransportError.ConnectionResetByPeer,
-                error.NetworkUnreachable => TransportError.NetworkUnreachable,
-                error.WouldBlock => TransportError.WouldBlock,
-                else => TransportError.IoError,
-            };
-        };
-    }
-
-    /// Receives data from the transport.
-    pub fn recvFrom(self: *UdpTransport, buf: []u8) TransportError!RecvResult {
-        if (self.closed) {
-            return TransportError.Closed;
-        }
-
-        var from_addr: std.net.Address = undefined;
-        var from_len: posix.socklen_t = @sizeOf(std.net.Address);
-
-        const n = posix.recvfrom(
-            self.socket,
-            buf,
-            0,
-            @ptrCast(&from_addr.any),
-            &from_len,
-        ) catch |err| {
-            return switch (err) {
-                error.ConnectionResetByPeer => TransportError.ConnectionResetByPeer,
-                error.WouldBlock => TransportError.WouldBlock,
-                else => TransportError.IoError,
-            };
-        };
-
-        return RecvResult{
-            .bytes_read = n,
-            .from_addr = Addr{ .udp = UdpAddr.init(from_addr) },
-        };
-    }
-
-    /// Closes the transport.
-    pub fn close(self: *UdpTransport) void {
-        if (!self.closed) {
-            posix.close(self.socket);
-            self.closed = true;
-        }
-    }
-
-    /// Returns the local address.
-    pub fn localAddr(self: *UdpTransport) Addr {
-        return Addr{ .udp = UdpAddr.init(self.local_address) };
-    }
-
-    /// Frees the transport.
-    pub fn deinit(self: *UdpTransport) void {
-        self.close();
-        std.heap.page_allocator.destroy(self);
     }
 };
 
@@ -454,10 +324,4 @@ test "mock transport inject" {
     const result = try t.recvFrom(&buf);
     try std.testing.expectEqualStrings(buf[0..result.bytes_read], "injected");
     try std.testing.expectEqualStrings(result.from_addr.mock.name, "sender");
-}
-
-test "udp addr" {
-    const addr = try UdpAddr.fromString("127.0.0.1", 8080);
-    const wrapped = Addr{ .udp = addr };
-    try std.testing.expectEqualStrings(wrapped.network(), "udp");
 }

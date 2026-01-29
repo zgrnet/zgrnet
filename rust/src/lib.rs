@@ -48,5 +48,5 @@ pub use message::{
     build_handshake_init, build_handshake_resp, build_transport_message,
     encode_payload, decode_payload,
 };
-pub use transport::{Addr, Transport, TransportError, UdpAddr, UdpTransport, MockAddr, MockTransport};
+pub use transport::{Addr, Transport, TransportError, MockAddr, MockTransport};
 pub use conn::{Conn, ConnConfig, ConnState, ConnError};
