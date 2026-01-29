@@ -3,6 +3,91 @@
 const std = @import("std");
 const kcp = @import("kcp.zig");
 
+/// RingBuffer - O(1) read/write from head/tail
+pub fn RingBuffer(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        buf: []T,
+        head: usize = 0,
+        tail: usize = 0,
+        allocator: std.mem.Allocator,
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{
+                .buf = &[_]T{},
+                .head = 0,
+                .tail = 0,
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.buf.len > 0) {
+                self.allocator.free(self.buf);
+            }
+        }
+
+        pub fn readableLength(self: *const Self) usize {
+            if (self.tail >= self.head) {
+                return self.tail - self.head;
+            } else {
+                return self.buf.len - self.head + self.tail;
+            }
+        }
+
+        pub fn read(self: *Self, dest: []T) usize {
+            const available = self.readableLength();
+            const to_read = @min(dest.len, available);
+            if (to_read == 0) return 0;
+
+            var i: usize = 0;
+            while (i < to_read) : (i += 1) {
+                dest[i] = self.buf[self.head];
+                self.head = (self.head + 1) % self.buf.len;
+            }
+            return to_read;
+        }
+
+        pub fn write(self: *Self, src: []const T) !void {
+            // Ensure capacity
+            const needed = self.readableLength() + src.len + 1;
+            if (needed > self.buf.len) {
+                try self.grow(needed);
+            }
+
+            for (src) |item| {
+                self.buf[self.tail] = item;
+                self.tail = (self.tail + 1) % self.buf.len;
+            }
+        }
+
+        fn grow(self: *Self, min_cap: usize) !void {
+            var new_cap = if (self.buf.len == 0) 64 else self.buf.len;
+            while (new_cap < min_cap) {
+                new_cap *= 2;
+            }
+
+            const new_buf = try self.allocator.alloc(T, new_cap);
+            const len = self.readableLength();
+
+            // Copy old data
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
+                new_buf[i] = self.buf[(self.head + i) % self.buf.len];
+            }
+
+            if (self.buf.len > 0) {
+                self.allocator.free(self.buf);
+            }
+
+            self.buf = new_buf;
+            self.head = 0;
+            self.tail = len;
+        }
+    };
+}
+
 /// Stream state
 pub const StreamState = enum {
     init,
@@ -25,7 +110,7 @@ pub const Stream = struct {
     mux: *Mux,
     kcp_instance: ?kcp.Kcp,
     state: StreamState,
-    recv_buf: std.ArrayListUnmanaged(u8),
+    recv_buf: RingBuffer(u8), // O(1) head removal
     allocator: std.mem.Allocator,
 
     /// Initialize a new stream.
@@ -38,14 +123,14 @@ pub const Stream = struct {
             .mux = mux,
             .kcp_instance = null,
             .state = .open,
-            .recv_buf = .{},
+            .recv_buf = RingBuffer(u8).init(allocator),
             .allocator = allocator,
         };
 
-        // Create KCP after self is stable
-        // Note: We pass null for output callback initially
-        self.kcp_instance = try kcp.Kcp.init(id, null, null);
+        // Create KCP with output callback that routes data through the Mux
+        self.kcp_instance = try kcp.Kcp.init(id, &Stream.kcpOutput, self);
         if (self.kcp_instance) |*k| {
+            k.setUserPtr(); // Set user pointer for callback to access this Stream
             k.setDefaultConfig();
         }
 
@@ -57,7 +142,7 @@ pub const Stream = struct {
         if (self.kcp_instance) |*k| {
             k.deinit();
         }
-        self.recv_buf.deinit(self.allocator);
+        self.recv_buf.deinit();
         self.allocator.destroy(self);
     }
 
@@ -90,24 +175,15 @@ pub const Stream = struct {
 
     /// Read data from the stream.
     pub fn read(self: *Stream, buffer: []u8) StreamError!usize {
-        if (self.recv_buf.items.len == 0) {
+        if (self.recv_buf.readableLength() == 0) {
             if (self.state == .closed or self.state == .remote_close) {
                 return 0; // EOF
             }
             return 0; // No data available
         }
 
-        const n = @min(buffer.len, self.recv_buf.items.len);
-        @memcpy(buffer[0..n], self.recv_buf.items[0..n]);
-
-        // Remove read data from buffer
-        const remaining = self.recv_buf.items.len - n;
-        if (remaining > 0) {
-            std.mem.copyForwards(u8, self.recv_buf.items[0..remaining], self.recv_buf.items[n..]);
-        }
-        self.recv_buf.shrinkRetainingCapacity(remaining);
-
-        return n;
+        // LinearFifo.read() automatically removes data from head - O(1)
+        return self.recv_buf.read(buffer);
     }
 
     /// Close the stream.
@@ -135,15 +211,19 @@ pub const Stream = struct {
     /// Receive data from KCP and buffer it.
     pub fn kcpRecv(self: *Stream) void {
         if (self.kcp_instance) |*k| {
-            var buf: [64 * 1024]u8 = undefined;
             while (true) {
                 const size = k.peekSize();
                 if (size <= 0) break;
 
-                const n = k.recv(&buf);
+                // Allocate buffer on heap based on actual message size
+                const buf = self.allocator.alloc(u8, @intCast(size)) catch break;
+                defer self.allocator.free(buf);
+
+                const n = k.recv(buf);
                 if (n <= 0) break;
 
-                self.recv_buf.appendSlice(self.allocator, buf[0..@intCast(n)]) catch break;
+                // LinearFifo.write appends to tail - O(1) amortized
+                self.recv_buf.write(buf[0..@intCast(n)]) catch break;
             }
         }
     }

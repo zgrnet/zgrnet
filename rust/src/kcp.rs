@@ -44,8 +44,8 @@ struct KcpContext {
 pub struct Kcp {
     kcp: *mut IKCPCB,
     conv: u32,
-    #[allow(dead_code)] // Prevents Arc from being dropped early
-    context: Arc<Mutex<KcpContext>>,
+    /// Raw pointer to the Arc passed to C, for cleanup in Drop
+    context_ptr: *const Mutex<KcpContext>,
 }
 
 // SAFETY: Kcp is Send because we properly synchronize access to the C library
@@ -62,16 +62,17 @@ impl Kcp {
             output_fn: Some(output),
         }));
 
-        let context_ptr = Arc::into_raw(context.clone()) as *mut c_void;
+        // Convert Arc to raw pointer - we'll reclaim it in Drop
+        let context_ptr = Arc::into_raw(context);
 
-        let kcp = unsafe { ikcp_create(conv, context_ptr) };
+        let kcp = unsafe { ikcp_create(conv, context_ptr as *mut c_void) };
         assert!(!kcp.is_null(), "Failed to create KCP instance");
 
         unsafe {
             ikcp_setoutput(kcp, kcp_output_callback);
         }
 
-        Kcp { kcp, conv, context }
+        Kcp { kcp, conv, context_ptr }
     }
 
     /// Set nodelay mode for fast transmission.
@@ -177,12 +178,14 @@ impl Kcp {
 
 impl Drop for Kcp {
     fn drop(&mut self) {
-        // Get the context pointer before releasing KCP
         unsafe {
-            // Release KCP
+            // Release KCP first
             ikcp_release(self.kcp);
+            // Reclaim the Arc from raw pointer to properly drop it
+            if !self.context_ptr.is_null() {
+                let _ = Arc::from_raw(self.context_ptr);
+            }
         }
-        // Arc will be dropped automatically, cleaning up context
     }
 }
 
@@ -289,9 +292,11 @@ impl Frame {
     }
 
     /// Encode frame to existing buffer (unchecked, fast path).
-    /// Caller must ensure buffer is large enough.
+    /// 
+    /// # Safety
+    /// Caller must ensure buffer is at least `FRAME_HEADER_SIZE + payload.len()` bytes.
     #[inline(always)]
-    pub fn encode_to_unchecked(&self, buf: &mut [u8]) -> usize {
+    pub unsafe fn encode_to_unchecked(&self, buf: &mut [u8]) -> usize {
         let total_len = FRAME_HEADER_SIZE + self.payload.len();
         unsafe {
             let ptr = buf.as_mut_ptr();

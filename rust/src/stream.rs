@@ -1,6 +1,6 @@
 //! Stream - A multiplexed reliable stream over KCP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -49,7 +49,7 @@ pub struct Stream {
     id: u32,
     kcp: Mutex<Kcp>,
     state: RwLock<StreamState>,
-    recv_buf: Mutex<Vec<u8>>,
+    recv_buf: Mutex<VecDeque<u8>>, // O(1) head removal
 }
 
 impl Stream {
@@ -63,7 +63,7 @@ impl Stream {
             id,
             kcp: Mutex::new(kcp),
             state: RwLock::new(StreamState::Open),
-            recv_buf: Mutex::new(Vec::new()),
+            recv_buf: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -106,8 +106,10 @@ impl Stream {
         }
 
         let n = std::cmp::min(buf.len(), recv_buf.len());
-        buf[..n].copy_from_slice(&recv_buf[..n]);
-        recv_buf.drain(..n);
+        // VecDeque drain returns an iterator - O(1) for front removal
+        for (i, byte) in recv_buf.drain(..n).enumerate() {
+            buf[i] = byte;
+        }
 
         Ok(n)
     }
@@ -141,19 +143,20 @@ impl Stream {
         let mut kcp = self.kcp.lock().unwrap();
         let mut recv_buf = self.recv_buf.lock().unwrap();
 
-        let mut buf = [0u8; 64 * 1024];
         loop {
             let size = kcp.peek_size();
             if size <= 0 {
                 break;
             }
 
+            // Allocate buffer on heap based on actual message size
+            let mut buf = vec![0u8; size as usize];
             let n = kcp.recv(&mut buf);
             if n <= 0 {
                 break;
             }
 
-            recv_buf.extend_from_slice(&buf[..n as usize]);
+            recv_buf.extend(&buf[..n as usize]);
         }
     }
 
@@ -244,7 +247,9 @@ impl Mux {
             id,
             Box::new(move |data| {
                 let frame = Frame::new(Cmd::Psh, id, data.to_vec());
-                let _ = output(&frame.encode());
+                if let Err(e) = output(&frame.encode()) {
+                    eprintln!("Mux output error: {}", e);
+                }
             }),
         ));
 
@@ -314,7 +319,9 @@ impl Mux {
             id,
             Box::new(move |data| {
                 let frame = Frame::new(Cmd::Psh, id, data.to_vec());
-                let _ = output(&frame.encode());
+                if let Err(e) = output(&frame.encode()) {
+                    eprintln!("Mux output error: {}", e);
+                }
             }),
         ));
 
