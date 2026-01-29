@@ -12,17 +12,16 @@ pub const Kcp = struct {
     output_fn: ?*const fn ([]const u8, ?*anyopaque) void,
     user_data: ?*anyopaque,
 
-    /// Create a new KCP control block.
+    /// Create a new KCP control block (stack-allocated, requires manual setUserPtr call).
     /// conv: Connection ID (must be the same on both sides)
+    /// NOTE: Prefer using `create()` for heap allocation with automatic user pointer setup.
     pub fn init(conv: u32, output_fn: ?*const fn ([]const u8, ?*anyopaque) void, user_data: ?*anyopaque) !Kcp {
-        // Note: We pass a temporary null for user, then update it after struct is created
         var self = Kcp{
             .kcp = undefined,
             .output_fn = output_fn,
             .user_data = user_data,
         };
 
-        // Create KCP with self pointer as user data (will be updated after return)
         const kcp = c.ikcp_create(conv, null) orelse return error.KcpCreateFailed;
         self.kcp = kcp;
 
@@ -32,8 +31,31 @@ pub const Kcp = struct {
         return self;
     }
 
+    /// Create a heap-allocated KCP instance with user pointer automatically set.
+    /// This is the preferred factory function as it ensures correct initialization in one step.
+    pub fn create(allocator: std.mem.Allocator, conv: u32, output_fn: ?*const fn ([]const u8, ?*anyopaque) void, user_data: ?*anyopaque) !*Kcp {
+        const self = try allocator.create(Kcp);
+        errdefer allocator.destroy(self);
+
+        self.* = Kcp{
+            .kcp = undefined,
+            .output_fn = output_fn,
+            .user_data = user_data,
+        };
+
+        const kcp = c.ikcp_create(conv, null) orelse return error.KcpCreateFailed;
+        self.kcp = kcp;
+
+        // Set output callback and user pointer in one atomic step
+        _ = c.ikcp_setoutput(kcp, kcpOutputCallback);
+        self.kcp.*.user = @ptrCast(self);
+
+        return self;
+    }
+
     /// Set the user pointer for callbacks. Must be called after init if you need
     /// the callback to access this Kcp instance.
+    /// NOTE: Not needed if using create() factory function.
     pub fn setUserPtr(self: *Kcp) void {
         self.kcp.*.user = @ptrCast(self);
     }

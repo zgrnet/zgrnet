@@ -9,7 +9,6 @@ use crate::kcp::{Cmd, Frame, Kcp, FRAME_HEADER_SIZE};
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
-    Init,
     Open,
     LocalClose,  // We sent FIN
     RemoteClose, // We received FIN

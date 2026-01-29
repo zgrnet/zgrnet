@@ -37,15 +37,22 @@ pub fn RingBuffer(comptime T: type) type {
         }
 
         pub fn read(self: *Self, dest: []T) usize {
-            const available = self.readableLength();
-            const to_read = @min(dest.len, available);
+            const to_read = @min(dest.len, self.readableLength());
             if (to_read == 0) return 0;
 
-            var i: usize = 0;
-            while (i < to_read) : (i += 1) {
-                dest[i] = self.buf[self.head];
-                self.head = (self.head + 1) % self.buf.len;
+            const head = self.head;
+            const cap = self.buf.len;
+
+            // Use @memcpy for efficient bulk copy (handles wrap-around with at most 2 copies)
+            const part1_len = @min(to_read, cap - head);
+            @memcpy(dest[0..part1_len], self.buf[head..][0..part1_len]);
+
+            const part2_len = to_read - part1_len;
+            if (part2_len > 0) {
+                @memcpy(dest[part1_len..][0..part2_len], self.buf[0..part2_len]);
             }
+
+            self.head = (head + to_read) % cap;
             return to_read;
         }
 
@@ -90,7 +97,6 @@ pub fn RingBuffer(comptime T: type) type {
 
 /// Stream state
 pub const StreamState = enum {
-    init,
     open,
     local_close, // We sent FIN
     remote_close, // We received FIN
