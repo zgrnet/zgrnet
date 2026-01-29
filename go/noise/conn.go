@@ -262,8 +262,7 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 	// Get transport keys
 	sendCS, recvCS, err := c.hsState.Split()
 	if err != nil {
-		c.state = ConnStateNew
-		c.hsState = nil
+		c.resetHandshakeStateLocked()
 		return err
 	}
 
@@ -281,8 +280,7 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 		RemotePK:    c.remotePK,
 	})
 	if err != nil {
-		c.state = ConnStateNew
-		c.hsState = nil
+		c.resetHandshakeStateLocked()
 		return err
 	}
 
@@ -293,12 +291,18 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 	return nil
 }
 
+// resetHandshakeStateLocked resets the connection to new state.
+// Must be called with c.mu held.
+func (c *Conn) resetHandshakeStateLocked() {
+	c.state = ConnStateNew
+	c.hsState = nil
+}
+
 // failHandshake handles handshake failure.
 func (c *Conn) failHandshake(err error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.state = ConnStateNew
-	c.hsState = nil
+	c.resetHandshakeStateLocked()
 	return err
 }
 
