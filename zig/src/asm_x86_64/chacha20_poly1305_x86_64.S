@@ -219,7 +219,7 @@ poly_hash_ad_internal:
 .align	64
 chacha20_poly1305_open_sse41:
 .cfi_startproc	
-_CET_ENDBR
+
 	pushq	%rbp
 .cfi_adjust_cfa_offset	8
 .cfi_offset	%rbp,-16
@@ -2100,7 +2100,7 @@ _CET_ENDBR
 .align	64
 chacha20_poly1305_seal_sse41:
 .cfi_startproc	
-_CET_ENDBR
+
 	pushq	%rbp
 .cfi_adjust_cfa_offset	8
 .cfi_offset	%rbp,-16
@@ -4096,7 +4096,7 @@ process_extra_in_trailer:
 .align	64
 chacha20_poly1305_open_avx2:
 .cfi_startproc	
-_CET_ENDBR
+
 	pushq	%rbp
 .cfi_adjust_cfa_offset	8
 .cfi_offset	%rbp,-16
@@ -6269,7 +6269,7 @@ _CET_ENDBR
 .align	64
 chacha20_poly1305_seal_avx2:
 .cfi_startproc	
-_CET_ENDBR
+
 	pushq	%rbp
 .cfi_adjust_cfa_offset	8
 .cfi_offset	%rbp,-16

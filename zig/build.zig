@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     // Helper to add x86_64 ASM files
     const addX86AsmFiles = struct {
         fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
+            compile.linkLibC();
             compile.addAssemblyFile(builder.path("src/asm_x86_64/chacha20_poly1305_x86_64.S"));
             compile.addCSourceFile(.{
                 .file = builder.path("src/asm_x86_64/chacha20_poly1305_wrapper.c"),
