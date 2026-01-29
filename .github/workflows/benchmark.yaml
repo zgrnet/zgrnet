@@ -13,6 +13,15 @@ on:
           - go
           - rust
           - zig
+      os:
+        description: 'Operating system'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - ubuntu
+          - macos
 
 permissions:
   contents: read
@@ -20,7 +29,10 @@ permissions:
 jobs:
   benchmark-go:
     if: inputs.language == 'all' || inputs.language == 'go'
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: ${{ inputs.os == 'all' && fromJSON('["ubuntu-latest", "macos-latest"]') || (inputs.os == 'ubuntu' && fromJSON('["ubuntu-latest"]') || fromJSON('["macos-latest"]')) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,18 +43,31 @@ jobs:
       - name: Run Go benchmarks
         working-directory: go
         run: |
-          echo "=== Go Noise Protocol Benchmarks ==="
-          go test -bench=. -benchmem ./noise/... | tee benchmark-go.txt
+          echo "=== Go Noise Protocol Benchmarks (${{ runner.os }}) ==="
+          echo ""
+          echo "--- Basic Benchmarks ---"
+          go test -bench='Benchmark(Key|DH|Hash|HKDF|Encrypt|Decrypt|Handshake|Transport)' -benchmem ./noise/...
+          echo ""
+          echo "--- Concurrent Benchmarks ---"
+          go test -bench='BenchmarkConcurrent|BenchmarkSessionManager' -benchmem ./noise/...
+
+      - name: Save results
+        run: |
+          mkdir -p results
+          go test -bench=. -benchmem ./go/noise/... 2>&1 | tee results/benchmark-go-${{ runner.os }}.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-go
-          path: go/benchmark-go.txt
+          name: benchmark-go-${{ runner.os }}
+          path: results/benchmark-go-${{ runner.os }}.txt
 
   benchmark-rust:
     if: inputs.language == 'all' || inputs.language == 'rust'
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: ${{ inputs.os == 'all' && fromJSON('["ubuntu-latest", "macos-latest"]') || (inputs.os == 'ubuntu' && fromJSON('["ubuntu-latest"]') || fromJSON('["macos-latest"]')) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,18 +80,32 @@ jobs:
       - name: Run Rust benchmarks
         working-directory: rust
         run: |
-          echo "=== Rust Noise Protocol Benchmarks ==="
-          cargo bench 2>&1 | tee benchmark-rust.txt
+          echo "=== Rust Noise Protocol Benchmarks (${{ runner.os }}) ==="
+          echo ""
+          echo "--- Basic Benchmarks ---"
+          cargo bench -- 'key_generation|dh|hash|encrypt|decrypt|handshake|transport' 2>&1 | grep -E '(Benchmarking|time:|thrpt:)'
+          echo ""
+          echo "--- Concurrent Benchmarks ---"
+          cargo bench -- 'concurrent|session_manager' 2>&1 | grep -E '(Benchmarking|time:|thrpt:)'
+
+      - name: Save results
+        working-directory: rust
+        run: |
+          mkdir -p ../results
+          cargo bench 2>&1 | tee ../results/benchmark-rust-${{ runner.os }}.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-rust
-          path: rust/benchmark-rust.txt
+          name: benchmark-rust-${{ runner.os }}
+          path: results/benchmark-rust-${{ runner.os }}.txt
 
   benchmark-zig:
     if: inputs.language == 'all' || inputs.language == 'zig'
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: ${{ inputs.os == 'all' && fromJSON('["ubuntu-latest", "macos-latest"]') || (inputs.os == 'ubuntu' && fromJSON('["ubuntu-latest"]') || fromJSON('["macos-latest"]')) }}
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -75,17 +114,23 @@ jobs:
           version: 0.15.2
 
       - name: Run Zig benchmarks
-        working-directory: zig/src
+        working-directory: zig
         run: |
-          echo "=== Zig Noise Protocol Benchmarks ==="
-          zig build-exe bench.zig -OReleaseFast -femit-bin=bench
-          ./bench 2>&1 | tee ../../benchmark-zig.txt
+          echo "=== Zig Noise Protocol Benchmarks (${{ runner.os }}) ==="
+          zig build bench
+          ./zig-out/bin/bench
+
+      - name: Save results
+        working-directory: zig
+        run: |
+          mkdir -p ../results
+          ./zig-out/bin/bench 2>&1 | tee ../results/benchmark-zig-${{ runner.os }}.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-zig
-          path: benchmark-zig.txt
+          name: benchmark-zig-${{ runner.os }}
+          path: results/benchmark-zig-${{ runner.os }}.txt
           if-no-files-found: ignore
 
   summary:
@@ -102,13 +147,23 @@ jobs:
         run: |
           echo "# Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Language: ${{ inputs.language }}" >> $GITHUB_STEP_SUMMARY
+          echo "- OS: ${{ inputs.os }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          for lang in go rust zig; do
-            if [ -f "results/benchmark-$lang/benchmark-$lang.txt" ]; then
-              echo "## $lang" >> $GITHUB_STEP_SUMMARY
-              echo '```' >> $GITHUB_STEP_SUMMARY
-              cat "results/benchmark-$lang/benchmark-$lang.txt" >> $GITHUB_STEP_SUMMARY
-              echo '```' >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-            fi
+          for os in Linux macOS; do
+            echo "## $os" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            for lang in go rust zig; do
+              file="results/benchmark-$lang-$os/benchmark-$lang-$os.txt"
+              if [ -f "$file" ]; then
+                echo "### $lang" >> $GITHUB_STEP_SUMMARY
+                echo '```' >> $GITHUB_STEP_SUMMARY
+                cat "$file" >> $GITHUB_STEP_SUMMARY
+                echo '```' >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+              fi
+            done
           done
