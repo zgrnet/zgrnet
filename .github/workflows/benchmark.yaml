@@ -113,12 +113,27 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Install OpenSSL (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
       - name: Run Zig benchmarks
         working-directory: zig
         run: |
           echo "=== Zig Noise Protocol Benchmarks (${{ runner.os }}) ==="
           mkdir -p ../results
-          zig build bench 2>&1 | tee ../results/benchmark-zig-${{ runner.os }}.txt
+          
+          # Set OpenSSL paths based on OS
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            export CRYPTO_INCLUDE=/usr/include
+            export CRYPTO_LIB=/usr/lib/x86_64-linux-gnu
+          else
+            export CRYPTO_INCLUDE=/opt/homebrew/opt/openssl@3/include
+            export CRYPTO_LIB=/opt/homebrew/opt/openssl@3/lib
+          fi
+          
+          # Run with system crypto backend for best performance
+          zig build bench -Dbackend=system 2>&1 | tee ../results/benchmark-zig-${{ runner.os }}.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
