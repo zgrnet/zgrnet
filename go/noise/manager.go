@@ -141,16 +141,16 @@ func (m *SessionManager) ExpireSessions() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var expired []uint32
-	for index, session := range m.byIndex {
+	// Store session pointers directly to avoid second lookup
+	var expired []*Session
+	for _, session := range m.byIndex {
 		if session.IsExpired() {
-			expired = append(expired, index)
+			expired = append(expired, session)
 		}
 	}
 
-	for _, index := range expired {
-		session := m.byIndex[index]
-		delete(m.byIndex, index)
+	for _, session := range expired {
+		delete(m.byIndex, session.LocalIndex())
 		delete(m.byPubkey, session.RemotePublicKey())
 	}
 
