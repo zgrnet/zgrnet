@@ -255,6 +255,7 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 	sendCS, recvCS, err := c.hsState.Split()
 	if err != nil {
 		c.state = ConnStateNew
+		c.hsState = nil
 		return err
 	}
 
@@ -273,6 +274,7 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 	})
 	if err != nil {
 		c.state = ConnStateNew
+		c.hsState = nil
 		return err
 	}
 

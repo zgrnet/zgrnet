@@ -244,7 +244,11 @@ func (l *Listener) handleTransport(data []byte, addr Addr) {
 	// Make a copy of the data since the buffer may be reused
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
-	conn.deliverPacket(dataCopy, addr)
+	if !conn.deliverPacket(dataCopy, addr) {
+		// Packet dropped due to full buffer or closed connection
+		// This is expected under high load, the application should
+		// handle retransmissions at a higher level
+	}
 }
 
 // SendTo sends data through the listener's transport.

@@ -32,6 +32,7 @@ type MockTransport struct {
 	localAddr *MockAddr
 	peer      *MockTransport // Direct peer for simple testing
 	inbox     chan mockPacket
+	done      chan struct{} // Closed when transport is closed
 	closed    bool
 }
 
@@ -45,6 +46,7 @@ func NewMockTransport(name string) *MockTransport {
 	return &MockTransport{
 		localAddr: NewMockAddr(name),
 		inbox:     make(chan mockPacket, 100),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -78,15 +80,11 @@ func (t *MockTransport) SendTo(data []byte, addr Addr) error {
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 
-	// Send to peer's inbox
-	peer.mu.Lock()
-	if peer.closed {
-		peer.mu.Unlock()
-		return ErrTransportClosed
-	}
-	peer.mu.Unlock()
-
+	// Send to peer's inbox, using done channel to detect closure
+	// This avoids a TOCTOU race between checking closed and sending
 	select {
+	case <-peer.done:
+		return ErrTransportClosed
 	case peer.inbox <- mockPacket{data: dataCopy, from: t.localAddr}:
 		return nil
 	default:
@@ -96,20 +94,16 @@ func (t *MockTransport) SendTo(data []byte, addr Addr) error {
 
 // RecvFrom receives data and returns the sender's address.
 func (t *MockTransport) RecvFrom(buf []byte) (int, Addr, error) {
-	t.mu.Lock()
-	if t.closed {
-		t.mu.Unlock()
+	select {
+	case <-t.done:
 		return 0, nil, ErrTransportClosed
+	case pkt, ok := <-t.inbox:
+		if !ok {
+			return 0, nil, ErrTransportClosed
+		}
+		n := copy(buf, pkt.data)
+		return n, pkt.from, nil
 	}
-	t.mu.Unlock()
-
-	pkt, ok := <-t.inbox
-	if !ok {
-		return 0, nil, ErrTransportClosed
-	}
-
-	n := copy(buf, pkt.data)
-	return n, pkt.from, nil
 }
 
 // Close closes the transport.
@@ -122,7 +116,8 @@ func (t *MockTransport) Close() error {
 	}
 
 	t.closed = true
-	close(t.inbox)
+	close(t.done)  // Signal closure to all goroutines
+	close(t.inbox) // Close inbox to unblock RecvFrom
 	return nil
 }
 
@@ -134,17 +129,12 @@ func (t *MockTransport) LocalAddr() Addr {
 // InjectPacket injects a packet into the transport's inbox.
 // This is useful for testing without a connected peer.
 func (t *MockTransport) InjectPacket(data []byte, from Addr) error {
-	t.mu.Lock()
-	if t.closed {
-		t.mu.Unlock()
-		return ErrTransportClosed
-	}
-	t.mu.Unlock()
-
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 
 	select {
+	case <-t.done:
+		return ErrTransportClosed
 	case t.inbox <- mockPacket{data: dataCopy, from: from}:
 		return nil
 	default:

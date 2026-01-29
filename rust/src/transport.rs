@@ -150,7 +150,7 @@ pub struct MockTransport {
     local_addr: MockAddr,
     peer: Mutex<Option<Arc<MockTransport>>>,
     inbox: Mutex<Receiver<MockPacket>>,
-    sender: Sender<MockPacket>,
+    sender: Mutex<Option<Sender<MockPacket>>>,
     closed: Mutex<bool>,
 }
 
@@ -162,7 +162,7 @@ impl MockTransport {
             local_addr: MockAddr::new(name),
             peer: Mutex::new(None),
             inbox: Mutex::new(receiver),
-            sender,
+            sender: Mutex::new(Some(sender)),
             closed: Mutex::new(false),
         })
     }
@@ -178,7 +178,10 @@ impl MockTransport {
         if *self.closed.lock().unwrap() {
             return Err(TransportError::Closed);
         }
-        self.sender
+        let sender = self.sender.lock().unwrap();
+        sender
+            .as_ref()
+            .ok_or(TransportError::Closed)?
             .send(MockPacket {
                 data: data.to_vec(),
                 from: MockAddr::new(from),
@@ -194,12 +197,15 @@ impl Transport for MockTransport {
         }
         let peer = self.peer.lock().unwrap();
         let peer = peer.as_ref().ok_or(TransportError::NoPeer)?;
-        
+
         if *peer.closed.lock().unwrap() {
             return Err(TransportError::Closed);
         }
-        
-        peer.sender
+
+        let sender = peer.sender.lock().unwrap();
+        sender
+            .as_ref()
+            .ok_or(TransportError::Closed)?
             .send(MockPacket {
                 data: data.to_vec(),
                 from: self.local_addr.clone(),
@@ -208,8 +214,11 @@ impl Transport for MockTransport {
     }
 
     fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, Box<dyn Addr>)> {
-        if *self.closed.lock().unwrap() {
-            return Err(TransportError::Closed);
+        // Don't hold the lock while blocking on recv
+        {
+            if *self.closed.lock().unwrap() {
+                return Err(TransportError::Closed);
+            }
         }
         let inbox = self.inbox.lock().unwrap();
         let packet = inbox.recv().map_err(|_| TransportError::Closed)?;
@@ -220,7 +229,13 @@ impl Transport for MockTransport {
 
     fn close(&self) -> Result<()> {
         let mut closed = self.closed.lock().unwrap();
+        if *closed {
+            return Ok(());
+        }
         *closed = true;
+        // Drop the sender to unblock any recv() calls
+        let mut sender = self.sender.lock().unwrap();
+        *sender = None;
         Ok(())
     }
 

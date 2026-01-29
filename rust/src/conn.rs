@@ -183,17 +183,30 @@ impl<T: Transport + 'static> Conn<T> {
 
         // Create handshake state (IK pattern)
         let remote_pk = *self.remote_pk.read().unwrap();
-        let mut hs = HandshakeState::new(Config {
+        let hs_result = HandshakeState::new(Config {
             pattern: Some(Pattern::IK),
             initiator: true,
             local_static: Some(self.local_key.clone()),
             remote_static: Some(remote_pk),
             ..Default::default()
-        })?;
+        });
+        let mut hs = match hs_result {
+            Ok(hs) => hs,
+            Err(e) => {
+                self.fail_handshake();
+                return Err(e.into());
+            }
+        };
 
         // Generate and send handshake initiation
-        let msg1 = hs.write_message(&[])?;
-        
+        let msg1 = match hs.write_message(&[]) {
+            Ok(msg) => msg,
+            Err(e) => {
+                self.fail_handshake();
+                return Err(e.into());
+            }
+        };
+
         // msg1 format: ephemeral(32) + encrypted_static(48) = 80 bytes
         let wire_msg = build_handshake_init(
             self.local_idx,
@@ -202,15 +215,32 @@ impl<T: Transport + 'static> Conn<T> {
         );
 
         let remote_addr = self.remote_addr.read().unwrap();
-        self.transport
-            .send_to(&wire_msg, remote_addr.as_ref().unwrap().as_ref())?;
+        if let Err(e) = self
+            .transport
+            .send_to(&wire_msg, remote_addr.as_ref().unwrap().as_ref())
+        {
+            self.fail_handshake();
+            return Err(e.into());
+        }
 
         // Wait for handshake response
         let mut buf = vec![0u8; MAX_PACKET_SIZE];
-        let (n, _) = self.transport.recv_from(&mut buf)?;
+        let (n, _) = match self.transport.recv_from(&mut buf) {
+            Ok(result) => result,
+            Err(e) => {
+                self.fail_handshake();
+                return Err(e.into());
+            }
+        };
 
         // Parse response
-        let resp = parse_handshake_resp(&buf[..n])?;
+        let resp = match parse_handshake_resp(&buf[..n]) {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.fail_handshake();
+                return Err(e.into());
+            }
+        };
 
         // Verify receiver index matches our sender index
         if resp.receiver_index != self.local_idx {
@@ -223,7 +253,10 @@ impl<T: Transport + 'static> Conn<T> {
         noise_msg[..KEY_SIZE].copy_from_slice(resp.ephemeral.as_bytes());
         noise_msg[KEY_SIZE..].copy_from_slice(&resp.empty_encrypted);
 
-        hs.read_message(&noise_msg)?;
+        if let Err(e) = hs.read_message(&noise_msg) {
+            self.fail_handshake();
+            return Err(e.into());
+        }
 
         // Complete handshake
         self.complete_handshake(&hs, resp.sender_index, None)
@@ -242,25 +275,40 @@ impl<T: Transport + 'static> Conn<T> {
         }
 
         // Create handshake state (IK pattern - responder)
-        let mut hs = HandshakeState::new(Config {
+        let mut hs = match HandshakeState::new(Config {
             pattern: Some(Pattern::IK),
             initiator: false,
             local_static: Some(self.local_key.clone()),
             ..Default::default()
-        })?;
+        }) {
+            Ok(hs) => hs,
+            Err(e) => {
+                self.fail_handshake();
+                return Err(e.into());
+            }
+        };
 
         // Reconstruct the noise message: ephemeral(32) + static_enc(48) = 80 bytes
         let mut noise_msg = vec![0u8; KEY_SIZE + 48];
         noise_msg[..KEY_SIZE].copy_from_slice(msg.ephemeral.as_bytes());
         noise_msg[KEY_SIZE..].copy_from_slice(&msg.static_encrypted);
 
-        hs.read_message(&noise_msg)?;
+        if let Err(e) = hs.read_message(&noise_msg) {
+            self.fail_handshake();
+            return Err(e.into());
+        }
 
         // Get remote public key from handshake
         let remote_pk = *hs.remote_static();
 
         // Generate response
-        let msg2 = hs.write_message(&[])?;
+        let msg2 = match hs.write_message(&[]) {
+            Ok(msg) => msg,
+            Err(e) => {
+                self.fail_handshake();
+                return Err(e.into());
+            }
+        };
 
         // Store initiator's index as remote index
         let remote_idx = msg.sender_index;
