@@ -27,15 +27,14 @@ pub const Backend = enum {
     native_zig,
 };
 
-/// Check if BoringSSL is available (detected via build system).
-pub const boringssl_available: bool = build_options.use_boringssl;
+/// Check if ASM optimizations are available (detected via build system).
+/// ARM64 ASM is used on macOS and Linux aarch64 targets.
+pub const asm_available: bool = build_options.use_asm;
 
 /// Active backend selection.
 pub const backend: Backend = blk: {
-    // Only use BoringSSL if available AND on ARM64
-    if (boringssl_available and builtin.cpu.arch == .aarch64 and
-        (builtin.os.tag == .macos or builtin.os.tag == .linux))
-    {
+    // Use ASM if available (build system detected ARM64 + macOS/Linux)
+    if (asm_available) {
         break :blk .boringssl_arm64;
     }
     break :blk .native_zig;
