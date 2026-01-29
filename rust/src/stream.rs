@@ -167,6 +167,65 @@ impl Stream {
         }
     }
 
+    /// Receive data directly from KCP into user-provided buffer (zero-copy fast path).
+    /// Returns the number of bytes received, or 0 if no data available.
+    /// This bypasses the internal recv_buf for lower latency when caller can process immediately.
+    pub fn recv_into_buffer(&self, buf: &mut [u8]) -> Result<usize, StreamError> {
+        // First drain any buffered data
+        {
+            let mut recv_buf = self.recv_buf.lock().unwrap();
+            if !recv_buf.is_empty() {
+                let (s1, s2) = recv_buf.as_slices();
+                let n1 = std::cmp::min(buf.len(), s1.len());
+                buf[..n1].copy_from_slice(&s1[..n1]);
+
+                let n2 = std::cmp::min(buf.len().saturating_sub(n1), s2.len());
+                if n2 > 0 {
+                    buf[n1..n1 + n2].copy_from_slice(&s2[..n2]);
+                }
+
+                let total_read = n1 + n2;
+                recv_buf.drain(..total_read);
+                return Ok(total_read);
+            }
+        }
+
+        // No buffered data, try direct receive from KCP
+        let mut kcp = self.kcp.lock().unwrap();
+        let size = kcp.peek_size();
+        if size <= 0 {
+            let state = self.state();
+            if state == StreamState::Closed || state == StreamState::RemoteClose {
+                return Ok(0); // EOF
+            }
+            return Ok(0); // No data available
+        }
+
+        // Direct receive into user buffer if it fits
+        if buf.len() >= size as usize {
+            let n = kcp.recv(buf);
+            if n > 0 {
+                return Ok(n as usize);
+            }
+        } else {
+            // Buffer too small, need intermediate allocation
+            let mut tmp = vec![0u8; size as usize];
+            let n = kcp.recv(&mut tmp);
+            if n > 0 {
+                let copy_len = std::cmp::min(buf.len(), n as usize);
+                buf[..copy_len].copy_from_slice(&tmp[..copy_len]);
+                // Buffer remaining data
+                if n as usize > copy_len {
+                    let mut recv_buf = self.recv_buf.lock().unwrap();
+                    recv_buf.extend(&tmp[copy_len..n as usize]);
+                }
+                return Ok(copy_len);
+            }
+        }
+
+        Ok(0)
+    }
+
     /// Update KCP state.
     pub(crate) fn kcp_update(&self, current: u32) {
         if self.state() == StreamState::Closed {
@@ -253,8 +312,9 @@ impl Mux {
         let stream = Arc::new(Stream::new(
             id,
             Box::new(move |data| {
-                let frame = Frame::new(Cmd::Psh, id, data.to_vec());
-                if let Err(e) = output(&frame.encode()) {
+                // Use encode_with_payload to avoid intermediate allocations
+                let encoded = Frame::encode_with_payload(Cmd::Psh, id, data);
+                if let Err(e) = output(&encoded) {
                     eprintln!("Mux output error: {}", e);
                 }
             }),
@@ -325,8 +385,9 @@ impl Mux {
         let stream = Arc::new(Stream::new(
             id,
             Box::new(move |data| {
-                let frame = Frame::new(Cmd::Psh, id, data.to_vec());
-                if let Err(e) = output(&frame.encode()) {
+                // Use encode_with_payload to avoid intermediate allocations
+                let encoded = Frame::encode_with_payload(Cmd::Psh, id, data);
+                if let Err(e) = output(&encoded) {
                     eprintln!("Mux output error: {}", e);
                 }
             }),

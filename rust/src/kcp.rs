@@ -312,6 +312,39 @@ impl Frame {
         total_len
     }
 
+    /// Encode a frame directly from payload slice (zero-copy).
+    /// Avoids creating intermediate Frame struct and Vec allocation.
+    #[inline]
+    pub fn encode_with_payload(cmd: Cmd, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let total_len = FRAME_HEADER_SIZE + payload.len();
+        let mut buf = Vec::with_capacity(total_len);
+        buf.push(cmd as u8);
+        buf.extend_from_slice(&stream_id.to_be_bytes());
+        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// Encode a frame directly to buffer from payload slice (zero-copy).
+    /// Returns the number of bytes written.
+    #[inline]
+    pub fn encode_with_payload_to(cmd: Cmd, stream_id: u32, payload: &[u8], buf: &mut [u8]) -> Result<usize, FrameError> {
+        let total_len = FRAME_HEADER_SIZE + payload.len();
+        if buf.len() < total_len {
+            return Err(FrameError::BufferTooSmall);
+        }
+        if payload.len() > MAX_PAYLOAD_SIZE {
+            return Err(FrameError::PayloadTooLarge);
+        }
+
+        buf[0] = cmd as u8;
+        buf[1..5].copy_from_slice(&stream_id.to_be_bytes());
+        buf[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf[FRAME_HEADER_SIZE..total_len].copy_from_slice(payload);
+
+        Ok(total_len)
+    }
+
     /// Decode frame from bytes.
     pub fn decode(data: &[u8]) -> Result<Frame, FrameError> {
         if data.len() < FRAME_HEADER_SIZE {
@@ -474,6 +507,15 @@ mod tests {
         assert_eq!(decoded.cmd, Cmd::Psh);
         assert_eq!(decoded.stream_id, 42);
         assert_eq!(decoded.payload, b"hello");
+
+        // Test encode_with_payload produces same result
+        let encoded2 = Frame::encode_with_payload(Cmd::Psh, 42, b"hello");
+        assert_eq!(encoded, encoded2);
+
+        // Test encode_with_payload_to
+        let mut buf = [0u8; 128];
+        let len = Frame::encode_with_payload_to(Cmd::Psh, 42, b"hello", &mut buf).unwrap();
+        assert_eq!(&buf[..len], &encoded[..]);
     }
 
     #[test]
