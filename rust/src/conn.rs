@@ -226,7 +226,7 @@ impl<T: Transport + 'static> Conn<T> {
         hs.read_message(&noise_msg)?;
 
         // Complete handshake
-        self.complete_handshake(&hs, resp.sender_index)
+        self.complete_handshake(&hs, resp.sender_index, None)
     }
 
     /// Processes an incoming handshake initiation and completes the handshake.
@@ -257,10 +257,7 @@ impl<T: Transport + 'static> Conn<T> {
         hs.read_message(&noise_msg)?;
 
         // Get remote public key from handshake
-        {
-            let mut remote_pk = self.remote_pk.write().unwrap();
-            *remote_pk = *hs.remote_static();
-        }
+        let remote_pk = *hs.remote_static();
 
         // Generate response
         let msg2 = hs.write_message(&[])?;
@@ -268,8 +265,8 @@ impl<T: Transport + 'static> Conn<T> {
         // Store initiator's index as remote index
         let remote_idx = msg.sender_index;
 
-        // Complete handshake
-        self.complete_handshake(&hs, remote_idx)?;
+        // Complete handshake (updates remote_pk atomically with state)
+        self.complete_handshake(&hs, remote_idx, Some(remote_pk))?;
 
         // Build wire response message
         Ok(build_handshake_resp(
@@ -281,7 +278,8 @@ impl<T: Transport + 'static> Conn<T> {
     }
 
     /// Completes the handshake and creates the session.
-    fn complete_handshake(&self, hs: &HandshakeState, remote_idx: u32) -> Result<()> {
+    /// If remote_pk is provided, it will be set atomically with the state transition.
+    fn complete_handshake(&self, hs: &HandshakeState, remote_idx: u32, remote_pk: Option<Key>) -> Result<()> {
         if !hs.is_finished() {
             return Err(ConnError::HandshakeIncomplete);
         }
@@ -289,14 +287,20 @@ impl<T: Transport + 'static> Conn<T> {
         // Get transport keys
         let (send_cipher, recv_cipher) = hs.split()?;
 
+        // Update remote_pk if provided (for responder case)
+        if let Some(pk) = remote_pk {
+            let mut remote_pk_lock = self.remote_pk.write().unwrap();
+            *remote_pk_lock = pk;
+        }
+
         // Create session
-        let remote_pk = *self.remote_pk.read().unwrap();
+        let current_remote_pk = *self.remote_pk.read().unwrap();
         let session = Session::new(SessionConfig {
             local_index: self.local_idx,
             remote_index: remote_idx,
             send_key: *send_cipher.key(),
             recv_key: *recv_cipher.key(),
-            remote_pk,
+            remote_pk: current_remote_pk,
         });
 
         // Update state
@@ -320,32 +324,28 @@ impl<T: Transport + 'static> Conn<T> {
 
     /// Sends an encrypted message to the remote peer.
     pub fn send(&self, protocol: u8, payload: &[u8]) -> Result<()> {
-        let session = {
+        // Check state and get session info
+        let (ciphertext, counter, remote_index) = {
             let state = self.state.read().unwrap();
             if *state != ConnState::Established {
                 return Err(ConnError::NotEstablished);
             }
+
             let session_lock = self.session.read().unwrap();
-            session_lock.as_ref().unwrap().clone_for_send()
+            let session = session_lock.as_ref().unwrap();
+
+            // Encode and encrypt
+            let plaintext = encode_payload(protocol, payload);
+            let (ciphertext, counter) = session.encrypt(&plaintext)?;
+            (ciphertext, counter, session.remote_index())
         };
 
+        // Get remote address
         let remote_addr = self.remote_addr.read().unwrap();
         let remote_addr = remote_addr.as_ref().ok_or(ConnError::MissingRemoteAddr)?;
 
-        // Encode payload with protocol byte
-        let plaintext = encode_payload(protocol, payload);
-
-        // Encrypt
-        let (ciphertext, counter) = {
-            let session_lock = self.session.read().unwrap();
-            let session = session_lock.as_ref().unwrap();
-            session.encrypt(&plaintext)?
-        };
-
-        // Build wire message
-        let msg = build_transport_message(session.remote_index, counter, &ciphertext);
-
-        // Send
+        // Build and send message
+        let msg = build_transport_message(remote_index, counter, &ciphertext);
         self.transport.send_to(&msg, remote_addr.as_ref())?;
 
         Ok(())
@@ -419,19 +419,6 @@ impl<T: Transport + 'static> Conn<T> {
     pub fn set_remote_addr(&self, addr: Box<dyn Addr>) {
         let mut remote_addr = self.remote_addr.write().unwrap();
         *remote_addr = Some(addr);
-    }
-}
-
-/// Helper struct for sending that avoids holding locks.
-struct SendSession {
-    remote_index: u32,
-}
-
-impl Session {
-    fn clone_for_send(&self) -> SendSession {
-        SendSession {
-            remote_index: self.remote_index(),
-        }
     }
 }
 

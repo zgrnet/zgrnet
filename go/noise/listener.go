@@ -14,8 +14,8 @@ type Listener struct {
 	localKey  *KeyPair
 	transport Transport
 
-	// Pending handshakes indexed by remote address string
-	pending map[string]*Conn
+	// Active connections indexed by local session index
+	conns map[uint32]*Conn
 
 	// Completed connections ready to be accepted
 	ready chan *Conn
@@ -55,7 +55,7 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 	l := &Listener{
 		localKey:  cfg.LocalKey,
 		transport: cfg.Transport,
-		pending:   make(map[string]*Conn),
+		conns:     make(map[uint32]*Conn),
 		ready:     make(chan *Conn, queueSize),
 		manager:   NewSessionManager(),
 		done:      make(chan struct{}),
@@ -81,16 +81,33 @@ func (l *Listener) Accept() (*Conn, error) {
 // Close closes the listener.
 func (l *Listener) Close() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if l.closed {
+		l.mu.Unlock()
 		return nil
 	}
 
 	l.closed = true
 	close(l.done)
 
+	// Close all connections
+	for idx, conn := range l.conns {
+		if conn.inbound != nil {
+			close(conn.inbound)
+		}
+		conn.Close()
+		delete(l.conns, idx)
+	}
+	l.mu.Unlock()
+
 	return l.transport.Close()
+}
+
+// RemoveConn removes a connection from the listener.
+// This should be called when a connection is closed.
+func (l *Listener) RemoveConn(localIdx uint32) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.conns, localIdx)
 }
 
 // LocalAddr returns the local address of the listener.
@@ -168,18 +185,28 @@ func (l *Listener) handleHandshakeInit(data []byte, addr Addr) {
 		return
 	}
 
+	// Set up inbound channel for the connection
+	inbound := make(chan inboundPacket, 64)
+	conn.setInbound(inbound)
+
 	// Process the handshake
 	resp, err := conn.Accept(msg)
 	if err != nil {
+		close(inbound)
 		return
 	}
 
 	// Send the response
 	if err := l.transport.SendTo(resp, addr); err != nil {
+		close(inbound)
 		return
 	}
 
-	// Register the session
+	// Register the connection and session
+	l.mu.Lock()
+	l.conns[conn.LocalIndex()] = conn
+	l.mu.Unlock()
+
 	if conn.Session() != nil {
 		l.manager.RegisterSession(conn.Session())
 	}
@@ -189,6 +216,10 @@ func (l *Listener) handleHandshakeInit(data []byte, addr Addr) {
 	case l.ready <- conn:
 	default:
 		// Accept queue full, drop connection
+		l.mu.Lock()
+		delete(l.conns, conn.LocalIndex())
+		l.mu.Unlock()
+		close(inbound)
 		conn.Close()
 	}
 }
@@ -200,19 +231,20 @@ func (l *Listener) handleTransport(data []byte, addr Addr) {
 		return
 	}
 
-	// Look up session by receiver index
-	session := l.manager.GetByIndex(msg.ReceiverIndex)
-	if session == nil {
-		return // Unknown session
+	// Look up connection by receiver index
+	l.mu.Lock()
+	conn := l.conns[msg.ReceiverIndex]
+	l.mu.Unlock()
+
+	if conn == nil {
+		return // Unknown connection
 	}
 
-	// Update remote address if changed (NAT rebinding)
-	// This would require associating Conn with Session
-	// For now, just ignore - the Conn handles its own receives
-
-	// Note: In the current design, the Conn.Recv() handles its own receives.
-	// This handler is for cases where we need to route packets to the right Conn.
-	// A more complete implementation would maintain a map of Conn by session index.
+	// Route the packet to the connection
+	// Make a copy of the data since the buffer may be reused
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	conn.deliverPacket(dataCopy, addr)
 }
 
 // SendTo sends data through the listener's transport.

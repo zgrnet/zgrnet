@@ -162,8 +162,14 @@ func TestConnRecvNotEstablished(t *testing.T) {
 // TestConnHandshakeAndCommunication tests the full handshake and communication flow
 func TestConnHandshakeAndCommunication(t *testing.T) {
 	// Create key pairs
-	initiatorKey, _ := GenerateKeyPair()
-	responderKey, _ := GenerateKeyPair()
+	initiatorKey, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair() initiator error = %v", err)
+	}
+	responderKey, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair() responder error = %v", err)
+	}
 
 	// Create transports
 	initiatorTransport := NewMockTransport("initiator")
@@ -173,18 +179,24 @@ func TestConnHandshakeAndCommunication(t *testing.T) {
 	defer responderTransport.Close()
 
 	// Create connections
-	initiatorConn, _ := NewConn(ConnConfig{
+	initiatorConn, err := NewConn(ConnConfig{
 		LocalKey:   initiatorKey,
 		RemotePK:   responderKey.Public,
 		Transport:  initiatorTransport,
 		RemoteAddr: responderTransport.LocalAddr(),
 	})
+	if err != nil {
+		t.Fatalf("NewConn() initiator error = %v", err)
+	}
 
-	responderConn, _ := NewConn(ConnConfig{
+	responderConn, err := NewConn(ConnConfig{
 		LocalKey:   responderKey,
 		Transport:  responderTransport,
 		RemoteAddr: initiatorTransport.LocalAddr(),
 	})
+	if err != nil {
+		t.Fatalf("NewConn() responder error = %v", err)
+	}
 
 	var wg sync.WaitGroup
 	var initiatorErr, responderErr error
@@ -337,8 +349,14 @@ func TestConnSetRemoteAddr(t *testing.T) {
 
 func TestConnMultipleMessages(t *testing.T) {
 	// Setup two connected peers
-	initiatorKey, _ := GenerateKeyPair()
-	responderKey, _ := GenerateKeyPair()
+	initiatorKey, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair() initiator error = %v", err)
+	}
+	responderKey, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair() responder error = %v", err)
+	}
 
 	initiatorTransport := NewMockTransport("initiator")
 	responderTransport := NewMockTransport("responder")
@@ -346,34 +364,62 @@ func TestConnMultipleMessages(t *testing.T) {
 	defer initiatorTransport.Close()
 	defer responderTransport.Close()
 
-	initiatorConn, _ := NewConn(ConnConfig{
+	initiatorConn, err := NewConn(ConnConfig{
 		LocalKey:   initiatorKey,
 		RemotePK:   responderKey.Public,
 		Transport:  initiatorTransport,
 		RemoteAddr: responderTransport.LocalAddr(),
 	})
+	if err != nil {
+		t.Fatalf("NewConn() initiator error = %v", err)
+	}
 
-	responderConn, _ := NewConn(ConnConfig{
+	responderConn, err := NewConn(ConnConfig{
 		LocalKey:   responderKey,
 		Transport:  responderTransport,
 		RemoteAddr: initiatorTransport.LocalAddr(),
 	})
+	if err != nil {
+		t.Fatalf("NewConn() responder error = %v", err)
+	}
 
 	// Perform handshake
 	var wg sync.WaitGroup
+	var responderErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, MaxPacketSize)
-		n, _, _ := responderTransport.RecvFrom(buf)
-		initMsg, _ := ParseHandshakeInit(buf[:n])
-		resp, _ := responderConn.Accept(initMsg)
-		responderTransport.SendTo(resp, initiatorTransport.LocalAddr())
+		n, _, err := responderTransport.RecvFrom(buf)
+		if err != nil {
+			responderErr = err
+			return
+		}
+		initMsg, err := ParseHandshakeInit(buf[:n])
+		if err != nil {
+			responderErr = err
+			return
+		}
+		resp, err := responderConn.Accept(initMsg)
+		if err != nil {
+			responderErr = err
+			return
+		}
+		if err := responderTransport.SendTo(resp, initiatorTransport.LocalAddr()); err != nil {
+			responderErr = err
+			return
+		}
 	}()
 
 	time.Sleep(10 * time.Millisecond)
-	initiatorConn.Open()
+	if err := initiatorConn.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
 	wg.Wait()
+
+	if responderErr != nil {
+		t.Fatalf("Responder error = %v", responderErr)
+	}
 
 	// Send multiple messages
 	for i := 0; i < 100; i++ {
@@ -404,8 +450,14 @@ func TestConnMultipleMessages(t *testing.T) {
 
 func TestConnDifferentProtocols(t *testing.T) {
 	// Setup two connected peers
-	initiatorKey, _ := GenerateKeyPair()
-	responderKey, _ := GenerateKeyPair()
+	initiatorKey, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair() initiator error = %v", err)
+	}
+	responderKey, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair() responder error = %v", err)
+	}
 
 	initiatorTransport := NewMockTransport("initiator")
 	responderTransport := NewMockTransport("responder")
@@ -413,34 +465,62 @@ func TestConnDifferentProtocols(t *testing.T) {
 	defer initiatorTransport.Close()
 	defer responderTransport.Close()
 
-	initiatorConn, _ := NewConn(ConnConfig{
+	initiatorConn, err := NewConn(ConnConfig{
 		LocalKey:   initiatorKey,
 		RemotePK:   responderKey.Public,
 		Transport:  initiatorTransport,
 		RemoteAddr: responderTransport.LocalAddr(),
 	})
+	if err != nil {
+		t.Fatalf("NewConn() initiator error = %v", err)
+	}
 
-	responderConn, _ := NewConn(ConnConfig{
+	responderConn, err := NewConn(ConnConfig{
 		LocalKey:   responderKey,
 		Transport:  responderTransport,
 		RemoteAddr: initiatorTransport.LocalAddr(),
 	})
+	if err != nil {
+		t.Fatalf("NewConn() responder error = %v", err)
+	}
 
 	// Perform handshake
 	var wg sync.WaitGroup
+	var responderErr error
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, MaxPacketSize)
-		n, _, _ := responderTransport.RecvFrom(buf)
-		initMsg, _ := ParseHandshakeInit(buf[:n])
-		resp, _ := responderConn.Accept(initMsg)
-		responderTransport.SendTo(resp, initiatorTransport.LocalAddr())
+		n, _, err := responderTransport.RecvFrom(buf)
+		if err != nil {
+			responderErr = err
+			return
+		}
+		initMsg, err := ParseHandshakeInit(buf[:n])
+		if err != nil {
+			responderErr = err
+			return
+		}
+		resp, err := responderConn.Accept(initMsg)
+		if err != nil {
+			responderErr = err
+			return
+		}
+		if err := responderTransport.SendTo(resp, initiatorTransport.LocalAddr()); err != nil {
+			responderErr = err
+			return
+		}
 	}()
 
 	time.Sleep(10 * time.Millisecond)
-	initiatorConn.Open()
+	if err := initiatorConn.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
 	wg.Wait()
+
+	if responderErr != nil {
+		t.Fatalf("Responder error = %v", responderErr)
+	}
 
 	// Test different protocol types
 	protocols := []byte{

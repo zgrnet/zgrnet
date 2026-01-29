@@ -133,65 +133,83 @@ pub const Conn = struct {
     /// Initiates a handshake with the remote peer.
     /// This is a blocking call that completes the full handshake.
     pub fn open(self: *Conn) ConnError!void {
+        // Phase 1: Check state and prepare handshake (with lock)
+        var hs: HandshakeState = undefined;
+        var wire_msg: [message.handshake_init_size]u8 = undefined;
+        var remote_addr: Addr = undefined;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Check state
+            if (self.state != .new) {
+                return ConnError.InvalidState;
+            }
+            if (self.remote_pk.isZero()) {
+                return ConnError.MissingRemotePK;
+            }
+            if (self.remote_addr == null) {
+                return ConnError.MissingRemoteAddr;
+            }
+            self.state = .handshaking;
+            remote_addr = self.remote_addr.?;
+
+            // Create handshake state (IK pattern)
+            hs = HandshakeState.init(.{
+                .pattern = .IK,
+                .initiator = true,
+                .local_static = self.local_key,
+                .remote_static = self.remote_pk,
+            }) catch {
+                self.state = .new;
+                return ConnError.HandshakeError;
+            };
+
+            // Generate handshake initiation
+            var msg1_buf: [key_size + key_size + 16]u8 = undefined;
+            const msg1_len = hs.writeMessage(&[_]u8{}, &msg1_buf) catch {
+                self.state = .new;
+                return ConnError.HandshakeError;
+            };
+
+            // Extract ephemeral public key
+            const ephemeral = if (hs.local_ephemeral) |le| le.public else {
+                self.state = .new;
+                return ConnError.HandshakeError;
+            };
+
+            // Build wire message
+            wire_msg = message.buildHandshakeInit(
+                self.local_idx,
+                &ephemeral,
+                msg1_buf[key_size..msg1_len],
+            );
+        }
+
+        // Phase 2: Network I/O (without lock)
+        self.transport.sendTo(&wire_msg, remote_addr) catch {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.state = .new;
+            return ConnError.TransportError;
+        };
+
+        var buf: [message.max_packet_size]u8 = undefined;
+        const result = self.transport.recvFrom(&buf) catch {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.state = .new;
+            return ConnError.TransportError;
+        };
+
+        // Phase 3: Process response and complete handshake (with lock)
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Check state
-        if (self.state != .new) {
+        // Check if state changed while we were waiting
+        if (self.state != .handshaking) {
             return ConnError.InvalidState;
         }
-        if (self.remote_pk.isZero()) {
-            return ConnError.MissingRemotePK;
-        }
-        if (self.remote_addr == null) {
-            return ConnError.MissingRemoteAddr;
-        }
-        self.state = .handshaking;
-
-        // Create handshake state (IK pattern)
-        var hs = HandshakeState.init(.{
-            .pattern = .IK,
-            .initiator = true,
-            .local_static = self.local_key,
-            .remote_static = self.remote_pk,
-        }) catch {
-            self.state = .new;
-            return ConnError.HandshakeError;
-        };
-
-        // Generate and send handshake initiation
-        var msg1_buf: [key_size + key_size + 16]u8 = undefined; // ephemeral + encrypted_static
-        const msg1_len = hs.writeMessage(&[_]u8{}, &msg1_buf) catch {
-            self.state = .new;
-            return ConnError.HandshakeError;
-        };
-
-        // Extract ephemeral public key from local_ephemeral
-        const ephemeral = if (hs.local_ephemeral) |le| le.public else {
-            self.state = .new;
-            return ConnError.HandshakeError;
-        };
-
-        // Build wire message: msg1_buf contains ephemeral(32) + encrypted_static(48) = 80 bytes
-        // We need to send: type(1) + sender_idx(4) + ephemeral(32) + encrypted_static(48) = 85
-        const wire_msg = message.buildHandshakeInit(
-            self.local_idx,
-            &ephemeral,
-            msg1_buf[key_size..msg1_len],
-        );
-
-        // Send handshake init
-        self.transport.sendTo(&wire_msg, self.remote_addr.?) catch {
-            self.state = .new;
-            return ConnError.TransportError;
-        };
-
-        // Wait for handshake response
-        var buf: [message.max_packet_size]u8 = undefined;
-        const result = self.transport.recvFrom(&buf) catch {
-            self.state = .new;
-            return ConnError.TransportError;
-        };
 
         // Parse response
         const resp = message.parseHandshakeResp(buf[0..result.bytes_read]) catch {
@@ -206,7 +224,6 @@ pub const Conn = struct {
         }
 
         // Reconstruct the noise message and process
-        // Response format: ephemeral(32) + empty_encrypted(16) = 48 bytes
         var noise_msg: [key_size + 16]u8 = undefined;
         @memcpy(noise_msg[0..key_size], resp.ephemeral.asBytes());
         @memcpy(noise_msg[key_size..][0..16], &resp.empty_encrypted);
@@ -218,11 +235,12 @@ pub const Conn = struct {
         };
 
         // Complete handshake
-        try self.completeHandshake(&hs, resp.sender_index);
+        try self.completeHandshakeLocked(&hs, resp.sender_index, null);
     }
 
     /// Processes an incoming handshake initiation and completes the handshake.
     /// Returns the handshake response to send back.
+    /// Note: This doesn't perform blocking I/O, so holding the lock is acceptable.
     pub fn accept(self: *Conn, msg: *const HandshakeInit) ConnError![message.handshake_resp_size]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -254,8 +272,8 @@ pub const Conn = struct {
             return ConnError.HandshakeError;
         };
 
-        // Get remote public key from handshake
-        self.remote_pk = hs.getRemoteStatic();
+        // Get remote public key from handshake and update atomically
+        const remote_pk = hs.getRemoteStatic();
 
         // Generate response
         var msg2_buf: [key_size + 16]u8 = undefined;
@@ -267,8 +285,8 @@ pub const Conn = struct {
         // Store initiator's index as remote index
         const remote_idx = msg.sender_index;
 
-        // Complete handshake
-        try self.completeHandshake(&hs, remote_idx);
+        // Complete handshake (updates remote_pk atomically with state)
+        try self.completeHandshakeLocked(&hs, remote_idx, remote_pk);
 
         // Extract ephemeral for response
         const ephemeral = if (hs.local_ephemeral) |le| le.public else {
@@ -286,7 +304,9 @@ pub const Conn = struct {
     }
 
     /// Completes the handshake and creates the session.
-    fn completeHandshake(self: *Conn, hs: *const HandshakeState, remote_idx: u32) ConnError!void {
+    /// Must be called with mutex held.
+    /// If remote_pk is provided, it will be set atomically with the state transition.
+    fn completeHandshakeLocked(self: *Conn, hs: *const HandshakeState, remote_idx: u32, remote_pk: ?Key) ConnError!void {
         if (!hs.isFinished()) {
             return ConnError.HandshakeIncomplete;
         }
@@ -296,6 +316,11 @@ pub const Conn = struct {
             self.state = .new;
             return ConnError.HandshakeError;
         };
+
+        // Update remote_pk if provided (for responder case)
+        if (remote_pk) |pk| {
+            self.remote_pk = pk;
+        }
 
         // Create session
         self.session = Session.init(.{
@@ -311,51 +336,68 @@ pub const Conn = struct {
 
     /// Sends an encrypted message to the remote peer.
     pub fn send(self: *Conn, protocol: Protocol, payload: []const u8) ConnError!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Phase 1: Check state and encrypt (with lock)
+        var msg: []u8 = undefined;
+        var remote_addr: Addr = undefined;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
-        if (self.state != .established) {
-            return ConnError.NotEstablished;
+            if (self.state != .established) {
+                return ConnError.NotEstablished;
+            }
+            remote_addr = self.remote_addr orelse return ConnError.MissingRemoteAddr;
+
+            var session = &(self.session orelse return ConnError.NotEstablished);
+
+            // Encode payload with protocol byte
+            const plaintext = self.allocator.alloc(u8, 1 + payload.len) catch return ConnError.OutOfMemory;
+            defer self.allocator.free(plaintext);
+            plaintext[0] = @intFromEnum(protocol);
+            @memcpy(plaintext[1..], payload);
+
+            // Encrypt
+            const ciphertext = self.allocator.alloc(u8, plaintext.len + session_mod.tag_size) catch return ConnError.OutOfMemory;
+            defer self.allocator.free(ciphertext);
+
+            const counter = session.encrypt(plaintext, ciphertext) catch return ConnError.SessionError;
+
+            // Build wire message
+            msg = message.buildTransportMessage(self.allocator, session.remoteIndex(), counter, ciphertext) catch return ConnError.OutOfMemory;
         }
-        const remote_addr = self.remote_addr orelse return ConnError.MissingRemoteAddr;
-
-        var session = &(self.session orelse return ConnError.NotEstablished);
-
-        // Encode payload with protocol byte
-        const plaintext = self.allocator.alloc(u8, 1 + payload.len) catch return ConnError.OutOfMemory;
-        defer self.allocator.free(plaintext);
-        plaintext[0] = @intFromEnum(protocol);
-        @memcpy(plaintext[1..], payload);
-
-        // Encrypt
-        const ciphertext = self.allocator.alloc(u8, plaintext.len + session_mod.tag_size) catch return ConnError.OutOfMemory;
-        defer self.allocator.free(ciphertext);
-
-        const counter = session.encrypt(plaintext, ciphertext) catch return ConnError.SessionError;
-
-        // Build wire message
-        const msg = message.buildTransportMessage(self.allocator, session.remoteIndex(), counter, ciphertext) catch return ConnError.OutOfMemory;
         defer self.allocator.free(msg);
 
-        // Send
+        // Phase 2: Send (without lock)
         self.transport.sendTo(msg, remote_addr) catch return ConnError.TransportError;
     }
 
     /// Receives and decrypts a message from the remote peer.
     /// Returns the protocol and number of bytes written to the output buffer.
     pub fn recv(self: *Conn, out_buf: []u8) ConnError!RecvResult {
+        // Phase 1: Check state (with lock)
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            if (self.state != .established) {
+                return ConnError.NotEstablished;
+            }
+        }
+
+        // Phase 2: Receive packet (without lock)
+        var buf: [message.max_packet_size]u8 = undefined;
+        const result = self.transport.recvFrom(&buf) catch return ConnError.TransportError;
+
+        // Phase 3: Decrypt and process (with lock)
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Re-check state in case it changed
         if (self.state != .established) {
             return ConnError.NotEstablished;
         }
 
         var session = &(self.session orelse return ConnError.NotEstablished);
-
-        // Receive packet
-        var buf: [message.max_packet_size]u8 = undefined;
-        const result = self.transport.recvFrom(&buf) catch return ConnError.TransportError;
 
         // Parse transport message
         const msg = message.parseTransportMessage(buf[0..result.bytes_read]) catch return ConnError.MessageError;

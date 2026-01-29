@@ -55,6 +55,16 @@ type Conn struct {
 
 	// Timestamps
 	createdAt time.Time
+
+	// Inbound channel for listener-managed connections
+	// When set, Recv() reads from this channel instead of the transport
+	inbound chan inboundPacket
+}
+
+// inboundPacket represents a packet received from the listener
+type inboundPacket struct {
+	data []byte
+	addr Addr
 }
 
 // ConnConfig contains the configuration for creating a connection.
@@ -172,7 +182,7 @@ func (c *Conn) Open() error {
 	}
 
 	// Complete handshake
-	return c.completeHandshake(resp.SenderIndex)
+	return c.completeHandshake(resp.SenderIndex, nil)
 }
 
 // Accept processes an incoming handshake initiation and completes the handshake.
@@ -211,9 +221,7 @@ func (c *Conn) Accept(msg *HandshakeInitMessage) ([]byte, error) {
 	}
 
 	// Get remote public key from handshake
-	c.mu.Lock()
-	c.remotePK = hs.RemoteStatic()
-	c.mu.Unlock()
+	remotePK := hs.RemoteStatic()
 
 	// Generate response
 	msg2, err := hs.WriteMessage(nil)
@@ -224,8 +232,8 @@ func (c *Conn) Accept(msg *HandshakeInitMessage) ([]byte, error) {
 	// Store initiator's index as remote index
 	remoteIdx := msg.SenderIndex
 
-	// Complete handshake
-	if err := c.completeHandshake(remoteIdx); err != nil {
+	// Complete handshake (updates remotePK atomically with state)
+	if err := c.completeHandshake(remoteIdx, &remotePK); err != nil {
 		return nil, err
 	}
 
@@ -234,7 +242,8 @@ func (c *Conn) Accept(msg *HandshakeInitMessage) ([]byte, error) {
 }
 
 // completeHandshake finalizes the handshake and creates the session.
-func (c *Conn) completeHandshake(remoteIdx uint32) error {
+// If remotePK is not nil, it will be set atomically with the state transition.
+func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -247,6 +256,11 @@ func (c *Conn) completeHandshake(remoteIdx uint32) error {
 	if err != nil {
 		c.state = ConnStateNew
 		return err
+	}
+
+	// Update remotePK if provided (for responder case)
+	if remotePK != nil {
+		c.remotePK = *remotePK
 	}
 
 	// Create session
@@ -316,17 +330,30 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 		return 0, nil, ErrNotEstablished
 	}
 	session := c.session
+	inbound := c.inbound
 	c.mu.RUnlock()
 
-	// Receive packet
-	buf := make([]byte, MaxPacketSize)
-	n, _, err := c.transport.RecvFrom(buf)
-	if err != nil {
-		return 0, nil, err
+	var data []byte
+
+	if inbound != nil {
+		// Listener-managed connection: read from inbound channel
+		pkt, ok := <-inbound
+		if !ok {
+			return 0, nil, ErrConnClosed
+		}
+		data = pkt.data
+	} else {
+		// Direct connection: read from transport
+		buf := make([]byte, MaxPacketSize)
+		n, _, err := c.transport.RecvFrom(buf)
+		if err != nil {
+			return 0, nil, err
+		}
+		data = buf[:n]
 	}
 
 	// Parse transport message
-	msg, err := ParseTransportMessage(buf[:n])
+	msg, err := ParseTransportMessage(data)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -405,6 +432,34 @@ func (c *Conn) SetRemoteAddr(addr Addr) {
 	c.remoteAddr = addr
 }
 
+// setInbound sets up the inbound channel for listener-managed connections.
+// This should only be called by Listener before the connection is returned.
+func (c *Conn) setInbound(ch chan inboundPacket) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.inbound = ch
+}
+
+// deliverPacket delivers a packet to the connection's inbound channel.
+// Returns false if the channel is full or the connection is closed.
+func (c *Conn) deliverPacket(data []byte, addr Addr) bool {
+	c.mu.RLock()
+	inbound := c.inbound
+	state := c.state
+	c.mu.RUnlock()
+
+	if inbound == nil || state == ConnStateClosed {
+		return false
+	}
+
+	select {
+	case inbound <- inboundPacket{data: data, addr: addr}:
+		return true
+	default:
+		return false
+	}
+}
+
 // Connection errors.
 var (
 	ErrMissingLocalKey      = errors.New("noise: missing local key pair")
@@ -415,4 +470,5 @@ var (
 	ErrNotEstablished       = errors.New("noise: connection not established")
 	ErrInvalidReceiverIndex = errors.New("noise: invalid receiver index")
 	ErrHandshakeIncomplete  = errors.New("noise: handshake not complete")
+	ErrConnClosed           = errors.New("noise: connection closed")
 )
