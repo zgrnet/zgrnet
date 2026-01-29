@@ -23,14 +23,21 @@ pub fn build(b: *std.Build) void {
     // Helper to configure system crypto linking
     const configureSystemCrypto = struct {
         fn configure(compile: *std.Build.Step.Compile, builder: *std.Build, include: []const u8, lib_path: []const u8) void {
+            // Link libc for OpenSSL
+            compile.linkLibC();
+            
             // Add OpenSSL wrapper C source
             compile.addCSourceFile(.{
                 .file = builder.path("src/openssl/openssl_wrapper.c"),
                 .flags = &.{ "-O3", "-I", include },
             });
-            // Link system libcrypto
+            
+            // Add library search path and link OpenSSL
             compile.addLibraryPath(.{ .cwd_relative = lib_path });
             compile.linkSystemLibrary2("crypto", .{ .use_pkg_config = .no });
+            
+            // Add rpath for runtime library lookup
+            compile.addRPath(.{ .cwd_relative = lib_path });
         }
     }.configure;
 
