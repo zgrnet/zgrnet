@@ -4,32 +4,35 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // ASM support: opt-in via -Duse-asm=true (disabled by default until ASM bug is fixed)
-    // ARM64 ASM is available for macOS and Linux
-    const target_arch = target.result.cpu.arch;
-    const target_os = target.result.os.tag;
-    const asm_supported = (target_arch == .aarch64) and 
-                          (target_os == .macos or target_os == .linux);
-    
-    // User can enable ASM via build option if supported
-    const use_asm = b.option(bool, "use-asm", "Enable ARM64 ASM optimizations") orelse false;
-    _ = asm_supported; // TODO: auto-enable when ASM bug is fixed
+    // Backend selection:
+    // - "zig": Pure Zig implementation (default, portable, ~6 Gbps)
+    // - "system": Link system crypto library (OpenSSL/BoringSSL, ~13 Gbps on ARM64)
+    const backend = b.option([]const u8, "backend", "Crypto backend: 'zig' (default) or 'system'") orelse "zig";
+    const use_system_crypto = std.mem.eql(u8, backend, "system");
 
     // Build options to pass to source code
     const options = b.addOptions();
-    options.addOption(bool, "use_asm", use_asm);
+    options.addOption(bool, "use_system_crypto", use_system_crypto);
 
-    // Helper to link precompiled ASM library
-    // Note: ASM must be precompiled with system clang (Zig's linker has issues with this ASM)
-    // Run: clang -c src/boringssl/chacha20_poly1305.S -o /tmp/asm.o && \
-    //      clang -c src/boringssl/chacha20_poly1305_wrapper.c -I src/boringssl -O3 -o /tmp/wrapper.o && \
-    //      ar rcs src/boringssl/libchacha20_asm.a /tmp/asm.o /tmp/wrapper.o
-    const addAsmLib = struct {
-        fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
-            compile.addLibraryPath(builder.path("src/boringssl"));
-            compile.linkSystemLibrary2("chacha20_asm", .{ .use_pkg_config = .no });
+    // System crypto library paths (only used when backend=system)
+    const crypto_include = std.posix.getenv("CRYPTO_INCLUDE") orelse
+        "/opt/homebrew/opt/openssl@3/include";
+    const crypto_lib = std.posix.getenv("CRYPTO_LIB") orelse
+        "/opt/homebrew/opt/openssl@3/lib";
+
+    // Helper to configure system crypto linking
+    const configureSystemCrypto = struct {
+        fn configure(compile: *std.Build.Step.Compile, builder: *std.Build, include: []const u8, lib_path: []const u8) void {
+            // Add OpenSSL wrapper C source
+            compile.addCSourceFile(.{
+                .file = builder.path("src/openssl/openssl_wrapper.c"),
+                .flags = &.{ "-O3", "-I", include },
+            });
+            // Link system libcrypto
+            compile.addLibraryPath(.{ .cwd_relative = lib_path });
+            compile.linkSystemLibrary2("crypto", .{ .use_pkg_config = .no });
         }
-    }.add;
+    }.configure;
 
     // Library module
     const lib_module = b.createModule(.{
@@ -44,7 +47,9 @@ pub fn build(b: *std.Build) void {
         .name = "noise",
         .root_module = lib_module,
     });
-    if (use_asm) addAsmLib(lib, b);
+    if (use_system_crypto) {
+        configureSystemCrypto(lib, b, crypto_include, crypto_lib);
+    }
     b.installArtifact(lib);
 
     // Test module
@@ -59,7 +64,9 @@ pub fn build(b: *std.Build) void {
     const main_tests = b.addTest(.{
         .root_module = test_module,
     });
-    if (use_asm) addAsmLib(main_tests, b);
+    if (use_system_crypto) {
+        configureSystemCrypto(main_tests, b, crypto_include, crypto_lib);
+    }
 
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run library tests");
@@ -78,7 +85,9 @@ pub fn build(b: *std.Build) void {
         .name = "bench",
         .root_module = bench_module,
     });
-    if (use_asm) addAsmLib(bench_exe, b);
+    if (use_system_crypto) {
+        configureSystemCrypto(bench_exe, b, crypto_include, crypto_lib);
+    }
     b.installArtifact(bench_exe);
 
     const run_bench = b.addRunArtifact(bench_exe);

@@ -1,8 +1,8 @@
 //! ChaCha20-Poly1305 AEAD cipher.
 //!
-//! Automatically selects the best backend based on target architecture:
-//! - ARM64 (aarch64) with BoringSSL: Assembly optimized (fastest, ~13 Gbps)
-//! - Other platforms: Pure Zig implementation (portable, ~7 Gbps)
+//! Backend selection via build option `-Dbackend=`:
+//! - "zig" (default): Pure Zig implementation (portable, ~6 Gbps)
+//! - "system": Link system crypto library (OpenSSL/BoringSSL, ~13 Gbps on ARM64)
 //!
 //! This module provides a unified API for encrypt/decrypt operations.
 
@@ -19,43 +19,36 @@ pub const key_size = keypair.key_size;
 /// AEAD tag size (Poly1305).
 pub const tag_size: usize = 16;
 
-/// Backend selection based on target architecture.
+/// Backend selection.
 pub const Backend = enum {
-    /// BoringSSL ARM64 assembly - fastest (~13 Gbps on Apple Silicon)
-    boringssl_arm64,
-    /// Pure Zig using std.crypto - portable (~7 Gbps)
+    /// System crypto library (OpenSSL/BoringSSL) - fastest (~13 Gbps on Apple Silicon)
+    system_crypto,
+    /// Pure Zig using std.crypto - portable (~6 Gbps)
     native_zig,
 };
 
-/// Check if ASM optimizations are available (detected via build system).
-/// ARM64 ASM is used on macOS and Linux aarch64 targets.
-pub const asm_available: bool = build_options.use_asm;
+/// Whether system crypto is enabled via build option.
+pub const use_system_crypto: bool = build_options.use_system_crypto;
 
 /// Active backend selection.
-pub const backend: Backend = blk: {
-    // Use ASM if available (build system detected ARM64 + macOS/Linux)
-    if (asm_available) {
-        break :blk .boringssl_arm64;
-    }
-    break :blk .native_zig;
-};
+pub const backend: Backend = if (use_system_crypto) .system_crypto else .native_zig;
 
 // =============================================================================
-// BoringSSL ARM64 Backend
+// System Crypto Backend (OpenSSL/BoringSSL)
 // =============================================================================
 
-const boringssl = struct {
-    // C functions from boringssl/chacha20_poly1305_wrapper.c
+const system_crypto = struct {
+    // C functions from boringssl/chacha20_poly1305_wrapper.c (links to system libcrypto)
     extern fn aead_seal(out: [*]u8, key: [*]const u8, nonce: u64, plaintext: [*]const u8, plaintext_len: usize) void;
     extern fn aead_open(out: [*]u8, key: [*]const u8, nonce: u64, ciphertext: [*]const u8, ciphertext_len: usize) c_int;
 
     fn encrypt(key: *const [key_size]u8, nonce: u64, plaintext: []const u8, ad: []const u8, out: []u8) void {
-        _ = ad; // BoringSSL wrapper doesn't support AD yet, TODO: add support
+        _ = ad; // TODO: add AD support
         aead_seal(out.ptr, key, nonce, plaintext.ptr, plaintext.len);
     }
 
     fn decrypt(key: *const [key_size]u8, nonce: u64, ciphertext: []const u8, ad: []const u8, out: []u8) !void {
-        _ = ad; // BoringSSL wrapper doesn't support AD yet
+        _ = ad; // TODO: add AD support
         if (ciphertext.len < tag_size) return error.InvalidCiphertext;
         const ret = aead_open(out.ptr, key, nonce, ciphertext.ptr, ciphertext.len);
         if (ret != 0) return error.DecryptionFailed;
@@ -110,7 +103,7 @@ pub fn encrypt(
     out: []u8,
 ) void {
     switch (backend) {
-        .boringssl_arm64 => boringssl.encrypt(key, nonce, plaintext, ad, out),
+        .system_crypto => system_crypto.encrypt(key, nonce, plaintext, ad, out),
         .native_zig => native.encrypt(key, nonce, plaintext, ad, out),
     }
 }
@@ -125,7 +118,7 @@ pub fn decrypt(
     out: []u8,
 ) !void {
     switch (backend) {
-        .boringssl_arm64 => try boringssl.decrypt(key, nonce, ciphertext, ad, out),
+        .system_crypto => try system_crypto.decrypt(key, nonce, ciphertext, ad, out),
         .native_zig => try native.decrypt(key, nonce, ciphertext, ad, out),
     }
 }
@@ -143,7 +136,7 @@ pub fn decryptWithAd(key: *const Key, ad: []const u8, ciphertext: []const u8, ou
 /// Returns the name of the active backend for debugging.
 pub fn backendName() []const u8 {
     return switch (backend) {
-        .boringssl_arm64 => "BoringSSL ARM64 ASM",
+        .system_crypto => "System Crypto (OpenSSL/BoringSSL)",
         .native_zig => "Native Zig (std.crypto)",
     };
 }
