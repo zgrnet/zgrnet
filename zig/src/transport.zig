@@ -43,14 +43,21 @@ pub const RecvResult = struct {
 // Address Interface
 // =============================================================================
 
+// Forward declare UdpAddr
+const udp = @import("udp.zig");
+pub const UdpAddr = udp.UdpAddr;
+
 /// Abstract address interface.
 pub const Addr = union(enum) {
     /// Mock address for testing.
     mock: MockAddr,
+    /// UDP address.
+    udp: UdpAddr,
 
     pub fn network(self: Addr) []const u8 {
         return switch (self) {
             .mock => |m| m.network(),
+            .udp => "udp",
         };
     }
 
@@ -64,6 +71,11 @@ pub const Addr = union(enum) {
         _ = options;
         switch (self) {
             .mock => |m| try writer.print("{s}", .{m.name}),
+            .udp => |u| {
+                var buf: [64]u8 = undefined;
+                const str = u.format(&buf) catch "?";
+                try writer.print("{s}", .{str});
+            },
         }
     }
 };

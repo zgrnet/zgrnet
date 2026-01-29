@@ -1,5 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use noise::{Config, HandshakeState, Key, KeyPair, Pattern, Session, SessionConfig, SessionManager};
+use noise::udp::Udp;
+use std::net::UdpSocket;
 use std::thread;
 
 fn bench_key_generation(c: &mut Criterion) {
@@ -335,6 +337,252 @@ fn bench_session_manager_concurrent(c: &mut Criterion) {
     group.finish();
 }
 
+// =============================================================================
+// UDP Transport Benchmarks
+// =============================================================================
+
+fn bench_udp_throughput(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    
+    // Create server socket for drain
+    let server = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    let server_addr = server.local_addr().unwrap();
+    server.set_read_timeout(Some(std::time::Duration::from_millis(100))).ok();
+    
+    // Create client using our Udp transport
+    let client = Udp::new("127.0.0.1:0", &server_addr.to_string()).unwrap();
+    
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let server_clone = server.clone();
+    
+    // Server drain thread
+    let server_handle = thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while !stop_clone.load(Ordering::Relaxed) {
+            let _ = server_clone.recv(&mut buf);
+        }
+    });
+    
+    let data = [0u8; 1400];
+    
+    let mut group = c.benchmark_group("udp");
+    group.throughput(Throughput::Bytes(1400));
+    group.bench_function("throughput", |b| {
+        b.iter(|| {
+            client.send(black_box(&data)).unwrap();
+        })
+    });
+    group.finish();
+    
+    stop.store(true, Ordering::Relaxed);
+    let _ = server_handle.join();
+}
+
+fn bench_udp_noise_throughput(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    
+    // Create server socket for drain
+    let server = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    let server_addr = server.local_addr().unwrap();
+    server.set_read_timeout(Some(std::time::Duration::from_millis(100))).ok();
+    
+    // Create client using our Udp transport
+    let client = Udp::new("127.0.0.1:0", &server_addr.to_string()).unwrap();
+    
+    // Create session
+    let send_key = Key::new(noise::cipher::hash(&[b"send"]));
+    let recv_key = Key::new(noise::cipher::hash(&[b"recv"]));
+    
+    let session = Session::new(SessionConfig {
+        local_index: 1,
+        remote_index: 2,
+        send_key,
+        recv_key,
+        remote_pk: Key::default(),
+    });
+    
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let server_clone = server.clone();
+    
+    // Server drain thread
+    let server_handle = thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while !stop_clone.load(Ordering::Relaxed) {
+            let _ = server_clone.recv(&mut buf);
+        }
+    });
+    
+    let plaintext = [0u8; 1400];
+    let mut send_buf = [0u8; 1500];
+    
+    let mut group = c.benchmark_group("udp_noise");
+    group.throughput(Throughput::Bytes(1400));
+    group.bench_function("throughput", |b| {
+        b.iter(|| {
+            // Encrypt
+            let nonce = session.encrypt_to(black_box(&plaintext), &mut send_buf[13..]).unwrap();
+            
+            // Build header
+            send_buf[0] = 4; // MessageTypeTransport
+            send_buf[1..5].copy_from_slice(&2u32.to_le_bytes());
+            send_buf[5..13].copy_from_slice(&nonce.to_le_bytes());
+            
+            // Send
+            client.send(&send_buf[..13 + plaintext.len() + 16]).unwrap();
+        })
+    });
+    group.finish();
+    
+    stop.store(true, Ordering::Relaxed);
+    let _ = server_handle.join();
+}
+
+fn bench_udp_sendrecv(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    
+    // Create server socket for echo
+    let server = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    let server_addr = server.local_addr().unwrap();
+    server.set_read_timeout(Some(std::time::Duration::from_millis(100))).ok();
+    
+    // Create client using our Udp transport
+    let client = Udp::new("127.0.0.1:0", &server_addr.to_string()).unwrap();
+    client.set_read_timeout(Some(std::time::Duration::from_secs(1))).ok();
+    
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let server_clone = server.clone();
+    
+    // Server echo thread
+    let server_handle = thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while !stop_clone.load(Ordering::Relaxed) {
+            match server_clone.recv_from(&mut buf) {
+                Ok((n, addr)) => {
+                    let _ = server_clone.send_to(&buf[..n], addr);
+                },
+                Err(_) => {},
+            }
+        }
+    });
+    
+    let data = [0u8; 1400];
+    let mut recv_buf = [0u8; 1500];
+    
+    let mut group = c.benchmark_group("udp");
+    group.throughput(Throughput::Bytes(1400 * 2));
+    group.bench_function("sendrecv", |b| {
+        b.iter(|| {
+            client.send(black_box(&data)).unwrap();
+            client.recv(&mut recv_buf).unwrap();
+        })
+    });
+    group.finish();
+    
+    stop.store(true, Ordering::Relaxed);
+    let _ = server_handle.join();
+}
+
+fn bench_udp_noise_sendrecv(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    
+    // Create server socket for echo
+    let server = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    let server_addr = server.local_addr().unwrap();
+    server.set_read_timeout(Some(std::time::Duration::from_millis(100))).ok();
+    
+    // Create client using our Udp transport
+    let client = Udp::new("127.0.0.1:0", &server_addr.to_string()).unwrap();
+    client.set_read_timeout(Some(std::time::Duration::from_secs(1))).ok();
+    
+    // Create sessions
+    let send_key = Key::new(noise::cipher::hash(&[b"send"]));
+    let recv_key = Key::new(noise::cipher::hash(&[b"recv"]));
+    
+    let client_session = Session::new(SessionConfig {
+        local_index: 1,
+        remote_index: 2,
+        send_key: send_key.clone(),
+        recv_key: recv_key.clone(),
+        remote_pk: Key::default(),
+    });
+    
+    let server_session = Session::new(SessionConfig {
+        local_index: 2,
+        remote_index: 1,
+        send_key: recv_key,
+        recv_key: send_key,
+        remote_pk: Key::default(),
+    });
+    
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let server_clone = server.clone();
+    
+    // Server echo thread
+    let server_handle = thread::spawn(move || {
+        let mut recv_buf = [0u8; 1500];
+        let mut send_buf = [0u8; 1500];
+        let mut pt_buf = [0u8; 1500];
+        
+        while !stop_clone.load(Ordering::Relaxed) {
+            match server_clone.recv_from(&mut recv_buf) {
+                Ok((n, addr)) => {
+                    if n < 13 { continue; }
+                    
+                    // Parse and decrypt
+                    let nonce = u64::from_le_bytes(recv_buf[5..13].try_into().unwrap());
+                    let pt_len = server_session.decrypt_to(&recv_buf[13..n], nonce, &mut pt_buf).unwrap_or(0);
+                    
+                    if pt_len == 0 { continue; }
+                    
+                    // Re-encrypt and send back
+                    let resp_nonce = server_session.encrypt_to(&pt_buf[..pt_len], &mut send_buf[13..]).unwrap();
+                    send_buf[0] = 4;
+                    send_buf[1..5].copy_from_slice(&1u32.to_le_bytes());
+                    send_buf[5..13].copy_from_slice(&resp_nonce.to_le_bytes());
+                    
+                    let _ = server_clone.send_to(&send_buf[..13 + pt_len + 16], addr);
+                },
+                Err(_) => {},
+            }
+        }
+    });
+    
+    let plaintext = [0u8; 1024];
+    let mut send_buf = [0u8; 1500];
+    let mut recv_buf = [0u8; 1500];
+    let mut pt_buf = [0u8; 1500];
+    
+    let mut group = c.benchmark_group("udp_noise");
+    group.throughput(Throughput::Bytes(1024 * 2));
+    group.bench_function("sendrecv", |b| {
+        b.iter(|| {
+            // Encrypt and send
+            let nonce = client_session.encrypt_to(black_box(&plaintext), &mut send_buf[13..]).unwrap();
+            send_buf[0] = 4;
+            send_buf[1..5].copy_from_slice(&2u32.to_le_bytes());
+            send_buf[5..13].copy_from_slice(&nonce.to_le_bytes());
+            client.send(&send_buf[..13 + plaintext.len() + 16]).unwrap();
+            
+            // Recv and decrypt
+            let n = client.recv(&mut recv_buf).unwrap();
+            let resp_nonce = u64::from_le_bytes(recv_buf[5..13].try_into().unwrap());
+            client_session.decrypt_to(&recv_buf[13..n], resp_nonce, &mut pt_buf).unwrap();
+        })
+    });
+    group.finish();
+    
+    stop.store(true, Ordering::Relaxed);
+    let _ = server_handle.join();
+}
+
 criterion_group!(
     benches,
     bench_key_generation,
@@ -349,5 +597,9 @@ criterion_group!(
     bench_concurrent_session_encrypt,
     bench_concurrent_multi_session,
     bench_session_manager_concurrent,
+    bench_udp_throughput,
+    bench_udp_noise_throughput,
+    bench_udp_sendrecv,
+    bench_udp_noise_sendrecv,
 );
 criterion_main!(benches);

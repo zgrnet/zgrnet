@@ -5,6 +5,8 @@
 const std = @import("std");
 const time = std.time;
 const Thread = std.Thread;
+const net = std.net;
+const posix = std.posix;
 const noise = @import("noise.zig");
 const keypair = noise.keypair;
 const cipher = noise.cipher;
@@ -15,6 +17,46 @@ const session_mod = @import("session.zig");
 const manager_mod = @import("manager.zig");
 const Session = session_mod.Session;
 const SessionManager = manager_mod.SessionManager;
+const udp_mod = @import("udp.zig");
+const Udp = udp_mod.Udp;
+
+/// Helper for UDP benchmark setup - creates a server socket and client transport
+const UdpBenchSetup = struct {
+    server_fd: posix.fd_t,
+    client: Udp,
+
+    pub fn init() !UdpBenchSetup {
+        // Create server socket
+        const server_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+        const server_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        errdefer posix.close(server_fd);
+
+        try posix.bind(server_fd, &server_addr.any, server_addr.getOsSockLen());
+
+        // Get assigned port
+        var bound_addr: net.Address = undefined;
+        var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        try posix.getsockname(server_fd, &bound_addr.any, &bound_len);
+
+        const server_port = bound_addr.getPort();
+
+        // Create client using Udp transport
+        var addr_buf: [32]u8 = undefined;
+        const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{server_port});
+
+        const client = try Udp.init("127.0.0.1:0", addr_str);
+
+        return .{
+            .server_fd = server_fd,
+            .client = client,
+        };
+    }
+
+    pub fn deinit(self: *UdpBenchSetup) void {
+        posix.close(self.server_fd);
+        self.client.close();
+    }
+};
 
 fn doNotOptimize(ptr: anytype) void {
     // Prevent compiler from optimizing away the result
@@ -486,6 +528,111 @@ pub fn main() !void {
             num_threads,
             per_op_ns,
             throughput_gbps,
+        });
+    }
+
+    // ==========================================================================
+    // UDP Transport Benchmarks
+    // ==========================================================================
+    std.debug.print("\n=== UDP Transport Benchmarks ===\n\n", .{});
+
+    // UDP Throughput benchmark (using udp.Udp)
+    {
+        const iterations: usize = 100000;
+
+        // Use helper for setup
+        var setup = UdpBenchSetup.init() catch |e| {
+            std.debug.print("Failed to setup UDP benchmark: {}\n", .{e});
+            return;
+        };
+
+        // Server drain thread
+        const server_thread = Thread.spawn(.{}, struct {
+            fn run(fd: posix.fd_t) void {
+                var buf: [1500]u8 = undefined;
+                while (true) {
+                    _ = posix.recv(fd, &buf, 0) catch break;
+                }
+            }
+        }.run, .{setup.server_fd}) catch unreachable;
+
+        const data = [_]u8{0} ** 1400;
+
+        const start = time.nanoTimestamp();
+        for (0..iterations) |_| {
+            _ = setup.client.send(&data) catch break;
+        }
+        const end = time.nanoTimestamp();
+
+        // Close server first to unblock recv, then join
+        setup.deinit();
+        server_thread.join();
+
+        const elapsed_ns = @as(f64, @floatFromInt(end - start));
+        const per_op_ns = elapsed_ns / @as(f64, iterations);
+        const throughput_mbps = (1400.0 * @as(f64, iterations)) / (elapsed_ns / 1_000_000_000.0) / 1_000_000.0;
+        std.debug.print("udp_throughput: {d:.0} ns/op ({d:.0} MB/s)\n", .{
+            per_op_ns,
+            throughput_mbps,
+        });
+    }
+
+    // UDP + Noise Throughput benchmark (using udp.Udp)
+    {
+        const iterations: usize = 100000;
+
+        // Use helper for setup
+        var setup = UdpBenchSetup.init() catch return;
+
+        // Create session
+        const send_key = keypair.Key.fromBytes(crypto.hash(&.{"send"}));
+        const recv_key = keypair.Key.fromBytes(crypto.hash(&.{"recv"}));
+
+        var client_session = Session.init(.{
+            .local_index = 1,
+            .remote_index = 2,
+            .send_key = send_key,
+            .recv_key = recv_key,
+        });
+
+        // Server drain thread
+        const server_thread = Thread.spawn(.{}, struct {
+            fn run(fd: posix.fd_t) void {
+                var buf: [1500]u8 = undefined;
+                while (true) {
+                    _ = posix.recv(fd, &buf, 0) catch break;
+                }
+            }
+        }.run, .{setup.server_fd}) catch unreachable;
+
+        const plaintext = [_]u8{0} ** 1400;
+        var send_buf: [1500]u8 = undefined;
+
+        const start = time.nanoTimestamp();
+        for (0..iterations) |_| {
+            // Encrypt
+            const nonce = client_session.encrypt(&plaintext, send_buf[13..]) catch continue;
+
+            // Build header
+            send_buf[0] = 4; // MessageTypeTransport
+            std.mem.writeInt(u32, send_buf[1..5], 2, .little);
+            std.mem.writeInt(u64, send_buf[5..13], nonce, .little);
+
+            // Send using Udp transport
+            _ = setup.client.send(send_buf[0 .. 13 + plaintext.len + 16]) catch break;
+        }
+        const end = time.nanoTimestamp();
+
+        // Close server first to unblock recv
+        setup.deinit();
+        server_thread.join();
+
+        const elapsed_ns = @as(f64, @floatFromInt(end - start));
+        const per_op_ns = elapsed_ns / @as(f64, iterations);
+        const throughput_mbps = (1400.0 * @as(f64, iterations)) / (elapsed_ns / 1_000_000_000.0) / 1_000_000.0;
+        std.debug.print("udp_noise_throughput: {d:.0} ns/op ({d:.0} MB/s)\n", .{
+            per_op_ns,
+            throughput_mbps,
         });
     }
 
