@@ -19,14 +19,15 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(bool, "use_asm", use_asm);
 
-    // Helper to add ASM files to a compile step
-    const addAsmFiles = struct {
+    // Helper to link precompiled ASM library
+    // Note: ASM must be precompiled with system clang (Zig's linker has issues with this ASM)
+    // Run: clang -c src/boringssl/chacha20_poly1305.S -o /tmp/asm.o && \
+    //      clang -c src/boringssl/chacha20_poly1305_wrapper.c -I src/boringssl -O3 -o /tmp/wrapper.o && \
+    //      ar rcs src/boringssl/libchacha20_asm.a /tmp/asm.o /tmp/wrapper.o
+    const addAsmLib = struct {
         fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
-            compile.addAssemblyFile(builder.path("src/boringssl/chacha20_poly1305.S"));
-            compile.addCSourceFile(.{
-                .file = builder.path("src/boringssl/chacha20_poly1305_wrapper.c"),
-                .flags = &.{"-O3"},
-            });
+            compile.addLibraryPath(builder.path("src/boringssl"));
+            compile.linkSystemLibrary2("chacha20_asm", .{ .use_pkg_config = .no });
         }
     }.add;
 
@@ -43,7 +44,7 @@ pub fn build(b: *std.Build) void {
         .name = "noise",
         .root_module = lib_module,
     });
-    if (use_asm) addAsmFiles(lib, b);
+    if (use_asm) addAsmLib(lib, b);
     b.installArtifact(lib);
 
     // Test module
@@ -58,7 +59,7 @@ pub fn build(b: *std.Build) void {
     const main_tests = b.addTest(.{
         .root_module = test_module,
     });
-    if (use_asm) addAsmFiles(main_tests, b);
+    if (use_asm) addAsmLib(main_tests, b);
 
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run library tests");
@@ -77,7 +78,7 @@ pub fn build(b: *std.Build) void {
         .name = "bench",
         .root_module = bench_module,
     });
-    if (use_asm) addAsmFiles(bench_exe, b);
+    if (use_asm) addAsmLib(bench_exe, b);
     b.installArtifact(bench_exe);
 
     const run_bench = b.addRunArtifact(bench_exe);
