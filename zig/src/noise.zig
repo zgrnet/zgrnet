@@ -22,6 +22,7 @@ pub const manager = @import("manager.zig");
 pub const message = @import("message.zig");
 pub const transport = @import("transport.zig");
 pub const conn = @import("conn.zig");
+pub const udp = @import("udp.zig");
 
 // Re-export main types
 pub const Key = keypair.Key;
@@ -52,6 +53,8 @@ pub const Transport = transport.Transport;
 pub const Addr = transport.Addr;
 pub const MockTransport = transport.MockTransport;
 pub const MockAddr = transport.MockAddr;
+pub const Udp = udp.Udp;
+pub const UdpAddr = udp.UdpAddr;
 pub const Conn = conn.Conn;
 pub const ConnConfig = conn.ConnConfig;
 pub const ConnState = conn.ConnState;
@@ -80,4 +83,5 @@ test {
     _ = message;
     _ = transport;
     _ = conn;
+    _ = udp;
 }
