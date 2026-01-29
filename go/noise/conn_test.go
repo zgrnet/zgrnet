@@ -91,9 +91,9 @@ func TestConnOpenMissingRemoteAddr(t *testing.T) {
 	defer transport.Close()
 
 	conn, _ := NewConn(ConnConfig{
-		LocalKey: key,
+		LocalKey:  key,
 		Transport: transport,
-		RemotePK: peerKey.Public,
+		RemotePK:  peerKey.Public,
 	})
 
 	err := conn.Open()
