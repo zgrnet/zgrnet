@@ -2,7 +2,7 @@
 //!
 //! Backend selection via build option `-Dbackend=`:
 //! - "zig" (default): Pure Zig implementation (portable, ~6 Gbps)
-//! - "system": Link system crypto library (OpenSSL/BoringSSL, ~13 Gbps on ARM64)
+//! - "asm": BoringSSL ARM64 assembly (fastest, ~13 Gbps on ARM64)
 //!
 //! This module provides a unified API for encrypt/decrypt operations.
 
@@ -21,34 +21,34 @@ pub const tag_size: usize = 16;
 
 /// Backend selection.
 pub const Backend = enum {
-    /// System crypto library (OpenSSL/BoringSSL) - fastest (~13 Gbps on Apple Silicon)
-    system_crypto,
+    /// BoringSSL ARM64 assembly - fastest (~13 Gbps on Apple Silicon)
+    boringssl_asm,
     /// Pure Zig using std.crypto - portable (~6 Gbps)
     native_zig,
 };
 
-/// Whether system crypto is enabled via build option.
-pub const use_system_crypto: bool = build_options.use_system_crypto;
+/// Whether ASM backend is enabled via build option.
+pub const use_asm: bool = build_options.use_asm;
 
 /// Active backend selection.
-pub const backend: Backend = if (use_system_crypto) .system_crypto else .native_zig;
+pub const backend: Backend = if (use_asm) .boringssl_asm else .native_zig;
 
 // =============================================================================
-// System Crypto Backend (OpenSSL/BoringSSL)
+// BoringSSL ARM64 ASM Backend (no external dependencies)
 // =============================================================================
 
-const system_crypto = struct {
-    // C functions from boringssl/chacha20_poly1305_wrapper.c (links to system libcrypto)
+const boringssl = struct {
+    // C functions from boringssl/chacha20_poly1305_wrapper.c (calls ARM64 ASM)
     extern fn aead_seal(out: [*]u8, key: [*]const u8, nonce: u64, plaintext: [*]const u8, plaintext_len: usize) void;
     extern fn aead_open(out: [*]u8, key: [*]const u8, nonce: u64, ciphertext: [*]const u8, ciphertext_len: usize) c_int;
 
     fn encrypt(key: *const [key_size]u8, nonce: u64, plaintext: []const u8, ad: []const u8, out: []u8) void {
-        _ = ad; // TODO: add AD support
+        _ = ad; // ASM wrapper doesn't support AD yet
         aead_seal(out.ptr, key, nonce, plaintext.ptr, plaintext.len);
     }
 
     fn decrypt(key: *const [key_size]u8, nonce: u64, ciphertext: []const u8, ad: []const u8, out: []u8) !void {
-        _ = ad; // TODO: add AD support
+        _ = ad; // ASM wrapper doesn't support AD yet
         if (ciphertext.len < tag_size) return error.InvalidCiphertext;
         const ret = aead_open(out.ptr, key, nonce, ciphertext.ptr, ciphertext.len);
         if (ret != 0) return error.DecryptionFailed;
@@ -103,7 +103,7 @@ pub fn encrypt(
     out: []u8,
 ) void {
     switch (backend) {
-        .system_crypto => system_crypto.encrypt(key, nonce, plaintext, ad, out),
+        .boringssl_asm => boringssl.encrypt(key, nonce, plaintext, ad, out),
         .native_zig => native.encrypt(key, nonce, plaintext, ad, out),
     }
 }
@@ -118,7 +118,7 @@ pub fn decrypt(
     out: []u8,
 ) !void {
     switch (backend) {
-        .system_crypto => try system_crypto.decrypt(key, nonce, ciphertext, ad, out),
+        .boringssl_asm => try boringssl.decrypt(key, nonce, ciphertext, ad, out),
         .native_zig => try native.decrypt(key, nonce, ciphertext, ad, out),
     }
 }
@@ -136,7 +136,7 @@ pub fn decryptWithAd(key: *const Key, ad: []const u8, ciphertext: []const u8, ou
 /// Returns the name of the active backend for debugging.
 pub fn backendName() []const u8 {
     return switch (backend) {
-        .system_crypto => "System Crypto (OpenSSL/BoringSSL)",
+        .boringssl_asm => "BoringSSL ARM64 ASM",
         .native_zig => "Native Zig (std.crypto)",
     };
 }

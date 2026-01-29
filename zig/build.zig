@@ -6,40 +6,37 @@ pub fn build(b: *std.Build) void {
 
     // Backend selection:
     // - "zig": Pure Zig implementation (default, portable, ~6 Gbps)
-    // - "system": Link system crypto library (OpenSSL/BoringSSL, ~13 Gbps on ARM64)
-    const backend = b.option([]const u8, "backend", "Crypto backend: 'zig' (default) or 'system'") orelse "zig";
-    const use_system_crypto = std.mem.eql(u8, backend, "system");
+    // - "asm": BoringSSL ARM64 assembly (fastest, ~13 Gbps on ARM64)
+    const backend = b.option([]const u8, "backend", "Crypto backend: 'zig' (default) or 'asm'") orelse "zig";
+    const use_asm = std.mem.eql(u8, backend, "asm");
+
+    // Check if ASM is supported on target
+    const target_arch = target.result.cpu.arch;
+    const asm_supported = (target_arch == .aarch64);
+
+    if (use_asm and !asm_supported) {
+        std.log.warn("ASM backend only supported on ARM64, falling back to Zig", .{});
+    }
+
+    const effective_use_asm = use_asm and asm_supported;
 
     // Build options to pass to source code
     const options = b.addOptions();
-    options.addOption(bool, "use_system_crypto", use_system_crypto);
+    options.addOption(bool, "use_asm", effective_use_asm);
 
-    // System crypto library paths (only used when backend=system)
-    const crypto_include = std.posix.getenv("CRYPTO_INCLUDE") orelse
-        "/opt/homebrew/opt/openssl@3/include";
-    const crypto_lib = std.posix.getenv("CRYPTO_LIB") orelse
-        "/opt/homebrew/opt/openssl@3/lib";
-
-    // Helper to configure system crypto linking
-    const configureSystemCrypto = struct {
-        fn configure(compile: *std.Build.Step.Compile, builder: *std.Build, include: []const u8, lib_path: []const u8) void {
-            // Link libc for OpenSSL
-            compile.linkLibC();
-            
-            // Add OpenSSL wrapper C source
+    // Helper to compile and link ASM files
+    // Note: Using _no_cfi.S because Zig linker crashes on CFI directives
+    const addAsmFiles = struct {
+        fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
+            // Add ASM file (CFI stripped version to avoid Zig linker bug)
+            compile.addAssemblyFile(builder.path("src/boringssl/chacha20_poly1305_no_cfi.S"));
+            // Add C wrapper
             compile.addCSourceFile(.{
-                .file = builder.path("src/openssl/openssl_wrapper.c"),
-                .flags = &.{ "-O3", "-I", include },
+                .file = builder.path("src/boringssl/chacha20_poly1305_wrapper.c"),
+                .flags = &.{ "-O3", "-I", "src/boringssl" },
             });
-            
-            // Add library search path and link OpenSSL
-            compile.addLibraryPath(.{ .cwd_relative = lib_path });
-            compile.linkSystemLibrary2("crypto", .{ .use_pkg_config = .no });
-            
-            // Add rpath for runtime library lookup
-            compile.addRPath(.{ .cwd_relative = lib_path });
         }
-    }.configure;
+    }.add;
 
     // Library module
     const lib_module = b.createModule(.{
@@ -54,9 +51,7 @@ pub fn build(b: *std.Build) void {
         .name = "noise",
         .root_module = lib_module,
     });
-    if (use_system_crypto) {
-        configureSystemCrypto(lib, b, crypto_include, crypto_lib);
-    }
+    if (effective_use_asm) addAsmFiles(lib, b);
     b.installArtifact(lib);
 
     // Test module
@@ -71,9 +66,7 @@ pub fn build(b: *std.Build) void {
     const main_tests = b.addTest(.{
         .root_module = test_module,
     });
-    if (use_system_crypto) {
-        configureSystemCrypto(main_tests, b, crypto_include, crypto_lib);
-    }
+    if (effective_use_asm) addAsmFiles(main_tests, b);
 
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run library tests");
@@ -92,9 +85,7 @@ pub fn build(b: *std.Build) void {
         .name = "bench",
         .root_module = bench_module,
     });
-    if (use_system_crypto) {
-        configureSystemCrypto(bench_exe, b, crypto_include, crypto_lib);
-    }
+    if (effective_use_asm) addAsmFiles(bench_exe, b);
     b.installArtifact(bench_exe);
 
     const run_bench = b.addRunArtifact(bench_exe);
