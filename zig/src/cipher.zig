@@ -1,12 +1,13 @@
 //! ChaCha20-Poly1305 AEAD cipher.
 //!
 //! Automatically selects the best backend based on target architecture:
-//! - ARM64 (aarch64): BoringSSL assembly (fastest, ~13 Gbps)
+//! - ARM64 (aarch64) with BoringSSL: Assembly optimized (fastest, ~13 Gbps)
 //! - Other platforms: Pure Zig implementation (portable, ~7 Gbps)
 //!
 //! This module provides a unified API for encrypt/decrypt operations.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const builtin = @import("builtin");
 const crypto = std.crypto;
 const mem = std.mem;
@@ -26,9 +27,8 @@ pub const Backend = enum {
     native_zig,
 };
 
-/// Check if BoringSSL is available (linked at compile time).
-/// Set this to true when building with BoringSSL library.
-pub const boringssl_available: bool = false; // TODO: detect via build system
+/// Check if BoringSSL is available (detected via build system).
+pub const boringssl_available: bool = build_options.use_boringssl;
 
 /// Active backend selection.
 pub const backend: Backend = blk: {

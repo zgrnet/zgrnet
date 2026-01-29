@@ -4,11 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // BoringSSL paths (set via BORINGSSL_INCLUDE and BORINGSSL_LIB env vars, or use defaults)
-    const boringssl_include = std.posix.getenv("BORINGSSL_INCLUDE") orelse
-        "/opt/homebrew/opt/openssl@3/include"; // fallback to OpenSSL
-    const boringssl_lib = std.posix.getenv("BORINGSSL_LIB") orelse
-        "/opt/homebrew/opt/openssl@3/lib";
+    // BoringSSL is disabled for now - pure Zig implementation is used
+    // TODO: Re-enable when we have a proper BoringSSL wrapper that works with OpenSSL
+    const use_boringssl = false;
+
+    // Build options to pass to source code
+    const options = b.addOptions();
+    options.addOption(bool, "use_boringssl", use_boringssl);
 
     // Library module
     const lib_module = b.createModule(.{
@@ -16,15 +18,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    lib_module.addSystemIncludePath(.{ .cwd_relative = boringssl_include });
-    lib_module.addLibraryPath(.{ .cwd_relative = boringssl_lib });
-
-    // Try BoringSSL first, fallback to OpenSSL
-    if (std.posix.getenv("BORINGSSL_LIB") != null) {
-        lib_module.linkSystemLibrary("crypto_internal", .{});
-    } else {
-        lib_module.linkSystemLibrary("crypto", .{});
-    }
+    lib_module.addOptions("build_options", options);
 
     // Library
     const lib = b.addLibrary(.{
@@ -39,13 +33,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    test_module.addSystemIncludePath(.{ .cwd_relative = boringssl_include });
-    test_module.addLibraryPath(.{ .cwd_relative = boringssl_lib });
-    if (std.posix.getenv("BORINGSSL_LIB") != null) {
-        test_module.linkSystemLibrary("crypto_internal", .{});
-    } else {
-        test_module.linkSystemLibrary("crypto", .{});
-    }
+    test_module.addOptions("build_options", options);
 
     const main_tests = b.addTest(.{
         .root_module = test_module,
@@ -61,13 +49,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    bench_module.addSystemIncludePath(.{ .cwd_relative = boringssl_include });
-    bench_module.addLibraryPath(.{ .cwd_relative = boringssl_lib });
-    if (std.posix.getenv("BORINGSSL_LIB") != null) {
-        bench_module.linkSystemLibrary("crypto_internal", .{});
-    } else {
-        bench_module.linkSystemLibrary("crypto", .{});
-    }
+    bench_module.addOptions("build_options", options);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
