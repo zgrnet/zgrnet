@@ -183,7 +183,8 @@ impl Session {
             return Err(SessionError::NotEstablished);
         }
 
-        if !self.recv_filter.check(nonce) {
+        // Atomically check and update replay filter to prevent race conditions
+        if !self.recv_filter.check_and_update(nonce) {
             return Err(SessionError::ReplayDetected);
         }
 
@@ -199,7 +200,6 @@ impl Session {
         let len = plaintext.len();
         buffer.truncate(len);
 
-        self.recv_filter.update(nonce);
         *self.last_received.write().unwrap() = Instant::now();
 
         Ok(buffer)
@@ -211,7 +211,8 @@ impl Session {
             return Err(SessionError::NotEstablished);
         }
 
-        if !self.recv_filter.check(nonce) {
+        // Atomically check and update replay filter to prevent race conditions
+        if !self.recv_filter.check_and_update(nonce) {
             return Err(SessionError::ReplayDetected);
         }
 
@@ -227,7 +228,6 @@ impl Session {
             .map_err(|_| SessionError::DecryptFailed)?;
         
         let len = plaintext.len();
-        self.recv_filter.update(nonce);
         *self.last_received.write().unwrap() = Instant::now();
 
         Ok(len)

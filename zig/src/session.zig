@@ -162,7 +162,8 @@ pub const Session = struct {
             return SessionError.NotEstablished;
         }
 
-        if (!self.recv_filter.check(nonce)) {
+        // Atomically check and update replay filter to prevent race conditions
+        if (!self.recv_filter.checkAndUpdate(nonce)) {
             return SessionError.ReplayDetected;
         }
 
@@ -173,8 +174,6 @@ pub const Session = struct {
         cipher_mod.decrypt(&self.recv_key.data, nonce, ciphertext, "", out) catch {
             return SessionError.AuthenticationFailed;
         };
-
-        self.recv_filter.update(nonce);
 
         self.mutex.lock();
         self.last_received = time.nanoTimestamp();

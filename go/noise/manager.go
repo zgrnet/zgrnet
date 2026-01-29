@@ -250,8 +250,6 @@ func (m *SessionManager) StartExpiryWorker(interval time.Duration) func() {
 
 // Errors
 var (
-	ErrIndexInUse      = errors.New("noise: session index already in use")
-	ErrSessionExists   = errors.New("noise: session already exists for peer")
-	ErrSessionNotFound = errors.New("noise: session not found")
-	ErrNoFreeIndex     = errors.New("noise: no free session index available")
+	ErrIndexInUse  = errors.New("noise: session index already in use")
+	ErrNoFreeIndex = errors.New("noise: no free session index available")
 )
