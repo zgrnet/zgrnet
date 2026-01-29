@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 /// KCP C library types
 #[repr(C)]
+#[allow(clippy::upper_case_acronyms)]
 struct IKCPCB {
     _private: [u8; 0],
 }

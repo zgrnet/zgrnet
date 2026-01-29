@@ -54,6 +54,7 @@ pub struct Stream {
 
 impl Stream {
     /// Create a new stream.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn new(id: u32, output: Box<dyn Fn(&[u8]) + Send + Sync>) -> Self {
         let mut kcp = Kcp::new(id, output);
         kcp.set_default_config();
