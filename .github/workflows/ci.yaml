@@ -116,8 +116,8 @@ jobs:
           version: 0.15.2
 
       - name: Test
-        working-directory: zig/src
-        run: zig test noise.zig
+        working-directory: zig
+        run: zig build test
 
   # Format check
   format:

@@ -6,12 +6,16 @@ go_library(
     srcs = glob(["noise/*.go"], exclude = ["noise/*_test.go"]),
     importpath = "github.com/vibing/zgrnet/noise",
     visibility = ["//visibility:public"],
-    deps = ["@org_golang_x_crypto//chacha20poly1305"],
+    deps = [
+        "@org_golang_x_crypto//blake2s",
+        "@org_golang_x_crypto//chacha20poly1305",
+        "@org_golang_x_crypto//curve25519",
+        "@org_golang_x_crypto//hkdf",
+    ],
 )
 
 go_test(
     name = "noise_test",
     srcs = glob(["noise/*_test.go"]),
     embed = [":noise"],
-    deps = ["@org_golang_x_crypto//chacha20poly1305"],
 )

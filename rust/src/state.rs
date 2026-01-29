@@ -121,6 +121,7 @@ impl CipherState {
 }
 
 /// Holds the evolving state during a Noise handshake.
+#[derive(Clone)]
 pub struct SymmetricState {
     chaining_key: Key,
     hash: Hash,
@@ -181,7 +182,7 @@ impl SymmetricState {
     /// Splits into two CipherStates for transport.
     pub fn split(&self) -> (CipherState, CipherState) {
         let keys = cipher::hkdf(&self.chaining_key, &[], 2);
-        (CipherState::new(keys[0].clone()), CipherState::new(keys[1].clone()))
+        (CipherState::new(keys[0]), CipherState::new(keys[1]))
     }
 
     /// Returns the current chaining key.
@@ -193,14 +194,6 @@ impl SymmetricState {
     pub fn hash(&self) -> &Hash {
         &self.hash
     }
-
-    /// Clones the state.
-    pub fn clone(&self) -> Self {
-        Self {
-            chaining_key: self.chaining_key.clone(),
-            hash: self.hash,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -210,7 +203,7 @@ mod tests {
     #[test]
     fn test_cipher_state_new() {
         let key = Key::new([42u8; KEY_SIZE]);
-        let cs = CipherState::new(key.clone());
+        let cs = CipherState::new(key);
         assert_eq!(cs.nonce(), 0);
         assert_eq!(cs.key(), &key);
     }
@@ -218,7 +211,7 @@ mod tests {
     #[test]
     fn test_cipher_state_encrypt_decrypt() {
         let key = Key::new([42u8; KEY_SIZE]);
-        let mut cs1 = CipherState::new(key.clone());
+        let mut cs1 = CipherState::new(key);
         let mut cs2 = CipherState::new(key);
 
         let plaintext = b"hello, world!";
@@ -252,7 +245,7 @@ mod tests {
     #[test]
     fn test_cipher_state_wrong_nonce() {
         let key = Key::new([0u8; KEY_SIZE]);
-        let mut cs1 = CipherState::new(key.clone());
+        let mut cs1 = CipherState::new(key);
         let mut cs2 = CipherState::new(key);
 
         let ct = cs1.encrypt(b"test", &[]);
@@ -282,16 +275,16 @@ mod tests {
     #[test]
     fn test_symmetric_state_mix_key() {
         let mut ss = SymmetricState::new("Test");
-        let initial = ss.chaining_key().clone();
+        let initial = *ss.chaining_key();
         let k = ss.mix_key(b"input");
-        assert_ne!(ss.chaining_key(), &initial);
+        assert_ne!(*ss.chaining_key(), initial);
         assert!(!k.is_zero());
     }
 
     #[test]
     fn test_symmetric_state_mix_key_and_hash() {
         let mut ss = SymmetricState::new("Test");
-        let initial_ck = ss.chaining_key().clone();
+        let initial_ck = *ss.chaining_key();
         let initial_h = *ss.hash();
         
         let k = ss.mix_key_and_hash(b"input");
@@ -343,7 +336,7 @@ mod tests {
     #[test]
     fn test_encrypt_to_decrypt_to() {
         let key = Key::new([42u8; KEY_SIZE]);
-        let mut cs1 = CipherState::new(key.clone());
+        let mut cs1 = CipherState::new(key);
         let mut cs2 = CipherState::new(key);
 
         let plaintext = b"hello, world!";

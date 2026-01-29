@@ -908,6 +908,7 @@ dependencies = [
  "hex",
  "rand",
  "rand_core",
+ "rayon",
  "ring",
  "thiserror",
  "x25519-dalek",

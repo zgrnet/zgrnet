@@ -91,13 +91,13 @@ pub fn hkdf(chaining_key: &Key, input: &[u8], num_outputs: usize) -> Vec<Key> {
 /// Derives two keys from chaining key and input.
 pub fn kdf2(chaining_key: &Key, input: &[u8]) -> (Key, Key) {
     let keys = hkdf(chaining_key, input, 2);
-    (keys[0].clone(), keys[1].clone())
+    (keys[0], keys[1])
 }
 
 /// Derives three keys from chaining key and input.
 pub fn kdf3(chaining_key: &Key, input: &[u8]) -> (Key, Key, Key) {
     let keys = hkdf(chaining_key, input, 3);
-    (keys[0].clone(), keys[1].clone(), keys[2].clone())
+    (keys[0], keys[1], keys[2])
 }
 
 /// Creates a nonce from u64 counter.

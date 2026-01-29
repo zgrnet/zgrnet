@@ -5,5 +5,5 @@ package(default_visibility = ["//visibility:public"])
 # Filegroup for all documentation
 filegroup(
     name = "docs",
-    srcs = glob(["docs/**/*.md"]),
+    srcs = glob(["docs/**/*.md"], allow_empty = True),
 )
