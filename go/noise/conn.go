@@ -355,22 +355,21 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 	} else {
 		// Direct connection: read from transport using pooled buffer
 		bufPtr := recvBufferPool.Get().(*[]byte)
+		defer recvBufferPool.Put(bufPtr)
 		buf := *bufPtr
 
 		n, _, err := c.transport.RecvFrom(buf)
 		if err != nil {
-			recvBufferPool.Put(bufPtr)
 			return 0, nil, err
 		}
 
-		// Parse transport message (make a copy of ciphertext since we're returning buffer to pool)
+		// Parse transport message
 		parsed, err := ParseTransportMessage(buf[:n])
 		if err != nil {
-			recvBufferPool.Put(bufPtr)
 			return 0, nil, err
 		}
 
-		// Copy ciphertext before returning buffer to pool
+		// Copy ciphertext before buffer is reused (buffer returned to pool on function exit)
 		cipherCopy := make([]byte, len(parsed.Ciphertext))
 		copy(cipherCopy, parsed.Ciphertext)
 		msg = &TransportMessage{
@@ -378,7 +377,6 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 			Counter:       parsed.Counter,
 			Ciphertext:    cipherCopy,
 		}
-		recvBufferPool.Put(bufPtr)
 	}
 
 	// Verify receiver index

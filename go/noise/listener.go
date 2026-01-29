@@ -215,10 +215,13 @@ func (l *Listener) handleHandshakeInit(data []byte, addr Addr) {
 	select {
 	case l.ready <- conn:
 	default:
-		// Accept queue full, drop connection
+		// Accept queue full, drop connection and clean up resources
 		l.mu.Lock()
 		delete(l.conns, conn.LocalIndex())
 		l.mu.Unlock()
+		if conn.Session() != nil {
+			l.manager.RemoveSession(conn.Session().LocalIndex())
+		}
 		close(inbound)
 		conn.Close()
 	}
