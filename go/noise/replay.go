@@ -129,9 +129,8 @@ func (rf *ReplayFilter) slideWindow(shift uint64) {
 
 	// First handle word shifts (move entire words to higher indices)
 	if wordShift > 0 {
-		for i := replayWindowWords - 1; i >= int(wordShift); i-- {
-			rf.bitmap[i] = rf.bitmap[i-int(wordShift)]
-		}
+		copy(rf.bitmap[wordShift:], rf.bitmap[:replayWindowWords-int(wordShift)])
+		// Clear the lower words
 		for i := 0; i < int(wordShift); i++ {
 			rf.bitmap[i] = 0
 		}

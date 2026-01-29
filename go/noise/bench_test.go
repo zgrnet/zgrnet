@@ -1,7 +1,6 @@
 package noise
 
 import (
-	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -230,7 +229,6 @@ func BenchmarkConcurrentSessionEncryptDecrypt(b *testing.B) {
 	b.SetBytes(1024)
 	b.ResetTimer()
 
-	var wg sync.WaitGroup
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			// Alice encrypts
@@ -238,15 +236,10 @@ func BenchmarkConcurrentSessionEncryptDecrypt(b *testing.B) {
 			if err != nil {
 				continue
 			}
-			// Bob decrypts
-			wg.Add(1)
-			go func(ct []byte, n uint64) {
-				defer wg.Done()
-				bob.Decrypt(ct, n)
-			}(ct, nonce)
+			// Bob decrypts synchronously to ensure timing is accurate
+			bob.Decrypt(ct, nonce)
 		}
 	})
-	wg.Wait()
 }
 
 // BenchmarkConcurrentMultiSession benchmarks multiple concurrent sessions

@@ -95,14 +95,10 @@ impl ReplayFilter {
         let word_shift = (shift / 64) as usize;
         let bit_shift = (shift % 64) as u32;
 
-        // First handle word shifts
+        // First handle word shifts using copy_within for efficiency
         if word_shift > 0 {
-            for i in (word_shift..REPLAY_WINDOW_WORDS).rev() {
-                inner.bitmap[i] = inner.bitmap[i - word_shift];
-            }
-            for i in 0..word_shift {
-                inner.bitmap[i] = 0;
-            }
+            inner.bitmap.copy_within(..REPLAY_WINDOW_WORDS - word_shift, word_shift);
+            inner.bitmap[..word_shift].fill(0);
         }
 
         // Then handle bit shifts

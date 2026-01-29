@@ -89,16 +89,14 @@ pub const ReplayFilter = struct {
         const word_shift: usize = @intCast(shift / 64);
         const bit_shift: u6 = @intCast(shift % 64);
 
-        // First handle word shifts
+        // First handle word shifts using memmove for efficiency
         if (word_shift > 0) {
-            var i: usize = window_words - 1;
-            while (i >= word_shift) : (i -= 1) {
-                self.bitmap[i] = self.bitmap[i - word_shift];
-                if (i == word_shift) break;
-            }
-            for (0..word_shift) |j| {
-                self.bitmap[j] = 0;
-            }
+            const src = self.bitmap[0 .. window_words - word_shift];
+            const dst = self.bitmap[word_shift..window_words];
+            // Use backward copy to handle overlapping regions
+            std.mem.copyBackwards(u64, dst, src);
+            // Clear the lower words
+            @memset(self.bitmap[0..word_shift], 0);
         }
 
         // Then handle bit shifts
