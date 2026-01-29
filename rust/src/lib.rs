@@ -29,6 +29,9 @@ mod handshake;
 mod replay;
 mod session;
 mod manager;
+pub mod message;
+pub mod transport;
+pub mod conn;
 
 pub use keypair::{Key, KeyPair};
 pub use cipher::{Hash, HASH_SIZE, TAG_SIZE};
@@ -37,3 +40,13 @@ pub use handshake::{HandshakeState, Config, Pattern, Error};
 pub use replay::ReplayFilter;
 pub use session::{Session, SessionConfig, SessionState, SessionError, generate_index};
 pub use manager::{SessionManager, ManagerError};
+
+// Conn layer exports
+pub use message::{
+    HandshakeInit, HandshakeResp, TransportMessage, MessageError,
+    parse_handshake_init, parse_handshake_resp, parse_transport_message,
+    build_handshake_init, build_handshake_resp, build_transport_message,
+    encode_payload, decode_payload,
+};
+pub use transport::{Addr, Transport, TransportError, MockAddr, MockTransport};
+pub use conn::{Conn, ConnConfig, ConnState, ConnError};
