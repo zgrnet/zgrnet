@@ -4,12 +4,17 @@
 
 const std = @import("std");
 const time = std.time;
+const Thread = std.Thread;
 const noise = @import("noise.zig");
 const keypair = noise.keypair;
 const cipher = noise.cipher;
 const crypto = noise.crypto;
 const state = noise.state;
 const handshake = noise.handshake;
+const session_mod = @import("session.zig");
+const manager_mod = @import("manager.zig");
+const Session = session_mod.Session;
+const SessionManager = manager_mod.SessionManager;
 
 fn doNotOptimize(ptr: anytype) void {
     // Prevent compiler from optimizing away the result
@@ -296,6 +301,256 @@ pub fn main() !void {
         const throughput_gbps = (1024.0 * 8.0 * @as(f64, iterations)) / (elapsed_ns / 1_000_000_000.0) / 1e9;
 
         std.debug.print("transport_1kb: {d:.0} ns/op ({d:.2} Gbps)\n", .{
+            per_op_ns,
+            throughput_gbps,
+        });
+    }
+
+    // ==========================================================================
+    // Concurrent Session Benchmarks
+    // ==========================================================================
+    std.debug.print("\n=== Concurrent Benchmarks ===\n\n", .{});
+
+    // Concurrent Session Create benchmark
+    {
+        const num_threads: usize = 4;
+        const ops_per_thread: usize = 1000;
+        const allocator = std.heap.page_allocator;
+
+        var manager = SessionManager.init(allocator);
+        defer manager.deinit();
+
+        const ThreadContext = struct {
+            manager: *SessionManager,
+            ops: usize,
+        };
+
+        const worker = struct {
+            fn run(ctx: ThreadContext) void {
+                for (0..ctx.ops) |_| {
+                    const kp = keypair.KeyPair.generate();
+                    const send_key = keypair.Key.fromBytes(crypto.hash(&.{"send"}));
+                    const recv_key = keypair.Key.fromBytes(crypto.hash(&.{"recv"}));
+
+                    if (ctx.manager.createSession(kp.public, send_key, recv_key)) |sess| {
+                        ctx.manager.removeSession(sess.local_index);
+                    } else |_| {}
+                }
+            }
+        }.run;
+
+        // Warmup
+        for (0..100) |_| {
+            const kp = keypair.KeyPair.generate();
+            const send_key = keypair.Key.fromBytes(crypto.hash(&.{"send"}));
+            const recv_key = keypair.Key.fromBytes(crypto.hash(&.{"recv"}));
+            if (manager.createSession(kp.public, send_key, recv_key)) |sess| {
+                manager.removeSession(sess.local_index);
+            } else |_| {}
+        }
+
+        const ctx = ThreadContext{ .manager = &manager, .ops = ops_per_thread };
+        var threads: [num_threads]Thread = undefined;
+
+        const start = time.nanoTimestamp();
+        for (0..num_threads) |i| {
+            threads[i] = Thread.spawn(.{}, worker, .{ctx}) catch unreachable;
+        }
+        for (threads) |t| {
+            t.join();
+        }
+        const end = time.nanoTimestamp();
+
+        const total_ops = num_threads * ops_per_thread;
+        const elapsed_ns = @as(f64, @floatFromInt(end - start));
+        const per_op_us = elapsed_ns / @as(f64, @floatFromInt(total_ops)) / 1000.0;
+
+        std.debug.print("concurrent_session_create ({d} threads): {d:.2} us/op ({d:.0} ops/sec)\n", .{
+            num_threads,
+            per_op_us,
+            1_000_000.0 / per_op_us,
+        });
+    }
+
+    // Concurrent Handshake benchmark
+    {
+        const num_threads: usize = 4;
+        const ops_per_thread: usize = 500;
+
+        const worker = struct {
+            fn run(ops: usize) void {
+                for (0..ops) |_| {
+                    const initiator_static = keypair.KeyPair.generate();
+                    const responder_static = keypair.KeyPair.generate();
+
+                    var initiator = handshake.HandshakeState.init(.{
+                        .pattern = .IK,
+                        .initiator = true,
+                        .local_static = initiator_static,
+                        .remote_static = responder_static.public,
+                    }) catch continue;
+
+                    var responder = handshake.HandshakeState.init(.{
+                        .pattern = .IK,
+                        .initiator = false,
+                        .local_static = responder_static,
+                    }) catch continue;
+
+                    var msg1: [256]u8 = undefined;
+                    const msg1_len = initiator.writeMessage("", &msg1) catch continue;
+                    var p1: [64]u8 = undefined;
+                    _ = responder.readMessage(msg1[0..msg1_len], &p1) catch continue;
+
+                    var msg2: [256]u8 = undefined;
+                    const msg2_len = responder.writeMessage("", &msg2) catch continue;
+                    var p2: [64]u8 = undefined;
+                    _ = initiator.readMessage(msg2[0..msg2_len], &p2) catch continue;
+
+                    _ = initiator.split() catch continue;
+                    _ = responder.split() catch continue;
+                }
+            }
+        }.run;
+
+        var threads: [num_threads]Thread = undefined;
+
+        const start = time.nanoTimestamp();
+        for (0..num_threads) |i| {
+            threads[i] = Thread.spawn(.{}, worker, .{ops_per_thread}) catch unreachable;
+        }
+        for (threads) |t| {
+            t.join();
+        }
+        const end = time.nanoTimestamp();
+
+        const total_ops = num_threads * ops_per_thread;
+        const elapsed_ns = @as(f64, @floatFromInt(end - start));
+        const per_op_us = elapsed_ns / @as(f64, @floatFromInt(total_ops)) / 1000.0;
+
+        std.debug.print("concurrent_handshake_ik ({d} threads): {d:.2} us/op ({d:.0} ops/sec)\n", .{
+            num_threads,
+            per_op_us,
+            1_000_000.0 / per_op_us,
+        });
+    }
+
+    // Concurrent Session Encrypt benchmark
+    {
+        const num_threads: usize = 4;
+        const ops_per_thread: usize = 100000;
+
+        const send_key = keypair.Key.fromBytes(crypto.hash(&.{"send"}));
+        const recv_key = keypair.Key.fromBytes(crypto.hash(&.{"recv"}));
+
+        var session = Session.init(.{
+            .local_index = 1,
+            .remote_index = 2,
+            .send_key = send_key,
+            .recv_key = recv_key,
+        });
+
+        const ThreadContext = struct {
+            session: *Session,
+            ops: usize,
+        };
+
+        const worker = struct {
+            fn run(ctx: ThreadContext) void {
+                const plaintext = [_]u8{0} ** 1024;
+                var out: [1024 + 16]u8 = undefined;
+
+                for (0..ctx.ops) |_| {
+                    _ = ctx.session.encrypt(&plaintext, &out) catch continue;
+                }
+            }
+        }.run;
+
+        const ctx = ThreadContext{ .session = &session, .ops = ops_per_thread };
+        var threads: [num_threads]Thread = undefined;
+
+        const start = time.nanoTimestamp();
+        for (0..num_threads) |i| {
+            threads[i] = Thread.spawn(.{}, worker, .{ctx}) catch unreachable;
+        }
+        for (threads) |t| {
+            t.join();
+        }
+        const end = time.nanoTimestamp();
+
+        const total_ops = num_threads * ops_per_thread;
+        const elapsed_ns = @as(f64, @floatFromInt(end - start));
+        const per_op_ns = elapsed_ns / @as(f64, @floatFromInt(total_ops));
+        const throughput_gbps = (1024.0 * 8.0 * @as(f64, @floatFromInt(total_ops))) / (elapsed_ns / 1_000_000_000.0) / 1e9;
+
+        std.debug.print("concurrent_session_encrypt_1kb ({d} threads): {d:.0} ns/op ({d:.2} Gbps total)\n", .{
+            num_threads,
+            per_op_ns,
+            throughput_gbps,
+        });
+    }
+
+    // Concurrent Multi-Session benchmark
+    {
+        const num_threads: usize = 4;
+        const num_sessions: usize = 100;
+        const ops_per_thread: usize = 10000;
+
+        var sessions: [num_sessions]Session = undefined;
+        for (0..num_sessions) |i| {
+            const send_input = [_]u8{ @intCast(i), 's', 'e', 'n', 'd' };
+            const recv_input = [_]u8{ @intCast(i), 'r', 'e', 'c', 'v' };
+            const send_key = keypair.Key.fromBytes(crypto.hash(&.{&send_input}));
+            const recv_key = keypair.Key.fromBytes(crypto.hash(&.{&recv_input}));
+            sessions[i] = Session.init(.{
+                .local_index = @intCast(i + 1),
+                .remote_index = @intCast(i + 1001),
+                .send_key = send_key,
+                .recv_key = recv_key,
+            });
+        }
+
+        const ThreadContext = struct {
+            sessions: *[num_sessions]Session,
+            ops: usize,
+            thread_id: usize,
+        };
+
+        const worker = struct {
+            fn run(ctx: ThreadContext) void {
+                const plaintext = [_]u8{0} ** 256;
+                var out: [256 + 16]u8 = undefined;
+
+                for (0..ctx.ops) |i| {
+                    const idx = (ctx.thread_id * ctx.ops + i) % num_sessions;
+                    _ = ctx.sessions[idx].encrypt(&plaintext, &out) catch continue;
+                }
+            }
+        }.run;
+
+        var threads: [num_threads]Thread = undefined;
+
+        const start = time.nanoTimestamp();
+        for (0..num_threads) |i| {
+            const ctx = ThreadContext{
+                .sessions = &sessions,
+                .ops = ops_per_thread,
+                .thread_id = i,
+            };
+            threads[i] = Thread.spawn(.{}, worker, .{ctx}) catch unreachable;
+        }
+        for (threads) |t| {
+            t.join();
+        }
+        const end = time.nanoTimestamp();
+
+        const total_ops = num_threads * ops_per_thread;
+        const elapsed_ns = @as(f64, @floatFromInt(end - start));
+        const per_op_ns = elapsed_ns / @as(f64, @floatFromInt(total_ops));
+        const throughput_gbps = (256.0 * 8.0 * @as(f64, @floatFromInt(total_ops))) / (elapsed_ns / 1_000_000_000.0) / 1e9;
+
+        std.debug.print("concurrent_multi_session ({d} sessions, {d} threads): {d:.0} ns/op ({d:.2} Gbps total)\n", .{
+            num_sessions,
+            num_threads,
             per_op_ns,
             throughput_gbps,
         });

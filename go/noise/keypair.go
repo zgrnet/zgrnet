@@ -22,6 +22,10 @@ const KeySize = 32
 // Key represents a 32-byte cryptographic key.
 type Key [KeySize]byte
 
+// PublicKey is an alias for Key used to represent a peer's public key.
+// Using a distinct type improves code readability and type safety.
+type PublicKey = Key
+
 // IsZero returns true if the key is all zeros.
 func (k Key) IsZero() bool {
 	var zero Key
