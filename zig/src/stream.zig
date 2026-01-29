@@ -215,21 +215,31 @@ pub const Stream = struct {
     }
 
     /// Receive data from KCP and buffer it.
+    /// Uses stack buffer for common MTU-sized messages, heap fallback for oversized.
     pub fn kcpRecv(self: *Stream) void {
         if (self.kcp_instance) |*k| {
+            // Reusable MTU-sized stack buffer for common case
+            var stack_buf: [1500]u8 = undefined;
+
             while (true) {
                 const size = k.peekSize();
                 if (size <= 0) break;
 
-                // Allocate buffer on heap based on actual message size
-                const buf = self.allocator.alloc(u8, @intCast(size)) catch break;
-                defer self.allocator.free(buf);
+                const usize_size: usize = @intCast(size);
 
-                const n = k.recv(buf);
-                if (n <= 0) break;
-
-                // LinearFifo.write appends to tail - O(1) amortized
-                self.recv_buf.write(buf[0..@intCast(n)]) catch break;
+                if (usize_size <= stack_buf.len) {
+                    // Common path: use stack buffer (no allocation)
+                    const n = k.recv(stack_buf[0..usize_size]);
+                    if (n <= 0) break;
+                    self.recv_buf.write(stack_buf[0..@intCast(n)]) catch break;
+                } else {
+                    // Rare path: heap allocate for oversized messages
+                    const buf = self.allocator.alloc(u8, usize_size) catch break;
+                    defer self.allocator.free(buf);
+                    const n = k.recv(buf);
+                    if (n <= 0) break;
+                    self.recv_buf.write(buf[0..@intCast(n)]) catch break;
+                }
             }
         }
     }

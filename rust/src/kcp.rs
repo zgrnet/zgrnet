@@ -190,6 +190,7 @@ impl Drop for Kcp {
 }
 
 /// KCP output callback (called by C library)
+/// Uses catch_unwind to prevent panics from crossing FFI boundary (which is UB).
 extern "C" fn kcp_output_callback(
     buf: *const c_char,
     len: c_int,
@@ -201,16 +202,25 @@ extern "C" fn kcp_output_callback(
     }
 
     let context = unsafe { Arc::from_raw(user as *const Mutex<KcpContext>) };
-    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
 
-    if let Ok(ctx) = context.lock() {
-        if let Some(ref output_fn) = ctx.output_fn {
-            output_fn(data);
+    // Wrap in catch_unwind to prevent panic from crossing FFI boundary
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let data = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
+        if let Ok(ctx) = context.lock() {
+            if let Some(ref output_fn) = ctx.output_fn {
+                output_fn(data);
+            }
         }
-    }
+    }));
 
     // Don't drop the Arc - we need it to stay alive
     std::mem::forget(context);
+
+    if result.is_err() {
+        // Panic occurred - abort to prevent UB from unwinding across FFI
+        eprintln!("FATAL: Panic in KCP output callback, aborting to prevent UB");
+        std::process::abort();
+    }
 
     0
 }
