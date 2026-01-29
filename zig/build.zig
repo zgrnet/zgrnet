@@ -36,9 +36,9 @@ pub fn build(b: *std.Build) void {
     };
 
     // Map to cipher.zig Backend enum
-    const CipherBackend = enum { boringssl_asm, x86_64_asm, simd_zig, native_zig };
+    const CipherBackend = enum { aarch64_asm, x86_64_asm, simd_zig, native_zig };
     const cipher_backend: CipherBackend = switch (effective_backend) {
-        .arm64_asm => .boringssl_asm,
+        .arm64_asm => .aarch64_asm,
         .x86_64_asm => .x86_64_asm,
         .simd => .simd_zig,
         .pure_zig => .native_zig,
@@ -51,10 +51,10 @@ pub fn build(b: *std.Build) void {
     // Helper to add ARM64 ASM files
     const addArm64AsmFiles = struct {
         fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
-            compile.addAssemblyFile(builder.path("src/boringssl/chacha20_poly1305_no_cfi.S"));
+            compile.addAssemblyFile(builder.path("src/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"));
             compile.addCSourceFile(.{
-                .file = builder.path("src/boringssl/chacha20_poly1305_wrapper.c"),
-                .flags = &.{ "-O3", "-I", "src/boringssl" },
+                .file = builder.path("src/chacha20_poly1305/aarch64/chacha20_poly1305_wrapper.c"),
+                .flags = &.{ "-O3", "-I", "src/chacha20_poly1305/aarch64" },
             });
         }
     }.add;
@@ -63,9 +63,9 @@ pub fn build(b: *std.Build) void {
     const addX86AsmFiles = struct {
         fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
             compile.linkLibC();
-            compile.addAssemblyFile(builder.path("src/asm_x86_64/chacha20_poly1305_x86_64.S"));
+            compile.addAssemblyFile(builder.path("src/chacha20_poly1305/x86_64/chacha20_poly1305_x86_64.S"));
             compile.addCSourceFile(.{
-                .file = builder.path("src/asm_x86_64/chacha20_poly1305_wrapper.c"),
+                .file = builder.path("src/chacha20_poly1305/x86_64/chacha20_poly1305_wrapper.c"),
                 .flags = &.{ "-O3", "-mavx2", "-mbmi2" },
             });
         }

@@ -22,8 +22,8 @@ pub const tag_size: usize = 16;
 
 /// Backend selection.
 pub const Backend = enum {
-    /// BoringSSL ARM64 assembly - fastest on ARM64 (~13 Gbps)
-    boringssl_asm,
+    /// ARM64 assembly - fastest on ARM64 (~13 Gbps)
+    aarch64_asm,
     /// x86_64 AVX2/SSE4.1 assembly - fastest on x86_64 (~12 Gbps)
     x86_64_asm,
     /// SIMD-optimized Zig (~10 Gbps, experimental)
@@ -61,7 +61,7 @@ const asm_backend = struct {
 // SIMD-optimized Zig Backend (for x86_64)
 // =============================================================================
 
-const simd = @import("simd/chacha20_simd.zig");
+const simd = @import("chacha20_poly1305/simd.zig");
 
 const simd_backend = struct {
     fn encrypt(key: *const [key_size]u8, nonce: u64, plaintext: []const u8, ad: []const u8, out: []u8) void {
@@ -121,7 +121,7 @@ pub fn encrypt(
     out: []u8,
 ) void {
     switch (backend) {
-        .boringssl_asm, .x86_64_asm => asm_backend.encrypt(key, nonce, plaintext, ad, out),
+        .aarch64_asm, .x86_64_asm => asm_backend.encrypt(key, nonce, plaintext, ad, out),
         .simd_zig => simd_backend.encrypt(key, nonce, plaintext, ad, out),
         .native_zig => native.encrypt(key, nonce, plaintext, ad, out),
     }
@@ -137,7 +137,7 @@ pub fn decrypt(
     out: []u8,
 ) !void {
     switch (backend) {
-        .boringssl_asm, .x86_64_asm => try asm_backend.decrypt(key, nonce, ciphertext, ad, out),
+        .aarch64_asm, .x86_64_asm => try asm_backend.decrypt(key, nonce, ciphertext, ad, out),
         .simd_zig => try simd_backend.decrypt(key, nonce, ciphertext, ad, out),
         .native_zig => try native.decrypt(key, nonce, ciphertext, ad, out),
     }
@@ -156,7 +156,7 @@ pub fn decryptWithAd(key: *const Key, ad: []const u8, ciphertext: []const u8, ou
 /// Returns the name of the active backend for debugging.
 pub fn backendName() []const u8 {
     return switch (backend) {
-        .boringssl_asm => "BoringSSL ARM64 ASM",
+        .aarch64_asm => "ARM64 ASM",
         .x86_64_asm => "x86_64 AVX2/SSE4.1 ASM",
         .simd_zig => "SIMD Zig (experimental)",
         .native_zig => "Native Zig (std.crypto)",

@@ -32,6 +32,7 @@ mod manager;
 pub mod message;
 pub mod transport;
 pub mod conn;
+pub mod udp;
 
 pub use keypair::{Key, KeyPair};
 pub use cipher::{Hash, HASH_SIZE, TAG_SIZE};
