@@ -585,15 +585,15 @@ mod tests {
         let throughput_gbps = (frame_size as f64 * 8.0 * iterations as f64) / elapsed.as_secs_f64() / 1e9;
         println!("\nRust Frame encode_to (checked): {:.2} ns/op, {:.2} Gbps ({}ms)", ns_per_op, throughput_gbps, elapsed.as_millis());
 
-        // Benchmark unchecked LE (like Go) version with volatile
+        // Benchmark unchecked BE (matching implementation) version with volatile
         let start2 = Instant::now();
         let mut stream_id = 12345u32;
         for _ in 0..iterations {
             unsafe {
                 let ptr = buf.as_mut_ptr();
                 std::ptr::write_volatile(ptr, Cmd::Psh as u8);
-                std::ptr::write_unaligned(ptr.add(1) as *mut u32, stream_id.to_le()); // LE like Go
-                std::ptr::write_unaligned(ptr.add(5) as *mut u16, (payload.len() as u16).to_le());
+                std::ptr::write_unaligned(ptr.add(1) as *mut u32, stream_id.to_be()); // BE like implementation
+                std::ptr::write_unaligned(ptr.add(5) as *mut u16, (payload.len() as u16).to_be());
                 std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr.add(FRAME_HEADER_SIZE), payload.len());
                 stream_id = stream_id.wrapping_add(std::ptr::read_volatile(ptr.add(1)) as u32);
             }
@@ -602,7 +602,7 @@ mod tests {
         black_box(stream_id);
         let ns_per_op2 = elapsed2.as_nanos() as f64 / iterations as f64;
         let throughput_gbps2 = (frame_size as f64 * 8.0 * iterations as f64) / elapsed2.as_secs_f64() / 1e9;
-        println!("Rust Frame encode_to (unchecked LE): {:.2} ns/op, {:.2} Gbps ({}ms, {} bytes/frame)", 
+        println!("Rust Frame encode_to (unchecked BE): {:.2} ns/op, {:.2} Gbps ({}ms, {} bytes/frame)", 
                  ns_per_op2, throughput_gbps2, elapsed2.as_millis(), frame_size);
     }
 

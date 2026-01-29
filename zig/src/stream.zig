@@ -63,10 +63,18 @@ pub fn RingBuffer(comptime T: type) type {
                 try self.grow(needed);
             }
 
-            for (src) |item| {
-                self.buf[self.tail] = item;
-                self.tail = (self.tail + 1) % self.buf.len;
+            // Use @memcpy for efficient bulk copy (handles wrap-around)
+            const tail = self.tail;
+            const cap = self.buf.len;
+            const part1_len = @min(src.len, cap - tail);
+            @memcpy(self.buf[tail..][0..part1_len], src[0..part1_len]);
+
+            const part2_len = src.len - part1_len;
+            if (part2_len > 0) {
+                @memcpy(self.buf[0..part2_len], src[part1_len..][0..part2_len]);
             }
+
+            self.tail = (tail + src.len) % cap;
         }
 
         fn grow(self: *Self, min_cap: usize) !void {
@@ -78,10 +86,17 @@ pub fn RingBuffer(comptime T: type) type {
             const new_buf = try self.allocator.alloc(T, new_cap);
             const len = self.readableLength();
 
-            // Copy old data
-            var i: usize = 0;
-            while (i < len) : (i += 1) {
-                new_buf[i] = self.buf[(self.head + i) % self.buf.len];
+            // Use @memcpy for efficient bulk copy (handles wrap-around)
+            if (len > 0) {
+                const head = self.head;
+                const cap = self.buf.len;
+                const part1_len = @min(len, cap - head);
+                @memcpy(new_buf[0..part1_len], self.buf[head..][0..part1_len]);
+
+                const part2_len = len - part1_len;
+                if (part2_len > 0) {
+                    @memcpy(new_buf[part1_len..][0..part2_len], self.buf[0..part2_len]);
+                }
             }
 
             if (self.buf.len > 0) {
@@ -265,7 +280,9 @@ pub const Stream = struct {
     fn kcpOutput(data: []const u8, user: ?*anyopaque) void {
         if (user) |u| {
             const stream: *Stream = @ptrCast(@alignCast(u));
-            stream.mux.sendPsh(stream.id, data) catch {};
+            stream.mux.sendPsh(stream.id, data) catch |err| {
+                std.log.err("Mux output error in stream {d}: {s}", .{ stream.id, @errorName(err) });
+            };
         }
     }
 };
