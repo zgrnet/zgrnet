@@ -15,6 +15,7 @@ pub const SessionConfig = session_mod.SessionConfig;
 pub const ManagerError = error{
     IndexInUse,
     OutOfMemory,
+    NoFreeIndex,
 };
 
 /// Manages multiple sessions with different peers.
@@ -58,7 +59,7 @@ pub const SessionManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const local_index = self.allocateIndex();
+        const local_index = self.allocateIndex() orelse return ManagerError.NoFreeIndex;
 
         const session = self.allocator.create(Session) catch return ManagerError.OutOfMemory;
         session.* = Session.init(.{
@@ -69,11 +70,10 @@ pub const SessionManager = struct {
         });
 
         // Remove existing session for this peer
-        if (self.by_pubkey.get(remote_pk)) |existing| {
-            _ = self.by_index.remove(existing.local_index);
-            self.allocator.destroy(existing);
+        if (self.by_pubkey.fetchRemove(remote_pk)) |removed| {
+            _ = self.by_index.remove(removed.value.local_index);
+            self.allocator.destroy(removed.value);
         }
-        _ = self.by_pubkey.remove(remote_pk);
 
         self.by_index.put(local_index, session) catch {
             self.allocator.destroy(session);
@@ -102,11 +102,10 @@ pub const SessionManager = struct {
         }
 
         // Remove existing session for this peer
-        if (self.by_pubkey.get(remote_pk)) |existing| {
-            _ = self.by_index.remove(existing.local_index);
-            self.allocator.destroy(existing);
+        if (self.by_pubkey.fetchRemove(remote_pk)) |removed| {
+            _ = self.by_index.remove(removed.value.local_index);
+            self.allocator.destroy(removed.value);
         }
-        _ = self.by_pubkey.remove(remote_pk);
 
         self.by_index.put(local_index, session) catch return ManagerError.OutOfMemory;
         self.by_pubkey.put(remote_pk, session) catch {
@@ -201,7 +200,8 @@ pub const SessionManager = struct {
         self.by_pubkey.clearAndFree();
     }
 
-    fn allocateIndex(self: *SessionManager) u32 {
+    fn allocateIndex(self: *SessionManager) ?u32 {
+        const start_index = self.next_index;
         while (true) {
             const index = self.next_index;
             self.next_index +%= 1;
@@ -211,6 +211,11 @@ pub const SessionManager = struct {
 
             if (!self.by_index.contains(index)) {
                 return index;
+            }
+
+            // Check if we've wrapped around completely
+            if (self.next_index == start_index) {
+                return null; // No free index available
             }
         }
     }

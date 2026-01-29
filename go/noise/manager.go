@@ -38,6 +38,9 @@ func (m *SessionManager) CreateSession(remotePK PublicKey, sendKey, recvKey Key)
 
 	// Generate a unique local index
 	localIndex := m.allocateIndex()
+	if localIndex == 0 {
+		return nil, ErrNoFreeIndex
+	}
 
 	// Create the session
 	session, err := NewSession(SessionConfig{
@@ -196,7 +199,9 @@ func (m *SessionManager) Clear() {
 
 // allocateIndex generates a unique session index.
 // Must be called with mu held.
+// Returns 0 if no free index is available (extremely unlikely).
 func (m *SessionManager) allocateIndex() uint32 {
+	startIndex := m.nextIndex
 	for {
 		index := m.nextIndex
 		m.nextIndex++
@@ -207,6 +212,11 @@ func (m *SessionManager) allocateIndex() uint32 {
 		// Check if index is in use
 		if _, exists := m.byIndex[index]; !exists {
 			return index
+		}
+
+		// Check if we've wrapped around completely
+		if m.nextIndex == startIndex {
+			return 0 // No free index available
 		}
 	}
 }
@@ -243,4 +253,5 @@ var (
 	ErrIndexInUse      = errors.New("noise: session index already in use")
 	ErrSessionExists   = errors.New("noise: session already exists for peer")
 	ErrSessionNotFound = errors.New("noise: session not found")
+	ErrNoFreeIndex     = errors.New("noise: no free session index available")
 )

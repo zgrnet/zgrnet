@@ -159,8 +159,8 @@ func (s *Session) SetState(state SessionState) {
 // Returns the ciphertext and the nonce used.
 // The ciphertext includes the 16-byte authentication tag.
 func (s *Session) Encrypt(plaintext []byte) (ciphertext []byte, nonce uint64, err error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.state != SessionStateEstablished {
 		return nil, 0, ErrSessionNotEstablished
@@ -182,11 +182,7 @@ func (s *Session) Encrypt(plaintext []byte) (ciphertext []byte, nonce uint64, er
 	ciphertext = s.sendAEAD.Seal(nil, nonceBytes[:], plaintext, nil)
 
 	// Update last sent time
-	s.mu.RUnlock()
-	s.mu.Lock()
 	s.lastSent = time.Now()
-	s.mu.Unlock()
-	s.mu.RLock()
 
 	return ciphertext, nonce, nil
 }
