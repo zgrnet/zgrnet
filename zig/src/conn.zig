@@ -337,9 +337,8 @@ pub const Conn = struct {
     /// Sends an encrypted message to the remote peer.
     pub fn send(self: *Conn, protocol: Protocol, payload: []const u8) ConnError!void {
         // Phase 1: Check state and encrypt (with lock)
-        var msg: []u8 = undefined;
         var remote_addr: Addr = undefined;
-        {
+        const msg = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -363,8 +362,8 @@ pub const Conn = struct {
             const counter = session.encrypt(plaintext, ciphertext) catch return ConnError.SessionError;
 
             // Build wire message
-            msg = message.buildTransportMessage(self.allocator, session.remoteIndex(), counter, ciphertext) catch return ConnError.OutOfMemory;
-        }
+            break :blk message.buildTransportMessage(self.allocator, session.remoteIndex(), counter, ciphertext) catch return ConnError.OutOfMemory;
+        };
         defer self.allocator.free(msg);
 
         // Phase 2: Send (without lock)

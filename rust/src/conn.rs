@@ -8,9 +8,8 @@ use std::sync::RwLock;
 use crate::handshake::{Config, HandshakeState, Pattern};
 use crate::keypair::{Key, KeyPair};
 use crate::message::{
-    build_handshake_init, build_handshake_resp, build_transport_message, decode_payload,
-    encode_payload, parse_handshake_resp, parse_transport_message, HandshakeInit,
-    KEY_SIZE, MAX_PACKET_SIZE,
+    build_handshake_init, build_handshake_resp, build_transport_message, encode_payload,
+    parse_handshake_resp, parse_transport_message, HandshakeInit, KEY_SIZE, MAX_PACKET_SIZE,
 };
 use crate::session::{generate_index, Session, SessionConfig};
 use crate::transport::{Addr, Transport, TransportError};
@@ -411,10 +410,34 @@ impl<T: Transport + 'static> Conn<T> {
         self.recv_with_buffer(&mut buf)
     }
 
-    /// Receives and decrypts a message using the provided buffer.
-    /// This avoids allocating a new buffer on each call.
+    /// Receives and decrypts a message using the provided buffer for network I/O.
+    /// This avoids allocating a new buffer for receiving on each call.
     /// The buffer should be at least MAX_PACKET_SIZE bytes.
     pub fn recv_with_buffer(&self, buf: &mut [u8]) -> Result<(u8, Vec<u8>)> {
+        let (protocol, plaintext) = self.recv_internal(buf)?;
+        // Skip protocol byte and return owned payload
+        Ok((protocol, plaintext[1..].to_vec()))
+    }
+
+    /// Receives and decrypts a message into the provided output buffer.
+    /// This is the most efficient receive method, avoiding all intermediate allocations.
+    /// 
+    /// # Arguments
+    /// * `recv_buf` - Buffer for receiving network data (should be at least MAX_PACKET_SIZE)
+    /// * `out_buf` - Buffer to write decrypted payload into
+    /// 
+    /// # Returns
+    /// * `(protocol, bytes_written)` - The protocol byte and number of bytes written to out_buf
+    pub fn recv_into(&self, recv_buf: &mut [u8], out_buf: &mut [u8]) -> Result<(u8, usize)> {
+        let (protocol, plaintext) = self.recv_internal(recv_buf)?;
+        let payload = &plaintext[1..]; // Skip protocol byte
+        let n = std::cmp::min(out_buf.len(), payload.len());
+        out_buf[..n].copy_from_slice(&payload[..n]);
+        Ok((protocol, n))
+    }
+
+    /// Internal receive implementation that returns the decrypted plaintext.
+    fn recv_internal(&self, buf: &mut [u8]) -> Result<(u8, Vec<u8>)> {
         {
             let state = self.state.read().unwrap();
             if *state != ConnState::Established {
@@ -440,9 +463,9 @@ impl<T: Transport + 'static> Conn<T> {
             session.decrypt(msg.ciphertext, msg.counter)?
         };
 
-        // Decode protocol and payload
-        let (protocol, payload) = decode_payload(&plaintext)?;
-        Ok((protocol, payload.to_vec()))
+        // Return protocol and full plaintext (including protocol byte)
+        let protocol = plaintext.first().copied().unwrap_or(0);
+        Ok((protocol, plaintext))
     }
 
     /// Closes the connection.
