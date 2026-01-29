@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Noise Protocol implementation for zgrnet"
 license = "MIT"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1.2"
 
 [dependencies]
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }

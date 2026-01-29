@@ -4,6 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // KCP dependency
+    const kcp_dep = b.dependency("kcp", .{});
+    const kcp_path = kcp_dep.path("");
+
     const target_arch = target.result.cpu.arch;
     const target_os = target.result.os.tag;
 
@@ -71,6 +75,20 @@ pub fn build(b: *std.Build) void {
         }
     }.add;
 
+    // Helper to add KCP C files
+    // Note: KCP uses offsetof-style macro with null pointer dereference ((TYPE*)0)->member
+    // which triggers zig cc's undefined behavior sanitizer. We disable it with -fno-sanitize=undefined.
+    const addKcpFiles = struct {
+        fn add(compile: *std.Build.Step.Compile, kcp: std.Build.LazyPath) void {
+            compile.linkLibC();
+            compile.addCSourceFile(.{
+                .file = kcp.path(compile.step.owner, "ikcp.c"),
+                .flags = &.{ "-O3", "-DNDEBUG", "-fno-sanitize=undefined" },
+            });
+            compile.addIncludePath(kcp);
+        }
+    }.add;
+
     // Library module
     const lib_module = b.createModule(.{
         .root_source_file = b.path("src/noise.zig"),
@@ -86,6 +104,7 @@ pub fn build(b: *std.Build) void {
     });
     if (effective_backend == .arm64_asm) addArm64AsmFiles(lib, b);
     if (effective_backend == .x86_64_asm) addX86AsmFiles(lib, b);
+    addKcpFiles(lib, kcp_path);
     b.installArtifact(lib);
 
     // Test module
@@ -102,6 +121,7 @@ pub fn build(b: *std.Build) void {
     });
     if (effective_backend == .arm64_asm) addArm64AsmFiles(main_tests, b);
     if (effective_backend == .x86_64_asm) addX86AsmFiles(main_tests, b);
+    addKcpFiles(main_tests, kcp_path);
 
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run library tests");
@@ -122,6 +142,7 @@ pub fn build(b: *std.Build) void {
     });
     if (effective_backend == .arm64_asm) addArm64AsmFiles(bench_exe, b);
     if (effective_backend == .x86_64_asm) addX86AsmFiles(bench_exe, b);
+    addKcpFiles(bench_exe, kcp_path);
     b.installArtifact(bench_exe);
 
     const run_bench = b.addRunArtifact(bench_exe);
