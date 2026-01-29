@@ -225,21 +225,20 @@ fn bench_concurrent_session_encrypt(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(1024 * 4 * 100)); // 4 threads * 100 ops
     group.bench_function("1kb_4threads", |b| {
         b.iter(|| {
-            let mut handles = Vec::new();
-            
-            for _ in 0..4 {
-                let s: Arc<Session> = Arc::clone(&session);
-                handles.push(thread::spawn(move || {
-                    let plaintext = [0u8; 1024];
-                    for _ in 0..100 {
-                        let _ = s.encrypt(black_box(&plaintext));
-                    }
-                }));
-            }
-
-            for h in handles {
-                h.join().unwrap();
-            }
+            // Use scoped threads to avoid thread creation overhead in measurement
+            thread::scope(|scope| {
+                for _ in 0..4 {
+                    let s = &session;
+                    scope.spawn(move || {
+                        let plaintext = [0u8; 1024];
+                        let mut out = [0u8; 1024 + 16]; // Pre-allocated buffer
+                        for _ in 0..100 {
+                            // Use encrypt_to to avoid Vec allocation
+                            let _ = s.encrypt_to(black_box(&plaintext), &mut out);
+                        }
+                    });
+                }
+            });
         })
     });
     group.finish();
@@ -247,7 +246,7 @@ fn bench_concurrent_session_encrypt(c: &mut Criterion) {
 
 fn bench_concurrent_multi_session(c: &mut Criterion) {
     const NUM_SESSIONS: usize = 100;
-    let mut sessions_vec: Vec<Arc<Session>> = Vec::with_capacity(NUM_SESSIONS);
+    let mut sessions_vec: Vec<Session> = Vec::with_capacity(NUM_SESSIONS);
     
     for i in 0..NUM_SESSIONS {
         let mut send_input = vec![i as u8];
@@ -256,37 +255,32 @@ fn bench_concurrent_multi_session(c: &mut Criterion) {
         recv_input.extend_from_slice(b"recv");
         let send_key = Key::new(noise::cipher::hash(&[&send_input[..]]));
         let recv_key = Key::new(noise::cipher::hash(&[&recv_input[..]]));
-        sessions_vec.push(Arc::new(Session::new(SessionConfig {
+        sessions_vec.push(Session::new(SessionConfig {
             local_index: i as u32 + 1,
             remote_index: i as u32 + 1001,
             send_key,
             recv_key,
             remote_pk: Key::default(),
-        })));
+        }));
     }
-
-    let sessions = Arc::new(sessions_vec);
 
     let mut group = c.benchmark_group("concurrent_multi_session");
     group.throughput(Throughput::Bytes(256 * 4 * 100)); // 4 threads * 100 ops
     group.bench_function("100_sessions_4threads", |b| {
         b.iter(|| {
-            let mut handles = Vec::new();
-            
-            for t in 0..4usize {
-                let ss = Arc::clone(&sessions);
-                handles.push(thread::spawn(move || {
-                    let plaintext = [0u8; 256];
-                    for i in 0..100usize {
-                        let idx = (t * 100 + i) % NUM_SESSIONS;
-                        let _ = ss[idx].encrypt(black_box(&plaintext));
-                    }
-                }));
-            }
-
-            for h in handles {
-                h.join().unwrap();
-            }
+            thread::scope(|scope| {
+                for t in 0..4usize {
+                    let sessions = &sessions_vec;
+                    scope.spawn(move || {
+                        let plaintext = [0u8; 256];
+                        let mut out = [0u8; 256 + 16]; // Pre-allocated buffer
+                        for i in 0..100usize {
+                            let idx = (t * 100 + i) % NUM_SESSIONS;
+                            let _ = sessions[idx].encrypt_to(black_box(&plaintext), &mut out);
+                        }
+                    });
+                }
+            });
         })
     });
     group.finish();

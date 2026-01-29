@@ -4,9 +4,9 @@ use crate::cipher::TAG_SIZE;
 use crate::keypair::Key;
 use crate::replay::ReplayFilter;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Session state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +59,17 @@ pub struct Session {
     remote_pk: Key,
     
     created_at: Instant,
-    last_received: RwLock<Instant>,
-    last_sent: RwLock<Instant>,
+    // Use atomic timestamps (nanos since UNIX_EPOCH) to avoid lock contention
+    last_received_nanos: AtomicI64,
+    last_sent_nanos: AtomicI64,
+}
+
+/// Get current time as nanos since UNIX_EPOCH
+fn now_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
 }
 
 impl Session {
@@ -76,6 +85,7 @@ impl Session {
         );
         
         let now = Instant::now();
+        let now_ns = now_nanos();
         Self {
             local_index: cfg.local_index,
             remote_index: RwLock::new(cfg.remote_index),
@@ -86,8 +96,8 @@ impl Session {
             state: RwLock::new(SessionState::Established),
             remote_pk: cfg.remote_pk,
             created_at: now,
-            last_received: RwLock::new(now),
-            last_sent: RwLock::new(now),
+            last_received_nanos: AtomicI64::new(now_ns),
+            last_sent_nanos: AtomicI64::new(now_ns),
         }
     }
 
@@ -144,7 +154,8 @@ impl Session {
             .seal_in_place_append_tag(ring_nonce, Aad::empty(), &mut buffer)
             .map_err(|_| SessionError::EncryptFailed)?;
 
-        *self.last_sent.write().unwrap() = Instant::now();
+        // Atomic timestamp update - no lock contention
+        self.last_sent_nanos.store(now_nanos(), Ordering::Relaxed);
 
         Ok((buffer, nonce))
     }
@@ -172,7 +183,8 @@ impl Session {
             .map_err(|_| SessionError::EncryptFailed)?;
         out[pt_len..pt_len + TAG_SIZE].copy_from_slice(tag.as_ref());
 
-        *self.last_sent.write().unwrap() = Instant::now();
+        // Atomic timestamp update - no lock contention
+        self.last_sent_nanos.store(now_nanos(), Ordering::Relaxed);
 
         Ok(nonce)
     }
@@ -200,7 +212,8 @@ impl Session {
         let len = plaintext.len();
         buffer.truncate(len);
 
-        *self.last_received.write().unwrap() = Instant::now();
+        // Atomic timestamp update - no lock contention
+        self.last_received_nanos.store(now_nanos(), Ordering::Relaxed);
 
         Ok(buffer)
     }
@@ -228,7 +241,8 @@ impl Session {
             .map_err(|_| SessionError::DecryptFailed)?;
         
         let len = plaintext.len();
-        *self.last_received.write().unwrap() = Instant::now();
+        // Atomic timestamp update - no lock contention
+        self.last_received_nanos.store(now_nanos(), Ordering::Relaxed);
 
         Ok(len)
     }
@@ -238,7 +252,9 @@ impl Session {
         if self.state() == SessionState::Expired {
             return true;
         }
-        self.last_received.read().unwrap().elapsed() > SESSION_TIMEOUT
+        let last_nanos = self.last_received_nanos.load(Ordering::Relaxed);
+        let elapsed_nanos = now_nanos() - last_nanos;
+        elapsed_nanos > SESSION_TIMEOUT.as_nanos() as i64
     }
 
     /// Marks the session as expired.
@@ -251,14 +267,14 @@ impl Session {
         self.created_at
     }
 
-    /// Returns when last message was received.
-    pub fn last_received(&self) -> Instant {
-        *self.last_received.read().unwrap()
+    /// Returns when last message was received (as nanos since UNIX_EPOCH).
+    pub fn last_received_nanos(&self) -> i64 {
+        self.last_received_nanos.load(Ordering::Relaxed)
     }
 
-    /// Returns when last message was sent.
-    pub fn last_sent(&self) -> Instant {
-        *self.last_sent.read().unwrap()
+    /// Returns when last message was sent (as nanos since UNIX_EPOCH).
+    pub fn last_sent_nanos(&self) -> i64 {
+        self.last_sent_nanos.load(Ordering::Relaxed)
     }
 
     /// Returns current send nonce.
