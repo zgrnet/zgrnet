@@ -149,7 +149,7 @@ fn bench_concurrent_session_create(c: &mut Criterion) {
                             let kp = KeyPair::generate();
                             let send_key = Key::new(noise::cipher::hash(&[b"send"]));
                             let recv_key = Key::new(noise::cipher::hash(&[b"recv"]));
-                            let session = m.create_session(kp.public, send_key, recv_key);
+                            let session = m.create_session(kp.public, send_key, recv_key).unwrap();
                             let idx = session.local_index();
                             m.remove_session(idx);
                         }
@@ -305,7 +305,7 @@ fn bench_session_manager_concurrent(c: &mut Criterion) {
                 let kp = KeyPair::generate();
                 let send_key = Key::new(noise::cipher::hash(&[b"send"]));
                 let recv_key = Key::new(noise::cipher::hash(&[b"recv"]));
-                let _ = manager.create_session(kp.public, send_key, recv_key);
+                let _ = manager.create_session(kp.public, send_key, recv_key).unwrap();
             }
 
             thread::scope(|scope| {
@@ -318,7 +318,7 @@ fn bench_session_manager_concurrent(c: &mut Criterion) {
                             let recv_key = Key::new(noise::cipher::hash(&[b"recv"]));
 
                             // Create
-                            let session = m.create_session(kp.public, send_key, recv_key);
+                            let session = m.create_session(kp.public, send_key, recv_key).unwrap();
                             // Lookup by index
                             let idx = session.local_index();
                             let _ = m.get_by_index(idx);

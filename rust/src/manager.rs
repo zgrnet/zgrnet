@@ -34,10 +34,10 @@ impl SessionManager {
         remote_pk: Key,
         send_key: Key,
         recv_key: Key,
-    ) -> Arc<Session> {
+    ) -> Result<Arc<Session>, ManagerError> {
         let mut inner = self.inner.write().unwrap();
 
-        let local_index = Self::allocate_index(&mut inner);
+        let local_index = Self::allocate_index(&mut inner)?;
 
         let session = Arc::new(Session::new(SessionConfig {
             local_index,
@@ -55,7 +55,7 @@ impl SessionManager {
         inner.by_index.insert(local_index, session.clone());
         inner.by_pubkey.insert(remote_pk, session.clone());
 
-        session
+        Ok(session)
     }
 
     /// Registers an externally created session.
@@ -153,7 +153,8 @@ impl SessionManager {
         inner.by_pubkey.clear();
     }
 
-    fn allocate_index(inner: &mut SessionManagerInner) -> u32 {
+    fn allocate_index(inner: &mut SessionManagerInner) -> Result<u32, ManagerError> {
+        let start_index = inner.next_index;
         loop {
             let index = inner.next_index;
             inner.next_index = inner.next_index.wrapping_add(1);
@@ -162,7 +163,12 @@ impl SessionManager {
             }
 
             if !inner.by_index.contains_key(&index) {
-                return index;
+                return Ok(index);
+            }
+
+            // Wrapped around without finding a free index
+            if inner.next_index == start_index {
+                return Err(ManagerError::NoFreeIndex);
             }
         }
     }
@@ -211,12 +217,15 @@ impl Drop for ExpiryTaskHandle {
 pub enum ManagerError {
     /// Session index already in use.
     IndexInUse,
+    /// No free session index available (all indices exhausted).
+    NoFreeIndex,
 }
 
 impl std::fmt::Display for ManagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IndexInUse => write!(f, "session index already in use"),
+            Self::NoFreeIndex => write!(f, "no free session index available"),
         }
     }
 }
@@ -233,7 +242,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk = Key::new([1u8; KEY_SIZE]);
-        let session = m.create_session(pk, Key::default(), Key::default());
+        let session = m.create_session(pk, Key::default(), Key::default()).unwrap();
         
         assert!(session.local_index() > 0);
         assert_eq!(m.count(), 1);
@@ -244,7 +253,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk = Key::new([1u8; KEY_SIZE]);
-        let session = m.create_session(pk, Key::default(), Key::default());
+        let session = m.create_session(pk, Key::default(), Key::default()).unwrap();
         let index = session.local_index();
         
         assert!(m.get_by_index(index).is_some());
@@ -256,7 +265,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk = Key::new([1u8; KEY_SIZE]);
-        let _session = m.create_session(pk, Key::default(), Key::default());
+        let _session = m.create_session(pk, Key::default(), Key::default()).unwrap();
         
         assert!(m.get_by_pubkey(&pk).is_some());
         assert!(m.get_by_pubkey(&Key::new([9u8; KEY_SIZE])).is_none());
@@ -267,7 +276,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk = Key::new([1u8; KEY_SIZE]);
-        let session = m.create_session(pk, Key::default(), Key::default());
+        let session = m.create_session(pk, Key::default(), Key::default()).unwrap();
         let index = session.local_index();
         
         m.remove_session(index);
@@ -282,7 +291,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk = Key::new([1u8; KEY_SIZE]);
-        let session = m.create_session(pk, Key::default(), Key::default());
+        let session = m.create_session(pk, Key::default(), Key::default()).unwrap();
         let index = session.local_index();
         
         m.remove_by_pubkey(&pk);
@@ -297,10 +306,10 @@ mod tests {
         
         let pk = Key::new([1u8; KEY_SIZE]);
         
-        let s1 = m.create_session(pk, Key::default(), Key::default());
+        let s1 = m.create_session(pk, Key::default(), Key::default()).unwrap();
         let i1 = s1.local_index();
         
-        let s2 = m.create_session(pk, Key::new([1u8; KEY_SIZE]), Key::default());
+        let s2 = m.create_session(pk, Key::new([1u8; KEY_SIZE]), Key::default()).unwrap();
         let i2 = s2.local_index();
         
         assert!(m.get_by_index(i1).is_none());
@@ -315,7 +324,7 @@ mod tests {
         let peers: Vec<Key> = (0..5).map(|i| Key::new([i; KEY_SIZE])).collect();
         let sessions: Vec<_> = peers
             .iter()
-            .map(|pk| m.create_session(*pk, Key::default(), Key::default()))
+            .map(|pk| m.create_session(*pk, Key::default(), Key::default()).unwrap())
             .collect();
         
         assert_eq!(m.count(), 5);
@@ -333,8 +342,8 @@ mod tests {
         let pk1 = Key::new([1u8; KEY_SIZE]);
         let pk2 = Key::new([2u8; KEY_SIZE]);
         
-        let s1 = m.create_session(pk1, Key::default(), Key::default());
-        let _s2 = m.create_session(pk2, Key::default(), Key::default());
+        let s1 = m.create_session(pk1, Key::default(), Key::default()).unwrap();
+        let _s2 = m.create_session(pk2, Key::default(), Key::default()).unwrap();
         
         s1.expire();
         
@@ -351,7 +360,7 @@ mod tests {
         
         for i in 0..5 {
             let pk = Key::new([i; KEY_SIZE]);
-            m.create_session(pk, Key::default(), Key::default());
+            let _ = m.create_session(pk, Key::default(), Key::default()).unwrap();
         }
         
         assert_eq!(m.sessions().len(), 5);
@@ -363,7 +372,7 @@ mod tests {
         
         for i in 0..5 {
             let pk = Key::new([i; KEY_SIZE]);
-            m.create_session(pk, Key::default(), Key::default());
+            let _ = m.create_session(pk, Key::default(), Key::default()).unwrap();
         }
         
         let mut count = 0;
@@ -377,7 +386,7 @@ mod tests {
         
         for i in 0..5 {
             let pk = Key::new([i; KEY_SIZE]);
-            m.create_session(pk, Key::default(), Key::default());
+            let _ = m.create_session(pk, Key::default(), Key::default()).unwrap();
         }
         
         m.clear();
@@ -406,7 +415,7 @@ mod tests {
         let m = SessionManager::new();
         
         let pk1 = Key::new([1u8; KEY_SIZE]);
-        let s1 = m.create_session(pk1, Key::default(), Key::default());
+        let s1 = m.create_session(pk1, Key::default(), Key::default()).unwrap();
         
         let s2 = Arc::new(Session::new(SessionConfig {
             local_index: s1.local_index(),
@@ -431,7 +440,7 @@ mod tests {
         
         for i in 0..10 {
             let pk = Key::new([i; KEY_SIZE]);
-            m.create_session(pk, Key::default(), Key::default());
+            let _ = m.create_session(pk, Key::default(), Key::default()).unwrap();
         }
         
         assert_eq!(m.count(), 10);
