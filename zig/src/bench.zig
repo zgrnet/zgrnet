@@ -5,8 +5,6 @@
 const std = @import("std");
 const time = std.time;
 const Thread = std.Thread;
-const net = std.net;
-const posix = std.posix;
 const noise = @import("noise.zig");
 const keypair = noise.keypair;
 const cipher = noise.cipher;
@@ -17,46 +15,6 @@ const session_mod = @import("session.zig");
 const manager_mod = @import("manager.zig");
 const Session = session_mod.Session;
 const SessionManager = manager_mod.SessionManager;
-const udp_mod = @import("udp.zig");
-const Udp = udp_mod.Udp;
-
-/// Helper for UDP benchmark setup - creates a server socket and client transport
-const UdpBenchSetup = struct {
-    server_fd: posix.fd_t,
-    client: Udp,
-
-    pub fn init() !UdpBenchSetup {
-        // Create server socket
-        const server_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-        const server_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
-        errdefer posix.close(server_fd);
-
-        try posix.bind(server_fd, &server_addr.any, server_addr.getOsSockLen());
-
-        // Get assigned port
-        var bound_addr: net.Address = undefined;
-        var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-        try posix.getsockname(server_fd, &bound_addr.any, &bound_len);
-
-        const server_port = bound_addr.getPort();
-
-        // Create client using Udp transport
-        var addr_buf: [32]u8 = undefined;
-        const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{server_port});
-
-        const client = try Udp.init("127.0.0.1:0", addr_str);
-
-        return .{
-            .server_fd = server_fd,
-            .client = client,
-        };
-    }
-
-    pub fn deinit(self: *UdpBenchSetup) void {
-        posix.close(self.server_fd);
-        self.client.close();
-    }
-};
 
 fn doNotOptimize(ptr: anytype) void {
     // Prevent compiler from optimizing away the result
@@ -536,37 +494,70 @@ pub fn main() !void {
     // ==========================================================================
     std.debug.print("\n=== UDP Transport Benchmarks ===\n\n", .{});
 
+    const udp_mod = @import("udp.zig");
+    const Udp = udp_mod.Udp;
+
     // UDP Throughput benchmark (using udp.Udp)
     {
         const iterations: usize = 100000;
+        const net = std.net;
 
-        // Use helper for setup
-        var setup = UdpBenchSetup.init() catch |e| {
-            std.debug.print("Failed to setup UDP benchmark: {}\n", .{e});
+        // Create server socket for drain
+        const server_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+        const server_fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch |e| {
+            std.debug.print("Failed to create server socket: {}\n", .{e});
+            return;
+        };
+
+        std.posix.bind(server_fd, &server_addr.any, server_addr.getOsSockLen()) catch |e| {
+            std.debug.print("Failed to bind server: {}\n", .{e});
+            std.posix.close(server_fd);
+            return;
+        };
+
+        // Get assigned port
+        var bound_addr: net.Address = undefined;
+        var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        std.posix.getsockname(server_fd, &bound_addr.any, &bound_len) catch |e| {
+            std.debug.print("Failed to get server addr: {}\n", .{e});
+            std.posix.close(server_fd);
+            return;
+        };
+
+        const server_port = bound_addr.getPort();
+
+        // Create client using our Udp transport
+        var addr_buf: [32]u8 = undefined;
+        const addr_str = std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{server_port}) catch return;
+
+        var client = Udp.init("127.0.0.1:0", addr_str) catch |e| {
+            std.debug.print("Failed to create Udp client: {}\n", .{e});
+            std.posix.close(server_fd);
             return;
         };
 
         // Server drain thread
         const server_thread = Thread.spawn(.{}, struct {
-            fn run(fd: posix.fd_t) void {
+            fn run(fd: std.posix.fd_t) void {
                 var buf: [1500]u8 = undefined;
                 while (true) {
-                    _ = posix.recv(fd, &buf, 0) catch break;
+                    _ = std.posix.recv(fd, &buf, 0) catch break;
                 }
             }
-        }.run, .{setup.server_fd}) catch unreachable;
+        }.run, .{server_fd}) catch unreachable;
 
         const data = [_]u8{0} ** 1400;
 
         const start = time.nanoTimestamp();
         for (0..iterations) |_| {
-            _ = setup.client.send(&data) catch break;
+            _ = client.send(&data) catch break;
         }
         const end = time.nanoTimestamp();
 
         // Close server first to unblock recv, then join
-        setup.deinit();
+        std.posix.close(server_fd);
         server_thread.join();
+        client.close();
 
         const elapsed_ns = @as(f64, @floatFromInt(end - start));
         const per_op_ns = elapsed_ns / @as(f64, iterations);
@@ -580,9 +571,37 @@ pub fn main() !void {
     // UDP + Noise Throughput benchmark (using udp.Udp)
     {
         const iterations: usize = 100000;
+        const net = std.net;
 
-        // Use helper for setup
-        var setup = UdpBenchSetup.init() catch return;
+        // Create server socket for drain
+        const server_addr2 = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+        const server_fd2 = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0) catch return;
+
+        std.posix.bind(server_fd2, &server_addr2.any, server_addr2.getOsSockLen()) catch {
+            std.posix.close(server_fd2);
+            return;
+        };
+
+        var bound_addr2: net.Address = undefined;
+        var bound_len2: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        std.posix.getsockname(server_fd2, &bound_addr2.any, &bound_len2) catch {
+            std.posix.close(server_fd2);
+            return;
+        };
+
+        const server_port2 = bound_addr2.getPort();
+
+        // Create client using our Udp transport
+        var addr_buf2: [32]u8 = undefined;
+        const addr_str2 = std.fmt.bufPrint(&addr_buf2, "127.0.0.1:{d}", .{server_port2}) catch {
+            std.posix.close(server_fd2);
+            return;
+        };
+
+        var client2 = Udp.init("127.0.0.1:0", addr_str2) catch {
+            std.posix.close(server_fd2);
+            return;
+        };
 
         // Create session
         const send_key = keypair.Key.fromBytes(crypto.hash(&.{"send"}));
@@ -596,14 +615,14 @@ pub fn main() !void {
         });
 
         // Server drain thread
-        const server_thread = Thread.spawn(.{}, struct {
-            fn run(fd: posix.fd_t) void {
+        const server_thread2 = Thread.spawn(.{}, struct {
+            fn run(fd: std.posix.fd_t) void {
                 var buf: [1500]u8 = undefined;
                 while (true) {
-                    _ = posix.recv(fd, &buf, 0) catch break;
+                    _ = std.posix.recv(fd, &buf, 0) catch break;
                 }
             }
-        }.run, .{setup.server_fd}) catch unreachable;
+        }.run, .{server_fd2}) catch unreachable;
 
         const plaintext = [_]u8{0} ** 1400;
         var send_buf: [1500]u8 = undefined;
@@ -619,13 +638,14 @@ pub fn main() !void {
             std.mem.writeInt(u64, send_buf[5..13], nonce, .little);
 
             // Send using Udp transport
-            _ = setup.client.send(send_buf[0 .. 13 + plaintext.len + 16]) catch break;
+            _ = client2.send(send_buf[0 .. 13 + plaintext.len + 16]) catch break;
         }
         const end = time.nanoTimestamp();
 
         // Close server first to unblock recv
-        setup.deinit();
-        server_thread.join();
+        std.posix.close(server_fd2);
+        server_thread2.join();
+        client2.close();
 
         const elapsed_ns = @as(f64, @floatFromInt(end - start));
         const per_op_ns = elapsed_ns / @as(f64, iterations);

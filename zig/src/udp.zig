@@ -28,11 +28,18 @@ pub const UdpAddr = struct {
 
         const port_num = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidAddress;
 
-        // Use std.net.Ip4Address.parse for robust IPv4 address parsing
-        const ip4 = std.net.Ip4Address.parse(host, port_num) catch return error.InvalidAddress;
+        // Parse IPv4
+        var octets: [4]u8 = undefined;
+        var octet_it = std.mem.splitScalar(u8, host, '.');
+        var i: usize = 0;
+        while (octet_it.next()) |octet_str| : (i += 1) {
+            if (i >= 4) return error.InvalidAddress;
+            octets[i] = std.fmt.parseInt(u8, octet_str, 10) catch return error.InvalidAddress;
+        }
+        if (i != 4) return error.InvalidAddress;
 
         return .{
-            .inner = net.Address{ .in = ip4 },
+            .inner = net.Address.initIp4(octets, port_num),
         };
     }
 

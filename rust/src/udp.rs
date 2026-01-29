@@ -73,7 +73,7 @@ impl Udp {
     ///
     /// # Example
     /// ```no_run
-    /// use noise::udp::Udp;
+    /// use zgrnet_noise::udp::Udp;
     /// let transport = Udp::new("0.0.0.0:0", "192.168.1.100:51820").unwrap();
     /// ```
     pub fn new(local_addr: &str, remote_addr: &str) -> io::Result<Self> {

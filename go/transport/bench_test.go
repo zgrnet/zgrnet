@@ -290,34 +290,22 @@ func BenchmarkUDP_ParallelSend(b *testing.B) {
 
 // BenchmarkUDP_NoiseParallel benchmarks parallel encrypted sends
 func BenchmarkUDP_NoiseParallel(b *testing.B) {
-	serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("ResolveUDPAddr: %v", err)
-	}
-	server, err := net.ListenUDP("udp", serverAddr)
-	if err != nil {
-		b.Fatalf("ListenUDP: %v", err)
-	}
+	serverAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	server, _ := net.ListenUDP("udp", serverAddr)
 	defer server.Close()
 
-	clientUDP, err := net.DialUDP("udp", nil, server.LocalAddr().(*net.UDPAddr))
-	if err != nil {
-		b.Fatalf("DialUDP: %v", err)
-	}
+	clientUDP, _ := net.DialUDP("udp", nil, server.LocalAddr().(*net.UDPAddr))
 	defer clientUDP.Close()
 
 	sendKey := noise.Hash([]byte("send"))
 	recvKey := noise.Hash([]byte("recv"))
 
-	session, err := noise.NewSession(noise.SessionConfig{
+	session, _ := noise.NewSession(noise.SessionConfig{
 		LocalIndex:  1,
 		RemoteIndex: 2,
 		SendKey:     sendKey,
 		RecvKey:     recvKey,
 	})
-	if err != nil {
-		b.Fatalf("NewSession: %v", err)
-	}
 
 	plaintext := make([]byte, 1400)
 
@@ -357,35 +345,23 @@ func BenchmarkUDP_NoiseParallel(b *testing.B) {
 // BenchmarkUDP_NoiseThroughput benchmarks one-way encrypted throughput
 func BenchmarkUDP_NoiseThroughput(b *testing.B) {
 	// Create UDP pair
-	serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("ResolveUDPAddr: %v", err)
-	}
-	server, err := net.ListenUDP("udp", serverAddr)
-	if err != nil {
-		b.Fatalf("ListenUDP: %v", err)
-	}
+	serverAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	server, _ := net.ListenUDP("udp", serverAddr)
 	defer server.Close()
 
-	clientUDP, err := net.DialUDP("udp", nil, server.LocalAddr().(*net.UDPAddr))
-	if err != nil {
-		b.Fatalf("DialUDP: %v", err)
-	}
+	clientUDP, _ := net.DialUDP("udp", nil, server.LocalAddr().(*net.UDPAddr))
 	defer clientUDP.Close()
 
 	// Create session
 	sendKey := noise.Hash([]byte("send"))
 	recvKey := noise.Hash([]byte("recv"))
 
-	clientSession, err := noise.NewSession(noise.SessionConfig{
+	clientSession, _ := noise.NewSession(noise.SessionConfig{
 		LocalIndex:  1,
 		RemoteIndex: 2,
 		SendKey:     sendKey,
 		RecvKey:     recvKey,
 	})
-	if err != nil {
-		b.Fatalf("NewSession: %v", err)
-	}
 
 	// Pre-allocate
 	plaintext := make([]byte, 1400) // MTU-sized
@@ -430,45 +406,30 @@ func BenchmarkUDP_NoiseThroughput(b *testing.B) {
 // BenchmarkUDP_RawNoise benchmarks UDP with raw Session API (no Conn overhead)
 func BenchmarkUDP_RawNoise(b *testing.B) {
 	// Create UDP pair
-	serverAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("ResolveUDPAddr: %v", err)
-	}
-	server, err := net.ListenUDP("udp", serverAddr)
-	if err != nil {
-		b.Fatalf("ListenUDP: %v", err)
-	}
+	serverAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	server, _ := net.ListenUDP("udp", serverAddr)
 	defer server.Close()
 
-	clientUDP, err := net.DialUDP("udp", nil, server.LocalAddr().(*net.UDPAddr))
-	if err != nil {
-		b.Fatalf("DialUDP: %v", err)
-	}
+	clientUDP, _ := net.DialUDP("udp", nil, server.LocalAddr().(*net.UDPAddr))
 	defer clientUDP.Close()
 
 	// Create sessions directly (skip handshake for benchmark)
 	sendKey := noise.Hash([]byte("send"))
 	recvKey := noise.Hash([]byte("recv"))
 
-	clientSession, err := noise.NewSession(noise.SessionConfig{
+	clientSession, _ := noise.NewSession(noise.SessionConfig{
 		LocalIndex:  1,
 		RemoteIndex: 2,
 		SendKey:     sendKey,
 		RecvKey:     recvKey,
 	})
-	if err != nil {
-		b.Fatalf("NewSession (client): %v", err)
-	}
 
-	serverSession, err := noise.NewSession(noise.SessionConfig{
+	serverSession, _ := noise.NewSession(noise.SessionConfig{
 		LocalIndex:  2,
 		RemoteIndex: 1,
 		SendKey:     recvKey,
 		RecvKey:     sendKey,
 	})
-	if err != nil {
-		b.Fatalf("NewSession (server): %v", err)
-	}
 
 	// Pre-allocate buffers
 	plaintext := make([]byte, 1024)
