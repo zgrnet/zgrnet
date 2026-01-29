@@ -117,14 +117,8 @@ jobs:
         working-directory: zig
         run: |
           echo "=== Zig Noise Protocol Benchmarks (${{ runner.os }}) ==="
-          zig build bench
-          ./zig-out/bin/bench
-
-      - name: Save results
-        working-directory: zig
-        run: |
           mkdir -p ../results
-          ./zig-out/bin/bench 2>&1 | tee ../results/benchmark-zig-${{ runner.os }}.txt
+          zig build bench 2>&1 | tee ../results/benchmark-zig-${{ runner.os }}.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
