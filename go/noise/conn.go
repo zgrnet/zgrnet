@@ -262,8 +262,7 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 	// Get transport keys
 	sendCS, recvCS, err := c.hsState.Split()
 	if err != nil {
-		c.state = ConnStateNew
-		c.hsState = nil
+		c.resetHandshakeStateLocked()
 		return err
 	}
 
@@ -281,8 +280,7 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 		RemotePK:    c.remotePK,
 	})
 	if err != nil {
-		c.state = ConnStateNew
-		c.hsState = nil
+		c.resetHandshakeStateLocked()
 		return err
 	}
 
@@ -293,12 +291,18 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *PublicKey) error {
 	return nil
 }
 
+// resetHandshakeStateLocked resets the connection to new state.
+// Must be called with c.mu held.
+func (c *Conn) resetHandshakeStateLocked() {
+	c.state = ConnStateNew
+	c.hsState = nil
+}
+
 // failHandshake handles handshake failure.
 func (c *Conn) failHandshake(err error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.state = ConnStateNew
-	c.hsState = nil
+	c.resetHandshakeStateLocked()
 	return err
 }
 
@@ -355,30 +359,26 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 	} else {
 		// Direct connection: read from transport using pooled buffer
 		bufPtr := recvBufferPool.Get().(*[]byte)
+		defer recvBufferPool.Put(bufPtr)
 		buf := *bufPtr
 
 		n, _, err := c.transport.RecvFrom(buf)
 		if err != nil {
-			recvBufferPool.Put(bufPtr)
 			return 0, nil, err
 		}
 
-		// Parse transport message (make a copy of ciphertext since we're returning buffer to pool)
+		// Parse transport message
 		parsed, err := ParseTransportMessage(buf[:n])
 		if err != nil {
-			recvBufferPool.Put(bufPtr)
 			return 0, nil, err
 		}
 
-		// Copy ciphertext before returning buffer to pool
+		// Copy ciphertext before buffer is reused (buffer returned to pool on function exit)
+		// Modify parsed in-place to avoid allocating a new TransportMessage struct
 		cipherCopy := make([]byte, len(parsed.Ciphertext))
 		copy(cipherCopy, parsed.Ciphertext)
-		msg = &TransportMessage{
-			ReceiverIndex: parsed.ReceiverIndex,
-			Counter:       parsed.Counter,
-			Ciphertext:    cipherCopy,
-		}
-		recvBufferPool.Put(bufPtr)
+		parsed.Ciphertext = cipherCopy
+		msg = parsed
 	}
 
 	// Verify receiver index
