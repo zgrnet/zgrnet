@@ -374,13 +374,11 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 		}
 
 		// Copy ciphertext before buffer is reused (buffer returned to pool on function exit)
+		// Modify parsed in-place to avoid allocating a new TransportMessage struct
 		cipherCopy := make([]byte, len(parsed.Ciphertext))
 		copy(cipherCopy, parsed.Ciphertext)
-		msg = &TransportMessage{
-			ReceiverIndex: parsed.ReceiverIndex,
-			Counter:       parsed.Counter,
-			Ciphertext:    cipherCopy,
-		}
+		parsed.Ciphertext = cipherCopy
+		msg = parsed
 	}
 
 	// Verify receiver index
