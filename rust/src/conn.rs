@@ -164,25 +164,28 @@ impl<T: Transport + 'static> Conn<T> {
     /// Initiates a handshake with the remote peer.
     /// This is a blocking call that completes the full handshake.
     pub fn open(&self) -> Result<()> {
-        // Check and update state
+        // Read required values first (read locks are cheap)
+        let remote_pk = *self.remote_pk.read().unwrap();
+        if remote_pk.is_zero() {
+            return Err(ConnError::MissingRemotePK);
+        }
+        {
+            let remote_addr = self.remote_addr.read().unwrap();
+            if remote_addr.is_none() {
+                return Err(ConnError::MissingRemoteAddr);
+            }
+        }
+
+        // Now atomically check and update state (minimizing write lock time)
         {
             let mut state = self.state.write().unwrap();
             if *state != ConnState::New {
                 return Err(ConnError::InvalidState);
             }
-            let remote_pk = self.remote_pk.read().unwrap();
-            if remote_pk.is_zero() {
-                return Err(ConnError::MissingRemotePK);
-            }
-            let remote_addr = self.remote_addr.read().unwrap();
-            if remote_addr.is_none() {
-                return Err(ConnError::MissingRemoteAddr);
-            }
             *state = ConnState::Handshaking;
         }
 
         // Create handshake state (IK pattern)
-        let remote_pk = *self.remote_pk.read().unwrap();
         let hs_result = HandshakeState::new(Config {
             pattern: Some(Pattern::IK),
             initiator: true,
@@ -401,7 +404,17 @@ impl<T: Transport + 'static> Conn<T> {
 
     /// Receives and decrypts a message from the remote peer.
     /// Returns the protocol byte and decrypted payload.
+    ///
+    /// For better performance in tight loops, use `recv_with_buffer` with a reusable buffer.
     pub fn recv(&self) -> Result<(u8, Vec<u8>)> {
+        let mut buf = vec![0u8; MAX_PACKET_SIZE];
+        self.recv_with_buffer(&mut buf)
+    }
+
+    /// Receives and decrypts a message using the provided buffer.
+    /// This avoids allocating a new buffer on each call.
+    /// The buffer should be at least MAX_PACKET_SIZE bytes.
+    pub fn recv_with_buffer(&self, buf: &mut [u8]) -> Result<(u8, Vec<u8>)> {
         {
             let state = self.state.read().unwrap();
             if *state != ConnState::Established {
@@ -410,8 +423,7 @@ impl<T: Transport + 'static> Conn<T> {
         }
 
         // Receive packet
-        let mut buf = vec![0u8; MAX_PACKET_SIZE];
-        let (n, _) = self.transport.recv_from(&mut buf)?;
+        let (n, _) = self.transport.recv_from(buf)?;
 
         // Parse transport message
         let msg = parse_transport_message(&buf[..n])?;

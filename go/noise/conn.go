@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// recvBufferPool is a pool for receive buffers to reduce allocations.
+var recvBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, MaxPacketSize)
+		return &buf
+	},
+}
+
 // ConnState represents the state of a connection.
 type ConnState int
 
@@ -61,9 +69,9 @@ type Conn struct {
 	inbound chan inboundPacket
 }
 
-// inboundPacket represents a packet received from the listener
+// inboundPacket represents a parsed transport message from the listener
 type inboundPacket struct {
-	data []byte
+	msg  *TransportMessage
 	addr Addr
 }
 
@@ -335,29 +343,42 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 	inbound := c.inbound
 	c.mu.RUnlock()
 
-	var data []byte
+	var msg *TransportMessage
 
 	if inbound != nil {
-		// Listener-managed connection: read from inbound channel
+		// Listener-managed connection: read pre-parsed message from inbound channel
 		pkt, ok := <-inbound
 		if !ok {
 			return 0, nil, ErrConnClosed
 		}
-		data = pkt.data
+		msg = pkt.msg
 	} else {
-		// Direct connection: read from transport
-		buf := make([]byte, MaxPacketSize)
+		// Direct connection: read from transport using pooled buffer
+		bufPtr := recvBufferPool.Get().(*[]byte)
+		buf := *bufPtr
+
 		n, _, err := c.transport.RecvFrom(buf)
 		if err != nil {
+			recvBufferPool.Put(bufPtr)
 			return 0, nil, err
 		}
-		data = buf[:n]
-	}
 
-	// Parse transport message
-	msg, err := ParseTransportMessage(data)
-	if err != nil {
-		return 0, nil, err
+		// Parse transport message (make a copy of ciphertext since we're returning buffer to pool)
+		parsed, err := ParseTransportMessage(buf[:n])
+		if err != nil {
+			recvBufferPool.Put(bufPtr)
+			return 0, nil, err
+		}
+
+		// Copy ciphertext before returning buffer to pool
+		cipherCopy := make([]byte, len(parsed.Ciphertext))
+		copy(cipherCopy, parsed.Ciphertext)
+		msg = &TransportMessage{
+			ReceiverIndex: parsed.ReceiverIndex,
+			Counter:       parsed.Counter,
+			Ciphertext:    cipherCopy,
+		}
+		recvBufferPool.Put(bufPtr)
 	}
 
 	// Verify receiver index
@@ -442,9 +463,9 @@ func (c *Conn) setInbound(ch chan inboundPacket) {
 	c.inbound = ch
 }
 
-// deliverPacket delivers a packet to the connection's inbound channel.
+// deliverPacket delivers a parsed transport message to the connection's inbound channel.
 // Returns false if the channel is full or the connection is closed.
-func (c *Conn) deliverPacket(data []byte, addr Addr) bool {
+func (c *Conn) deliverPacket(msg *TransportMessage, addr Addr) bool {
 	c.mu.RLock()
 	inbound := c.inbound
 	state := c.state
@@ -455,7 +476,7 @@ func (c *Conn) deliverPacket(data []byte, addr Addr) bool {
 	}
 
 	select {
-	case inbound <- inboundPacket{data: data, addr: addr}:
+	case inbound <- inboundPacket{msg: msg, addr: addr}:
 		return true
 	default:
 		return false

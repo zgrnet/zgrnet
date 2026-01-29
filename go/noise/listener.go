@@ -240,11 +240,16 @@ func (l *Listener) handleTransport(data []byte, addr Addr) {
 		return // Unknown connection
 	}
 
-	// Route the packet to the connection
-	// Make a copy of the data since the buffer may be reused
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	if !conn.deliverPacket(dataCopy, addr) {
+	// Route the parsed message to the connection
+	// Copy ciphertext since the buffer will be reused
+	cipherCopy := make([]byte, len(msg.Ciphertext))
+	copy(cipherCopy, msg.Ciphertext)
+	msgCopy := &TransportMessage{
+		ReceiverIndex: msg.ReceiverIndex,
+		Counter:       msg.Counter,
+		Ciphertext:    cipherCopy,
+	}
+	if !conn.deliverPacket(msgCopy, addr) {
 		// Packet dropped due to full buffer or closed connection
 		// This is expected under high load, the application should
 		// handle retransmissions at a higher level
