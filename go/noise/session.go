@@ -159,10 +159,13 @@ func (s *Session) SetState(state SessionState) {
 // Returns the ciphertext and the nonce used.
 // The ciphertext includes the 16-byte authentication tag.
 func (s *Session) Encrypt(plaintext []byte) (ciphertext []byte, nonce uint64, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Use read lock to get state and cipher (allows concurrent encryptions)
+	s.mu.RLock()
+	state := s.state
+	sendAEAD := s.sendAEAD
+	s.mu.RUnlock()
 
-	if s.state != SessionStateEstablished {
+	if state != SessionStateEstablished {
 		return nil, 0, ErrSessionNotEstablished
 	}
 
@@ -178,11 +181,13 @@ func (s *Session) Encrypt(plaintext []byte) (ciphertext []byte, nonce uint64, er
 	var nonceBytes [12]byte
 	binary.LittleEndian.PutUint64(nonceBytes[:], nonce)
 
-	// Encrypt
-	ciphertext = s.sendAEAD.Seal(nil, nonceBytes[:], plaintext, nil)
+	// Encrypt (AEAD is safe for concurrent use)
+	ciphertext = sendAEAD.Seal(nil, nonceBytes[:], plaintext, nil)
 
-	// Update last sent time
+	// Update last sent time with write lock
+	s.mu.Lock()
 	s.lastSent = time.Now()
+	s.mu.Unlock()
 
 	return ciphertext, nonce, nil
 }
@@ -190,16 +195,21 @@ func (s *Session) Encrypt(plaintext []byte) (ciphertext []byte, nonce uint64, er
 // Decrypt decrypts a ciphertext message from transport.
 // The nonce must be provided separately (from the packet header).
 // Returns the plaintext if successful.
+// Note: A corrupted packet that fails decryption will still consume its nonce
+// in the replay filter. This is an acceptable trade-off for concurrent performance.
 func (s *Session) Decrypt(ciphertext []byte, nonce uint64) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Use read lock to get state and cipher (allows concurrent decryptions)
+	s.mu.RLock()
+	state := s.state
+	recvAEAD := s.recvAEAD
+	s.mu.RUnlock()
 
-	if s.state != SessionStateEstablished {
+	if state != SessionStateEstablished {
 		return nil, ErrSessionNotEstablished
 	}
 
-	// Check replay
-	if !s.recvNonce.Check(nonce) {
+	// Atomically check and update replay filter
+	if !s.recvNonce.CheckAndUpdate(nonce) {
 		return nil, ErrReplayDetected
 	}
 
@@ -207,15 +217,16 @@ func (s *Session) Decrypt(ciphertext []byte, nonce uint64) ([]byte, error) {
 	var nonceBytes [12]byte
 	binary.LittleEndian.PutUint64(nonceBytes[:], nonce)
 
-	// Decrypt
-	plaintext, err := s.recvAEAD.Open(nil, nonceBytes[:], ciphertext, nil)
+	// Decrypt (AEAD is safe for concurrent use)
+	plaintext, err := recvAEAD.Open(nil, nonceBytes[:], ciphertext, nil)
 	if err != nil {
 		return nil, ErrDecryptionFailed
 	}
 
-	// Update replay filter and last received time
-	s.recvNonce.Update(nonce)
+	// Update last received time with write lock
+	s.mu.Lock()
 	s.lastReceived = time.Now()
+	s.mu.Unlock()
 
 	return plaintext, nil
 }

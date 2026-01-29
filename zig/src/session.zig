@@ -137,7 +137,10 @@ pub const Session = struct {
     /// Encrypts a message.
     /// Returns the nonce used. Output buffer must be at least plaintext.len + tag_size.
     pub fn encrypt(self: *Session, plaintext: []const u8, out: []u8) SessionError!u64 {
-        if (self.getState() != .established) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.state != .established) {
             return SessionError.NotEstablished;
         }
 
@@ -148,9 +151,7 @@ pub const Session = struct {
 
         cipher_mod.encrypt(&self.send_key.data, nonce, plaintext, "", out);
 
-        self.mutex.lock();
         self.last_sent = time.nanoTimestamp();
-        self.mutex.unlock();
 
         return nonce;
     }
@@ -158,11 +159,15 @@ pub const Session = struct {
     /// Decrypts a message.
     /// Output buffer must be at least ciphertext.len - tag_size.
     pub fn decrypt(self: *Session, ciphertext: []const u8, nonce: u64, out: []u8) SessionError!usize {
-        if (self.getState() != .established) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.state != .established) {
             return SessionError.NotEstablished;
         }
 
         // Atomically check and update replay filter to prevent race conditions
+        // Note: recv_filter has its own mutex, safe to call while holding session mutex
         if (!self.recv_filter.checkAndUpdate(nonce)) {
             return SessionError.ReplayDetected;
         }
@@ -175,9 +180,7 @@ pub const Session = struct {
             return SessionError.AuthenticationFailed;
         };
 
-        self.mutex.lock();
         self.last_received = time.nanoTimestamp();
-        self.mutex.unlock();
 
         return ciphertext.len - tag_size;
     }
