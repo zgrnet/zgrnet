@@ -1,9 +1,8 @@
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
-const KCP_VERSION: &str = "1.7";
 const KCP_URL: &str = "https://raw.githubusercontent.com/skywind3000/kcp/1.7/ikcp.c";
 const KCP_HEADER_URL: &str = "https://raw.githubusercontent.com/skywind3000/kcp/1.7/ikcp.h";
 
