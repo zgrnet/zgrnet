@@ -201,7 +201,10 @@ extern "C" fn kcp_output_callback(
         return 0;
     }
 
-    let context = unsafe { Arc::from_raw(user as *const Mutex<KcpContext>) };
+    // The `user` pointer points to the Mutex inside the Arc held by Kcp struct.
+    // Its lifetime is guaranteed by the Kcp struct, so we can safely use a reference
+    // instead of Arc::from_raw (which would leak memory due to refcount increment).
+    let context = unsafe { &*(user as *const Mutex<KcpContext>) };
 
     // Wrap in catch_unwind to prevent panic from crossing FFI boundary
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -212,9 +215,6 @@ extern "C" fn kcp_output_callback(
             }
         }
     }));
-
-    // Don't drop the Arc - we need it to stay alive
-    std::mem::forget(context);
 
     if result.is_err() {
         // Panic occurred - abort to prevent UB from unwinding across FFI
