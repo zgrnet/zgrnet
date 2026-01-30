@@ -50,6 +50,7 @@ pub struct Stream {
     state: RwLock<StreamState>,
     recv_buf: Mutex<VecDeque<u8>>, // O(1) head removal
     fin_sender: Option<Box<dyn Fn() + Send + Sync>>, // Callback to send FIN frame
+    output_error: Arc<std::sync::atomic::AtomicBool>, // Set on transport output error
 }
 
 impl Stream {
@@ -58,6 +59,7 @@ impl Stream {
         id: u32,
         output: crate::kcp::OutputFn,
         fin_sender: Option<Box<dyn Fn() + Send + Sync>>,
+        output_error: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let mut kcp = Kcp::new(id, output);
         kcp.set_default_config();
@@ -68,6 +70,7 @@ impl Stream {
             state: RwLock::new(StreamState::Open),
             recv_buf: Mutex::new(VecDeque::new()),
             fin_sender,
+            output_error,
         }
     }
 
@@ -79,6 +82,12 @@ impl Stream {
     /// Get stream state.
     pub fn state(&self) -> StreamState {
         *self.state.read().unwrap()
+    }
+
+    /// Check if a transport output error has occurred.
+    /// This can be used to detect underlying connection issues.
+    pub fn has_output_error(&self) -> bool {
+        self.output_error.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Write data to the stream.
@@ -130,8 +139,12 @@ impl Stream {
         total
     }
 
-    /// Close the stream.
-    pub fn close(&self) {
+    /// Shutdown the write-half of the stream.
+    /// 
+    /// Sends a FIN frame to the remote peer and transitions to `LocalClose` state.
+    /// The stream can still receive data until a FIN is received from the peer.
+    /// For full close, wait for `state()` to become `Closed` after receiving remote FIN.
+    pub fn shutdown(&self) {
         let mut state = self.state.write().unwrap();
         if *state == StreamState::Closed {
             return;
@@ -317,6 +330,9 @@ impl Mux {
     fn create_stream(&self, id: u32) -> Arc<Stream> {
         let output = self.output.clone();
         let fin_output = self.output.clone();
+        let output_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output_error_cb = output_error.clone();
+        let output_error_fin = output_error.clone();
 
         Arc::new(Stream::new(
             id,
@@ -324,6 +340,7 @@ impl Mux {
                 // Use encode_with_payload to avoid intermediate allocations
                 let encoded = Frame::encode_with_payload(Cmd::Psh, id, data);
                 if let Err(e) = output(&encoded) {
+                    output_error_cb.store(true, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("Mux output error: {}", e);
                 }
             }),
@@ -331,9 +348,11 @@ impl Mux {
                 // Send FIN frame when stream is closed
                 let encoded = Frame::encode_with_payload(Cmd::Fin, id, &[]);
                 if let Err(e) = fin_output(&encoded) {
+                    output_error_fin.store(true, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("Mux FIN output error: {}", e);
                 }
             })),
+            output_error,
         ))
     }
 
@@ -540,7 +559,7 @@ mod tests {
         let stream = mux.open_stream().unwrap();
         assert_eq!(stream.state(), StreamState::Open);
 
-        stream.close();
+        stream.shutdown();
         assert_eq!(stream.state(), StreamState::LocalClose);
     }
 }

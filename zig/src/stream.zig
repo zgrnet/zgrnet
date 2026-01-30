@@ -30,6 +30,7 @@ pub const Stream = struct {
     state: StreamState,
     recv_buf: RingBuffer(u8), // O(1) head removal
     allocator: std.mem.Allocator,
+    output_error: bool, // Set on transport output error
 
     /// Initialize a new stream.
     pub fn init(allocator: std.mem.Allocator, id: u32, mux: *Mux) !*Stream {
@@ -43,6 +44,7 @@ pub const Stream = struct {
             .state = .open,
             .recv_buf = RingBuffer(u8).init(allocator),
             .allocator = allocator,
+            .output_error = false,
         };
 
         // Create KCP with output callback that routes data through the Mux
@@ -105,7 +107,10 @@ pub const Stream = struct {
     }
 
     /// Close the stream.
-    pub fn close(self: *Stream) void {
+    /// Shutdown the write-half of the stream.
+    /// Sends a FIN frame to the remote peer and transitions to `local_close` state.
+    /// The stream can still receive data until a FIN is received from the peer.
+    pub fn shutdown(self: *Stream) void {
         if (self.state == .closed) return;
 
         if (self.state == .open) {
@@ -116,6 +121,11 @@ pub const Stream = struct {
 
         // Send FIN
         self.mux.sendFin(self.id) catch {};
+    }
+
+    /// Check if a transport output error has occurred.
+    pub fn hasOutputError(self: *const Stream) bool {
+        return self.output_error;
     }
 
     /// Input data from KCP.
@@ -178,6 +188,7 @@ pub const Stream = struct {
         if (user) |u| {
             const stream: *Stream = @ptrCast(@alignCast(u));
             stream.mux.sendPsh(stream.id, data) catch |err| {
+                stream.output_error = true;
                 std.log.err("Mux output error in stream {d}: {s}", .{ stream.id, @errorName(err) });
             };
         }
