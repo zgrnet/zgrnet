@@ -1,0 +1,131 @@
+// Package kcp provides KCP reliable transport and stream multiplexing.
+package kcp
+
+import (
+	"encoding/binary"
+	"errors"
+)
+
+// Frame commands for KCP mux protocol.
+const (
+	CmdSYN byte = iota // Stream open
+	CmdFIN             // Stream close (EOF)
+	CmdPSH             // Data push
+	CmdNOP             // No operation (keepalive)
+	CmdUPD             // Window update (flow control)
+)
+
+// Frame header size: cmd(1) + stream_id(4) + length(2) = 7 bytes
+const (
+	FrameHeaderSize = 7
+	MaxFrameSize    = 65535
+)
+
+// Frame represents a multiplexed frame.
+//
+// Wire format:
+//
+//	+-------+------------+--------+---------+
+//	| cmd   | stream_id  | length | payload |
+//	| (1B)  | (4B LE)    | (2B LE)| (var)   |
+//	+-------+------------+--------+---------+
+type Frame struct {
+	Cmd      byte   // Command type
+	StreamID uint32 // Stream identifier
+	Payload  []byte // Frame payload
+}
+
+// Encode serializes the frame to bytes.
+func (f *Frame) Encode() []byte {
+	buf := make([]byte, FrameHeaderSize+len(f.Payload))
+	buf[0] = f.Cmd
+	binary.LittleEndian.PutUint32(buf[1:5], f.StreamID)
+	binary.LittleEndian.PutUint16(buf[5:7], uint16(len(f.Payload)))
+	copy(buf[7:], f.Payload)
+	return buf
+}
+
+// EncodeTo serializes the frame to the given buffer.
+// Returns the number of bytes written.
+// The buffer must be at least FrameHeaderSize + len(f.Payload) bytes.
+func (f *Frame) EncodeTo(buf []byte) int {
+	buf[0] = f.Cmd
+	binary.LittleEndian.PutUint32(buf[1:5], f.StreamID)
+	binary.LittleEndian.PutUint16(buf[5:7], uint16(len(f.Payload)))
+	copy(buf[7:], f.Payload)
+	return FrameHeaderSize + len(f.Payload)
+}
+
+// DecodeFrame parses a frame from bytes.
+func DecodeFrame(data []byte) (*Frame, error) {
+	if len(data) < FrameHeaderSize {
+		return nil, ErrFrameTooShort
+	}
+
+	length := binary.LittleEndian.Uint16(data[5:7])
+	if len(data) < FrameHeaderSize+int(length) {
+		return nil, ErrFrameTooShort
+	}
+
+	f := &Frame{
+		Cmd:      data[0],
+		StreamID: binary.LittleEndian.Uint32(data[1:5]),
+	}
+
+	if length > 0 {
+		f.Payload = make([]byte, length)
+		copy(f.Payload, data[7:7+length])
+	}
+
+	return f, nil
+}
+
+// DecodeFrameHeader parses only the frame header.
+// Returns cmd, streamID, payloadLength, error.
+func DecodeFrameHeader(data []byte) (cmd byte, streamID uint32, length uint16, err error) {
+	if len(data) < FrameHeaderSize {
+		return 0, 0, 0, ErrFrameTooShort
+	}
+	return data[0], binary.LittleEndian.Uint32(data[1:5]), binary.LittleEndian.Uint16(data[5:7]), nil
+}
+
+// UpdatePayload represents the payload of a UPD frame.
+//
+// Wire format:
+//
+//	+----------+--------+
+//	| consumed | window |
+//	| (4B LE)  | (4B LE)|
+//	+----------+--------+
+type UpdatePayload struct {
+	Consumed uint32 // Bytes consumed by remote
+	Window   uint32 // Remote window size
+}
+
+// UpdatePayloadSize is the size of UpdatePayload in bytes.
+const UpdatePayloadSize = 8
+
+// Encode serializes the update payload to bytes.
+func (u *UpdatePayload) Encode() []byte {
+	buf := make([]byte, UpdatePayloadSize)
+	binary.LittleEndian.PutUint32(buf[0:4], u.Consumed)
+	binary.LittleEndian.PutUint32(buf[4:8], u.Window)
+	return buf
+}
+
+// DecodeUpdatePayload parses an update payload from bytes.
+func DecodeUpdatePayload(data []byte) (*UpdatePayload, error) {
+	if len(data) < UpdatePayloadSize {
+		return nil, ErrFrameTooShort
+	}
+	return &UpdatePayload{
+		Consumed: binary.LittleEndian.Uint32(data[0:4]),
+		Window:   binary.LittleEndian.Uint32(data[4:8]),
+	}, nil
+}
+
+// Frame errors.
+var (
+	ErrFrameTooShort = errors.New("kcp: frame too short")
+	ErrInvalidCmd    = errors.New("kcp: invalid command")
+)
