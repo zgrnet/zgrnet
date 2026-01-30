@@ -49,11 +49,16 @@ pub struct Stream {
     kcp: Mutex<Kcp>,
     state: RwLock<StreamState>,
     recv_buf: Mutex<VecDeque<u8>>, // O(1) head removal
+    fin_sender: Option<Box<dyn Fn() + Send + Sync>>, // Callback to send FIN frame
 }
 
 impl Stream {
     /// Create a new stream.
-    pub(crate) fn new(id: u32, output: crate::kcp::OutputFn) -> Self {
+    pub(crate) fn new(
+        id: u32,
+        output: crate::kcp::OutputFn,
+        fin_sender: Option<Box<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         let mut kcp = Kcp::new(id, output);
         kcp.set_default_config();
 
@@ -62,6 +67,7 @@ impl Stream {
             kcp: Mutex::new(kcp),
             state: RwLock::new(StreamState::Open),
             recv_buf: Mutex::new(VecDeque::new()),
+            fin_sender,
         }
     }
 
@@ -131,6 +137,11 @@ impl Stream {
         } else {
             *state = StreamState::Closed;
         }
+
+        // Send FIN frame to notify remote peer
+        if let Some(ref fin_sender) = self.fin_sender {
+            fin_sender();
+        }
     }
 
     /// Input data from KCP.
@@ -148,15 +159,30 @@ impl Stream {
         let mut kcp = self.kcp.lock().unwrap();
         let mut recv_buf = self.recv_buf.lock().unwrap();
 
+        // Stack buffer for common MTU-sized messages, avoiding heap allocation
+        const MTU: usize = 1500;
+        let mut stack_buf = [0u8; MTU];
+        let mut heap_buf: Option<Vec<u8>> = None;
+
         loop {
             let size = kcp.peek_size();
             if size <= 0 {
                 break;
             }
 
-            // Allocate buffer on heap based on actual message size
-            let mut buf = vec![0u8; size as usize];
-            let n = kcp.recv(&mut buf);
+            // Use stack buffer for small messages, heap for larger
+            let buf: &mut [u8] = if (size as usize) <= MTU {
+                &mut stack_buf[..size as usize]
+            } else {
+                // Reuse or grow heap buffer as needed
+                let hb = heap_buf.get_or_insert_with(|| vec![0u8; size as usize]);
+                if hb.len() < size as usize {
+                    hb.resize(size as usize, 0);
+                }
+                &mut hb[..size as usize]
+            };
+
+            let n = kcp.recv(buf);
             if n <= 0 {
                 break;
             }
@@ -296,6 +322,8 @@ impl Mux {
     /// Create a stream with given ID (helper to reduce duplication).
     fn create_stream(&self, id: u32) -> Arc<Stream> {
         let output = self.output.clone();
+        let fin_output = self.output.clone();
+
         Arc::new(Stream::new(
             id,
             Box::new(move |data| {
@@ -305,6 +333,13 @@ impl Mux {
                     eprintln!("Mux output error: {}", e);
                 }
             }),
+            Some(Box::new(move || {
+                // Send FIN frame when stream is closed
+                let encoded = Frame::encode_with_payload(Cmd::Fin, id, &[]);
+                if let Err(e) = fin_output(&encoded) {
+                    eprintln!("Mux FIN output error: {}", e);
+                }
+            })),
         ))
     }
 
