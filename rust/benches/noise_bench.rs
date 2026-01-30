@@ -1,11 +1,47 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use noise::{Config, HandshakeState, Key, KeyPair, Pattern, Session, SessionConfig, SessionManager};
 use noise::udp::Udp;
+use noise::{Frame, Cmd};
 use std::net::UdpSocket;
 use std::thread;
 
 fn bench_key_generation(c: &mut Criterion) {
     c.bench_function("key_generation", |b| b.iter(|| KeyPair::generate()));
+}
+
+fn bench_frame_encode(c: &mut Criterion) {
+    let payload = b"hello world benchmark payload data".to_vec();
+    let frame = Frame::new(Cmd::Psh, 12345, payload);
+    
+    c.bench_function("frame_encode", |b| {
+        b.iter(|| {
+            black_box(frame.encode())
+        })
+    });
+}
+
+fn bench_frame_encode_to(c: &mut Criterion) {
+    let payload = b"hello world benchmark payload data".to_vec();
+    let frame = Frame::new(Cmd::Psh, 12345, payload);
+    let mut buf = [0u8; 128];
+    
+    c.bench_function("frame_encode_to", |b| {
+        b.iter(|| {
+            black_box(frame.encode_to(&mut buf).unwrap())
+        })
+    });
+}
+
+fn bench_frame_decode(c: &mut Criterion) {
+    let payload = b"hello world benchmark payload data".to_vec();
+    let frame = Frame::new(Cmd::Psh, 12345, payload);
+    let encoded = frame.encode();
+    
+    c.bench_function("frame_decode", |b| {
+        b.iter(|| {
+            black_box(Frame::decode(black_box(&encoded)).unwrap())
+        })
+    });
 }
 
 fn bench_dh(c: &mut Criterion) {
@@ -585,6 +621,9 @@ fn bench_udp_noise_sendrecv(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_frame_encode,
+    bench_frame_encode_to,
+    bench_frame_decode,
     bench_key_generation,
     bench_dh,
     bench_hash,

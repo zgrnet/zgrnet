@@ -914,6 +914,7 @@ name = "zgrnet-noise"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "cc",
  "criterion",
  "hex",
  "rand",
