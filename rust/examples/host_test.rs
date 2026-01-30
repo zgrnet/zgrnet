@@ -39,9 +39,16 @@ fn main() {
         .map(|s| s.as_str())
         .expect("Usage: --name <name>");
 
-    // Load config
-    let config_path = env::var("CONFIG_PATH")
-        .unwrap_or_else(|_| "examples/host_test/config.json".to_string());
+    // Load config - try CONFIG_PATH env var first, then use path relative to crate manifest
+    let config_path = env::var("CONFIG_PATH").unwrap_or_else(|_| {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        std::path::Path::new(manifest_dir)
+            .parent()
+            .unwrap() // Move up to repo root from rust/
+            .join("examples/host_test/config.json")
+            .to_string_lossy()
+            .to_string()
+    });
     let config_data = fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("Failed to read config {}: {}", config_path, e));
     let config: Config = serde_json::from_str(&config_data)

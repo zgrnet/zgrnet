@@ -293,17 +293,19 @@ impl<T: Transport + Send + Sync + 'static> Host<T> {
     }
 
     /// Closes the host.
-    pub fn close(&mut self) {
+    pub fn close(&mut self) -> Result<()> {
         self.closed.store(true, Ordering::SeqCst);
         self.peer_manager.clear();
         
         // Close transport to unblock receive loop
-        let _ = self.peer_manager.transport().close();
+        let transport_result = self.peer_manager.transport().close();
 
         // Wait for receive loop to finish
         if let Some(handle) = self.recv_handle.take() {
             let _ = handle.join();
         }
+
+        transport_result.map_err(HostError::Transport)
     }
 
     /// Returns true if the host is closed.
@@ -315,7 +317,7 @@ impl<T: Transport + Send + Sync + 'static> Host<T> {
 impl<T: Transport + Send + Sync + 'static> Drop for Host<T> {
     fn drop(&mut self) {
         if !self.is_closed() {
-            self.close();
+            let _ = self.close();
         }
     }
 }

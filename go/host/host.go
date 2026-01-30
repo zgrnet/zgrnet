@@ -2,6 +2,7 @@ package host
 
 import (
 	"errors"
+	"log"
 	"sync"
 	"time"
 
@@ -268,19 +269,17 @@ func (h *Host) receiveLoop() {
 
 // handleHandshakeInit processes incoming handshake initiations.
 func (h *Host) handleHandshakeInit(data []byte, from noise.Addr) {
-	err := h.peerManager.HandleHandshakeInit(data, from, h.config.AllowUnknownPeers)
-	if err != nil {
-		// Log error in production
-		_ = err
+	if err := h.peerManager.HandleHandshakeInit(data, from, h.config.AllowUnknownPeers); err != nil {
+		// TODO: Use a more structured logger.
+		log.Printf("host: failed to handle handshake init from %s: %v", from.String(), err)
 	}
 }
 
 // handleHandshakeResp processes incoming handshake responses.
 func (h *Host) handleHandshakeResp(data []byte, from noise.Addr) {
-	err := h.peerManager.HandleHandshakeResp(data, from)
-	if err != nil {
-		// Log error in production
-		_ = err
+	if err := h.peerManager.HandleHandshakeResp(data, from); err != nil {
+		// TODO: Use a more structured logger.
+		log.Printf("host: failed to handle handshake response from %s: %v", from.String(), err)
 	}
 }
 
@@ -301,8 +300,9 @@ func (h *Host) handleTransport(data []byte, from noise.Addr) {
 	select {
 	case h.inbox <- msg:
 	default:
-		// Inbox full, drop message
-		// In production, we might want to handle this differently
+		// Inbox full, drop message.
+		// TODO: Use a more structured logger and consider adding a metric for this.
+		log.Printf("host: inbox full, dropping message from %x", msg.From[:8])
 	}
 }
 

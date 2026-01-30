@@ -2,8 +2,8 @@
 #
 # Cross-language Host communication test.
 #
-# Currently runs 3 Go hosts (simulating go/rust/zig) since 
-# Rust and Zig implementations are incomplete.
+# Runs 3 Go hosts by default, but can be configured to run
+# the Go, Rust, and Zig implementations for cross-language testing.
 #
 # Usage:
 #   ./run.sh

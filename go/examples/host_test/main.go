@@ -181,7 +181,11 @@ func main() {
 			continue
 		}
 
-		pubKeyBytes, _ := hex.DecodeString(hi.PrivateKey)
+		pubKeyBytes, err := hex.DecodeString(hi.PrivateKey)
+		if err != nil {
+			log.Printf("[%s] Failed to decode private key for %s: %v", *name, hi.Name, err)
+			continue
+		}
 		var peerPrivKey noise.Key
 		copy(peerPrivKey[:], pubKeyBytes)
 		peerKP, err := noise.NewKeyPair(peerPrivKey)
@@ -231,7 +235,10 @@ func loadConfig(path string) (*Config, error) {
 
 func findPeerName(config *Config, pubKey noise.PublicKey) string {
 	for _, h := range config.Hosts {
-		pubKeyBytes, _ := hex.DecodeString(h.PrivateKey)
+		pubKeyBytes, err := hex.DecodeString(h.PrivateKey)
+		if err != nil {
+			continue
+		}
 		var privKey noise.Key
 		copy(privKey[:], pubKeyBytes)
 		kp, err := noise.NewKeyPair(privKey)
