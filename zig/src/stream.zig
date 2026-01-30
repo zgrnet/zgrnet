@@ -260,6 +260,7 @@ pub const Mux = struct {
         errdefer stream.deinit();
 
         try self.streams.put(id, stream);
+        errdefer _ = self.streams.remove(id); // Remove from map before deinit to avoid dangling pointer
 
         // Send SYN
         try self.sendSyn(id);
@@ -316,6 +317,8 @@ pub const Mux = struct {
         errdefer stream.deinit();
 
         try self.streams.put(id, stream);
+        errdefer _ = self.streams.remove(id); // Remove from map before deinit to avoid dangling pointer
+
         // O(1) push to back using RingBuffer
         try self.accept_queue.write(&[_]*Stream{stream});
     }

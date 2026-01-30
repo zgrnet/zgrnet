@@ -341,7 +341,7 @@ impl Mux {
                 let encoded = Frame::encode_with_payload(Cmd::Psh, id, data);
                 if let Err(e) = output(&encoded) {
                     output_error_cb.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("Mux output error: {}", e);
+                    eprintln!("Mux output error on stream {}: {}", id, e);
                 }
             }),
             Some(Box::new(move || {
@@ -349,7 +349,7 @@ impl Mux {
                 let encoded = Frame::encode_with_payload(Cmd::Fin, id, &[]);
                 if let Err(e) = fin_output(&encoded) {
                     output_error_fin.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("Mux FIN output error: {}", e);
+                    eprintln!("Mux FIN output error on stream {}: {}", id, e);
                 }
             })),
             output_error,
@@ -372,8 +372,11 @@ impl Mux {
         let stream = self.create_stream(id);
         self.streams.write().unwrap().insert(id, stream.clone());
 
-        // Send SYN
-        self.send_syn(id)?;
+        // Send SYN - remove from map on failure to avoid resource leak
+        if let Err(e) = self.send_syn(id) {
+            self.streams.write().unwrap().remove(&id);
+            return Err(e);
+        }
 
         Ok(stream)
     }
