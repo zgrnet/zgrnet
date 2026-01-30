@@ -35,6 +35,10 @@ pub mod conn;
 pub mod udp;
 pub mod kcp;
 pub mod stream;
+pub mod udp_listener;
+pub mod peer;
+pub mod peer_manager;
+pub mod host;
 
 pub use keypair::{Key, KeyPair};
 pub use cipher::{Hash, HASH_SIZE, TAG_SIZE};
@@ -59,3 +63,9 @@ pub use kcp::{Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 // Stream multiplexing
 pub use stream::{Stream, StreamState, StreamError, Mux, MuxConfig, MuxError};
+
+// Host layer exports
+pub use peer::{Peer, PeerConfig, PeerState, PeerInfo};
+pub use peer_manager::{PeerManager, PeerManagerError};
+pub use host::{Host, HostConfig, HostError, Message};
+pub use udp_listener::UdpListener;

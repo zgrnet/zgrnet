@@ -23,6 +23,12 @@ pub const message = @import("message.zig");
 pub const transport = @import("transport.zig");
 pub const conn = @import("conn.zig");
 pub const udp = @import("udp.zig");
+pub const udp_listener = @import("udp_listener.zig");
+
+// Host layer
+pub const peer = @import("peer.zig");
+pub const peer_manager = @import("peer_manager.zig");
+pub const host = @import("host.zig");
 
 // KCP multiplexing
 pub const kcp = @import("kcp.zig");
@@ -59,6 +65,7 @@ pub const MockTransport = transport.MockTransport;
 pub const MockAddr = transport.MockAddr;
 pub const Udp = udp.Udp;
 pub const UdpAddr = udp.UdpAddr;
+pub const UdpListener = udp_listener.UdpListener;
 pub const Conn = conn.Conn;
 pub const ConnConfig = conn.ConnConfig;
 pub const ConnState = conn.ConnState;
@@ -75,6 +82,18 @@ pub const StreamState = stream.StreamState;
 pub const StreamError = stream.StreamError;
 pub const Mux = stream.Mux;
 pub const MuxConfig = stream.MuxConfig;
+
+// Host layer types
+pub const Peer = peer.Peer;
+pub const PeerConfig = peer.PeerConfig;
+pub const PeerState = peer.PeerState;
+pub const PeerInfo = peer.PeerInfo;
+pub const PeerManager = peer_manager.PeerManager;
+pub const PeerManagerError = peer_manager.PeerManagerError;
+pub const Host = host.Host;
+pub const HostConfig = host.HostConfig;
+pub const HostError = host.HostError;
+pub const Message = host.Message;
 
 // Re-export constants
 pub const key_size = keypair.key_size;
@@ -100,6 +119,10 @@ test {
     _ = transport;
     _ = conn;
     _ = udp;
+    _ = udp_listener;
+    _ = peer;
+    _ = peer_manager;
+    _ = host;
     _ = kcp;
     _ = stream;
 }
