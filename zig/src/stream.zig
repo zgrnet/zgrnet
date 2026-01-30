@@ -190,7 +190,9 @@ pub const Stream = struct {
     /// Receive data from KCP and buffer it.
     /// Uses stack buffer for common MTU-sized messages, heap fallback for oversized.
     /// Heap buffer is reused across loop iterations to avoid repeated allocations.
-    pub fn kcpRecv(self: *Stream) void {
+    /// Returns true if any data was received.
+    pub fn kcpRecv(self: *Stream) bool {
+        var received = false;
         if (self.kcp_instance) |*k| {
             // Reusable MTU-sized stack buffer for common case
             var stack_buf: [1500]u8 = undefined;
@@ -209,6 +211,7 @@ pub const Stream = struct {
                     const n = k.recv(stack_buf[0..usize_size]);
                     if (n <= 0) break;
                     self.recv_buf.write(stack_buf[0..@intCast(n)]) catch break;
+                    received = true;
                 } else {
                     // Rare path: reuse or grow heap buffer for oversized messages
                     if (heap_buf == null or heap_buf.?.len < usize_size) {
@@ -218,9 +221,11 @@ pub const Stream = struct {
                     const n = k.recv(heap_buf.?[0..usize_size]);
                     if (n <= 0) break;
                     self.recv_buf.write(heap_buf.?[0..@intCast(n)]) catch break;
+                    received = true;
                 }
             }
         }
+        return received;
     }
 
     /// Update KCP state.
@@ -256,17 +261,23 @@ pub const Stream = struct {
 pub const MuxConfig = struct {
     max_frame_size: usize = 32 * 1024,
     max_receive_buffer: usize = 256 * 1024,
-    accept_backlog: usize = 256,
 };
+
+/// Callback when stream has data available to read.
+pub const OnStreamDataFn = *const fn (stream_id: u32) void;
+
+/// Callback when a new stream is accepted.
+pub const OnNewStreamFn = *const fn (stream: *Stream) void;
 
 /// Mux multiplexes multiple streams over a single connection.
 pub const Mux = struct {
     config: MuxConfig,
     output_fn: *const fn ([]const u8) anyerror!void,
+    on_stream_data: OnStreamDataFn,
+    on_new_stream: OnNewStreamFn,
     is_client: bool,
     streams: std.AutoHashMap(u32, *Stream),
     next_id: u32,
-    accept_queue: RingBuffer(*Stream), // O(1) FIFO queue
     closed: bool,
     allocator: std.mem.Allocator,
 
@@ -276,6 +287,8 @@ pub const Mux = struct {
         config: MuxConfig,
         is_client: bool,
         output_fn: *const fn ([]const u8) anyerror!void,
+        on_stream_data: OnStreamDataFn,
+        on_new_stream: OnNewStreamFn,
     ) !*Mux {
         const self = try allocator.create(Mux);
         errdefer allocator.destroy(self);
@@ -283,10 +296,11 @@ pub const Mux = struct {
         self.* = Mux{
             .config = config,
             .output_fn = output_fn,
+            .on_stream_data = on_stream_data,
+            .on_new_stream = on_new_stream,
             .is_client = is_client,
             .streams = .init(allocator),
             .next_id = if (is_client) 1 else 2, // Client: odd, Server: even
-            .accept_queue = RingBuffer(*Stream).init(allocator),
             .closed = false,
             .allocator = allocator,
         };
@@ -302,7 +316,6 @@ pub const Mux = struct {
             stream.*.deinit();
         }
         self.streams.deinit();
-        self.accept_queue.deinit();
         self.allocator.destroy(self);
     }
 
@@ -323,17 +336,6 @@ pub const Mux = struct {
         try self.sendSyn(id);
 
         return stream;
-    }
-
-    /// Accept an incoming stream.
-    pub fn acceptStream(self: *Mux) !*Stream {
-        if (self.closed) return error.MuxClosed;
-
-        // O(1) pop from front using RingBuffer
-        var item: [1]*Stream = undefined;
-        const n = self.accept_queue.read(&item);
-        if (n == 0) return error.NoStreamAvailable;
-        return item[0];
     }
 
     /// Get number of active streams.
@@ -362,7 +364,6 @@ pub const Mux = struct {
             .fin => self.handleFin(frame.stream_id),
             .psh => self.handlePsh(frame.stream_id, frame.payload),
             .nop => {}, // Keepalive, nothing to do
-            .upd => {}, // TODO: Flow control
         }
     }
 
@@ -370,19 +371,13 @@ pub const Mux = struct {
     fn handleSyn(self: *Mux, id: u32) !void {
         if (self.streams.contains(id)) return; // Duplicate SYN
 
-        // Check accept_backlog limit to prevent SYN flood
-        if (self.accept_queue.readableLength() >= self.config.accept_backlog) {
-            return; // Silently drop - backlog full
-        }
-
         const stream = try Stream.init(self.allocator, id, self);
         errdefer stream.deinit();
 
         try self.streams.put(id, stream);
-        errdefer _ = self.streams.remove(id); // Remove from map before deinit to avoid dangling pointer
 
-        // O(1) push to back using RingBuffer
-        try self.accept_queue.write(&[_]*Stream{stream});
+        // Notify via callback
+        self.on_new_stream(stream);
     }
 
     /// Handle FIN (stream close).
@@ -396,7 +391,9 @@ pub const Mux = struct {
     fn handlePsh(self: *Mux, id: u32, payload: []const u8) void {
         if (self.streams.get(id)) |stream| {
             stream.kcpInput(payload);
-            stream.kcpRecv();
+            if (stream.kcpRecv()) {
+                self.on_stream_data(id);
+            }
         }
     }
 
@@ -454,10 +451,14 @@ pub const Mux = struct {
 
     /// Update all streams.
     pub fn update(self: *Mux, current: u32) void {
-        var iter = self.streams.valueIterator();
-        while (iter.next()) |stream| {
-            stream.*.kcpUpdate(current);
-            stream.*.kcpRecv();
+        var iter = self.streams.iterator();
+        while (iter.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const stream = entry.value_ptr.*;
+            stream.kcpUpdate(current);
+            if (stream.kcpRecv()) {
+                self.on_stream_data(id);
+            }
         }
     }
 };
@@ -482,8 +483,14 @@ test "Mux init deinit" {
     const outputFn = struct {
         fn output(_: []const u8) anyerror!void {}
     }.output;
+    const onStreamData = struct {
+        fn cb(_: u32) void {}
+    }.cb;
+    const onNewStream = struct {
+        fn cb(_: *Stream) void {}
+    }.cb;
 
-    const mux = try Mux.init(allocator, .{}, true, outputFn);
+    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream);
     mux.deinit();
 }
 
@@ -493,8 +500,14 @@ test "Mux open stream" {
     const outputFn = struct {
         fn output(_: []const u8) anyerror!void {}
     }.output;
+    const onStreamData = struct {
+        fn cb(_: u32) void {}
+    }.cb;
+    const onNewStream = struct {
+        fn cb(_: *Stream) void {}
+    }.cb;
 
-    const mux = try Mux.init(allocator, .{}, true, outputFn);
+    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream);
     defer mux.deinit();
 
     const stream = try mux.openStream();
@@ -508,8 +521,14 @@ test "Stream state" {
     const outputFn = struct {
         fn output(_: []const u8) anyerror!void {}
     }.output;
+    const onStreamData = struct {
+        fn cb(_: u32) void {}
+    }.cb;
+    const onNewStream = struct {
+        fn cb(_: *Stream) void {}
+    }.cb;
 
-    const mux = try Mux.init(allocator, .{}, true, outputFn);
+    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream);
     defer mux.deinit();
 
     const stream = try mux.openStream();

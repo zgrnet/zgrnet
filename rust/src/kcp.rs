@@ -235,7 +235,6 @@ pub enum Cmd {
     Fin = 0x02, // Stream close
     Psh = 0x03, // Data
     Nop = 0x04, // Keepalive
-    Upd = 0x05, // Window update
 }
 
 impl Cmd {
@@ -245,7 +244,6 @@ impl Cmd {
             0x02 => Some(Cmd::Fin),
             0x03 => Some(Cmd::Psh),
             0x04 => Some(Cmd::Nop),
-            0x05 => Some(Cmd::Upd),
             _ => None,
         }
     }
@@ -392,35 +390,6 @@ impl Frame {
     }
 }
 
-/// UpdatePayload for flow control (UPD frames)
-#[derive(Debug, Clone, Copy)]
-pub struct UpdatePayload {
-    pub consumed: u32,
-    pub window: u32,
-}
-
-impl UpdatePayload {
-    pub const SIZE: usize = 8;
-
-    pub fn encode(&self) -> [u8; 8] {
-        let mut buf = [0u8; 8];
-        buf[0..4].copy_from_slice(&self.consumed.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.window.to_le_bytes());
-        buf
-    }
-
-    pub fn decode(data: &[u8]) -> Result<Self, FrameError> {
-        if data.len() < Self::SIZE {
-            return Err(FrameError::PayloadTooShort);
-        }
-
-        Ok(UpdatePayload {
-            consumed: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            window: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-        })
-    }
-}
-
 /// Frame errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
@@ -428,7 +397,6 @@ pub enum FrameError {
     InvalidCmd,
     BufferTooSmall,
     PayloadTooLarge,
-    PayloadTooShort,
 }
 
 impl std::fmt::Display for FrameError {
@@ -438,7 +406,6 @@ impl std::fmt::Display for FrameError {
             FrameError::InvalidCmd => write!(f, "invalid command"),
             FrameError::BufferTooSmall => write!(f, "buffer too small"),
             FrameError::PayloadTooLarge => write!(f, "payload too large"),
-            FrameError::PayloadTooShort => write!(f, "payload too short"),
         }
     }
 }
@@ -540,26 +507,12 @@ mod tests {
     }
 
     #[test]
-    fn test_update_payload() {
-        let update = UpdatePayload {
-            consumed: 1024,
-            window: 65536,
-        };
-
-        let encoded = update.encode();
-        let decoded = UpdatePayload::decode(&encoded).unwrap();
-
-        assert_eq!(decoded.consumed, 1024);
-        assert_eq!(decoded.window, 65536);
-    }
-
-    #[test]
     fn test_cmd_from_byte() {
         assert_eq!(Cmd::from_byte(0x01), Some(Cmd::Syn));
         assert_eq!(Cmd::from_byte(0x02), Some(Cmd::Fin));
         assert_eq!(Cmd::from_byte(0x03), Some(Cmd::Psh));
         assert_eq!(Cmd::from_byte(0x04), Some(Cmd::Nop));
-        assert_eq!(Cmd::from_byte(0x05), Some(Cmd::Upd));
+        assert_eq!(Cmd::from_byte(0x05), None);
         assert_eq!(Cmd::from_byte(0x00), None);
         assert_eq!(Cmd::from_byte(0xFF), None);
     }

@@ -55,7 +55,7 @@ pub use transport::{Addr, Transport, TransportError, MockAddr, MockTransport};
 pub use conn::{Conn, ConnConfig, ConnState, ConnError};
 
 // KCP multiplexing
-pub use kcp::{Kcp, Frame, Cmd, UpdatePayload, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
+pub use kcp::{Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 // Stream multiplexing
 pub use stream::{Stream, StreamState, StreamError, Mux, MuxConfig, MuxError};

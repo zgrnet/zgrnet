@@ -106,7 +106,8 @@ impl Stream {
         Ok(n as usize)
     }
 
-    /// Read data from the stream.
+    /// Read data from the stream (non-blocking).
+    /// Returns immediately with 0 if no data is available.
     pub fn read_data(&self, buf: &mut [u8]) -> Result<usize, StreamError> {
         let mut recv_buf = self.recv_buf.lock().unwrap();
 
@@ -178,9 +179,11 @@ impl Stream {
     }
 
     /// Receive data from KCP and buffer it.
-    pub(crate) fn kcp_recv(&self) {
+    /// Returns true if any data was received.
+    pub(crate) fn kcp_recv(&self) -> bool {
         let mut kcp = self.kcp.lock().unwrap();
         let mut recv_buf = self.recv_buf.lock().unwrap();
+        let mut received_data = false;
 
         // Stack buffer for common MTU-sized messages, avoiding heap allocation
         const MTU: usize = 1500;
@@ -211,7 +214,10 @@ impl Stream {
             }
 
             recv_buf.extend(&buf[..n as usize]);
+            received_data = true;
         }
+
+        received_data
     }
 
     /// Receive data directly from KCP into user-provided buffer (zero-copy fast path).
@@ -288,7 +294,6 @@ impl Stream {
 pub struct MuxConfig {
     pub max_frame_size: usize,
     pub max_receive_buffer: usize,
-    pub accept_backlog: usize,
 }
 
 impl Default for MuxConfig {
@@ -296,7 +301,6 @@ impl Default for MuxConfig {
         MuxConfig {
             max_frame_size: 32 * 1024,
             max_receive_buffer: 256 * 1024,
-            accept_backlog: 256,
         }
     }
 }
@@ -304,29 +308,51 @@ impl Default for MuxConfig {
 /// Output function type for Mux
 pub type OutputFn = Box<dyn Fn(&[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
 
+/// Callback when stream has data available to read.
+/// Called with stream ID when new data arrives.
+pub type OnStreamDataFn = Box<dyn Fn(u32) + Send + Sync>;
+
+/// Callback when a new stream is accepted.
+/// Called with the new stream when a SYN is received from the remote.
+pub type OnNewStreamFn = Box<dyn Fn(Arc<Stream>) + Send + Sync>;
+
 /// Mux multiplexes multiple streams over a single connection.
 pub struct Mux {
     #[allow(dead_code)]
     config: MuxConfig,
     output: Arc<OutputFn>,
+    on_stream_data: Arc<OnStreamDataFn>,
+    on_new_stream: Arc<OnNewStreamFn>,
     #[allow(dead_code)]
     is_client: bool,
     streams: RwLock<HashMap<u32, Arc<Stream>>>,
     next_id: Mutex<u32>,
-    accept_queue: Mutex<VecDeque<Arc<Stream>>>, // O(1) pop_front
     closed: RwLock<bool>,
 }
 
 impl Mux {
     /// Create a new Mux.
-    pub fn new(config: MuxConfig, is_client: bool, output: OutputFn) -> Self {
+    /// 
+    /// - `config`: Mux configuration
+    /// - `is_client`: true for client (odd stream IDs), false for server (even stream IDs)
+    /// - `output`: Callback to send data to the network
+    /// - `on_stream_data`: Callback when a stream has data available to read (required)
+    /// - `on_new_stream`: Callback when a new stream is accepted (required)
+    pub fn new(
+        config: MuxConfig,
+        is_client: bool,
+        output: OutputFn,
+        on_stream_data: OnStreamDataFn,
+        on_new_stream: OnNewStreamFn,
+    ) -> Self {
         Mux {
             config,
             output: Arc::new(output),
+            on_stream_data: Arc::new(on_stream_data),
+            on_new_stream: Arc::new(on_new_stream),
             is_client,
             streams: RwLock::new(HashMap::new()),
             next_id: Mutex::new(if is_client { 1 } else { 2 }),
-            accept_queue: Mutex::new(VecDeque::new()),
             closed: RwLock::new(false),
         }
     }
@@ -386,16 +412,6 @@ impl Mux {
         Ok(stream)
     }
 
-    /// Accept an incoming stream.
-    pub fn accept_stream(&self) -> Result<Arc<Stream>, MuxError> {
-        if self.is_closed() {
-            return Err(MuxError::MuxClosed);
-        }
-
-        let mut queue = self.accept_queue.lock().unwrap();
-        queue.pop_front().ok_or(MuxError::NoStreamAvailable)
-    }
-
     /// Get number of active streams.
     pub fn num_streams(&self) -> usize {
         self.streams.read().unwrap().len()
@@ -424,7 +440,6 @@ impl Mux {
             Cmd::Fin => self.handle_fin(frame.stream_id),
             Cmd::Psh => self.handle_psh(frame.stream_id, &frame.payload),
             Cmd::Nop => {} // Keepalive
-            Cmd::Upd => {} // TODO: Flow control
         }
 
         Ok(())
@@ -435,17 +450,11 @@ impl Mux {
             return Ok(()); // Duplicate SYN
         }
 
-        // Check accept_backlog limit to prevent SYN flood
-        {
-            let queue = self.accept_queue.lock().unwrap();
-            if queue.len() >= self.config.accept_backlog {
-                return Ok(()); // Silently drop - backlog full
-            }
-        }
-
         let stream = self.create_stream(id);
         self.streams.write().unwrap().insert(id, stream.clone());
-        self.accept_queue.lock().unwrap().push_back(stream);
+
+        // Notify via callback
+        (self.on_new_stream)(stream);
 
         Ok(())
     }
@@ -459,7 +468,10 @@ impl Mux {
     fn handle_psh(&self, id: u32, payload: &[u8]) {
         if let Some(stream) = self.streams.read().unwrap().get(&id) {
             stream.kcp_input(payload);
-            stream.kcp_recv();
+            if stream.kcp_recv() {
+                // Data received, notify callback
+                (self.on_stream_data)(id);
+            }
         }
     }
 
@@ -498,9 +510,12 @@ impl Mux {
 
     /// Update all streams.
     pub fn update(&self, current: u32) {
-        for stream in self.streams.read().unwrap().values() {
+        for (id, stream) in self.streams.read().unwrap().iter() {
             stream.kcp_update(current);
-            stream.kcp_recv();
+            if stream.kcp_recv() {
+                // Data received, notify callback
+                (self.on_stream_data)(*id);
+            }
         }
     }
 }
@@ -509,7 +524,6 @@ impl Mux {
 #[derive(Debug)]
 pub enum MuxError {
     MuxClosed,
-    NoStreamAvailable,
     InvalidFrame,
     OutputFailed,
 }
@@ -518,7 +532,6 @@ impl std::fmt::Display for MuxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MuxError::MuxClosed => write!(f, "mux closed"),
-            MuxError::NoStreamAvailable => write!(f, "no stream available"),
             MuxError::InvalidFrame => write!(f, "invalid frame"),
             MuxError::OutputFailed => write!(f, "output failed"),
         }
@@ -538,6 +551,8 @@ mod tests {
             MuxConfig::default(),
             true,
             Box::new(|_| Ok(())),
+            Box::new(|_| {}),
+            Box::new(|_| {}),
         );
 
         assert!(!mux.is_closed());
@@ -556,6 +571,8 @@ mod tests {
                 output_count_clone.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }),
+            Box::new(|_| {}),
+            Box::new(|_| {}),
         );
 
         let stream = mux.open_stream().unwrap();
@@ -570,6 +587,8 @@ mod tests {
             MuxConfig::default(),
             true,
             Box::new(|_| Ok(())),
+            Box::new(|_| {}),
+            Box::new(|_| {}),
         );
 
         let stream = mux.open_stream().unwrap();

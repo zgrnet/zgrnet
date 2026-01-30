@@ -21,9 +21,6 @@ type Config struct {
 
 	// KeepAliveTimeout is the timeout for keepalive.
 	KeepAliveTimeout time.Duration
-
-	// AcceptBacklog is the size of the accept queue.
-	AcceptBacklog int
 }
 
 // DefaultConfig returns the default configuration.
@@ -33,18 +30,27 @@ func DefaultConfig() *Config {
 		MaxReceiveBuffer:  256 * 1024,
 		KeepAliveInterval: 10 * time.Second,
 		KeepAliveTimeout:  30 * time.Second,
-		AcceptBacklog:     256,
 	}
 }
 
 // OutputFunc is the callback for sending frames.
 type OutputFunc func(data []byte) error
 
+// OnStreamDataFunc is the callback when a stream has data available to read.
+// Called with stream ID when new data arrives.
+type OnStreamDataFunc func(streamID uint32)
+
+// OnNewStreamFunc is the callback when a new stream is accepted.
+// Called with the new stream when a SYN is received from the remote.
+type OnNewStreamFunc func(stream *Stream)
+
 // Mux multiplexes multiple streams over a single connection.
 type Mux struct {
-	config   *Config
-	output   OutputFunc
-	isClient bool
+	config       *Config
+	output       OutputFunc
+	onStreamData OnStreamDataFunc
+	onNewStream  OnNewStreamFunc
+	isClient     bool
 
 	// Streams
 	streams   map[uint32]*Stream
@@ -54,37 +60,32 @@ type Mux struct {
 	nextID   uint32
 	nextIDMu sync.Mutex
 
-	// Accept queue
-	accepts chan *Stream
-
 	// Lifecycle
 	die       chan struct{}
 	dieOnce   sync.Once
 	closed    atomic.Bool
 	closeErr  error
 	closeOnce sync.Once
-
-	// Update loop
-	updateTicker *time.Ticker
-	updateDone   chan struct{}
 }
 
 // NewMux creates a new multiplexer.
 // isClient determines stream ID allocation: client uses odd IDs, server uses even.
 // output is called to send frames over the underlying connection.
-func NewMux(config *Config, isClient bool, output OutputFunc) *Mux {
+// onStreamData is called when a stream has data available (required).
+// onNewStream is called when a new stream is accepted (required).
+func NewMux(config *Config, isClient bool, output OutputFunc, onStreamData OnStreamDataFunc, onNewStream OnNewStreamFunc) *Mux {
 	if config == nil {
 		config = DefaultConfig()
 	}
 
 	m := &Mux{
-		config:     config,
-		output:     output,
-		isClient:   isClient,
-		streams:    make(map[uint32]*Stream),
-		accepts:    make(chan *Stream, config.AcceptBacklog),
-		die:        make(chan struct{}),
-		updateDone: make(chan struct{}),
+		config:       config,
+		output:       output,
+		onStreamData: onStreamData,
+		onNewStream:  onNewStream,
+		isClient:     isClient,
+		streams:      make(map[uint32]*Stream),
+		die:          make(chan struct{}),
 	}
 
 	// Initialize stream ID
@@ -93,10 +94,6 @@ func NewMux(config *Config, isClient bool, output OutputFunc) *Mux {
 	} else {
 		m.nextID = 2 // Server uses even: 2, 4, 6, ...
 	}
-
-	// Start update loop
-	m.updateTicker = time.NewTicker(10 * time.Millisecond)
-	go m.updateLoop()
 
 	return m
 }
@@ -132,16 +129,6 @@ func (m *Mux) OpenStream() (*Stream, error) {
 	return stream, nil
 }
 
-// AcceptStream accepts an incoming stream.
-func (m *Mux) AcceptStream() (*Stream, error) {
-	select {
-	case stream := <-m.accepts:
-		return stream, nil
-	case <-m.die:
-		return nil, ErrMuxClosed
-	}
-}
-
 // NumStreams returns the number of active streams.
 func (m *Mux) NumStreams() int {
 	m.streamsMu.RLock()
@@ -154,10 +141,8 @@ func (m *Mux) Close() error {
 	m.closeOnce.Do(func() {
 		m.closed.Store(true)
 
-		// Stop update loop
-		m.updateTicker.Stop()
+		// Signal close
 		close(m.die)
-		<-m.updateDone
 
 		// Collect streams to close
 		m.streamsMu.Lock()
@@ -202,8 +187,6 @@ func (m *Mux) Input(data []byte) error {
 	case CmdNOP:
 		// Keepalive, nothing to do
 		return nil
-	case CmdUPD:
-		return m.handleUPD(frame.StreamID, frame.Payload)
 	default:
 		return ErrInvalidCmd
 	}
@@ -212,25 +195,20 @@ func (m *Mux) Input(data []byte) error {
 // handleSYN handles a SYN frame (stream open request).
 func (m *Mux) handleSYN(id uint32) error {
 	m.streamsMu.Lock()
-	defer m.streamsMu.Unlock()
 
 	// Check if stream already exists
 	if _, ok := m.streams[id]; ok {
+		m.streamsMu.Unlock()
 		return nil // Duplicate SYN, ignore
 	}
 
 	// Create new stream
 	stream := newStream(id, m)
 	m.streams[id] = stream
+	m.streamsMu.Unlock()
 
-	// Queue for accept
-	select {
-	case m.accepts <- stream:
-	default:
-		// Accept queue full, close the stream
-		stream.Close()
-		return ErrAcceptQueueFull
-	}
+	// Notify via callback
+	m.onNewStream(stream)
 
 	return nil
 }
@@ -263,14 +241,10 @@ func (m *Mux) handlePSH(id uint32, payload []byte) error {
 	stream.kcpInput(payload)
 
 	// Try to receive from KCP
-	stream.kcpRecv()
+	if stream.kcpRecv() && m.onStreamData != nil {
+		m.onStreamData(id)
+	}
 
-	return nil
-}
-
-// handleUPD handles a UPD frame (window update).
-func (m *Mux) handleUPD(id uint32, payload []byte) error {
-	// TODO: Implement flow control
 	return nil
 }
 
@@ -321,47 +295,28 @@ func (m *Mux) removeStream(id uint32) {
 	m.streamsMu.Unlock()
 }
 
-// updateLoop periodically updates all KCP instances.
-// Uses kcp.Check() to determine optimal update timing.
-func (m *Mux) updateLoop() {
-	defer close(m.updateDone)
+// Update updates all KCP instances.
+// Should be called periodically by the user (e.g., every 10ms).
+// current is the current time in milliseconds.
+func (m *Mux) Update(current uint32) {
+	if m.IsClosed() {
+		return
+	}
 
-	for {
-		select {
-		case <-m.die:
-			return
-		case <-m.updateTicker.C:
-			current := uint32(time.Now().UnixMilli())
-			nextUpdate := current + 100 // Default: 100ms max interval
+	m.streamsMu.RLock()
+	defer m.streamsMu.RUnlock()
 
-			m.streamsMu.RLock()
-			for _, s := range m.streams {
-				s.kcpUpdate(current)
-				s.kcpRecv() // Check if KCP has data ready
-
-				// Find earliest next update time
-				if check := s.kcp.Check(current); check < nextUpdate {
-					nextUpdate = check
-				}
-			}
-			m.streamsMu.RUnlock()
-
-			// Adjust ticker for next interval (min 1ms, max 100ms)
-			interval := nextUpdate - current
-			if interval < 1 {
-				interval = 1
-			} else if interval > 100 {
-				interval = 100
-			}
-			m.updateTicker.Reset(time.Duration(interval) * time.Millisecond)
+	for id, s := range m.streams {
+		s.kcpUpdate(current)
+		if s.kcpRecv() && m.onStreamData != nil {
+			m.onStreamData(id)
 		}
 	}
 }
 
 // Mux errors.
 var (
-	ErrMuxClosed       = errors.New("kcp: mux closed")
-	ErrAcceptQueueFull = errors.New("kcp: accept queue full")
+	ErrMuxClosed = errors.New("kcp: mux closed")
 )
 
 // Ensure Stream implements io.ReadWriteCloser

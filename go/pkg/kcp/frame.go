@@ -14,7 +14,6 @@ const (
 	CmdFIN             // Stream close (EOF) (0x02)
 	CmdPSH             // Data push (0x03)
 	CmdNOP             // No operation (keepalive) (0x04)
-	CmdUPD             // Window update (flow control) (0x05)
 )
 
 // Frame header size: cmd(1) + stream_id(4) + length(2) = 7 bytes
@@ -89,41 +88,6 @@ func DecodeFrameHeader(data []byte) (cmd byte, streamID uint32, length uint16, e
 		return 0, 0, 0, ErrFrameTooShort
 	}
 	return data[0], binary.LittleEndian.Uint32(data[1:5]), binary.LittleEndian.Uint16(data[5:7]), nil
-}
-
-// UpdatePayload represents the payload of a UPD frame.
-//
-// Wire format:
-//
-//	+----------+--------+
-//	| consumed | window |
-//	| (4B LE)  | (4B LE)|
-//	+----------+--------+
-type UpdatePayload struct {
-	Consumed uint32 // Bytes consumed by remote
-	Window   uint32 // Remote window size
-}
-
-// UpdatePayloadSize is the size of UpdatePayload in bytes.
-const UpdatePayloadSize = 8
-
-// Encode serializes the update payload to bytes.
-func (u *UpdatePayload) Encode() []byte {
-	buf := make([]byte, UpdatePayloadSize)
-	binary.LittleEndian.PutUint32(buf[0:4], u.Consumed)
-	binary.LittleEndian.PutUint32(buf[4:8], u.Window)
-	return buf
-}
-
-// DecodeUpdatePayload parses an update payload from bytes.
-func DecodeUpdatePayload(data []byte) (*UpdatePayload, error) {
-	if len(data) < UpdatePayloadSize {
-		return nil, ErrFrameTooShort
-	}
-	return &UpdatePayload{
-		Consumed: binary.LittleEndian.Uint32(data[0:4]),
-		Window:   binary.LittleEndian.Uint32(data[4:8]),
-	}, nil
 }
 
 // Frame errors.

@@ -9,38 +9,112 @@ import (
 	"time"
 )
 
-// TestMuxPipe creates a pair of connected Muxes for testing.
-func newMuxPair(t *testing.T) (*Mux, *Mux) {
+// readWithPoll reads from a stream with polling since Read() is non-blocking.
+// It polls every 1ms until data is available or timeout.
+func readWithPoll(s *Stream, buf []byte, timeout time.Duration) (int, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		n, err := s.Read(buf)
+		if err != nil {
+			return n, err
+		}
+		if n > 0 {
+			return n, nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return 0, nil
+}
+
+// readAllWithPoll reads all expected data from a stream with polling.
+func readAllWithPoll(s *Stream, expected int, timeout time.Duration) ([]byte, error) {
+	buf := make([]byte, expected*2)
+	received := make([]byte, 0, expected)
+	deadline := time.Now().Add(timeout)
+	for len(received) < expected && time.Now().Before(deadline) {
+		n, err := s.Read(buf)
+		if err != nil && err != io.EOF {
+			return received, err
+		}
+		if n > 0 {
+			received = append(received, buf[:n]...)
+		} else {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	return received, nil
+}
+
+// muxPair holds a connected pair of Muxes with stream channels.
+type muxPair struct {
+	client        *Mux
+	server        *Mux
+	clientStreams chan *Stream // New streams from server's perspective (client opened)
+	serverStreams chan *Stream // New streams from client's perspective (server opened)
+}
+
+// newMuxPair creates a pair of connected Muxes for testing.
+func newMuxPair(t *testing.T) *muxPair {
 	// Channels for packet exchange
 	clientToServer := make(chan []byte, 1000)
 	serverToClient := make(chan []byte, 1000)
 
-	clientMux := NewMux(DefaultConfig(), true, func(data []byte) error {
+	// Channels for new stream notification
+	clientStreams := make(chan *Stream, 100)
+	serverStreams := make(chan *Stream, 100)
+
+	var clientMux, serverMux *Mux
+
+	clientMux = NewMux(DefaultConfig(), true, func(data []byte) error {
 		select {
 		case clientToServer <- append([]byte(nil), data...):
 		default:
 			t.Log("clientToServer channel full")
 		}
 		return nil
+	}, func(streamID uint32) {
+		// onStreamData - nothing to do in tests
+	}, func(stream *Stream) {
+		// onNewStream - server opened a stream to us
+		select {
+		case serverStreams <- stream:
+		default:
+			t.Log("serverStreams channel full")
+		}
 	})
 
-	serverMux := NewMux(DefaultConfig(), false, func(data []byte) error {
+	serverMux = NewMux(DefaultConfig(), false, func(data []byte) error {
 		select {
 		case serverToClient <- append([]byte(nil), data...):
 		default:
 			t.Log("serverToClient channel full")
 		}
 		return nil
+	}, func(streamID uint32) {
+		// onStreamData - nothing to do in tests
+	}, func(stream *Stream) {
+		// onNewStream - client opened a stream to us
+		select {
+		case clientStreams <- stream:
+		default:
+			t.Log("clientStreams channel full")
+		}
 	})
 
-	// Packet forwarding goroutine
+	// Packet forwarding and update goroutine
 	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case data := <-clientToServer:
 				serverMux.Input(data)
 			case data := <-serverToClient:
 				clientMux.Input(data)
+			case <-ticker.C:
+				current := uint32(time.Now().UnixMilli())
+				clientMux.Update(current)
+				serverMux.Update(current)
 			case <-clientMux.die:
 				return
 			case <-serverMux.die:
@@ -49,37 +123,31 @@ func newMuxPair(t *testing.T) (*Mux, *Mux) {
 		}
 	}()
 
-	return clientMux, serverMux
+	return &muxPair{
+		client:        clientMux,
+		server:        serverMux,
+		clientStreams: clientStreams,
+		serverStreams: serverStreams,
+	}
 }
 
 func TestMuxOpenAccept(t *testing.T) {
-	clientMux, serverMux := newMuxPair(t)
-	defer clientMux.Close()
-	defer serverMux.Close()
+	pair := newMuxPair(t)
+	defer pair.client.Close()
+	defer pair.server.Close()
 
 	// Client opens a stream
-	clientStream, err := clientMux.OpenStream()
+	clientStream, err := pair.client.OpenStream()
 	if err != nil {
 		t.Fatalf("OpenStream() error = %v", err)
 	}
 
-	// Server accepts the stream
-	done := make(chan struct{})
+	// Server receives stream via callback
 	var serverStream *Stream
-	go func() {
-		defer close(done)
-		var err error
-		serverStream, err = serverMux.AcceptStream()
-		if err != nil {
-			t.Errorf("AcceptStream() error = %v", err)
-		}
-	}()
-
-	// Wait for accept
 	select {
-	case <-done:
+	case serverStream = <-pair.clientStreams:
 	case <-time.After(time.Second):
-		t.Fatal("AcceptStream() timeout")
+		t.Fatal("OnNewStream callback timeout")
 	}
 
 	// Verify stream IDs
@@ -92,21 +160,18 @@ func TestMuxOpenAccept(t *testing.T) {
 }
 
 func TestMuxStreamReadWrite(t *testing.T) {
-	clientMux, serverMux := newMuxPair(t)
-	defer clientMux.Close()
-	defer serverMux.Close()
+	pair := newMuxPair(t)
+	defer pair.client.Close()
+	defer pair.server.Close()
 
 	// Client opens stream
-	clientStream, err := clientMux.OpenStream()
+	clientStream, err := pair.client.OpenStream()
 	if err != nil {
 		t.Fatalf("OpenStream() error = %v", err)
 	}
 
-	// Server accepts
-	serverStream, err := serverMux.AcceptStream()
-	if err != nil {
-		t.Fatalf("AcceptStream() error = %v", err)
-	}
+	// Server receives stream via callback
+	serverStream := <-pair.clientStreams
 
 	// Client writes
 	testData := []byte("hello from client")
@@ -118,35 +183,23 @@ func TestMuxStreamReadWrite(t *testing.T) {
 		t.Errorf("Write() = %d, want %d", n, len(testData))
 	}
 
-	// Server reads
-	buf := make([]byte, 1024)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		n, err := serverStream.Read(buf)
-		if err != nil {
-			t.Errorf("Read() error = %v", err)
-			return
-		}
-		if !bytes.Equal(buf[:n], testData) {
-			t.Errorf("Read() = %q, want %q", buf[:n], testData)
-		}
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Read() timeout")
+	// Server reads (non-blocking, poll for data)
+	received, err := readAllWithPoll(serverStream, len(testData), 2*time.Second)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if !bytes.Equal(received, testData) {
+		t.Errorf("Read() = %q, want %q", received, testData)
 	}
 }
 
 func TestMuxBidirectional(t *testing.T) {
-	clientMux, serverMux := newMuxPair(t)
-	defer clientMux.Close()
-	defer serverMux.Close()
+	pair := newMuxPair(t)
+	defer pair.client.Close()
+	defer pair.server.Close()
 
-	clientStream, _ := clientMux.OpenStream()
-	serverStream, _ := serverMux.AcceptStream()
+	clientStream, _ := pair.client.OpenStream()
+	serverStream := <-pair.clientStreams
 
 	// Exchange messages
 	clientMsg := []byte("client says hello")
@@ -160,20 +213,18 @@ func TestMuxBidirectional(t *testing.T) {
 		defer wg.Done()
 		clientStream.Write(clientMsg)
 
-		buf := make([]byte, 1024)
-		n, _ := clientStream.Read(buf)
-		if !bytes.Equal(buf[:n], serverMsg) {
-			t.Errorf("Client received %q, want %q", buf[:n], serverMsg)
+		received, _ := readAllWithPoll(clientStream, len(serverMsg), 2*time.Second)
+		if !bytes.Equal(received, serverMsg) {
+			t.Errorf("Client received %q, want %q", received, serverMsg)
 		}
 	}()
 
 	// Server reads, then sends
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 1024)
-		n, _ := serverStream.Read(buf)
-		if !bytes.Equal(buf[:n], clientMsg) {
-			t.Errorf("Server received %q, want %q", buf[:n], clientMsg)
+		received, _ := readAllWithPoll(serverStream, len(clientMsg), 2*time.Second)
+		if !bytes.Equal(received, clientMsg) {
+			t.Errorf("Server received %q, want %q", received, clientMsg)
 		}
 
 		serverStream.Write(serverMsg)
@@ -187,15 +238,15 @@ func TestMuxBidirectional(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("Bidirectional test timeout")
 	}
 }
 
 func TestMuxMultipleStreams(t *testing.T) {
-	clientMux, serverMux := newMuxPair(t)
-	defer clientMux.Close()
-	defer serverMux.Close()
+	pair := newMuxPair(t)
+	defer pair.client.Close()
+	defer pair.server.Close()
 
 	numStreams := 5
 	var wg sync.WaitGroup
@@ -206,7 +257,7 @@ func TestMuxMultipleStreams(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 
-			clientStream, err := clientMux.OpenStream()
+			clientStream, err := pair.client.OpenStream()
 			if err != nil {
 				t.Errorf("Stream %d: OpenStream() error = %v", idx, err)
 				return
@@ -216,41 +267,37 @@ func TestMuxMultipleStreams(t *testing.T) {
 			msg := []byte{byte(idx)}
 			clientStream.Write(msg)
 
-			// Read echo
-			buf := make([]byte, 10)
-			n, err := clientStream.Read(buf)
+			// Read echo (poll for data)
+			received, err := readAllWithPoll(clientStream, 1, 2*time.Second)
 			if err != nil {
 				t.Errorf("Stream %d: Read() error = %v", idx, err)
 				return
 			}
-			if n != 1 || buf[0] != byte(idx)+100 {
-				t.Errorf("Stream %d: got %v, want [%d]", idx, buf[:n], idx+100)
+			if len(received) != 1 || received[0] != byte(idx)+100 {
+				t.Errorf("Stream %d: got %v, want [%d]", idx, received, idx+100)
 			}
 		}(i)
 	}
 
-	// Accept and echo
+	// Accept and echo via callback
 	for i := 0; i < numStreams; i++ {
 		go func() {
 			defer wg.Done()
 
-			serverStream, err := serverMux.AcceptStream()
-			if err != nil {
-				t.Errorf("AcceptStream() error = %v", err)
-				return
-			}
+			serverStream := <-pair.clientStreams
 
-			// Read
-			buf := make([]byte, 10)
-			n, err := serverStream.Read(buf)
+			// Read (poll for data)
+			received, err := readAllWithPoll(serverStream, 1, 2*time.Second)
 			if err != nil {
 				t.Errorf("Server Read() error = %v", err)
 				return
 			}
 
 			// Echo with modification
-			buf[0] += 100
-			serverStream.Write(buf[:n])
+			if len(received) > 0 {
+				received[0] += 100
+				serverStream.Write(received)
+			}
 		}()
 	}
 
@@ -268,12 +315,12 @@ func TestMuxMultipleStreams(t *testing.T) {
 }
 
 func TestMuxStreamClose(t *testing.T) {
-	clientMux, serverMux := newMuxPair(t)
-	defer clientMux.Close()
-	defer serverMux.Close()
+	pair := newMuxPair(t)
+	defer pair.client.Close()
+	defer pair.server.Close()
 
-	clientStream, _ := clientMux.OpenStream()
-	serverStream, _ := serverMux.AcceptStream()
+	clientStream, _ := pair.client.OpenStream()
+	serverStream := <-pair.clientStreams
 
 	// Client closes
 	clientStream.Close()
@@ -290,12 +337,12 @@ func TestMuxStreamClose(t *testing.T) {
 }
 
 func TestMuxLargeData(t *testing.T) {
-	clientMux, serverMux := newMuxPair(t)
-	defer clientMux.Close()
-	defer serverMux.Close()
+	pair := newMuxPair(t)
+	defer pair.client.Close()
+	defer pair.server.Close()
 
-	clientStream, _ := clientMux.OpenStream()
-	serverStream, _ := serverMux.AcceptStream()
+	clientStream, _ := pair.client.OpenStream()
+	serverStream := <-pair.clientStreams
 
 	// Send 100KB
 	testData := bytes.Repeat([]byte("X"), 100*1024)
@@ -357,22 +404,22 @@ func TestMuxLargeData(t *testing.T) {
 }
 
 func TestMuxNumStreams(t *testing.T) {
-	clientMux, serverMux := newMuxPair(t)
-	defer clientMux.Close()
-	defer serverMux.Close()
+	pair := newMuxPair(t)
+	defer pair.client.Close()
+	defer pair.server.Close()
 
-	if n := clientMux.NumStreams(); n != 0 {
+	if n := pair.client.NumStreams(); n != 0 {
 		t.Errorf("Initial NumStreams() = %d, want 0", n)
 	}
 
 	// Open streams
-	stream1, _ := clientMux.OpenStream()
-	serverMux.AcceptStream()
+	stream1, _ := pair.client.OpenStream()
+	<-pair.clientStreams
 
-	stream2, _ := clientMux.OpenStream()
-	serverMux.AcceptStream()
+	stream2, _ := pair.client.OpenStream()
+	<-pair.clientStreams
 
-	if n := clientMux.NumStreams(); n != 2 {
+	if n := pair.client.NumStreams(); n != 2 {
 		t.Errorf("After open NumStreams() = %d, want 2", n)
 	}
 
@@ -380,7 +427,7 @@ func TestMuxNumStreams(t *testing.T) {
 	stream1.Close()
 	time.Sleep(100 * time.Millisecond)
 
-	if n := clientMux.NumStreams(); n != 1 {
+	if n := pair.client.NumStreams(); n != 1 {
 		t.Errorf("After close NumStreams() = %d, want 1", n)
 	}
 
@@ -388,7 +435,7 @@ func TestMuxNumStreams(t *testing.T) {
 	stream2.Close()
 	time.Sleep(100 * time.Millisecond)
 
-	if n := clientMux.NumStreams(); n != 0 {
+	if n := pair.client.NumStreams(); n != 0 {
 		t.Errorf("After all close NumStreams() = %d, want 0", n)
 	}
 }
@@ -400,6 +447,7 @@ func TestMuxPacketLoss(t *testing.T) {
 
 	clientToServer := make(chan []byte, 1000)
 	serverToClient := make(chan []byte, 1000)
+	newStreams := make(chan *Stream, 10)
 
 	clientMux := NewMux(DefaultConfig(), true, func(data []byte) error {
 		count := atomic.AddInt64(&totalCount, 1)
@@ -413,7 +461,7 @@ func TestMuxPacketLoss(t *testing.T) {
 		default:
 		}
 		return nil
-	})
+	}, func(streamID uint32) {}, func(stream *Stream) {})
 	defer clientMux.Close()
 
 	serverMux := NewMux(DefaultConfig(), false, func(data []byte) error {
@@ -422,12 +470,16 @@ func TestMuxPacketLoss(t *testing.T) {
 		default:
 		}
 		return nil
+	}, func(streamID uint32) {}, func(stream *Stream) {
+		newStreams <- stream
 	})
 	defer serverMux.Close()
 
-	// Forwarding
+	// Forwarding and update
 	done := make(chan struct{})
 	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
@@ -436,12 +488,16 @@ func TestMuxPacketLoss(t *testing.T) {
 				serverMux.Input(data)
 			case data := <-serverToClient:
 				clientMux.Input(data)
+			case <-ticker.C:
+				current := uint32(time.Now().UnixMilli())
+				clientMux.Update(current)
+				serverMux.Update(current)
 			}
 		}
 	}()
 
 	clientStream, _ := clientMux.OpenStream()
-	serverStream, _ := serverMux.AcceptStream()
+	serverStream := <-newStreams
 
 	// Send larger data - KCP should handle retransmission
 	testData := bytes.Repeat([]byte("X"), 50*1024)
@@ -493,6 +549,7 @@ func TestMuxPacketLoss(t *testing.T) {
 func BenchmarkMuxOpenClose(b *testing.B) {
 	clientToServer := make(chan []byte, 10000)
 	serverToClient := make(chan []byte, 10000)
+	newStreams := make(chan *Stream, 10000)
 
 	clientMux := NewMux(DefaultConfig(), true, func(data []byte) error {
 		select {
@@ -500,7 +557,7 @@ func BenchmarkMuxOpenClose(b *testing.B) {
 		default:
 		}
 		return nil
-	})
+	}, func(streamID uint32) {}, func(stream *Stream) {})
 	defer clientMux.Close()
 
 	serverMux := NewMux(DefaultConfig(), false, func(data []byte) error {
@@ -509,12 +566,19 @@ func BenchmarkMuxOpenClose(b *testing.B) {
 		default:
 		}
 		return nil
+	}, func(streamID uint32) {}, func(stream *Stream) {
+		select {
+		case newStreams <- stream:
+		default:
+		}
 	})
 	defer serverMux.Close()
 
-	// Forwarding
+	// Forwarding and update
 	done := make(chan struct{})
 	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
@@ -523,17 +587,22 @@ func BenchmarkMuxOpenClose(b *testing.B) {
 				serverMux.Input(data)
 			case data := <-serverToClient:
 				clientMux.Input(data)
+			case <-ticker.C:
+				current := uint32(time.Now().UnixMilli())
+				clientMux.Update(current)
+				serverMux.Update(current)
 			}
 		}
 	}()
 
-	// Accept in parallel
+	// Drain new streams in parallel
 	acceptDone := make(chan struct{})
 	go func() {
 		defer close(acceptDone)
 		for {
-			_, err := serverMux.AcceptStream()
-			if err != nil {
+			select {
+			case <-newStreams:
+			case <-done:
 				return
 			}
 		}
@@ -550,14 +619,13 @@ func BenchmarkMuxOpenClose(b *testing.B) {
 	b.StopTimer()
 
 	close(done)
-	clientMux.Close()
-	serverMux.Close()
 	<-acceptDone
 }
 
 func BenchmarkMuxThroughput(b *testing.B) {
 	clientToServer := make(chan []byte, 10000)
 	serverToClient := make(chan []byte, 10000)
+	newStreams := make(chan *Stream, 10)
 
 	clientMux := NewMux(DefaultConfig(), true, func(data []byte) error {
 		select {
@@ -565,7 +633,7 @@ func BenchmarkMuxThroughput(b *testing.B) {
 		default:
 		}
 		return nil
-	})
+	}, func(streamID uint32) {}, func(stream *Stream) {})
 	defer clientMux.Close()
 
 	serverMux := NewMux(DefaultConfig(), false, func(data []byte) error {
@@ -574,12 +642,16 @@ func BenchmarkMuxThroughput(b *testing.B) {
 		default:
 		}
 		return nil
+	}, func(streamID uint32) {}, func(stream *Stream) {
+		newStreams <- stream
 	})
 	defer serverMux.Close()
 
-	// Forwarding
+	// Forwarding and update
 	done := make(chan struct{})
 	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
@@ -588,12 +660,16 @@ func BenchmarkMuxThroughput(b *testing.B) {
 				serverMux.Input(data)
 			case data := <-serverToClient:
 				clientMux.Input(data)
+			case <-ticker.C:
+				current := uint32(time.Now().UnixMilli())
+				clientMux.Update(current)
+				serverMux.Update(current)
 			}
 		}
 	}()
 
 	clientStream, _ := clientMux.OpenStream()
-	serverStream, _ := serverMux.AcceptStream()
+	serverStream := <-newStreams
 
 	data := bytes.Repeat([]byte("X"), 1024)
 	buf := make([]byte, 2048)

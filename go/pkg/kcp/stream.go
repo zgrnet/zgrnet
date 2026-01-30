@@ -52,9 +52,8 @@ type Stream struct {
 	kcp *KCP
 
 	// Receive buffer
-	recvBuf  []byte
-	recvCond *sync.Cond
-	recvMu   sync.Mutex
+	recvBuf []byte
+	recvMu  sync.Mutex
 
 	// State
 	state     atomic.Uint32
@@ -73,7 +72,6 @@ func newStream(id uint32, mux *Mux) *Stream {
 		mux:     mux,
 		closeCh: make(chan struct{}),
 	}
-	s.recvCond = sync.NewCond(&s.recvMu)
 
 	// Create KCP instance
 	s.kcp = NewKCP(id, func(data []byte) {
@@ -98,8 +96,9 @@ func (s *Stream) State() StreamState {
 	return StreamState(s.state.Load())
 }
 
-// Read reads data from the stream.
-// Implements io.Reader.
+// Read reads data from the stream (non-blocking).
+// Returns 0, nil if no data is available.
+// Returns 0, io.EOF if the stream is closed.
 func (s *Stream) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -108,8 +107,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 	s.recvMu.Lock()
 	defer s.recvMu.Unlock()
 
-	// Wait for data
-	for len(s.recvBuf) == 0 {
+	if len(s.recvBuf) == 0 {
 		state := s.State()
 		if state == StreamStateClosed || state == StreamStateRemoteClose {
 			return 0, io.EOF
@@ -121,15 +119,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 		default:
 		}
 
-		// Check deadline
-		if deadline, ok := s.readDeadline.Load().(time.Time); ok && !deadline.IsZero() {
-			if time.Now().After(deadline) {
-				return 0, ErrTimeout
-			}
-		}
-
-		// Wait for signal
-		s.recvCond.Wait()
+		return 0, nil // No data available
 	}
 
 	// Copy data
@@ -205,9 +195,8 @@ func (s *Stream) doClose(removeFromMux bool) error {
 		err = s.mux.sendFIN(s.id)
 	}
 
-	// Wake up readers
+	// Signal close
 	close(s.closeCh)
-	s.recvCond.Broadcast()
 
 	// Release KCP
 	s.kcp.Release()
@@ -249,11 +238,13 @@ func (s *Stream) kcpInput(data []byte) {
 }
 
 // kcpRecv tries to receive data from KCP and buffer it.
-func (s *Stream) kcpRecv() {
+// Returns true if any data was received.
+func (s *Stream) kcpRecv() bool {
 	bufPtr := bufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer bufferPool.Put(bufPtr)
 
+	received := false
 	for {
 		size := s.kcp.PeekSize()
 		if size <= 0 {
@@ -268,8 +259,9 @@ func (s *Stream) kcpRecv() {
 		s.recvMu.Lock()
 		s.recvBuf = append(s.recvBuf, buf[:n]...)
 		s.recvMu.Unlock()
-		s.recvCond.Signal()
+		received = true
 	}
+	return received
 }
 
 // kcpUpdate updates the KCP state.
@@ -289,9 +281,6 @@ func (s *Stream) fin() {
 	} else if state == StreamStateOpen {
 		s.state.Store(uint32(StreamStateRemoteClose))
 	}
-
-	// Wake up readers
-	s.recvCond.Broadcast()
 }
 
 // Stream errors.

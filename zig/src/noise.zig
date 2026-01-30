@@ -68,7 +68,6 @@ pub const ConnError = conn.ConnError;
 pub const Kcp = kcp.Kcp;
 pub const Frame = kcp.Frame;
 pub const Cmd = kcp.Cmd;
-pub const UpdatePayload = kcp.UpdatePayload;
 
 // Stream/Mux types
 pub const Stream = stream.Stream;

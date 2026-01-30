@@ -165,7 +165,6 @@ pub const Cmd = enum(u8) {
     fin = 0x02, // Stream close
     psh = 0x03, // Data
     nop = 0x04, // Keepalive
-    upd = 0x05, // Window update
 
     pub fn fromByte(byte: u8) ?Cmd {
         return switch (byte) {
@@ -173,7 +172,6 @@ pub const Cmd = enum(u8) {
             0x02 => .fin,
             0x03 => .psh,
             0x04 => .nop,
-            0x05 => .upd,
             else => null,
         };
     }
@@ -247,32 +245,6 @@ pub const Frame = struct {
             .cmd = cmd,
             .stream_id = stream_id,
             .payload_len = payload_len,
-        };
-    }
-};
-
-/// UpdatePayload for flow control (UPD frames)
-pub const UpdatePayload = struct {
-    consumed: u32,
-    window: u32,
-
-    pub const Size: usize = 8;
-
-    pub fn encode(self: *const UpdatePayload, buffer: []u8) ![]u8 {
-        if (buffer.len < Size) return error.BufferTooSmall;
-
-        std.mem.writeInt(u32, buffer[0..4], self.consumed, .little);
-        std.mem.writeInt(u32, buffer[4..8], self.window, .little);
-
-        return buffer[0..Size];
-    }
-
-    pub fn decode(data: []const u8) !UpdatePayload {
-        if (data.len < Size) return error.PayloadTooShort;
-
-        return UpdatePayload{
-            .consumed = std.mem.readInt(u32, data[0..4], .little),
-            .window = std.mem.readInt(u32, data[4..8], .little),
         };
     }
 };
@@ -535,26 +507,12 @@ test "Frame header decode" {
     try std.testing.expectEqual(@as(u16, 0), header.payload_len);
 }
 
-test "UpdatePayload encode decode" {
-    var buffer: [8]u8 = undefined;
-    const update = UpdatePayload{
-        .consumed = 1024,
-        .window = 65536,
-    };
-
-    _ = try update.encode(&buffer);
-    const decoded = try UpdatePayload.decode(&buffer);
-
-    try std.testing.expectEqual(@as(u32, 1024), decoded.consumed);
-    try std.testing.expectEqual(@as(u32, 65536), decoded.window);
-}
-
 test "Cmd fromByte" {
     try std.testing.expectEqual(Cmd.syn, Cmd.fromByte(0x01).?);
     try std.testing.expectEqual(Cmd.fin, Cmd.fromByte(0x02).?);
     try std.testing.expectEqual(Cmd.psh, Cmd.fromByte(0x03).?);
     try std.testing.expectEqual(Cmd.nop, Cmd.fromByte(0x04).?);
-    try std.testing.expectEqual(Cmd.upd, Cmd.fromByte(0x05).?);
+    try std.testing.expect(Cmd.fromByte(0x05) == null);
     try std.testing.expect(Cmd.fromByte(0x00) == null);
     try std.testing.expect(Cmd.fromByte(0xFF) == null);
 }

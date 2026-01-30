@@ -43,14 +43,6 @@ func TestFrameEncodeDecode(t *testing.T) {
 			},
 		},
 		{
-			name: "UPD frame",
-			frame: Frame{
-				Cmd:      CmdUPD,
-				StreamID: 42,
-				Payload:  (&UpdatePayload{Consumed: 1024, Window: 65536}).Encode(),
-			},
-		},
-		{
 			name: "PSH frame with large payload",
 			frame: Frame{
 				Cmd:      CmdPSH,
@@ -147,37 +139,6 @@ func TestDecodeFrameTooShort(t *testing.T) {
 	}
 }
 
-func TestUpdatePayload(t *testing.T) {
-	upd := UpdatePayload{
-		Consumed: 12345,
-		Window:   65536,
-	}
-
-	encoded := upd.Encode()
-	if len(encoded) != UpdatePayloadSize {
-		t.Errorf("Encode() length = %d, want %d", len(encoded), UpdatePayloadSize)
-	}
-
-	decoded, err := DecodeUpdatePayload(encoded)
-	if err != nil {
-		t.Fatalf("DecodeUpdatePayload() error = %v", err)
-	}
-
-	if decoded.Consumed != upd.Consumed {
-		t.Errorf("Consumed = %d, want %d", decoded.Consumed, upd.Consumed)
-	}
-	if decoded.Window != upd.Window {
-		t.Errorf("Window = %d, want %d", decoded.Window, upd.Window)
-	}
-}
-
-func TestUpdatePayloadTooShort(t *testing.T) {
-	_, err := DecodeUpdatePayload([]byte{1, 2, 3})
-	if err != ErrFrameTooShort {
-		t.Errorf("DecodeUpdatePayload() error = %v, want ErrFrameTooShort", err)
-	}
-}
-
 func TestCmdConstants(t *testing.T) {
 	// Verify command constants match expected values (starting from 1)
 	if CmdSYN != 1 {
@@ -191,9 +152,6 @@ func TestCmdConstants(t *testing.T) {
 	}
 	if CmdNOP != 4 {
 		t.Errorf("CmdNOP = %d, want 4", CmdNOP)
-	}
-	if CmdUPD != 5 {
-		t.Errorf("CmdUPD = %d, want 5", CmdUPD)
 	}
 }
 
