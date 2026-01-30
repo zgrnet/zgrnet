@@ -1,0 +1,17 @@
+.{
+    .name = .zgrnet_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xf6953e9e15a197f8,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{
+        .kcp = .{
+            .url = "https://github.com/skywind3000/kcp/archive/refs/tags/1.7.tar.gz",
+            .hash = "N-V-__8AAMOnBgAQRcPBLjneHujXuhWEDtVGruVOuwd_bv78",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

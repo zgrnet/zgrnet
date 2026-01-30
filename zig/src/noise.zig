@@ -24,6 +24,10 @@ pub const transport = @import("transport.zig");
 pub const conn = @import("conn.zig");
 pub const udp = @import("udp.zig");
 
+// KCP multiplexing
+pub const kcp = @import("kcp.zig");
+pub const stream = @import("stream.zig");
+
 // Re-export main types
 pub const Key = keypair.Key;
 pub const KeyPair = keypair.KeyPair;
@@ -60,6 +64,18 @@ pub const ConnConfig = conn.ConnConfig;
 pub const ConnState = conn.ConnState;
 pub const ConnError = conn.ConnError;
 
+// KCP types
+pub const Kcp = kcp.Kcp;
+pub const Frame = kcp.Frame;
+pub const Cmd = kcp.Cmd;
+
+// Stream/Mux types
+pub const Stream = stream.Stream;
+pub const StreamState = stream.StreamState;
+pub const StreamError = stream.StreamError;
+pub const Mux = stream.Mux;
+pub const MuxConfig = stream.MuxConfig;
+
 // Re-export constants
 pub const key_size = keypair.key_size;
 pub const tag_size = crypto.tag_size;
@@ -84,4 +100,6 @@ test {
     _ = transport;
     _ = conn;
     _ = udp;
+    _ = kcp;
+    _ = stream;
 }

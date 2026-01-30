@@ -33,6 +33,8 @@ pub mod message;
 pub mod transport;
 pub mod conn;
 pub mod udp;
+pub mod kcp;
+pub mod stream;
 
 pub use keypair::{Key, KeyPair};
 pub use cipher::{Hash, HASH_SIZE, TAG_SIZE};
@@ -51,3 +53,9 @@ pub use message::{
 };
 pub use transport::{Addr, Transport, TransportError, MockAddr, MockTransport};
 pub use conn::{Conn, ConnConfig, ConnState, ConnError};
+
+// KCP multiplexing
+pub use kcp::{Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
+
+// Stream multiplexing
+pub use stream::{Stream, StreamState, StreamError, Mux, MuxConfig, MuxError};

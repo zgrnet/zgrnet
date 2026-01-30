@@ -1,5 +1,15 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@crates//:defs.bzl", "all_crate_deps")
+
+# KCP C library
+cc_library(
+    name = "kcp_c",
+    srcs = ["kcp/ikcp.c"],
+    hdrs = ["kcp/ikcp.h"],
+    copts = ["-O3", "-DNDEBUG"],
+    visibility = ["//visibility:public"],
+)
 
 # Rust SDK - Noise Protocol implementation
 rust_library(
@@ -8,11 +18,11 @@ rust_library(
     crate_name = "noise",
     edition = "2021",
     visibility = ["//visibility:public"],
-    deps = all_crate_deps(),
+    deps = all_crate_deps() + [":kcp_c"],
 )
 
 rust_test(
     name = "noise_test",
     crate = ":noise",
-    deps = all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True) + [":kcp_c"],
 )
