@@ -275,7 +275,7 @@ pub struct Mux {
     is_client: bool,
     streams: RwLock<HashMap<u32, Arc<Stream>>>,
     next_id: Mutex<u32>,
-    accept_queue: Mutex<Vec<Arc<Stream>>>,
+    accept_queue: Mutex<VecDeque<Arc<Stream>>>, // O(1) pop_front
     closed: RwLock<bool>,
 }
 
@@ -288,7 +288,7 @@ impl Mux {
             is_client,
             streams: RwLock::new(HashMap::new()),
             next_id: Mutex::new(if is_client { 1 } else { 2 }),
-            accept_queue: Mutex::new(Vec::new()),
+            accept_queue: Mutex::new(VecDeque::new()),
             closed: RwLock::new(false),
         }
     }
@@ -337,11 +337,7 @@ impl Mux {
         }
 
         let mut queue = self.accept_queue.lock().unwrap();
-        if queue.is_empty() {
-            return Err(MuxError::NoStreamAvailable);
-        }
-
-        Ok(queue.remove(0))
+        queue.pop_front().ok_or(MuxError::NoStreamAvailable)
     }
 
     /// Get number of active streams.
@@ -385,7 +381,7 @@ impl Mux {
 
         let stream = self.create_stream(id);
         self.streams.write().unwrap().insert(id, stream.clone());
-        self.accept_queue.lock().unwrap().push(stream);
+        self.accept_queue.lock().unwrap().push_back(stream);
 
         Ok(())
     }

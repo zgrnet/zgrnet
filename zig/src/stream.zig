@@ -301,7 +301,7 @@ pub const Mux = struct {
     is_client: bool,
     streams: std.AutoHashMap(u32, *Stream),
     next_id: u32,
-    accept_queue: std.ArrayListUnmanaged(*Stream),
+    accept_queue: RingBuffer(*Stream), // O(1) FIFO queue
     closed: bool,
     allocator: std.mem.Allocator,
 
@@ -321,7 +321,7 @@ pub const Mux = struct {
             .is_client = is_client,
             .streams = .init(allocator),
             .next_id = if (is_client) 1 else 2, // Client: odd, Server: even
-            .accept_queue = .{},
+            .accept_queue = RingBuffer(*Stream).init(allocator),
             .closed = false,
             .allocator = allocator,
         };
@@ -337,7 +337,7 @@ pub const Mux = struct {
             stream.*.deinit();
         }
         self.streams.deinit();
-        self.accept_queue.deinit(self.allocator);
+        self.accept_queue.deinit();
         self.allocator.destroy(self);
     }
 
@@ -362,9 +362,12 @@ pub const Mux = struct {
     /// Accept an incoming stream.
     pub fn acceptStream(self: *Mux) !*Stream {
         if (self.closed) return error.MuxClosed;
-        if (self.accept_queue.items.len == 0) return error.NoStreamAvailable;
 
-        return self.accept_queue.orderedRemove(0);
+        // O(1) pop from front using RingBuffer
+        var item: [1]*Stream = undefined;
+        const n = self.accept_queue.read(&item);
+        if (n == 0) return error.NoStreamAvailable;
+        return item[0];
     }
 
     /// Get number of active streams.
@@ -405,7 +408,8 @@ pub const Mux = struct {
         errdefer stream.deinit();
 
         try self.streams.put(id, stream);
-        try self.accept_queue.append(self.allocator, stream);
+        // O(1) push to back using RingBuffer
+        try self.accept_queue.write(&[_]*Stream{stream});
     }
 
     /// Handle FIN (stream close).
