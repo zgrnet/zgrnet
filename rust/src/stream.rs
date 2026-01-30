@@ -146,9 +146,12 @@ impl Stream {
     /// For full close, wait for `state()` to become `Closed` after receiving remote FIN.
     pub fn shutdown(&self) {
         let mut state = self.state.write().unwrap();
-        if *state == StreamState::Closed {
+        if *state == StreamState::Closed || *state == StreamState::LocalClose {
             return;
         }
+
+        // Only send FIN when transitioning from Open to LocalClose
+        let should_send_fin = *state == StreamState::Open;
 
         if *state == StreamState::Open {
             *state = StreamState::LocalClose;
@@ -156,9 +159,11 @@ impl Stream {
             *state = StreamState::Closed;
         }
 
-        // Send FIN frame to notify remote peer
-        if let Some(ref fin_sender) = self.fin_sender {
-            fin_sender();
+        // Send FIN frame to notify remote peer (only once)
+        if should_send_fin {
+            if let Some(ref fin_sender) = self.fin_sender {
+                fin_sender();
+            }
         }
     }
 
@@ -428,6 +433,14 @@ impl Mux {
     fn handle_syn(&self, id: u32) -> Result<(), MuxError> {
         if self.streams.read().unwrap().contains_key(&id) {
             return Ok(()); // Duplicate SYN
+        }
+
+        // Check accept_backlog limit to prevent SYN flood
+        {
+            let queue = self.accept_queue.lock().unwrap();
+            if queue.len() >= self.config.accept_backlog {
+                return Ok(()); // Silently drop - backlog full
+            }
         }
 
         let stream = self.create_stream(id);

@@ -106,12 +106,61 @@ pub const Stream = struct {
         return self.recv_buf.read(buffer);
     }
 
+    /// Receive data directly from KCP into user-provided buffer (zero-copy fast path).
+    /// Returns the number of bytes received, or 0 if no data available.
+    /// This bypasses the internal recv_buf for lower latency when caller can process immediately.
+    pub fn recvIntoBuffer(self: *Stream, buffer: []u8) StreamError!usize {
+        // First drain any buffered data
+        if (self.recv_buf.readableLength() > 0) {
+            return self.recv_buf.read(buffer);
+        }
+
+        // No buffered data, try direct receive from KCP
+        if (self.kcp_instance) |*k| {
+            const size = k.peekSize();
+            if (size <= 0) {
+                if (self.state == .closed or self.state == .remote_close) {
+                    return 0; // EOF
+                }
+                return 0; // No data available
+            }
+
+            // Direct receive into user buffer if it fits
+            if (buffer.len >= @as(usize, @intCast(size))) {
+                const n = k.recv(buffer);
+                if (n > 0) {
+                    return @intCast(n);
+                }
+            } else {
+                // Buffer too small, need intermediate allocation
+                const tmp = try self.allocator.alloc(u8, @intCast(size));
+                defer self.allocator.free(tmp);
+
+                const n = k.recv(tmp);
+                if (n > 0) {
+                    const copy_len = @min(buffer.len, @as(usize, @intCast(n)));
+                    @memcpy(buffer[0..copy_len], tmp[0..copy_len]);
+                    // Buffer remaining data
+                    if (@as(usize, @intCast(n)) > copy_len) {
+                        try self.recv_buf.write(tmp[copy_len..@intCast(n)]);
+                    }
+                    return copy_len;
+                }
+            }
+        }
+
+        return 0;
+    }
+
     /// Close the stream.
     /// Shutdown the write-half of the stream.
     /// Sends a FIN frame to the remote peer and transitions to `local_close` state.
     /// The stream can still receive data until a FIN is received from the peer.
     pub fn shutdown(self: *Stream) void {
-        if (self.state == .closed) return;
+        if (self.state == .closed or self.state == .local_close) return;
+
+        // Only send FIN when transitioning from open to local_close
+        const should_send_fin = self.state == .open;
 
         if (self.state == .open) {
             self.state = .local_close;
@@ -119,8 +168,10 @@ pub const Stream = struct {
             self.state = .closed;
         }
 
-        // Send FIN
-        self.mux.sendFin(self.id) catch {};
+        // Send FIN (only once)
+        if (should_send_fin) {
+            self.mux.sendFin(self.id) catch {};
+        }
     }
 
     /// Check if a transport output error has occurred.
@@ -312,6 +363,11 @@ pub const Mux = struct {
     /// Handle SYN (stream open request).
     fn handleSyn(self: *Mux, id: u32) !void {
         if (self.streams.contains(id)) return; // Duplicate SYN
+
+        // Check accept_backlog limit to prevent SYN flood
+        if (self.accept_queue.readableLength() >= self.config.accept_backlog) {
+            return; // Silently drop - backlog full
+        }
 
         const stream = try Stream.init(self.allocator, id, self);
         errdefer stream.deinit();
