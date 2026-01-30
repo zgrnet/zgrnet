@@ -198,8 +198,8 @@ pub const Frame = struct {
         if (self.payload.len > MaxPayloadSize) return error.PayloadTooLarge;
 
         buffer[0] = @intFromEnum(self.cmd);
-        std.mem.writeInt(u32, buffer[1..5], self.stream_id, .big);
-        std.mem.writeInt(u16, buffer[5..7], @intCast(self.payload.len), .big);
+        std.mem.writeInt(u32, buffer[1..5], self.stream_id, .little);
+        std.mem.writeInt(u16, buffer[5..7], @intCast(self.payload.len), .little);
 
         if (self.payload.len > 0) {
             @memcpy(buffer[FrameHeaderSize..][0..self.payload.len], self.payload);
@@ -223,8 +223,8 @@ pub const Frame = struct {
         if (data.len < FrameHeaderSize) return error.FrameTooShort;
 
         const cmd = Cmd.fromByte(data[0]) orelse return error.InvalidCmd;
-        const stream_id = std.mem.readInt(u32, data[1..5], .big);
-        const payload_len = std.mem.readInt(u16, data[5..7], .big);
+        const stream_id = std.mem.readInt(u32, data[1..5], .little);
+        const payload_len = std.mem.readInt(u16, data[5..7], .little);
 
         if (data.len < FrameHeaderSize + payload_len) return error.FrameTooShort;
 
@@ -240,8 +240,8 @@ pub const Frame = struct {
         if (data.len < FrameHeaderSize) return error.FrameTooShort;
 
         const cmd = Cmd.fromByte(data[0]) orelse return error.InvalidCmd;
-        const stream_id = std.mem.readInt(u32, data[1..5], .big);
-        const payload_len = std.mem.readInt(u16, data[5..7], .big);
+        const stream_id = std.mem.readInt(u32, data[1..5], .little);
+        const payload_len = std.mem.readInt(u16, data[5..7], .little);
 
         return .{
             .cmd = cmd,
@@ -261,8 +261,8 @@ pub const UpdatePayload = struct {
     pub fn encode(self: *const UpdatePayload, buffer: []u8) ![]u8 {
         if (buffer.len < Size) return error.BufferTooSmall;
 
-        std.mem.writeInt(u32, buffer[0..4], self.consumed, .big);
-        std.mem.writeInt(u32, buffer[4..8], self.window, .big);
+        std.mem.writeInt(u32, buffer[0..4], self.consumed, .little);
+        std.mem.writeInt(u32, buffer[4..8], self.window, .little);
 
         return buffer[0..Size];
     }
@@ -271,8 +271,8 @@ pub const UpdatePayload = struct {
         if (data.len < Size) return error.PayloadTooShort;
 
         return UpdatePayload{
-            .consumed = std.mem.readInt(u32, data[0..4], .big),
-            .window = std.mem.readInt(u32, data[4..8], .big),
+            .consumed = std.mem.readInt(u32, data[0..4], .little),
+            .window = std.mem.readInt(u32, data[4..8], .little),
         };
     }
 };

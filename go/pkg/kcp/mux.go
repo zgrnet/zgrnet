@@ -322,6 +322,7 @@ func (m *Mux) removeStream(id uint32) {
 }
 
 // updateLoop periodically updates all KCP instances.
+// Uses kcp.Check() to determine optimal update timing.
 func (m *Mux) updateLoop() {
 	defer close(m.updateDone)
 
@@ -331,13 +332,28 @@ func (m *Mux) updateLoop() {
 			return
 		case <-m.updateTicker.C:
 			current := uint32(time.Now().UnixMilli())
+			nextUpdate := current + 100 // Default: 100ms max interval
 
 			m.streamsMu.RLock()
 			for _, s := range m.streams {
 				s.kcpUpdate(current)
 				s.kcpRecv() // Check if KCP has data ready
+
+				// Find earliest next update time
+				if check := s.kcp.Check(current); check < nextUpdate {
+					nextUpdate = check
+				}
 			}
 			m.streamsMu.RUnlock()
+
+			// Adjust ticker for next interval (min 1ms, max 100ms)
+			interval := nextUpdate - current
+			if interval < 1 {
+				interval = 1
+			} else if interval > 100 {
+				interval = 100
+			}
+			m.updateTicker.Reset(time.Duration(interval) * time.Millisecond)
 		}
 	}
 }

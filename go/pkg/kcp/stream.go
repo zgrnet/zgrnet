@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+// bufferPool is a pool of 64KB buffers for KCP recv operations.
+var bufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 64*1024)
+		return &buf
+	},
+}
+
 // StreamState represents the state of a stream.
 type StreamState uint32
 
@@ -242,7 +250,10 @@ func (s *Stream) kcpInput(data []byte) {
 
 // kcpRecv tries to receive data from KCP and buffer it.
 func (s *Stream) kcpRecv() {
-	buf := make([]byte, 64*1024)
+	bufPtr := bufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer bufferPool.Put(bufPtr)
+
 	for {
 		size := s.kcp.PeekSize()
 		if size <= 0 {

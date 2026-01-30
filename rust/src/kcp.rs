@@ -279,8 +279,8 @@ impl Frame {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + self.payload.len());
         buf.push(self.cmd as u8);
-        buf.extend_from_slice(&self.stream_id.to_be_bytes());
-        buf.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.stream_id.to_le_bytes());
+        buf.extend_from_slice(&(self.payload.len() as u16).to_le_bytes());
         buf.extend_from_slice(&self.payload);
         buf
     }
@@ -296,8 +296,8 @@ impl Frame {
         }
 
         buf[0] = self.cmd as u8;
-        buf[1..5].copy_from_slice(&self.stream_id.to_be_bytes());
-        buf[5..7].copy_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        buf[1..5].copy_from_slice(&self.stream_id.to_le_bytes());
+        buf[5..7].copy_from_slice(&(self.payload.len() as u16).to_le_bytes());
         buf[FRAME_HEADER_SIZE..total_len].copy_from_slice(&self.payload);
 
         Ok(total_len)
@@ -312,8 +312,8 @@ impl Frame {
         let total_len = FRAME_HEADER_SIZE + self.payload.len();
         let ptr = buf.as_mut_ptr();
         *ptr = self.cmd as u8;
-        std::ptr::write_unaligned(ptr.add(1) as *mut u32, self.stream_id.to_be());
-        std::ptr::write_unaligned(ptr.add(5) as *mut u16, (self.payload.len() as u16).to_be());
+        std::ptr::write_unaligned(ptr.add(1) as *mut u32, self.stream_id.to_le());
+        std::ptr::write_unaligned(ptr.add(5) as *mut u16, (self.payload.len() as u16).to_le());
         std::ptr::copy_nonoverlapping(
             self.payload.as_ptr(),
             ptr.add(FRAME_HEADER_SIZE),
@@ -329,8 +329,8 @@ impl Frame {
         let total_len = FRAME_HEADER_SIZE + payload.len();
         let mut buf = Vec::with_capacity(total_len);
         buf.push(cmd as u8);
-        buf.extend_from_slice(&stream_id.to_be_bytes());
-        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&stream_id.to_le_bytes());
+        buf.extend_from_slice(&(payload.len() as u16).to_le_bytes());
         buf.extend_from_slice(payload);
         buf
     }
@@ -348,8 +348,8 @@ impl Frame {
         }
 
         buf[0] = cmd as u8;
-        buf[1..5].copy_from_slice(&stream_id.to_be_bytes());
-        buf[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf[1..5].copy_from_slice(&stream_id.to_le_bytes());
+        buf[5..7].copy_from_slice(&(payload.len() as u16).to_le_bytes());
         buf[FRAME_HEADER_SIZE..total_len].copy_from_slice(payload);
 
         Ok(total_len)
@@ -362,8 +362,8 @@ impl Frame {
         }
 
         let cmd = Cmd::from_byte(data[0]).ok_or(FrameError::InvalidCmd)?;
-        let stream_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
-        let payload_len = u16::from_be_bytes(data[5..7].try_into().unwrap()) as usize;
+        let stream_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
+        let payload_len = u16::from_le_bytes(data[5..7].try_into().unwrap()) as usize;
 
         if data.len() < FRAME_HEADER_SIZE + payload_len {
             return Err(FrameError::FrameTooShort);
@@ -385,8 +385,8 @@ impl Frame {
         }
 
         let cmd = Cmd::from_byte(data[0]).ok_or(FrameError::InvalidCmd)?;
-        let stream_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
-        let payload_len = u16::from_be_bytes(data[5..7].try_into().unwrap());
+        let stream_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
+        let payload_len = u16::from_le_bytes(data[5..7].try_into().unwrap());
 
         Ok((cmd, stream_id, payload_len))
     }
@@ -404,8 +404,8 @@ impl UpdatePayload {
 
     pub fn encode(&self) -> [u8; 8] {
         let mut buf = [0u8; 8];
-        buf[0..4].copy_from_slice(&self.consumed.to_be_bytes());
-        buf[4..8].copy_from_slice(&self.window.to_be_bytes());
+        buf[0..4].copy_from_slice(&self.consumed.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.window.to_le_bytes());
         buf
     }
 
@@ -415,8 +415,8 @@ impl UpdatePayload {
         }
 
         Ok(UpdatePayload {
-            consumed: u32::from_be_bytes([data[0], data[1], data[2], data[3]]),
-            window: u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+            consumed: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            window: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
         })
     }
 }
@@ -593,8 +593,8 @@ mod tests {
             unsafe {
                 let ptr = buf.as_mut_ptr();
                 std::ptr::write_volatile(ptr, Cmd::Psh as u8);
-                std::ptr::write_unaligned(ptr.add(1) as *mut u32, stream_id.to_be()); // BE like implementation
-                std::ptr::write_unaligned(ptr.add(5) as *mut u16, (payload.len() as u16).to_be());
+                std::ptr::write_unaligned(ptr.add(1) as *mut u32, stream_id.to_le()); // LE like Go implementation
+                std::ptr::write_unaligned(ptr.add(5) as *mut u16, (payload.len() as u16).to_le());
                 std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr.add(FRAME_HEADER_SIZE), payload.len());
             }
             // Read back from written buffer to prevent optimization

@@ -7,12 +7,14 @@ import (
 )
 
 // Frame commands for KCP mux protocol.
+// Values start at 1 to match Rust/Zig implementations.
 const (
-	CmdSYN byte = iota // Stream open
-	CmdFIN             // Stream close (EOF)
-	CmdPSH             // Data push
-	CmdNOP             // No operation (keepalive)
-	CmdUPD             // Window update (flow control)
+	_      byte = iota // skip 0
+	CmdSYN             // Stream open (0x01)
+	CmdFIN             // Stream close (EOF) (0x02)
+	CmdPSH             // Data push (0x03)
+	CmdNOP             // No operation (keepalive) (0x04)
+	CmdUPD             // Window update (flow control) (0x05)
 )
 
 // Frame header size: cmd(1) + stream_id(4) + length(2) = 7 bytes

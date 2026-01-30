@@ -189,10 +189,14 @@ pub const Stream = struct {
 
     /// Receive data from KCP and buffer it.
     /// Uses stack buffer for common MTU-sized messages, heap fallback for oversized.
+    /// Heap buffer is reused across loop iterations to avoid repeated allocations.
     pub fn kcpRecv(self: *Stream) void {
         if (self.kcp_instance) |*k| {
             // Reusable MTU-sized stack buffer for common case
             var stack_buf: [1500]u8 = undefined;
+            // Reusable heap buffer for oversized messages
+            var heap_buf: ?[]u8 = null;
+            defer if (heap_buf) |buf| self.allocator.free(buf);
 
             while (true) {
                 const size = k.peekSize();
@@ -206,12 +210,14 @@ pub const Stream = struct {
                     if (n <= 0) break;
                     self.recv_buf.write(stack_buf[0..@intCast(n)]) catch break;
                 } else {
-                    // Rare path: heap allocate for oversized messages
-                    const buf = self.allocator.alloc(u8, usize_size) catch break;
-                    defer self.allocator.free(buf);
-                    const n = k.recv(buf);
+                    // Rare path: reuse or grow heap buffer for oversized messages
+                    if (heap_buf == null or heap_buf.?.len < usize_size) {
+                        if (heap_buf) |old| self.allocator.free(old);
+                        heap_buf = self.allocator.alloc(u8, usize_size) catch break;
+                    }
+                    const n = k.recv(heap_buf.?[0..usize_size]);
                     if (n <= 0) break;
-                    self.recv_buf.write(buf[0..@intCast(n)]) catch break;
+                    self.recv_buf.write(heap_buf.?[0..@intCast(n)]) catch break;
                 }
             }
         }

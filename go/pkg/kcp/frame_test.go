@@ -179,21 +179,21 @@ func TestUpdatePayloadTooShort(t *testing.T) {
 }
 
 func TestCmdConstants(t *testing.T) {
-	// Verify command constants match expected values
-	if CmdSYN != 0 {
-		t.Errorf("CmdSYN = %d, want 0", CmdSYN)
+	// Verify command constants match expected values (starting from 1)
+	if CmdSYN != 1 {
+		t.Errorf("CmdSYN = %d, want 1", CmdSYN)
 	}
-	if CmdFIN != 1 {
-		t.Errorf("CmdFIN = %d, want 1", CmdFIN)
+	if CmdFIN != 2 {
+		t.Errorf("CmdFIN = %d, want 2", CmdFIN)
 	}
-	if CmdPSH != 2 {
-		t.Errorf("CmdPSH = %d, want 2", CmdPSH)
+	if CmdPSH != 3 {
+		t.Errorf("CmdPSH = %d, want 3", CmdPSH)
 	}
-	if CmdNOP != 3 {
-		t.Errorf("CmdNOP = %d, want 3", CmdNOP)
+	if CmdNOP != 4 {
+		t.Errorf("CmdNOP = %d, want 4", CmdNOP)
 	}
-	if CmdUPD != 4 {
-		t.Errorf("CmdUPD = %d, want 4", CmdUPD)
+	if CmdUPD != 5 {
+		t.Errorf("CmdUPD = %d, want 5", CmdUPD)
 	}
 }
 
