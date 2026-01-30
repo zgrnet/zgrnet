@@ -109,7 +109,13 @@ impl Stream {
             return Ok(0); // No data available
         }
 
-        // Use as_slices() for efficient bulk copy instead of byte-by-byte
+        Ok(Self::drain_recv_buf(&mut recv_buf, buf))
+    }
+
+    /// Helper: drain data from recv_buf into user buffer (DRY).
+    /// Returns number of bytes copied.
+    #[inline]
+    fn drain_recv_buf(recv_buf: &mut VecDeque<u8>, buf: &mut [u8]) -> usize {
         let (s1, s2) = recv_buf.as_slices();
         let n1 = std::cmp::min(buf.len(), s1.len());
         buf[..n1].copy_from_slice(&s1[..n1]);
@@ -119,10 +125,9 @@ impl Stream {
             buf[n1..n1 + n2].copy_from_slice(&s2[..n2]);
         }
 
-        let total_read = n1 + n2;
-        recv_buf.drain(..total_read);
-
-        Ok(total_read)
+        let total = n1 + n2;
+        recv_buf.drain(..total);
+        total
     }
 
     /// Close the stream.
@@ -199,18 +204,7 @@ impl Stream {
         {
             let mut recv_buf = self.recv_buf.lock().unwrap();
             if !recv_buf.is_empty() {
-                let (s1, s2) = recv_buf.as_slices();
-                let n1 = std::cmp::min(buf.len(), s1.len());
-                buf[..n1].copy_from_slice(&s1[..n1]);
-
-                let n2 = std::cmp::min(buf.len().saturating_sub(n1), s2.len());
-                if n2 > 0 {
-                    buf[n1..n1 + n2].copy_from_slice(&s2[..n2]);
-                }
-
-                let total_read = n1 + n2;
-                recv_buf.drain(..total_read);
-                return Ok(total_read);
+                return Ok(Self::drain_recv_buf(&mut recv_buf, buf));
             }
         }
 
