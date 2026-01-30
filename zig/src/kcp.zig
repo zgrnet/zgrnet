@@ -578,7 +578,9 @@ pub fn benchmarkFrameEncode() u64 {
         };
         var buf: [FrameHeaderSize + 64]u8 = undefined;
         const encoded = frame.encode(&buf) catch continue;
-        checksum +%= encoded[0];
+        // Use varying bytes (stream_id at offset 1-4) to prevent optimization
+        checksum +%= encoded[1];
+        checksum +%= encoded[2];
     }
     const end = std.time.nanoTimestamp();
     sink = checksum; // Prevent optimization
@@ -600,7 +602,9 @@ pub fn benchmarkFrameDecode() u64 {
     var i: u64 = 0;
     while (i < bench_iterations) : (i += 1) {
         const decoded = Frame.decode(encoded) catch continue;
-        checksum +%= decoded.stream_id;
+        // Combine with loop counter to prevent constant folding
+        checksum +%= decoded.stream_id +% i;
+        checksum +%= decoded.payload.len;
     }
     const end = std.time.nanoTimestamp();
     sink = checksum; // Prevent optimization

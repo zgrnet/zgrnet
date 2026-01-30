@@ -48,7 +48,9 @@ pub struct Kcp {
     context_ptr: *const Mutex<KcpContext>,
 }
 
-// SAFETY: Kcp is Send because we properly synchronize access to the C library
+// SAFETY: Kcp is Send because all access to the underlying C library is protected
+// by external synchronization (Mutex<Kcp> in Stream). The KCP C library itself is
+// NOT thread-safe - callers MUST ensure single-threaded access or use a Mutex.
 unsafe impl Send for Kcp {}
 
 impl Kcp {
@@ -585,19 +587,21 @@ mod tests {
 
         // Benchmark unchecked BE (matching implementation) version with volatile
         let start2 = Instant::now();
-        let mut stream_id = 12345u32;
-        for _ in 0..iterations {
+        let mut checksum = 0u64;
+        for i in 0..iterations {
+            let stream_id = (12345u32).wrapping_add(i as u32); // Varying stream_id
             unsafe {
                 let ptr = buf.as_mut_ptr();
                 std::ptr::write_volatile(ptr, Cmd::Psh as u8);
                 std::ptr::write_unaligned(ptr.add(1) as *mut u32, stream_id.to_be()); // BE like implementation
                 std::ptr::write_unaligned(ptr.add(5) as *mut u16, (payload.len() as u16).to_be());
                 std::ptr::copy_nonoverlapping(payload.as_ptr(), ptr.add(FRAME_HEADER_SIZE), payload.len());
-                stream_id = stream_id.wrapping_add(std::ptr::read_volatile(ptr.add(1)) as u32);
             }
+            // Read back from written buffer to prevent optimization
+            checksum = checksum.wrapping_add(buf[1] as u64).wrapping_add(buf[5] as u64);
         }
         let elapsed2 = start2.elapsed();
-        black_box(stream_id);
+        black_box(checksum);
         let ns_per_op2 = elapsed2.as_nanos() as f64 / iterations as f64;
         let throughput_gbps2 = (frame_size as f64 * 8.0 * iterations as f64) / elapsed2.as_secs_f64() / 1e9;
         println!("Rust Frame encode_to (unchecked BE): {:.2} ns/op, {:.2} Gbps ({}ms, {} bytes/frame)", 
