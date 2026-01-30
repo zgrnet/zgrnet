@@ -125,13 +125,13 @@ func main() {
 			continue // Skip self
 		}
 
-		pubKeyBytes, err := hex.DecodeString(hi.PrivateKey)
+		privKeySeedBytes, err := hex.DecodeString(hi.PrivateKey)
 		if err != nil {
 			log.Printf("Warning: invalid key for %s: %v", hi.Name, err)
 			continue
 		}
 		var peerPrivKey noise.Key
-		copy(peerPrivKey[:], pubKeyBytes)
+		copy(peerPrivKey[:], privKeySeedBytes)
 		peerKP, err := noise.NewKeyPair(peerPrivKey)
 		if err != nil {
 			log.Printf("Warning: failed to derive key for %s: %v", hi.Name, err)
@@ -187,13 +187,13 @@ func main() {
 			continue
 		}
 
-		pubKeyBytes, err := hex.DecodeString(hi.PrivateKey)
+		privKeySeedBytes, err := hex.DecodeString(hi.PrivateKey)
 		if err != nil {
 			log.Printf("[%s] Failed to decode private key for %s: %v", *name, hi.Name, err)
 			continue
 		}
 		var peerPrivKey noise.Key
-		copy(peerPrivKey[:], pubKeyBytes)
+		copy(peerPrivKey[:], privKeySeedBytes)
 		peerKP, err := noise.NewKeyPair(peerPrivKey)
 		if err != nil {
 			log.Printf("[%s] Failed to derive key for %s: %v", *name, hi.Name, err)
