@@ -302,23 +302,21 @@ impl Frame {
     }
 
     /// Encode frame to existing buffer (unchecked, fast path).
-    /// 
+    ///
     /// # Safety
     /// Caller must ensure buffer is at least `FRAME_HEADER_SIZE + payload.len()` bytes.
     #[inline(always)]
     pub unsafe fn encode_to_unchecked(&self, buf: &mut [u8]) -> usize {
         let total_len = FRAME_HEADER_SIZE + self.payload.len();
-        unsafe {
-            let ptr = buf.as_mut_ptr();
-            *ptr = self.cmd as u8;
-            std::ptr::write_unaligned(ptr.add(1) as *mut u32, self.stream_id.to_be());
-            std::ptr::write_unaligned(ptr.add(5) as *mut u16, (self.payload.len() as u16).to_be());
-            std::ptr::copy_nonoverlapping(
-                self.payload.as_ptr(),
-                ptr.add(FRAME_HEADER_SIZE),
-                self.payload.len(),
-            );
-        }
+        let ptr = buf.as_mut_ptr();
+        *ptr = self.cmd as u8;
+        std::ptr::write_unaligned(ptr.add(1) as *mut u32, self.stream_id.to_be());
+        std::ptr::write_unaligned(ptr.add(5) as *mut u16, (self.payload.len() as u16).to_be());
+        std::ptr::copy_nonoverlapping(
+            self.payload.as_ptr(),
+            ptr.add(FRAME_HEADER_SIZE),
+            self.payload.len(),
+        );
         total_len
     }
 
@@ -362,8 +360,8 @@ impl Frame {
         }
 
         let cmd = Cmd::from_byte(data[0]).ok_or(FrameError::InvalidCmd)?;
-        let stream_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-        let payload_len = u16::from_be_bytes([data[5], data[6]]) as usize;
+        let stream_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
+        let payload_len = u16::from_be_bytes(data[5..7].try_into().unwrap()) as usize;
 
         if data.len() < FRAME_HEADER_SIZE + payload_len {
             return Err(FrameError::FrameTooShort);
@@ -385,8 +383,8 @@ impl Frame {
         }
 
         let cmd = Cmd::from_byte(data[0]).ok_or(FrameError::InvalidCmd)?;
-        let stream_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-        let payload_len = u16::from_be_bytes([data[5], data[6]]);
+        let stream_id = u32::from_be_bytes(data[1..5].try_into().unwrap());
+        let payload_len = u16::from_be_bytes(data[5..7].try_into().unwrap());
 
         Ok((cmd, stream_id, payload_len))
     }
