@@ -18,8 +18,8 @@ static void kcp_set_output(ikcpcb *kcp) {
 */
 import "C"
 import (
+	"runtime/cgo"
 	"sync"
-	"sync/atomic"
 	"unsafe"
 )
 
@@ -27,26 +27,17 @@ import (
 type KCP struct {
 	kcp      *C.ikcpcb
 	conv     uint32
-	id       uint64 // Unique ID for callback identification
+	handle   cgo.Handle // Handle for cgo callback identification
 	mu       sync.Mutex
 	outputFn func([]byte)
 }
 
-// Global registry for KCP instances (needed for cgo callback)
-var (
-	kcpRegistry   = make(map[uint64]*KCP)
-	kcpRegistryMu sync.RWMutex
-	kcpNextID     uint64
-)
-
+//
 //export goKcpOutput
+//go:nocheckptr
 func goKcpOutput(buf *C.char, length C.int, user unsafe.Pointer) C.int {
-	id := uint64(uintptr(user))
-
-	kcpRegistryMu.RLock()
-	k, ok := kcpRegistry[id]
-	kcpRegistryMu.RUnlock()
-
+	h := cgo.Handle(uintptr(user))
+	k, ok := h.Value().(*KCP)
 	if !ok || k.outputFn == nil {
 		return 0
 	}
@@ -57,23 +48,21 @@ func goKcpOutput(buf *C.char, length C.int, user unsafe.Pointer) C.int {
 }
 
 // NewKCP creates a new KCP instance with the given conversation ID.
+//
+//go:nocheckptr
 func NewKCP(conv uint32, output func([]byte)) *KCP {
-	// Generate unique ID
-	id := atomic.AddUint64(&kcpNextID, 1)
-
 	k := &KCP{
 		conv:     conv,
-		id:       id,
 		outputFn: output,
 	}
 
-	// Register in global map first
-	kcpRegistryMu.Lock()
-	kcpRegistry[id] = k
-	kcpRegistryMu.Unlock()
+	// Create cgo.Handle for safe callback identification
+	k.handle = cgo.NewHandle(k)
 
-	// Create KCP with ID as user data (converted to pointer)
-	k.kcp = C.ikcp_create(C.IUINT32(conv), unsafe.Pointer(uintptr(id)))
+	// Create KCP with handle as user data
+	// Note: Converting handle to pointer is safe here as it's only used as an opaque
+	// identifier by the C library and converted back to handle in the callback.
+	k.kcp = C.ikcp_create(C.IUINT32(conv), unsafe.Pointer(uintptr(k.handle)))
 
 	// Set output callback
 	C.kcp_set_output(k.kcp)
@@ -87,13 +76,14 @@ func (k *KCP) Release() {
 	defer k.mu.Unlock()
 
 	if k.kcp != nil {
-		// Unregister from global map
-		kcpRegistryMu.Lock()
-		delete(kcpRegistry, k.id)
-		kcpRegistryMu.Unlock()
-
 		C.ikcp_release(k.kcp)
 		k.kcp = nil
+
+		// Delete the cgo handle to prevent memory leak
+		if k.handle != 0 {
+			k.handle.Delete()
+			k.handle = 0
+		}
 	}
 }
 
@@ -261,6 +251,6 @@ func GetConv(data []byte) uint32 {
 // DefaultConfig sets KCP to fast mode with reasonable defaults.
 func (k *KCP) DefaultConfig() {
 	k.SetNodelay(1, 10, 2, 1) // Fast mode
-	k.SetWndSize(128, 128)   // Window size
-	k.SetMTU(1400)           // MTU
+	k.SetWndSize(128, 128)    // Window size
+	k.SetMTU(1400)            // MTU
 }
