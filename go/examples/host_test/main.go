@@ -94,6 +94,9 @@ func main() {
 
 	log.Printf("[%s] Public key: %s", *name, hex.EncodeToString(keyPair.Public[:]))
 
+	// Pre-calculate peer name map for efficient lookups
+	peerNames := buildPeerNameMap(config)
+
 	// Create UDP transport
 	bindAddr := fmt.Sprintf(":%d", myHost.Port)
 	udp, err := transport.NewUDPListener(bindAddr)
@@ -157,7 +160,10 @@ func main() {
 				continue
 			}
 
-			fromName := findPeerName(config, msg.From)
+			fromName := peerNames[msg.From]
+			if fromName == "" {
+				fromName = hex.EncodeToString(msg.From[:8]) + "..."
+			}
 			log.Printf("[%s] Received from %s: protocol=%d, data=%q",
 				*name, fromName, msg.Protocol, string(msg.Data))
 
@@ -233,7 +239,9 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
-func findPeerName(config *Config, pubKey noise.PublicKey) string {
+// buildPeerNameMap creates a map of public keys to host names for efficient lookups.
+func buildPeerNameMap(config *Config) map[noise.PublicKey]string {
+	m := make(map[noise.PublicKey]string)
 	for _, h := range config.Hosts {
 		pubKeyBytes, err := hex.DecodeString(h.PrivateKey)
 		if err != nil {
@@ -245,9 +253,7 @@ func findPeerName(config *Config, pubKey noise.PublicKey) string {
 		if err != nil {
 			continue
 		}
-		if kp.Public == pubKey {
-			return h.Name
-		}
+		m[kp.Public] = h.Name
 	}
-	return hex.EncodeToString(pubKey[:8]) + "..."
+	return m
 }

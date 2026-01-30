@@ -78,6 +78,14 @@ pub fn main() !void {
 
     std.debug.print("[{s}] Public key: {s}\n", .{ host_name, std.fmt.fmtSliceHexLower(&key_pair.public) });
 
+    // Pre-calculate peer keypairs for efficient lookups
+    var peer_keypairs: [hosts.len]KeyPair = undefined;
+    for (hosts, 0..) |h, i| {
+        var pk: Key = undefined;
+        _ = std.fmt.hexToBytes(&pk, h.private_key) catch continue;
+        peer_keypairs[i] = KeyPair.fromPrivate(pk);
+    }
+
     // Create UDP transport
     var bind_buf: [32]u8 = undefined;
     const bind_addr = try std.fmt.bufPrint(&bind_buf, "0.0.0.0:{d}", .{info.port});
@@ -157,7 +165,7 @@ pub fn main() !void {
             if (msg_opt) |*msg| {
                 defer msg.deinit();
 
-                const from_name = findPeerName(&msg.from);
+                const from_name = findPeerNameCached(&msg.from, &peer_keypairs);
                 std.debug.print("[{s}] Received from {s}: protocol={}, data={s}\n", .{ host_name, from_name, @intFromEnum(msg.protocol), msg.data });
 
                 // Echo back if not an ACK
@@ -173,12 +181,10 @@ pub fn main() !void {
     }
 }
 
-fn findPeerName(pubkey: *const Key) []const u8 {
-    for (hosts) |h| {
-        var priv_key: Key = undefined;
-        _ = std.fmt.hexToBytes(&priv_key, h.private_key) catch continue;
-        const kp = KeyPair.fromPrivate(priv_key);
-        if (std.mem.eql(u8, &kp.public, pubkey)) {
+/// Find peer name using pre-calculated keypairs for O(1) key derivation.
+fn findPeerNameCached(pubkey: *const Key, keypairs: []const KeyPair) []const u8 {
+    for (hosts, 0..) |h, i| {
+        if (std.mem.eql(u8, &keypairs[i].public, pubkey)) {
             return h.name;
         }
     }

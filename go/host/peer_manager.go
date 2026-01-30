@@ -460,33 +460,6 @@ func (pm *PeerManager) ExpireStale() int {
 	return len(expired)
 }
 
-// StartMaintenance starts a background goroutine for periodic maintenance.
-// Returns a stop function.
-func (pm *PeerManager) StartMaintenance(interval time.Duration) func() {
-	stop := make(chan struct{})
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				pm.ExpireStale()
-			case <-stop:
-				return
-			}
-		}
-	}()
-
-	return func() {
-		close(stop)
-		<-done
-	}
-}
-
 // ExpirePendingHandshakes removes handshakes that have been pending too long.
 // Returns the number of handshakes expired.
 func (pm *PeerManager) ExpirePendingHandshakes(maxAge time.Duration) int {

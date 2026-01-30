@@ -35,6 +35,8 @@ impl UdpListener {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address found"))?;
 
         let socket = UdpSocket::bind(addr)?;
+        // Set read timeout to allow receive loop to check closed flag periodically
+        socket.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
         let local_addr = UdpAddr::new(socket.local_addr()?);
 
         Ok(Self {

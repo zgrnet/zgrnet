@@ -6,14 +6,14 @@
 //! Or with Bazel:
 //!   bazel run //rust:host_test_example -- --name rust
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use noise::keypair::{Key, KeyPair};
-use noise::host::{Host, HostConfig, Message};
+use noise::host::{Host, HostConfig};
 use noise::message::protocol;
 use noise::udp_listener::UdpListener;
 use noise::udp::UdpAddr;
@@ -70,6 +70,9 @@ fn main() {
     let key_pair = KeyPair::from_private(Key::from(priv_key));
 
     println!("[{}] Public key: {}", name, hex::encode(key_pair.public.as_bytes()));
+
+    // Pre-calculate peer name map for efficient lookups
+    let peer_names = build_peer_name_map(&config);
 
     // Create UDP transport
     let bind_addr = format!("0.0.0.0:{}", my_host.port);
@@ -142,7 +145,9 @@ fn main() {
     loop {
         match host.recv_timeout(Duration::from_secs(1)) {
             Ok(msg) => {
-                let from_name = find_peer_name(&config, &msg.from);
+                let from_name = peer_names.get(&msg.from)
+                    .cloned()
+                    .unwrap_or_else(|| hex::encode(&msg.from.as_bytes()[..4]) + "...");
                 let data = String::from_utf8_lossy(&msg.data);
                 println!("[{}] Received from {}: protocol={}, data={:?}",
                          name, from_name, msg.protocol, data);
@@ -167,18 +172,18 @@ fn main() {
     }
 }
 
-fn find_peer_name(config: &Config, pubkey: &Key) -> String {
+/// Build a map of public keys to host names for efficient lookups.
+fn build_peer_name_map(config: &Config) -> HashMap<Key, String> {
+    let mut map = HashMap::new();
     for h in &config.hosts {
         if let Ok(priv_bytes) = hex::decode(&h.private_key) {
             if priv_bytes.len() == 32 {
                 let mut priv_key = [0u8; 32];
                 priv_key.copy_from_slice(&priv_bytes);
                 let kp = KeyPair::from_private(Key::from(priv_key));
-                if &kp.public == pubkey {
-                    return h.name.clone();
-                }
+                map.insert(kp.public, h.name.clone());
             }
         }
     }
-    hex::encode(&pubkey.as_bytes()[..4]) + "..."
+    map
 }

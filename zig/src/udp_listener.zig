@@ -31,6 +31,13 @@ pub const UdpListener = struct {
         const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
         errdefer posix.close(fd);
 
+        // Set read timeout to allow receive loop to check closed flag periodically
+        const tv = posix.timeval{
+            .sec = 0,
+            .usec = 500_000, // 500ms
+        };
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+
         // Bind
         try posix.bind(fd, &bind_addr.inner.any, bind_addr.inner.getOsSockLen());
 

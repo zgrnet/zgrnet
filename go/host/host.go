@@ -73,13 +73,12 @@ func NewHost(cfg HostConfig) (*Host, error) {
 		}
 	}
 
-	// Use provided transport or create one
+	// Use provided transport
+	// Note: We don't auto-create UDP transport here to avoid circular dependency
+	// between host and transport packages. Users should create transport explicitly:
+	//   udp, _ := transport.NewUDPListener(":51820")
+	//   host.NewHost(host.HostConfig{Transport: udp, ...})
 	transport := cfg.Transport
-	if transport == nil && cfg.ListenAddr != "" {
-		// For now, we don't have a real UDP listener transport
-		// This would be: transport, err = NewUDPListenerTransport(cfg.ListenAddr)
-		return nil, ErrNoTransport
-	}
 	if transport == nil {
 		return nil, ErrNoTransport
 	}
