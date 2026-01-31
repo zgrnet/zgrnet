@@ -47,6 +47,11 @@ func (s ConnState) String() string {
 // Conn represents a connection to a remote peer.
 // It manages the session and provides a simple API
 // for sending and receiving encrypted messages.
+//
+// The connection follows WireGuard's timer model:
+// - Tick() is called periodically to handle time-based actions
+// - Send() queues data if no session and triggers handshake
+// - Recv() processes incoming messages and updates state
 type Conn struct {
 	mu sync.RWMutex
 
@@ -56,17 +61,34 @@ type Conn struct {
 	transport  noise.Transport
 	remoteAddr noise.Addr
 
-	// State
+	// Connection state
 	state    ConnState
-	session  *noise.Session
-	hsState  *noise.HandshakeState
 	localIdx uint32
 
+	// Session management (WireGuard-style rotation)
+	// current: active session for sending
+	// previous: previous session (for receiving delayed packets)
+	current  *noise.Session
+	previous *noise.Session
+
+	// Handshake state
+	hsState             *noise.HandshakeState
+	handshakeStarted    time.Time // When current handshake attempt started
+	handshakeAttemptStart time.Time // When we first started trying to handshake (for 90s timeout)
+	lastHandshakeSent   time.Time // When we last sent a handshake message
+	isInitiator         bool      // Whether we initiated the current/pending session
+
 	// Timestamps
-	createdAt        time.Time
-	handshakeStarted time.Time
-	lastSent         time.Time
-	lastReceived     time.Time
+	createdAt      time.Time
+	sessionCreated time.Time // When current session was established
+	lastSent       time.Time
+	lastReceived   time.Time
+
+	// Pending packets waiting for session establishment
+	pendingPackets [][]byte
+
+	// Rekey state
+	rekeyTriggered bool // Whether we've already triggered rekey for current session age
 
 	// Inbound channel for listener-managed connections
 	// When set, Recv() reads from this channel instead of the transport
@@ -96,15 +118,16 @@ func newConn(localKey *noise.KeyPair, transport noise.Transport, remoteAddr nois
 
 	now := time.Now()
 	return &Conn{
-		localKey:     localKey,
-		remotePK:     remotePK,
-		transport:    transport,
-		remoteAddr:   remoteAddr,
-		state:        ConnStateNew,
-		localIdx:     localIdx,
-		createdAt:    now,
-		lastSent:     now,
-		lastReceived: now,
+		localKey:       localKey,
+		remotePK:       remotePK,
+		transport:      transport,
+		remoteAddr:     remoteAddr,
+		state:          ConnStateNew,
+		localIdx:       localIdx,
+		createdAt:      now,
+		lastSent:       now,
+		lastReceived:   now,
+		pendingPackets: make([][]byte, 0),
 	}, nil
 }
 
@@ -169,9 +192,9 @@ func (c *Conn) accept(msg *noise.HandshakeInitMessage) ([]byte, error) {
 // If remotePK is not nil, it will be set atomically with the state transition.
 func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *noise.PublicKey) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	if c.hsState == nil || !c.hsState.IsFinished() {
+		c.mu.Unlock()
 		return ErrHandshakeIncomplete
 	}
 
@@ -179,6 +202,7 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *noise.PublicKey) er
 	sendCS, recvCS, err := c.hsState.Split()
 	if err != nil {
 		c.resetHandshakeStateLocked()
+		c.mu.Unlock()
 		return err
 	}
 
@@ -197,15 +221,36 @@ func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *noise.PublicKey) er
 	})
 	if err != nil {
 		c.resetHandshakeStateLocked()
+		c.mu.Unlock()
 		return err
 	}
 
 	now := time.Now()
-	c.session = session
+
+	// Rotate sessions: current -> previous
+	if c.current != nil {
+		c.previous = c.current
+	}
+
+	c.current = session
+	c.sessionCreated = now
 	c.hsState = nil // Clear handshake state
+	c.handshakeStarted = time.Time{}
+	c.handshakeAttemptStart = time.Time{}
+	c.lastHandshakeSent = time.Time{}
 	c.state = ConnStateEstablished
 	c.lastSent = now
 	c.lastReceived = now
+	c.rekeyTriggered = false // Reset rekey trigger for new session
+
+	// Get pending packets count before unlocking
+	hasPending := len(c.pendingPackets) > 0
+	c.mu.Unlock()
+
+	// Flush pending packets (outside the lock)
+	if hasPending {
+		c.flushPendingPackets()
+	}
 
 	return nil
 }
@@ -227,27 +272,68 @@ func (c *Conn) failHandshake(err error) error {
 
 // Send sends an encrypted message to the remote peer.
 // The protocol byte indicates the type of payload.
+//
+// If the connection is not established, the packet is queued and
+// a handshake will be triggered (if not already in progress).
+//
+// If the session is too old, the packet is sent but a rekey is
+// also triggered in the background.
 func (c *Conn) Send(protocol byte, payload []byte) error {
 	plaintext := noise.EncodePayload(protocol, payload)
-	return c.sendPayload(plaintext)
+	return c.sendPayload(plaintext, false)
 }
 
 // SendKeepalive sends an empty keepalive message to maintain the connection.
+// Keepalive messages are only sent if the connection is established;
+// they are not queued.
 func (c *Conn) SendKeepalive() error {
-	return c.sendPayload(nil)
+	return c.sendPayload(nil, true)
 }
 
 // sendPayload encrypts and sends a payload to the remote peer.
 // This is the common implementation for Send and SendKeepalive.
-func (c *Conn) sendPayload(plaintext []byte) error {
-	c.mu.RLock()
-	if c.state != ConnStateEstablished {
-		c.mu.RUnlock()
-		return ErrNotEstablished
+// If isKeepalive is true, the message is not queued if no session is available.
+func (c *Conn) sendPayload(plaintext []byte, isKeepalive bool) error {
+	c.mu.Lock()
+
+	// Check connection state
+	if c.state == ConnStateClosed {
+		c.mu.Unlock()
+		return ErrConnClosed
 	}
-	session := c.session
+
+	// If no valid session, queue the packet (unless it's a keepalive)
+	if c.current == nil || c.state != ConnStateEstablished {
+		if isKeepalive {
+			c.mu.Unlock()
+			return ErrNotEstablished
+		}
+
+		// Queue the packet
+		if plaintext != nil {
+			pktCopy := make([]byte, len(plaintext))
+			copy(pktCopy, plaintext)
+			c.pendingPackets = append(c.pendingPackets, pktCopy)
+		}
+
+		// Trigger handshake if not already in progress
+		needHandshake := c.hsState == nil && c.state == ConnStateNew
+		c.mu.Unlock()
+
+		if needHandshake {
+			// This will be handled by the external dialer or listener
+			// For now, return an error indicating the packet is queued
+			return ErrNotEstablished
+		}
+		return nil
+	}
+
+	session := c.current
+	sessionCreated := c.sessionCreated
 	remoteAddr := c.remoteAddr
-	c.mu.RUnlock()
+	isInitiator := c.isInitiator
+	rekeyTriggered := c.rekeyTriggered
+	c.mu.Unlock()
 
 	// Encrypt
 	ciphertext, counter, err := session.Encrypt(plaintext)
@@ -264,27 +350,81 @@ func (c *Conn) sendPayload(plaintext []byte) error {
 	}
 
 	// Update last sent time
+	now := time.Now()
 	c.mu.Lock()
-	c.lastSent = time.Now()
+	c.lastSent = now
 	c.mu.Unlock()
 
+	// Check if rekey is needed (initiator only, session too old or message count)
+	// Only trigger once per session
+	if isInitiator && !rekeyTriggered {
+		needRekey := false
+
+		// Check time-based rekey
+		if !sessionCreated.IsZero() && now.Sub(sessionCreated) > RekeyAfterTime {
+			needRekey = true
+		}
+
+		// Check message-count-based rekey
+		if counter >= RekeyAfterMessages {
+			needRekey = true
+		}
+
+		if needRekey {
+			// Trigger rekey in background (non-blocking)
+			go func() {
+				_ = c.initiateRekey()
+			}()
+		}
+	}
+
 	return nil
+}
+
+// flushPendingPackets sends all queued packets after session establishment.
+// This should be called after a successful handshake completion.
+func (c *Conn) flushPendingPackets() {
+	c.mu.Lock()
+	packets := c.pendingPackets
+	c.pendingPackets = nil
+	c.mu.Unlock()
+
+	for _, pkt := range packets {
+		_ = c.sendPayload(pkt, false)
+	}
 }
 
 // Recv receives and decrypts a message from the remote peer.
 // Returns the protocol byte and decrypted payload.
 // This is a blocking call.
+//
+// Recv handles multiple message types:
+//   - Transport messages: decrypted and returned
+//   - Handshake responses: processed to complete rekey (returns empty payload)
+//
+// When receiving data on an old session (initiator only), Recv may
+// trigger a rekey in the background.
 func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 	c.mu.RLock()
-	if c.state != ConnStateEstablished {
-		c.mu.RUnlock()
-		return 0, nil, ErrNotEstablished
-	}
-	session := c.session
+	state := c.state
 	inbound := c.inbound
+	current := c.current
+	hsState := c.hsState
 	c.mu.RUnlock()
 
-	var msg *noise.TransportMessage
+	// Check basic state
+	if state == ConnStateClosed {
+		return 0, nil, ErrConnClosed
+	}
+
+	// For new connections with no session and no pending handshake, return early
+	// This prevents blocking on RecvFrom when there's nothing to receive
+	if state == ConnStateNew && current == nil && hsState == nil {
+		return 0, nil, ErrNotEstablished
+	}
+
+	var data []byte
+	var fromAddr noise.Addr
 
 	if inbound != nil {
 		// Listener-managed connection: read pre-parsed message from inbound channel
@@ -292,34 +432,83 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 		if !ok {
 			return 0, nil, ErrConnClosed
 		}
-		msg = pkt.msg
-	} else {
-		// Direct connection: read from transport using pooled buffer
-		bufPtr := recvBufferPool.Get().(*[]byte)
-		defer recvBufferPool.Put(bufPtr)
-		buf := *bufPtr
-
-		n, _, err := c.transport.RecvFrom(buf)
-		if err != nil {
-			return 0, nil, err
-		}
-
-		// Parse transport message
-		parsed, err := noise.ParseTransportMessage(buf[:n])
-		if err != nil {
-			return 0, nil, err
-		}
-
-		// Copy ciphertext before buffer is reused (buffer returned to pool on function exit)
-		// Modify parsed in-place to avoid allocating a new TransportMessage struct
-		cipherCopy := make([]byte, len(parsed.Ciphertext))
-		copy(cipherCopy, parsed.Ciphertext)
-		parsed.Ciphertext = cipherCopy
-		msg = parsed
+		// For listener-managed connections, we receive pre-parsed transport messages
+		return c.handleTransportMessage(pkt.msg)
 	}
 
-	// Verify receiver index
-	if msg.ReceiverIndex != session.LocalIndex() {
+	// Direct connection: read from transport using pooled buffer
+	bufPtr := recvBufferPool.Get().(*[]byte)
+	defer recvBufferPool.Put(bufPtr)
+	buf := *bufPtr
+
+	n, addr, err := c.transport.RecvFrom(buf)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	data = buf[:n]
+	fromAddr = addr
+
+	// Get message type
+	msgType, err := noise.GetMessageType(data)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	switch msgType {
+	case noise.MessageTypeTransport:
+		msg, err := noise.ParseTransportMessage(data)
+		if err != nil {
+			return 0, nil, err
+		}
+		// Copy ciphertext before buffer is reused
+		cipherCopy := make([]byte, len(msg.Ciphertext))
+		copy(cipherCopy, msg.Ciphertext)
+		msg.Ciphertext = cipherCopy
+		return c.handleTransportMessage(msg)
+
+	case noise.MessageTypeHandshakeResp:
+		resp, err := noise.ParseHandshakeResp(data)
+		if err != nil {
+			return 0, nil, err
+		}
+		return c.handleHandshakeResponse(resp, fromAddr)
+
+	case noise.MessageTypeHandshakeInit:
+		// For direct connections acting as responder during rekey
+		// This is unusual for Dial'd connections but possible
+		init, err := noise.ParseHandshakeInit(data)
+		if err != nil {
+			return 0, nil, err
+		}
+		return c.handleHandshakeInit(init, fromAddr)
+
+	default:
+		return 0, nil, noise.ErrInvalidMessageType
+	}
+}
+
+// handleTransportMessage processes an incoming transport message.
+func (c *Conn) handleTransportMessage(msg *noise.TransportMessage) (byte, []byte, error) {
+	c.mu.RLock()
+	current := c.current
+	previous := c.previous
+	sessionCreated := c.sessionCreated
+	isInitiator := c.isInitiator
+	rekeyTriggered := c.rekeyTriggered
+	c.mu.RUnlock()
+
+	if current == nil {
+		return 0, nil, ErrNotEstablished
+	}
+
+	// Try to find the right session based on receiver index
+	var session *noise.Session
+	if msg.ReceiverIndex == current.LocalIndex() {
+		session = current
+	} else if previous != nil && msg.ReceiverIndex == previous.LocalIndex() {
+		session = previous
+	} else {
 		return 0, nil, ErrInvalidReceiverIndex
 	}
 
@@ -330,9 +519,20 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 	}
 
 	// Update last received time
+	now := time.Now()
 	c.mu.Lock()
-	c.lastReceived = time.Now()
+	c.lastReceived = now
 	c.mu.Unlock()
+
+	// Check if we should trigger rekey on receive (initiator only)
+	// WireGuard: trigger at RekeyOnRecvThreshold (165s) if not already triggered
+	if isInitiator && !rekeyTriggered && !sessionCreated.IsZero() {
+		if now.Sub(sessionCreated) > RekeyOnRecvThreshold {
+			go func() {
+				_ = c.initiateRekey()
+			}()
+		}
+	}
 
 	// Handle keepalive (empty payload)
 	if len(plaintext) == 0 {
@@ -343,59 +543,381 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 	return noise.DecodePayload(plaintext)
 }
 
-// Tick checks the connection state and returns an action that should be taken.
+// handleHandshakeResponse processes an incoming handshake response.
+// This is called when we're the initiator and receive a response during rekey.
+func (c *Conn) handleHandshakeResponse(resp *noise.HandshakeRespMessage, fromAddr noise.Addr) (byte, []byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Verify we have a pending handshake and this is for us
+	if c.hsState == nil {
+		return 0, nil, ErrInvalidConnState
+	}
+
+	if resp.ReceiverIndex != c.localIdx {
+		return 0, nil, ErrInvalidReceiverIndex
+	}
+
+	// Reconstruct noise message: ephemeral(32) + encrypted_nothing(16) = 48 bytes
+	noiseMsg := make([]byte, noise.KeySize+16)
+	copy(noiseMsg[:noise.KeySize], resp.Ephemeral[:])
+	copy(noiseMsg[noise.KeySize:], resp.Empty)
+
+	// Read handshake response
+	if _, err := c.hsState.ReadMessage(noiseMsg); err != nil {
+		c.resetHandshakeStateLocked()
+		return 0, nil, err
+	}
+
+	// Get transport keys
+	sendCS, recvCS, err := c.hsState.Split()
+	if err != nil {
+		c.resetHandshakeStateLocked()
+		return 0, nil, err
+	}
+
+	// Create new session
+	session, err := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  c.localIdx,
+		RemoteIndex: resp.SenderIndex,
+		SendKey:     sendCS.Key(),
+		RecvKey:     recvCS.Key(),
+		RemotePK:    c.remotePK,
+	})
+	if err != nil {
+		c.resetHandshakeStateLocked()
+		return 0, nil, err
+	}
+
+	now := time.Now()
+
+	// Rotate sessions
+	if c.current != nil {
+		c.previous = c.current
+	}
+
+	c.current = session
+	c.sessionCreated = now
+	c.hsState = nil
+	c.handshakeStarted = time.Time{}
+	c.handshakeAttemptStart = time.Time{}
+	c.lastHandshakeSent = time.Time{}
+	c.state = ConnStateEstablished
+	c.lastReceived = now
+	c.rekeyTriggered = false
+	c.isInitiator = true
+
+	// Update remote address if it changed (NAT traversal)
+	if fromAddr != nil {
+		c.remoteAddr = fromAddr
+	}
+
+	// Return empty payload to indicate handshake completion
+	// Caller should continue receiving to get actual data
+	return 0, nil, nil
+}
+
+// handleHandshakeInit processes an incoming handshake initiation.
+// This is called when the peer initiates a rekey.
+func (c *Conn) handleHandshakeInit(init *noise.HandshakeInitMessage, fromAddr noise.Addr) (byte, []byte, error) {
+	c.mu.Lock()
+
+	// Create new handshake state as responder
+	hs, err := noise.NewHandshakeState(noise.Config{
+		Pattern:     noise.PatternIK,
+		Initiator:   false,
+		LocalStatic: c.localKey,
+	})
+	if err != nil {
+		c.mu.Unlock()
+		return 0, nil, err
+	}
+
+	// Reconstruct noise message: ephemeral(32) + static_enc(48) = 80 bytes
+	noiseMsg := make([]byte, noise.KeySize+48)
+	copy(noiseMsg[:noise.KeySize], init.Ephemeral[:])
+	copy(noiseMsg[noise.KeySize:], init.Static)
+
+	if _, err := hs.ReadMessage(noiseMsg); err != nil {
+		c.mu.Unlock()
+		return 0, nil, err
+	}
+
+	// Generate response
+	msg2, err := hs.WriteMessage(nil)
+	if err != nil {
+		c.mu.Unlock()
+		return 0, nil, err
+	}
+
+	// Generate new local index for the new session
+	newIdx, err := noise.GenerateIndex()
+	if err != nil {
+		c.mu.Unlock()
+		return 0, nil, err
+	}
+
+	// Build wire response
+	wireResp := noise.BuildHandshakeResp(newIdx, init.SenderIndex, hs.LocalEphemeral(), msg2[noise.KeySize:])
+
+	// Get transport keys
+	sendCS, recvCS, err := hs.Split()
+	if err != nil {
+		c.mu.Unlock()
+		return 0, nil, err
+	}
+
+	// Verify remote public key matches
+	remotePK := hs.RemoteStatic()
+	if c.remotePK != remotePK {
+		c.mu.Unlock()
+		return 0, nil, ErrInvalidRemotePK
+	}
+
+	// Create new session
+	session, err := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  newIdx,
+		RemoteIndex: init.SenderIndex,
+		SendKey:     sendCS.Key(),
+		RecvKey:     recvCS.Key(),
+		RemotePK:    c.remotePK,
+	})
+	if err != nil {
+		c.mu.Unlock()
+		return 0, nil, err
+	}
+
+	now := time.Now()
+
+	// Rotate sessions
+	if c.current != nil {
+		c.previous = c.current
+	}
+
+	c.current = session
+	c.localIdx = newIdx
+	c.sessionCreated = now
+	c.state = ConnStateEstablished
+	c.lastReceived = now
+	c.rekeyTriggered = false
+	c.isInitiator = false
+
+	// Update remote address if it changed
+	if fromAddr != nil {
+		c.remoteAddr = fromAddr
+	}
+
+	transport := c.transport
+	remoteAddr := c.remoteAddr
+	c.mu.Unlock()
+
+	// Send response
+	if err := transport.SendTo(wireResp, remoteAddr); err != nil {
+		return 0, nil, err
+	}
+
+	c.mu.Lock()
+	c.lastSent = time.Now()
+	c.mu.Unlock()
+
+	// Return empty payload to indicate handshake completion
+	return 0, nil, nil
+}
+
+// Tick performs periodic maintenance on the connection.
 // This method should be called periodically by the connection manager.
-// The returned TickAction indicates what the caller should do:
-//   - TickActionNone: no action needed
-//   - TickActionSendKeepalive: call SendKeepalive()
-//   - TickActionRekey: initiate a new handshake
 //
-// If the connection has timed out, Tick returns ErrConnTimeout.
-func (c *Conn) Tick(now time.Time) (TickAction, error) {
+// Tick directly executes time-based actions:
+//   - Sends keepalive if we haven't sent anything recently but have received data
+//   - Retransmits handshake initiation if waiting for response
+//   - Triggers rekey if session is too old (initiator only)
+//
+// Returns nil on success. Returns an error if:
+//   - ErrConnTimeout: connection timed out (no data received for RejectAfterTime)
+//   - ErrHandshakeTimeout: handshake attempt exceeded RekeyAttemptTime (90s)
+//   - ErrConnClosed: connection was closed
+func (c *Conn) Tick() error {
+	now := time.Now()
+
 	c.mu.RLock()
 	state := c.state
 	lastSent := c.lastSent
 	lastReceived := c.lastReceived
-	createdAt := c.createdAt
-	handshakeStarted := c.handshakeStarted
+	sessionCreated := c.sessionCreated
+	isInitiator := c.isInitiator
+	handshakeAttemptStart := c.handshakeAttemptStart
+	lastHandshakeSent := c.lastHandshakeSent
+	hsState := c.hsState
 	c.mu.RUnlock()
 
 	switch state {
 	case ConnStateNew:
 		// Nothing to do for new connections
-		return TickActionNone, nil
+		return nil
 
 	case ConnStateHandshaking:
-		// Check handshake timeout
-		if now.Sub(handshakeStarted) > HandshakeTimeout {
-			return TickActionNone, ErrHandshakeTimeout
+		// Check if handshake attempt has exceeded RekeyAttemptTime (90s)
+		if !handshakeAttemptStart.IsZero() && now.Sub(handshakeAttemptStart) > RekeyAttemptTime {
+			return ErrHandshakeTimeout
 		}
-		return TickActionNone, nil
+
+		// Check if we need to retransmit handshake (every RekeyTimeout = 5s)
+		if hsState != nil && !lastHandshakeSent.IsZero() && now.Sub(lastHandshakeSent) > RekeyTimeout {
+			// Retransmit handshake initiation
+			if err := c.retransmitHandshake(); err != nil {
+				return err
+			}
+		}
+		return nil
 
 	case ConnStateEstablished:
 		// Check if connection has timed out (no messages received)
 		if now.Sub(lastReceived) > RejectAfterTime {
-			return TickActionNone, ErrConnTimeout
+			return ErrConnTimeout
 		}
 
-		// Check if rekey is needed (session too old)
-		if now.Sub(createdAt) > RekeyAfterTime {
-			return TickActionRekey, nil
+		// Check if we're waiting for rekey response
+		if hsState != nil {
+			// Check if handshake attempt has exceeded RekeyAttemptTime (90s)
+			if !handshakeAttemptStart.IsZero() && now.Sub(handshakeAttemptStart) > RekeyAttemptTime {
+				return ErrHandshakeTimeout
+			}
+
+			// Check if we need to retransmit handshake (every RekeyTimeout = 5s)
+			if !lastHandshakeSent.IsZero() && now.Sub(lastHandshakeSent) > RekeyTimeout {
+				if err := c.retransmitHandshake(); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 
-		// Check if keepalive is needed (haven't sent anything recently)
-		if now.Sub(lastSent) > KeepaliveTimeout {
-			return TickActionSendKeepalive, nil
+		// Check if rekey is needed (session too old, initiator only)
+		// Only trigger once per session (rekeyTriggered is reset when new session is established)
+		c.mu.RLock()
+		rekeyTriggered := c.rekeyTriggered
+		c.mu.RUnlock()
+
+		if isInitiator && !rekeyTriggered && !sessionCreated.IsZero() && now.Sub(sessionCreated) > RekeyAfterTime {
+			if err := c.initiateRekey(); err != nil {
+				return err
+			}
+			return nil
 		}
 
-		return TickActionNone, nil
+		// Passive keepalive: send empty message if we haven't sent recently
+		// but have received data recently (peer is active)
+		sentDelta := now.Sub(lastSent)
+		recvDelta := now.Sub(lastReceived)
+		if sentDelta > KeepaliveTimeout && recvDelta < KeepaliveTimeout {
+			if err := c.SendKeepalive(); err != nil {
+				return err
+			}
+		}
+
+		return nil
 
 	case ConnStateClosed:
-		return TickActionNone, ErrConnClosed
+		return ErrConnClosed
 
 	default:
-		return TickActionNone, ErrInvalidConnState
+		return ErrInvalidConnState
 	}
+}
+
+// initiateRekey starts a new handshake to rekey the connection.
+// This is called when the current session is too old.
+func (c *Conn) initiateRekey() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Already have a pending handshake
+	if c.hsState != nil {
+		return nil
+	}
+
+	// Generate new local index for the new session
+	newIdx, err := noise.GenerateIndex()
+	if err != nil {
+		return err
+	}
+
+	// Create handshake state (IK pattern - initiator)
+	hs, err := noise.NewHandshakeState(noise.Config{
+		Pattern:      noise.PatternIK,
+		Initiator:    true,
+		LocalStatic:  c.localKey,
+		RemoteStatic: &c.remotePK,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Generate handshake initiation message
+	msg1, err := hs.WriteMessage(nil)
+	if err != nil {
+		return err
+	}
+
+	// Build wire message
+	wireMsg := noise.BuildHandshakeInit(newIdx, hs.LocalEphemeral(), msg1[noise.KeySize:])
+
+	// Send
+	if err := c.transport.SendTo(wireMsg, c.remoteAddr); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	c.hsState = hs
+	c.localIdx = newIdx
+	c.handshakeStarted = now
+	c.handshakeAttemptStart = now
+	c.lastHandshakeSent = now
+	c.isInitiator = true
+	c.rekeyTriggered = true
+
+	return nil
+}
+
+// retransmitHandshake resends the handshake initiation with a new ephemeral key.
+// According to WireGuard, each retransmit generates new ephemeral keys.
+func (c *Conn) retransmitHandshake() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.hsState == nil {
+		return nil
+	}
+
+	// Create a new handshake state with fresh ephemeral keys
+	hs, err := noise.NewHandshakeState(noise.Config{
+		Pattern:      noise.PatternIK,
+		Initiator:    true,
+		LocalStatic:  c.localKey,
+		RemoteStatic: &c.remotePK,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Generate handshake initiation message
+	msg1, err := hs.WriteMessage(nil)
+	if err != nil {
+		return err
+	}
+
+	// Build wire message with current local index
+	wireMsg := noise.BuildHandshakeInit(c.localIdx, hs.LocalEphemeral(), msg1[noise.KeySize:])
+
+	// Send
+	if err := c.transport.SendTo(wireMsg, c.remoteAddr); err != nil {
+		return err
+	}
+
+	c.hsState = hs
+	c.lastHandshakeSent = time.Now()
+
+	return nil
 }
 
 // Close closes the connection.
@@ -408,9 +930,17 @@ func (c *Conn) Close() error {
 	}
 
 	c.state = ConnStateClosed
-	if c.session != nil {
-		c.session.Expire()
+
+	// Expire all sessions
+	if c.current != nil {
+		c.current.Expire()
 	}
+	if c.previous != nil {
+		c.previous.Expire()
+	}
+
+	// Clear pending packets
+	c.pendingPackets = nil
 
 	return nil
 }
@@ -443,11 +973,11 @@ func (c *Conn) LocalIndex() uint32 {
 	return c.localIdx
 }
 
-// Session returns the underlying session (nil if not established).
+// Session returns the underlying current session (nil if not established).
 func (c *Conn) Session() *noise.Session {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.session
+	return c.current
 }
 
 // SetSession sets the session (for roaming/migration).
