@@ -103,6 +103,8 @@ const PeerStateInternal = struct {
     pk: Key,
     endpoint: ?posix.sockaddr,
     endpoint_len: posix.socklen_t,
+    endpoint_port: u16, // Cached port (network byte order converted)
+    endpoint_addr: u32, // Cached IPv4 addr (network byte order)
     session: ?Session,
     state: PeerState,
     rx_bytes: u64,
@@ -239,6 +241,16 @@ pub const UDP = struct {
             return;
         }
 
+        // Extract port and address from sockaddr (avoid alignment issues)
+        var ep_port: u16 = 0;
+        var ep_addr: u32 = 0;
+        if (addr_len >= @sizeOf(posix.sockaddr.in)) {
+            // Use byte-level access to avoid alignment issues
+            const bytes: [*]const u8 = @ptrCast(&addr);
+            ep_port = std.mem.bigToNative(u16, std.mem.readInt(u16, bytes[2..4], .big));
+            ep_addr = std.mem.readInt(u32, bytes[4..8], .big);
+        }
+
         self.peers_mutex.lock();
         defer self.peers_mutex.unlock();
 
@@ -247,12 +259,16 @@ pub const UDP = struct {
             defer peer.mutex.unlock();
             peer.endpoint = addr;
             peer.endpoint_len = addr_len;
+            peer.endpoint_port = ep_port;
+            peer.endpoint_addr = ep_addr;
         } else {
             const peer = self.allocator.create(PeerStateInternal) catch return;
             peer.* = .{
                 .pk = pk,
                 .endpoint = addr,
                 .endpoint_len = addr_len,
+                .endpoint_port = ep_port,
+                .endpoint_addr = ep_addr,
                 .session = null,
                 .state = .new,
                 .rx_bytes = 0,
@@ -320,21 +336,13 @@ pub const UDP = struct {
         peer.mutex.lock();
         defer peer.mutex.unlock();
 
-        var endpoint_port: u16 = 0;
-        var endpoint_addr: u32 = 0;
         const has_endpoint = peer.endpoint != null;
-        if (peer.endpoint) |ep| {
-            const addr_in: *const posix.sockaddr.in = @ptrCast(@alignCast(&ep));
-            endpoint_port = std.mem.bigToNative(u16, addr_in.port);
-            endpoint_addr = addr_in.addr;
-        }
-
         const last_seen_ns: i64 = if (peer.last_seen) |ls| @as(i64, @truncate(@mod(ls, std.math.maxInt(i64)))) else 0;
 
         return .{
             .public_key = peer.pk,
-            .endpoint_port = endpoint_port,
-            .endpoint_addr = endpoint_addr,
+            .endpoint_port = peer.endpoint_port,
+            .endpoint_addr = peer.endpoint_addr,
             .has_endpoint = has_endpoint,
             .state = peer.state,
             .rx_bytes = peer.rx_bytes,
@@ -357,22 +365,14 @@ pub const UDP = struct {
             peer.mutex.lock();
             defer peer.mutex.unlock();
 
-            var endpoint_port: u16 = 0;
-            var endpoint_addr: u32 = 0;
             const has_endpoint = peer.endpoint != null;
-            if (peer.endpoint) |ep| {
-                const addr_in: *const posix.sockaddr.in = @ptrCast(&ep);
-                endpoint_port = std.mem.bigToNative(u16, addr_in.port);
-                endpoint_addr = addr_in.addr;
-            }
-
             const last_seen_ns: i64 = if (peer.last_seen) |ls| @as(i64, @truncate(@mod(ls, std.math.maxInt(i64)))) else 0;
 
             try result.append(.{
                 .info = .{
                     .public_key = peer.pk,
-                    .endpoint_port = endpoint_port,
-                    .endpoint_addr = endpoint_addr,
+                    .endpoint_port = peer.endpoint_port,
+                    .endpoint_addr = peer.endpoint_addr,
                     .has_endpoint = has_endpoint,
                     .state = peer.state,
                     .rx_bytes = peer.rx_bytes,

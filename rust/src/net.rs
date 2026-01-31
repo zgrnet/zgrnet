@@ -134,6 +134,7 @@ struct PendingHandshake {
     hs_state: HandshakeState,
     local_idx: u32,
     done: std::sync::mpsc::Sender<Result<()>>,
+    #[allow(dead_code)] // TODO: implement timeout logic
     created_at: Instant,
 }
 
@@ -519,22 +520,19 @@ impl UDP {
         // Check if peer is known or if we allow unknown peers
         {
             let mut peers = self.peers.write().unwrap();
-            if !peers.contains_key(&remote_pk) {
+            if let std::collections::hash_map::Entry::Vacant(e) = peers.entry(remote_pk) {
                 if !self.allow_unknown {
                     return;
                 }
-                peers.insert(
-                    remote_pk,
-                    Arc::new(Mutex::new(PeerStateInternal {
-                        pk: remote_pk,
-                        endpoint: Some(from),
-                        session: None,
-                        state: PeerState::New,
-                        rx_bytes: 0,
-                        tx_bytes: 0,
-                        last_seen: None,
-                    })),
-                );
+                e.insert(Arc::new(Mutex::new(PeerStateInternal {
+                    pk: remote_pk,
+                    endpoint: Some(from),
+                    session: None,
+                    state: PeerState::New,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    last_seen: None,
+                })));
             }
         }
 
