@@ -263,11 +263,9 @@ pub const UDP = struct {
         if (addr_len >= @sizeOf(posix.sockaddr.in)) {
             // Use byte-level access to avoid alignment issues
             const bytes: [*]const u8 = @ptrCast(&addr);
-            // Read as big endian (network byte order) and convert to native
-            const port_be = std.mem.readInt(u16, bytes[2..4], .big);
-            const addr_be = std.mem.readInt(u32, bytes[4..8], .big);
-            ep_port = port_be; // Store in native order for display
-            ep_addr = addr_be; // Store in native order for comparison
+            // readInt with .big interprets bytes as big-endian and returns native order
+            ep_port = std.mem.readInt(u16, bytes[2..4], .big);
+            ep_addr = std.mem.readInt(u32, bytes[4..8], .big);
         }
 
         self.peers_mutex.lock();
