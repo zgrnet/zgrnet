@@ -124,7 +124,13 @@ pub const Transport = union(enum) {
         return switch (self) {
             .mock => |t| try t.recvFrom(buf),
             .udp => |t| {
-                const result = t.recvFrom(buf) catch return TransportError.IoError;
+                const result = t.recvFrom(buf) catch |err| {
+                    // Preserve WouldBlock for timeout handling in dial()
+                    if (err == error.WouldBlock) {
+                        return TransportError.WouldBlock;
+                    }
+                    return TransportError.IoError;
+                };
                 return RecvResult{
                     .bytes_read = result.bytes_read,
                     .from_addr = Addr{ .udp = result.from },
