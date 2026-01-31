@@ -1,12 +1,13 @@
-//! Noise Protocol implementation for zgrnet.
+//! zgrnet - Noise Protocol based networking library.
 //!
-//! This crate provides a pure Noise Protocol Framework implementation
-//! supporting IK, XX, and NN handshake patterns.
+//! This crate provides:
+//! - `noise`: Pure Noise Protocol Framework implementation
+//! - `net`: Network layer with WireGuard-style connection management
 //!
 //! # Example
 //!
-//! ```rust
-//! use noise::{KeyPair, HandshakeState, Config, Pattern};
+//! ```rust,ignore
+//! use zgrnet::noise::{KeyPair, HandshakeState, Config, Pattern};
 //!
 //! // Generate key pairs
 //! let initiator_static = KeyPair::generate();
@@ -22,44 +23,47 @@
 //! }).unwrap();
 //! ```
 
-mod keypair;
-pub mod cipher;
-mod state;
-mod handshake;
-mod replay;
-mod session;
-mod manager;
-pub mod message;
-pub mod transport;
-pub mod conn;
-pub mod udp;
+pub mod noise;
+pub mod net;
 pub mod kcp;
 pub mod stream;
-pub mod net;
 
-pub use keypair::{Key, KeyPair};
-pub use cipher::{Hash, HASH_SIZE, TAG_SIZE};
-pub use state::{CipherState, SymmetricState};
-pub use handshake::{HandshakeState, Config, Pattern, Error};
-pub use replay::ReplayFilter;
-pub use session::{Session, SessionConfig, SessionState, SessionError, generate_index};
-pub use manager::{SessionManager, ManagerError};
-
-// Conn layer exports
-pub use message::{
+// Re-export commonly used types at crate root for convenience
+pub use noise::{
+    // Core types
+    Key, KeyPair, KEY_SIZE,
+    Hash, HASH_SIZE, TAG_SIZE,
+    CipherState, SymmetricState,
+    HandshakeState, Config, Pattern, Error,
+    ReplayFilter,
+    Session, SessionConfig, SessionState, SessionError, generate_index,
+    // Message types
     HandshakeInit, HandshakeResp, TransportMessage, MessageError,
     parse_handshake_init, parse_handshake_resp, parse_transport_message,
     build_handshake_init, build_handshake_resp, build_transport_message,
-    encode_payload, decode_payload,
+    encode_payload, decode_payload, MAX_PACKET_SIZE,
+    // Transport types
+    Addr, Transport, TransportError, MockAddr, MockTransport,
 };
-pub use transport::{Addr, Transport, TransportError, MockAddr, MockTransport};
-pub use conn::{Conn, ConnConfig, ConnState, ConnError};
+
+pub use net::{
+    // Connection management
+    Conn, ConnConfig, ConnState, ConnError,
+    Listener, ListenerConfig, ListenerError,
+    dial, DialOptions,
+    SessionManager, ManagerError,
+    // Timer constants
+    KEEPALIVE_TIMEOUT, REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME,
+    REKEY_ON_RECV_THRESHOLD, REKEY_TIMEOUT, REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME,
+    SESSION_CLEANUP_TIME,
+    // Transport
+    UdpTransport,
+    // High-level UDP API
+    UDP, UdpOptions, UdpError, HostInfo, PeerInfo, Peer, PeerState,
+};
 
 // KCP multiplexing
 pub use kcp::{Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 // Stream multiplexing
 pub use stream::{Stream, StreamState, StreamError, Mux, MuxConfig, MuxError};
-
-// Net layer exports
-pub use net::{UDP, UdpOptions, UdpError, HostInfo, PeerInfo, Peer, PeerState};

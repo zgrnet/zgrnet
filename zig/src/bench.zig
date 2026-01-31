@@ -7,23 +7,22 @@ const time = std.time;
 const Thread = std.Thread;
 const net = std.net;
 const posix = std.posix;
-const noise = @import("noise.zig");
+const root = @import("noise.zig");
+const noise = root.noise;
+const net_mod = root.net;
 const keypair = noise.keypair;
 const cipher = noise.cipher;
 const crypto = noise.crypto;
 const state = noise.state;
 const handshake = noise.handshake;
-const session_mod = @import("session.zig");
-const manager_mod = @import("manager.zig");
-const Session = session_mod.Session;
-const SessionManager = manager_mod.SessionManager;
-const udp_mod = @import("udp.zig");
-const Udp = udp_mod.Udp;
+const session_mod = noise.session;
+const Session = noise.Session;
+const SessionManager = net_mod.SessionManager;
 
-/// Helper for UDP benchmark setup - creates a server socket and client transport
+/// Helper for UDP benchmark setup - creates connected server and client sockets
 const UdpBenchSetup = struct {
     server_fd: posix.fd_t,
-    client: Udp,
+    client_fd: posix.fd_t,
 
     pub fn init() !UdpBenchSetup {
         // Create server socket
@@ -38,23 +37,30 @@ const UdpBenchSetup = struct {
         var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr);
         try posix.getsockname(server_fd, &bound_addr.any, &bound_len);
 
-        const server_port = bound_addr.getPort();
+        // Create client socket
+        const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+        errdefer posix.close(client_fd);
 
-        // Create client using Udp transport
-        var addr_buf: [32]u8 = undefined;
-        const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{server_port});
+        // Bind client to any port
+        const client_addr = net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+        try posix.bind(client_fd, &client_addr.any, client_addr.getOsSockLen());
 
-        const client = try Udp.init("127.0.0.1:0", addr_str);
+        // Connect client to server
+        try posix.connect(client_fd, &bound_addr.any, bound_addr.getOsSockLen());
 
         return .{
             .server_fd = server_fd,
-            .client = client,
+            .client_fd = client_fd,
         };
     }
 
     pub fn deinit(self: *UdpBenchSetup) void {
         posix.close(self.server_fd);
-        self.client.close();
+        posix.close(self.client_fd);
+    }
+
+    pub fn send(self: UdpBenchSetup, data: []const u8) !usize {
+        return posix.send(self.client_fd, data, 0);
     }
 };
 
@@ -560,7 +566,7 @@ pub fn main() !void {
 
         const start = time.nanoTimestamp();
         for (0..iterations) |_| {
-            _ = setup.client.send(&data) catch break;
+            _ = setup.send(&data) catch break;
         }
         const end = time.nanoTimestamp();
 
@@ -618,8 +624,8 @@ pub fn main() !void {
             std.mem.writeInt(u32, send_buf[1..5], 2, .little);
             std.mem.writeInt(u64, send_buf[5..13], nonce, .little);
 
-            // Send using Udp transport
-            _ = setup.client.send(send_buf[0 .. 13 + plaintext.len + 16]) catch break;
+            // Send using connected UDP socket
+            _ = setup.send(send_buf[0 .. 13 + plaintext.len + 16]) catch break;
         }
         const end = time.nanoTimestamp();
 

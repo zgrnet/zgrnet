@@ -437,3 +437,8 @@ func (hs *HandshakeState) LocalEphemeral() Key {
 func (hs *HandshakeState) Hash() [HashSize]byte {
 	return hs.ss.Hash()
 }
+
+// ChainingKey returns the current chaining key (for debugging).
+func (hs *HandshakeState) ChainingKey() Key {
+	return hs.ss.ChainingKey()
+}

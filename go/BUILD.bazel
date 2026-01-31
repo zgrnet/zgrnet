@@ -19,3 +19,5 @@ go_test(
     srcs = glob(["noise/*_test.go"]),
     embed = [":noise"],
 )
+
+# Net layer is built from go/net/BUILD.bazel

@@ -55,10 +55,10 @@ pub fn build(b: *std.Build) void {
     // Helper to add ARM64 ASM files
     const addArm64AsmFiles = struct {
         fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
-            compile.addAssemblyFile(builder.path("src/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"));
+            compile.addAssemblyFile(builder.path("src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"));
             compile.addCSourceFile(.{
-                .file = builder.path("src/chacha20_poly1305/aarch64/chacha20_poly1305_wrapper.c"),
-                .flags = &.{ "-O3", "-I", "src/chacha20_poly1305/aarch64" },
+                .file = builder.path("src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_wrapper.c"),
+                .flags = &.{ "-O3", "-I", "src/noise/chacha20_poly1305/aarch64" },
             });
         }
     }.add;
@@ -67,9 +67,9 @@ pub fn build(b: *std.Build) void {
     const addX86AsmFiles = struct {
         fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
             compile.linkLibC();
-            compile.addAssemblyFile(builder.path("src/chacha20_poly1305/x86_64/chacha20_poly1305_x86_64.S"));
+            compile.addAssemblyFile(builder.path("src/noise/chacha20_poly1305/x86_64/chacha20_poly1305_x86_64.S"));
             compile.addCSourceFile(.{
-                .file = builder.path("src/chacha20_poly1305/x86_64/chacha20_poly1305_wrapper.c"),
+                .file = builder.path("src/noise/chacha20_poly1305/x86_64/chacha20_poly1305_wrapper.c"),
                 .flags = &.{ "-O3", "-mavx2", "-mbmi2" },
             });
         }
@@ -148,4 +148,28 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    // Host test example (for cross-language testing)
+    const host_test_module = b.createModule(.{
+        .root_source_file = b.path("examples/host_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    host_test_module.addOptions("build_options", options);
+    host_test_module.addImport("noise", lib_module);
+
+    // Link against the library to avoid duplicate symbols
+    const host_test_exe = b.addExecutable(.{
+        .name = "host_test",
+        .root_module = host_test_module,
+    });
+    host_test_exe.linkLibrary(lib);
+    b.installArtifact(host_test_exe);
+
+    const run_host_test = b.addRunArtifact(host_test_exe);
+    if (b.args) |args| {
+        run_host_test.addArgs(args);
+    }
+    const host_test_step = b.step("host_test", "Run host test example");
+    host_test_step.dependOn(&run_host_test.step);
 }
