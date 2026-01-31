@@ -46,6 +46,6 @@ const (
 
 	// RejectAfterMessages is the maximum number of messages that can be sent
 	// or received on a single session before it must be rekeyed.
-	// WireGuard: 2^64 - 2^13 - 1 (but we use a simpler approximation)
+	// WireGuard: 2^64 - 2^13 - 1. This equals (2^64 - 1) - 2^13.
 	RejectAfterMessages = ^uint64(0) - (1 << 13)
 )
