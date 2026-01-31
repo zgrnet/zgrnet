@@ -424,9 +424,8 @@ impl UDP {
         .map_err(|_| UdpError::HandshakeFailed)?;
 
         // Write handshake initiation
-        let mut msg_buf = [0u8; 256];
         let msg1 = hs
-            .write_message(&[], &mut msg_buf)
+            .write_message(&[])
             .map_err(|_| UdpError::HandshakeFailed)?;
 
         // Build wire message
@@ -546,8 +545,7 @@ impl UDP {
         let local_idx = generate_index();
 
         // Write response message
-        let mut resp_buf = [0u8; 256];
-        let resp_payload = match hs.write_message(&[], &mut resp_buf) {
+        let resp_payload = match hs.write_message(&[]) {
             Ok(p) => p,
             Err(_) => return,
         };

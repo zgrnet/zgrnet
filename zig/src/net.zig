@@ -291,7 +291,7 @@ pub const UDP = struct {
     }
 
     /// Returns information about the local host.
-    pub fn hostInfo(self: *UDP, out: *HostInfo) void {
+    pub noinline fn hostInfo(self: *UDP, out: *HostInfo) void {
         self.peers_mutex.lock();
         const peer_count = self.peers_map.count();
         self.peers_mutex.unlock();
