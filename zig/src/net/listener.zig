@@ -413,6 +413,8 @@ test "listener accept connection" {
     const server_key = KeyPair.generate();
     var server_transport = try UdpTransport.init("127.0.0.1:0");
     defer server_transport.close();
+    // Set recv timeout to prevent infinite blocking
+    try server_transport.setRecvTimeout(5000); // 5 second timeout
     const server_addr = server_transport.getLocalAddr();
 
     const listener = try Listener.init(allocator, .{
