@@ -1053,10 +1053,10 @@ func (c *Conn) Session() *noise.Session {
 
 // SetSession sets the session (for roaming/migration).
 // This also updates the state to Established.
-func (c *Conn) SetSession(s *Session) {
+func (c *Conn) SetSession(s *noise.Session) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.session = s
+	c.current = s
 	if s != nil {
 		c.state = ConnStateEstablished
 		c.localIdx = s.LocalIndex()

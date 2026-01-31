@@ -36,19 +36,22 @@ go_test(
     deps = [":noise"],
 )
 
-# Transport layer implementations
+# Net layer - UDP-based network with peer management
 go_library(
-    name = "transport",
-    srcs = glob(["transport/*.go"], exclude = ["transport/*_test.go"]),
-    importpath = "github.com/vibing/zgrnet/transport",
+    name = "net",
+    srcs = glob(["net/*.go"], exclude = ["net/*_test.go"]),
+    importpath = "github.com/vibing/zgrnet/net",
     visibility = ["//visibility:public"],
-    deps = [":noise"],
+    deps = [
+        ":conn",
+        ":noise",
+    ],
 )
 
 go_test(
-    name = "transport_test",
-    srcs = glob(["transport/*_test.go"]),
-    embed = [":transport"],
+    name = "net_test",
+    srcs = glob(["net/*_test.go"]),
+    embed = [":net"],
     deps = [
         ":conn",
         ":noise",

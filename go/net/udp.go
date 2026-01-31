@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/vibing/zgrnet/conn"
 	"github.com/vibing/zgrnet/noise"
 )
 
@@ -64,7 +65,7 @@ type PeerInfo struct {
 // Peer represents a complete peer with info and connection.
 type Peer struct {
 	Info *PeerInfo
-	Conn *noise.Conn
+	Conn *conn.Conn
 }
 
 // Errors
@@ -332,10 +333,10 @@ func (u *UDP) Peers() iter.Seq[*Peer] {
 	}
 }
 
-// Conn returns the noise.Conn for a peer.
+// Conn returns the conn.Conn for a peer.
 // Currently returns nil as Conn is not used without rekey logic.
-func (u *UDP) Conn(pk noise.PublicKey) *noise.Conn {
-	// In this simplified implementation, we don't use noise.Conn
+func (u *UDP) Conn(pk noise.PublicKey) *conn.Conn {
+	// In this simplified implementation, we don't use conn.Conn
 	// The session management is done directly in UDP
 	return nil
 }
