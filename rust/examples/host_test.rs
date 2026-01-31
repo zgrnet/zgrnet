@@ -1,4 +1,4 @@
-//! Cross-language Host communication demo.
+//! Cross-language UDP communication demo.
 //!
 //! Usage:
 //!   cargo run --example host_test -- --name rust
@@ -9,14 +9,13 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use noise::{Key, KeyPair};
-use noise::{Host, HostConfig};
-use noise::message::protocol;
-use noise::UdpListener;
-use noise::udp::UdpAddr;
+use noise::{UDP, UdpOptions};
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -74,20 +73,15 @@ fn main() {
     // Pre-calculate peer name map for efficient lookups
     let peer_names = build_peer_name_map(&config);
 
-    // Create UDP transport
+    // Create UDP
     let bind_addr = format!("0.0.0.0:{}", my_host.port);
-    let transport = UdpListener::bind(&bind_addr)
-        .unwrap_or_else(|e| panic!("Failed to bind: {}", e));
+    let udp = Arc::new(UDP::new(
+        key_pair.clone(),
+        UdpOptions::new().bind_addr(&bind_addr).allow_unknown(true),
+    ).unwrap_or_else(|e| panic!("Failed to create UDP: {}", e)));
 
-    println!("[{}] Listening on port {}", name, transport.port());
-
-    // Create Host
-    let mut host = Host::new(HostConfig {
-        private_key: Some(key_pair.clone()),
-        transport,
-        mtu: Some(1280),
-        allow_unknown_peers: true,
-    }).unwrap();
+    let info = udp.host_info();
+    println!("[{}] Listening on {}", name, info.addr);
 
     // Add other hosts as peers
     for h in &config.hosts {
@@ -100,14 +94,49 @@ fn main() {
         peer_priv.copy_from_slice(&peer_priv_bytes);
         let peer_kp = KeyPair::from_private(Key::from(peer_priv));
 
-        let addr = UdpAddr::parse(&format!("127.0.0.1:{}", h.port)).unwrap();
-        host.add_peer(peer_kp.public, Some(Box::new(addr))).unwrap();
+        let endpoint: SocketAddr = format!("127.0.0.1:{}", h.port).parse().unwrap();
+        udp.set_peer_endpoint(peer_kp.public, endpoint);
         println!("[{}] Added peer {} at port {}", name, h.name, h.port);
     }
 
     // Wait for other hosts to start
     println!("[{}] Waiting 2 seconds for other hosts...", name);
     thread::sleep(Duration::from_secs(2));
+
+    // Start receive loop in background
+    let udp_recv = Arc::clone(&udp);
+    let recv_name = name.to_string();
+    let peer_names_clone = peer_names.clone();
+    let recv_handle = thread::spawn(move || {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            if udp_recv.is_closed() {
+                break;
+            }
+            match udp_recv.read_from(&mut buf) {
+                Ok((from_pk, n)) => {
+                    let from_name = peer_names_clone.get(&from_pk)
+                        .cloned()
+                        .unwrap_or_else(|| hex::encode(&from_pk.as_bytes()[..4]) + "...");
+                    let data = String::from_utf8_lossy(&buf[..n]);
+                    println!("[{}] Received from {}: {:?}", recv_name, from_name, data);
+
+                    // Echo back if not already an ACK
+                    if !data.starts_with("ACK") {
+                        let reply = format!("ACK from {}: {}", recv_name, data);
+                        let _ = udp_recv.write_to(&from_pk, reply.as_bytes());
+                    }
+                }
+                Err(noise::UdpError::Closed) => {
+                    println!("[{}] UDP closed", recv_name);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout or other error, continue
+                }
+            }
+        }
+    });
 
     // Connect to and message other hosts
     for h in &config.hosts {
@@ -121,13 +150,13 @@ fn main() {
         let peer_kp = KeyPair::from_private(Key::from(peer_priv));
 
         println!("[{}] Connecting to {}...", name, h.name);
-        match host.connect(&peer_kp.public) {
+        match udp.connect(&peer_kp.public) {
             Ok(()) => {
                 println!("[{}] Connected to {}!", name, h.name);
 
                 // Send test message
                 let msg = format!("Hello from {} to {}!", name, h.name);
-                if let Err(e) = host.send(&peer_kp.public, protocol::CHAT, msg.as_bytes()) {
+                if let Err(e) = udp.write_to(&peer_kp.public, msg.as_bytes()) {
                     println!("[{}] Failed to send to {}: {}", name, h.name, e);
                 } else {
                     println!("[{}] Sent message to {}", name, h.name);
@@ -141,35 +170,10 @@ fn main() {
 
     println!("[{}] Running... Press Ctrl+C to exit", name);
 
-    // Receive messages
-    loop {
-        match host.recv_timeout(Duration::from_secs(1)) {
-            Ok(msg) => {
-                let from_name = peer_names.get(&msg.from)
-                    .cloned()
-                    .unwrap_or_else(|| hex::encode(&msg.from.as_bytes()[..4]) + "...");
-                let data = String::from_utf8_lossy(&msg.data);
-                println!("[{}] Received from {}: protocol={}, data={:?}",
-                         name, from_name, msg.protocol, data);
-
-                // Echo back if not already an ACK
-                if !data.starts_with("ACK") {
-                    let reply = format!("ACK from {}: {}", name, data);
-                    let _ = host.send(&msg.from, msg.protocol, reply.as_bytes());
-                }
-            }
-            Err(noise::host::HostError::Timeout) => {
-                // Normal timeout, continue
-            }
-            Err(noise::host::HostError::Closed) => {
-                println!("[{}] Host closed", name);
-                break;
-            }
-            Err(e) => {
-                eprintln!("[{}] Recv error: {}", name, e);
-            }
-        }
-    }
+    // Wait a bit for messages then exit
+    thread::sleep(Duration::from_secs(5));
+    udp.close().unwrap();
+    let _ = recv_handle.join();
 }
 
 /// Build a map of public keys to host names for efficient lookups.

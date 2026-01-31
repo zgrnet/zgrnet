@@ -1,4 +1,4 @@
-//! Cross-language Host communication demo.
+//! Cross-language UDP communication demo.
 //!
 //! Usage:
 //!   zig build && ./zig-out/bin/host_test --name zig
@@ -7,17 +7,12 @@
 //!   cd zig && zig run examples/host_test.zig -- --name zig
 
 const std = @import("std");
+const posix = std.posix;
 const noise = @import("../src/noise.zig");
 
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
-const Host = noise.Host;
-const HostConfig = noise.HostConfig;
-const Transport = noise.Transport;
-const Addr = noise.Addr;
-const UdpListener = noise.UdpListener;
-const UdpAddr = noise.UdpAddr;
-const Protocol = noise.Protocol;
+const UDP = noise.UDP;
 
 const HostInfo = struct {
     name: []const u8,
@@ -86,23 +81,19 @@ pub fn main() !void {
         peer_keypairs[i] = KeyPair.fromPrivate(pk);
     }
 
-    // Create UDP transport
-    var bind_buf: [32]u8 = undefined;
-    const bind_addr = try std.fmt.bufPrint(&bind_buf, "0.0.0.0:{d}", .{info.port});
+    // Create UDP
+    const udp = UDP.init(allocator, key_pair, .{
+        .port = info.port,
+        .allow_unknown = true,
+    }) catch |err| {
+        std.debug.print("Failed to create UDP: {}\n", .{err});
+        return;
+    };
+    defer udp.deinit();
 
-    var udp = try UdpListener.bind(bind_addr);
-    defer udp.close();
-
-    std.debug.print("[{s}] Listening on port {d}\n", .{ host_name, udp.port() });
-
-    // Create Host
-    var host = try Host.init(allocator, .{
-        .private_key = key_pair,
-        .transport = udp.asTransport(),
-        .mtu = 1280,
-        .allow_unknown_peers = true,
-    });
-    defer host.deinit();
+    const host_info = udp.hostInfo();
+    _ = host_info;
+    std.debug.print("[{s}] Listening on port {d}\n", .{ host_name, info.port });
 
     // Add other hosts as peers
     for (hosts) |h| {
@@ -114,17 +105,61 @@ pub fn main() !void {
         _ = std.fmt.hexToBytes(&peer_priv, h.private_key) catch continue;
         const peer_kp = KeyPair.fromPrivate(peer_priv);
 
-        var addr_buf: [32]u8 = undefined;
-        const addr_str = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{h.port});
-        const endpoint = UdpAddr.parse(addr_str) catch continue;
+        var endpoint: posix.sockaddr.in = .{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, h.port),
+            .addr = 0x7F000001, // 127.0.0.1
+        };
 
-        host.addPeer(peer_kp.public, endpoint.toAddr()) catch continue;
+        udp.setPeerEndpoint(peer_kp.public, @ptrCast(&endpoint).*, @sizeOf(posix.sockaddr.in));
         std.debug.print("[{s}] Added peer {s} at port {d}\n", .{ host_name, h.name, h.port });
     }
 
     // Wait for other hosts to start
     std.debug.print("[{s}] Waiting 2 seconds for other hosts...\n", .{host_name});
     std.time.sleep(2 * std.time.ns_per_s);
+
+    // Start receive thread
+    const RecvContext = struct {
+        udp: *UDP,
+        host_name: []const u8,
+        peer_keypairs: *const [hosts.len]KeyPair,
+        running: *std.atomic.Value(bool),
+        allocator: std.mem.Allocator,
+    };
+
+    var running = std.atomic.Value(bool).init(true);
+    const recv_ctx = RecvContext{
+        .udp = udp,
+        .host_name = host_name,
+        .peer_keypairs = &peer_keypairs,
+        .running = &running,
+        .allocator = allocator,
+    };
+
+    const recv_thread = std.Thread.spawn(.{}, struct {
+        fn run(ctx: RecvContext) void {
+            var buf: [4096]u8 = undefined;
+            while (ctx.running.load(.seq_cst) and !ctx.udp.isClosed()) {
+                if (ctx.udp.readFrom(&buf)) |result| {
+                    const from_name = findPeerNameCached(&result.pk, ctx.peer_keypairs);
+                    std.debug.print("[{s}] Received from {s}: {s}\n", .{ ctx.host_name, from_name, buf[0..result.n] });
+
+                    // Echo back if not an ACK
+                    if (result.n < 3 or !std.mem.eql(u8, buf[0..3], "ACK")) {
+                        var reply_buf: [256]u8 = undefined;
+                        const reply = std.fmt.bufPrint(&reply_buf, "ACK from {s}: {s}", .{ ctx.host_name, buf[0..result.n] }) catch continue;
+                        _ = ctx.udp.writeTo(&result.pk, reply) catch {};
+                    }
+                } else |_| {
+                    // Error or timeout, continue
+                }
+            }
+        }
+    }.run, .{recv_ctx}) catch {
+        std.debug.print("Failed to spawn receive thread\n", .{});
+        return;
+    };
 
     // Connect to and message other hosts
     for (hosts) |h| {
@@ -138,7 +173,7 @@ pub fn main() !void {
 
         std.debug.print("[{s}] Connecting to {s}...\n", .{ host_name, h.name });
 
-        host.connect(peer_kp.public) catch |err| {
+        udp.connect(&peer_kp.public) catch |err| {
             std.debug.print("[{s}] Failed to connect to {s}: {}\n", .{ host_name, h.name, err });
             continue;
         };
@@ -147,9 +182,9 @@ pub fn main() !void {
 
         // Send test message
         var msg_buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&msg_buf, "Hello from {s} to {s}!", .{ host_name, h.name });
+        const msg = std.fmt.bufPrint(&msg_buf, "Hello from {s} to {s}!", .{ host_name, h.name }) catch continue;
 
-        host.send(peer_kp.public, .chat, msg) catch |err| {
+        udp.writeTo(&peer_kp.public, msg) catch |err| {
             std.debug.print("[{s}] Failed to send to {s}: {}\n", .{ host_name, h.name, err });
             continue;
         };
@@ -159,30 +194,15 @@ pub fn main() !void {
 
     std.debug.print("[{s}] Running... Press Ctrl+C to exit\n", .{host_name});
 
-    // Receive messages
-    while (!host.isClosed()) {
-        if (host.recvMessage()) |msg_opt| {
-            if (msg_opt) |*msg| {
-                defer msg.deinit();
-
-                const from_name = findPeerNameCached(&msg.from, &peer_keypairs);
-                std.debug.print("[{s}] Received from {s}: protocol={}, data={s}\n", .{ host_name, from_name, @intFromEnum(msg.protocol), msg.data });
-
-                // Echo back if not an ACK
-                if (msg.data.len < 3 or !std.mem.eql(u8, msg.data[0..3], "ACK")) {
-                    var reply_buf: [256]u8 = undefined;
-                    const reply = std.fmt.bufPrint(&reply_buf, "ACK from {s}: {s}", .{ host_name, msg.data }) catch continue;
-                    _ = host.send(msg.from, msg.protocol, reply) catch {};
-                }
-            }
-        } else |_| {
-            // Error or timeout, continue
-        }
-    }
+    // Wait a bit for messages then exit
+    std.time.sleep(5 * std.time.ns_per_s);
+    running.store(false, .seq_cst);
+    udp.close();
+    recv_thread.join();
 }
 
 /// Find peer name using pre-calculated keypairs for O(1) key derivation.
-fn findPeerNameCached(pubkey: *const Key, keypairs: []const KeyPair) []const u8 {
+fn findPeerNameCached(pubkey: *const Key, keypairs: *const [hosts.len]KeyPair) []const u8 {
     for (hosts, 0..) |h, i| {
         if (std.mem.eql(u8, &keypairs[i].public, pubkey)) {
             return h.name;
