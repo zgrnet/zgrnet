@@ -1064,8 +1064,13 @@ func (c *Conn) SetSession(s *noise.Session) {
 	defer c.mu.Unlock()
 	c.current = s
 	if s != nil {
+		now := time.Now()
 		c.state = ConnStateEstablished
 		c.localIdx = s.LocalIndex()
+		c.sessionCreated = now
+		c.lastSent = now
+		c.lastReceived = now
+		c.rekeyTriggered = false
 	}
 }
 

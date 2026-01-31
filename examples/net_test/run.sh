@@ -63,7 +63,7 @@ PID_GO=$!
 sleep 0.5
 
 echo "--- Starting Rust on port 10002 ---"
-CONFIG_PATH="$CONFIG" ./net_rust --name rust &
+./net_rust --name rust --config "$CONFIG" &
 PID_RUST=$!
 
 sleep 0.5
