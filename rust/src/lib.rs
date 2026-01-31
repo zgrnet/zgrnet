@@ -2,7 +2,7 @@
 //!
 //! This crate provides:
 //! - `noise`: Pure Noise Protocol Framework implementation
-//! - `conn`: WireGuard-style connection management
+//! - `net`: Network layer with WireGuard-style connection management
 //!
 //! # Example
 //!
@@ -24,11 +24,9 @@
 //! ```
 
 pub mod noise;
-pub mod conn;
-pub mod udp;
+pub mod net;
 pub mod kcp;
 pub mod stream;
-pub mod net;
 
 // Re-export commonly used types at crate root for convenience
 pub use noise::{
@@ -48,7 +46,8 @@ pub use noise::{
     Addr, Transport, TransportError, MockAddr, MockTransport,
 };
 
-pub use conn::{
+pub use net::{
+    // Connection management
     Conn, ConnConfig, ConnState, ConnError,
     Listener, ListenerConfig, ListenerError,
     dial, DialOptions,
@@ -57,6 +56,10 @@ pub use conn::{
     KEEPALIVE_TIMEOUT, REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME,
     REKEY_ON_RECV_THRESHOLD, REKEY_TIMEOUT, REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME,
     SESSION_CLEANUP_TIME,
+    // Transport
+    UdpTransport,
+    // High-level UDP API
+    UDP, UdpOptions, UdpError, HostInfo, PeerInfo, Peer, PeerState,
 };
 
 // KCP multiplexing
@@ -64,6 +67,3 @@ pub use kcp::{Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 // Stream multiplexing
 pub use stream::{Stream, StreamState, StreamError, Mux, MuxConfig, MuxError};
-
-// Net layer exports
-pub use net::{UDP, UdpOptions, UdpError, HostInfo, PeerInfo, Peer, PeerState};

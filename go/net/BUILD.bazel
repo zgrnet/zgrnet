@@ -2,7 +2,17 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "net",
-    srcs = ["udp.go"],
+    srcs = [
+        "conn.go",
+        "consts.go",
+        "dial.go",
+        "errors.go",
+        "listener.go",
+        "manager.go",
+        "transport_mock.go",
+        "transport_udp.go",
+        "udp.go",
+    ],
     importpath = "github.com/vibing/zgrnet/net",
     visibility = ["//visibility:public"],
     deps = ["//go:noise"],
@@ -10,7 +20,17 @@ go_library(
 
 go_test(
     name = "net_test",
-    srcs = ["udp_test.go"],
+    srcs = [
+        "conn_test.go",
+        "coverage_test.go",
+        "dial_test.go",
+        "listener_test.go",
+        "manager_test.go",
+        "rekey_test.go",
+        "tick_test.go",
+        "transport_mock_test.go",
+        "udp_test.go",
+    ],
     embed = [":net"],
     deps = ["//go:noise"],
 )

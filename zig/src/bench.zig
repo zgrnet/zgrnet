@@ -9,7 +9,7 @@ const net = std.net;
 const posix = std.posix;
 const root = @import("noise.zig");
 const noise = root.noise;
-const conn = root.conn;
+const net_mod = root.net;
 const keypair = noise.keypair;
 const cipher = noise.cipher;
 const crypto = noise.crypto;
@@ -17,9 +17,9 @@ const state = noise.state;
 const handshake = noise.handshake;
 const session_mod = noise.session;
 const Session = noise.Session;
-const SessionManager = conn.SessionManager;
-const udp_mod = @import("udp.zig");
-const Udp = udp_mod.Udp;
+const SessionManager = net_mod.SessionManager;
+const transport_udp = net_mod.transport_udp;
+const Udp = transport_udp.Udp;
 
 /// Helper for UDP benchmark setup - creates a server socket and client transport
 const UdpBenchSetup = struct {

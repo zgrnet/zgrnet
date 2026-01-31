@@ -75,13 +75,15 @@ static inline int use_avx2(void) {
     return cpu_has_avx2;
 }
 
-// AEAD seal (encrypt)
-void aead_seal(
+// AEAD seal with AD (encrypt)
+void aead_seal_with_ad(
     uint8_t *out,
     const uint8_t *key,
     uint64_t nonce,
     const uint8_t *plaintext,
-    size_t plaintext_len
+    size_t plaintext_len,
+    const uint8_t *ad,
+    size_t ad_len
 ) {
     union seal_data data __attribute__((aligned(16)));
     memset(&data, 0, sizeof(data));
@@ -99,22 +101,35 @@ void aead_seal(
     data.input.extra_ciphertext_len = 0;
     
     if (use_avx2()) {
-        chacha20_poly1305_seal_avx2(out, plaintext, plaintext_len, NULL, 0, &data);
+        chacha20_poly1305_seal_avx2(out, plaintext, plaintext_len, ad, ad_len, &data);
     } else {
-        chacha20_poly1305_seal_sse41(out, plaintext, plaintext_len, NULL, 0, &data);
+        chacha20_poly1305_seal_sse41(out, plaintext, plaintext_len, ad, ad_len, &data);
     }
     
     // Append tag
     memcpy(out + plaintext_len, data.out.tag, 16);
 }
 
-// AEAD open (decrypt)
-int aead_open(
+// Legacy function for backward compatibility (no AD)
+void aead_seal(
+    uint8_t *out,
+    const uint8_t *key,
+    uint64_t nonce,
+    const uint8_t *plaintext,
+    size_t plaintext_len
+) {
+    aead_seal_with_ad(out, key, nonce, plaintext, plaintext_len, NULL, 0);
+}
+
+// AEAD open with AD (decrypt)
+int aead_open_with_ad(
     uint8_t *out,
     const uint8_t *key,
     uint64_t nonce,
     const uint8_t *ciphertext,
-    size_t ciphertext_len
+    size_t ciphertext_len,
+    const uint8_t *ad,
+    size_t ad_len
 ) {
     if (ciphertext_len < 16) return -1;
     size_t plaintext_len = ciphertext_len - 16;
@@ -132,9 +147,9 @@ int aead_open(
     memcpy(data.input.nonce, &nonce, 8);
     
     if (use_avx2()) {
-        chacha20_poly1305_open_avx2(out, ciphertext, plaintext_len, NULL, 0, &data);
+        chacha20_poly1305_open_avx2(out, ciphertext, plaintext_len, ad, ad_len, &data);
     } else {
-        chacha20_poly1305_open_sse41(out, ciphertext, plaintext_len, NULL, 0, &data);
+        chacha20_poly1305_open_sse41(out, ciphertext, plaintext_len, ad, ad_len, &data);
     }
     
     // Constant-time tag comparison
@@ -145,4 +160,15 @@ int aead_open(
     }
     
     return (diff == 0) ? 0 : -1;
+}
+
+// Legacy function for backward compatibility (no AD)
+int aead_open(
+    uint8_t *out,
+    const uint8_t *key,
+    uint64_t nonce,
+    const uint8_t *ciphertext,
+    size_t ciphertext_len
+) {
+    return aead_open_with_ad(out, key, nonce, ciphertext, ciphertext_len, NULL, 0);
 }

@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use noise::{Key, KeyPair};
-use noise::{UDP, UdpOptions};
+use zgrnet::{Key, KeyPair};
+use zgrnet::{UDP, UdpOptions, UdpError};
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -44,7 +44,7 @@ fn main() {
         std::path::Path::new(manifest_dir)
             .parent()
             .unwrap() // Move up to repo root from rust/
-            .join("examples/host_test/config.json")
+            .join("examples/net_test/config.json")
             .to_string_lossy()
             .to_string()
     });
@@ -127,7 +127,7 @@ fn main() {
                         let _ = udp_recv.write_to(&from_pk, reply.as_bytes());
                     }
                 }
-                Err(noise::UdpError::Closed) => {
+                Err(UdpError::Closed) => {
                     println!("[{}] UDP closed", recv_name);
                     break;
                 }

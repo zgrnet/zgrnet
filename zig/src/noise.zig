@@ -2,16 +2,13 @@
 //!
 //! This module provides:
 //! - `noise`: Pure Noise Protocol Framework implementation
-//! - `conn`: WireGuard-style connection management
+//! - `net`: Network layer with WireGuard-style connection management
 
 const std = @import("std");
 
 // Submodules
-pub const noise = @import("noise/root.zig");
-pub const conn = @import("conn/root.zig");
-pub const udp = @import("udp.zig");
-// Net layer (unified UDP)
-pub const net = @import("net.zig");
+pub const noise = @import("noise/mod.zig");
+pub const net = @import("net/mod.zig");
 
 // KCP multiplexing
 pub const kcp = @import("kcp.zig");
@@ -44,14 +41,31 @@ pub const MockAddr = noise.MockAddr;
 pub const tag_size = noise.tag_size;
 pub const hash_size = noise.hash_size;
 
-// Re-export conn types for convenience
-pub const Conn = conn.Conn;
-pub const ConnConfig = conn.ConnConfig;
-pub const ConnState = conn.ConnState;
-pub const ConnError = conn.ConnError;
-pub const RecvResult = conn.RecvResult;
-pub const SessionManager = conn.SessionManager;
-pub const ManagerError = conn.ManagerError;
+// Re-export net types for convenience
+pub const Conn = net.Conn;
+pub const ConnConfig = net.ConnConfig;
+pub const ConnState = net.ConnState;
+pub const ConnError = net.ConnError;
+pub const RecvResult = net.RecvResult;
+pub const SessionManager = net.SessionManager;
+pub const ManagerError = net.ManagerError;
+pub const dial = net.dial;
+pub const DialOptions = net.DialOptions;
+pub const DialError = net.DialError;
+pub const Listener = net.Listener;
+pub const ListenerConfig = net.ListenerConfig;
+pub const ListenerError = net.ListenerError;
+
+// Transport types
+pub const UdpTransport = net.UdpTransport;
+pub const UdpAddr = net.UdpAddr;
+
+// High-level UDP API types
+pub const UDP = net.UDP;
+pub const PeerInfo = net.PeerInfo;
+pub const PeerState = net.PeerState;
+pub const HostInfo = net.HostInfo;
+pub const ReadResult = net.ReadResult;
 
 // KCP types
 pub const Kcp = kcp.Kcp;
@@ -65,18 +79,6 @@ pub const StreamError = stream.StreamError;
 pub const Mux = stream.Mux;
 pub const MuxConfig = stream.MuxConfig;
 
-// Net layer types
-pub const UDP = net.UDP;
-pub const UdpOptions = net.UdpOptions;
-pub const UdpError = net.UdpError;
-pub const PeerInfo = net.PeerInfo;
-pub const NetPeerState = net.PeerState;
-pub const NetPeer = net.Peer;
-
-// Re-export UDP types
-pub const Udp = udp.Udp;
-pub const UdpAddr = udp.UdpAddr;
-
 /// Returns the name of the active cipher backend.
 pub fn backendName() []const u8 {
     return noise.backendName();
@@ -85,9 +87,7 @@ pub fn backendName() []const u8 {
 test {
     std.testing.refAllDecls(@This());
     _ = noise;
-    _ = conn;
-    _ = udp;
+    _ = net;
     _ = kcp;
     _ = stream;
-    _ = net;
 }

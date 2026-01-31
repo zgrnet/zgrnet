@@ -41,18 +41,16 @@ pub const backend: Backend = @enumFromInt(@intFromEnum(build_options.backend));
 
 const asm_backend = struct {
     // C functions from wrapper (same interface for ARM64 and x86_64)
-    extern fn aead_seal(out: [*]u8, key: [*]const u8, nonce: u64, plaintext: [*]const u8, plaintext_len: usize) void;
-    extern fn aead_open(out: [*]u8, key: [*]const u8, nonce: u64, ciphertext: [*]const u8, ciphertext_len: usize) c_int;
+    extern fn aead_seal_with_ad(out: [*]u8, key: [*]const u8, nonce: u64, plaintext: [*]const u8, plaintext_len: usize, ad: [*]const u8, ad_len: usize) void;
+    extern fn aead_open_with_ad(out: [*]u8, key: [*]const u8, nonce: u64, ciphertext: [*]const u8, ciphertext_len: usize, ad: [*]const u8, ad_len: usize) c_int;
 
     fn encrypt(key: *const [key_size]u8, nonce: u64, plaintext: []const u8, ad: []const u8, out: []u8) void {
-        _ = ad; // ASM wrapper doesn't support AD yet
-        aead_seal(out.ptr, key, nonce, plaintext.ptr, plaintext.len);
+        aead_seal_with_ad(out.ptr, key, nonce, plaintext.ptr, plaintext.len, ad.ptr, ad.len);
     }
 
     fn decrypt(key: *const [key_size]u8, nonce: u64, ciphertext: []const u8, ad: []const u8, out: []u8) !void {
-        _ = ad; // ASM wrapper doesn't support AD yet
         if (ciphertext.len < tag_size) return error.InvalidCiphertext;
-        const ret = aead_open(out.ptr, key, nonce, ciphertext.ptr, ciphertext.len);
+        const ret = aead_open_with_ad(out.ptr, key, nonce, ciphertext.ptr, ciphertext.len, ad.ptr, ad.len);
         if (ret != 0) return error.DecryptionFailed;
     }
 };

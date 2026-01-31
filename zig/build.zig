@@ -148,4 +148,28 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    // Host test example (for cross-language testing)
+    const host_test_module = b.createModule(.{
+        .root_source_file = b.path("examples/host_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    host_test_module.addOptions("build_options", options);
+    host_test_module.addImport("noise", lib_module);
+
+    // Link against the library to avoid duplicate symbols
+    const host_test_exe = b.addExecutable(.{
+        .name = "host_test",
+        .root_module = host_test_module,
+    });
+    host_test_exe.linkLibrary(lib);
+    b.installArtifact(host_test_exe);
+
+    const run_host_test = b.addRunArtifact(host_test_exe);
+    if (b.args) |args| {
+        run_host_test.addArgs(args);
+    }
+    const host_test_step = b.step("host_test", "Run host test example");
+    host_test_step.dependOn(&run_host_test.step);
 }

@@ -20,40 +20,4 @@ go_test(
     embed = [":noise"],
 )
 
-# Connection layer - manages connections with Dial/Accept, Tick for timers
-go_library(
-    name = "conn",
-    srcs = glob(["conn/*.go"], exclude = ["conn/*_test.go"]),
-    importpath = "github.com/vibing/zgrnet/conn",
-    visibility = ["//visibility:public"],
-    deps = [":noise"],
-)
-
-go_test(
-    name = "conn_test",
-    srcs = glob(["conn/*_test.go"]),
-    embed = [":conn"],
-    deps = [":noise"],
-)
-
-# Net layer - UDP-based network with peer management
-go_library(
-    name = "net",
-    srcs = glob(["net/*.go"], exclude = ["net/*_test.go"]),
-    importpath = "github.com/vibing/zgrnet/net",
-    visibility = ["//visibility:public"],
-    deps = [
-        ":conn",
-        ":noise",
-    ],
-)
-
-go_test(
-    name = "net_test",
-    srcs = glob(["net/*_test.go"]),
-    embed = [":net"],
-    deps = [
-        ":conn",
-        ":noise",
-    ],
-)
+# Net layer is built from go/net/BUILD.bazel

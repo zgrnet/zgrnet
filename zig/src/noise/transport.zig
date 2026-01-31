@@ -43,15 +43,23 @@ pub const RecvResult = struct {
 // Address Interface
 // =============================================================================
 
+// Import UDP types from net module
+const transport_udp = @import("../net/transport_udp.zig");
+pub const UdpAddr = transport_udp.UdpAddr;
+pub const UdpTransport = transport_udp.UdpTransport;
+
 /// Abstract address interface.
 /// Note: UDP address is defined in udp.zig to avoid circular dependencies.
 pub const Addr = union(enum) {
     /// Mock address for testing.
     mock: MockAddr,
+    /// UDP address.
+    udp: UdpAddr,
 
     pub fn network(self: Addr) []const u8 {
         return switch (self) {
             .mock => |m| m.network(),
+            .udp => "udp",
         };
     }
 
@@ -65,6 +73,11 @@ pub const Addr = union(enum) {
         _ = options;
         switch (self) {
             .mock => |m| try writer.print("{s}", .{m.name}),
+            .udp => |a| {
+                var buf: [64]u8 = undefined;
+                const str = a.format(&buf) catch "?";
+                try writer.print("{s}", .{str});
+            },
         }
     }
 };
@@ -91,28 +104,46 @@ pub const MockAddr = struct {
 pub const Transport = union(enum) {
     /// Mock transport for testing.
     mock: *MockTransport,
+    /// UDP transport.
+    udp: *UdpTransport,
 
     pub fn sendTo(self: Transport, data: []const u8, addr: Addr) TransportError!void {
         switch (self) {
             .mock => |t| try t.sendTo(data, addr),
+            .udp => |t| {
+                const udp_addr = switch (addr) {
+                    .udp => |a| a,
+                    else => return TransportError.InvalidAddress,
+                };
+                _ = t.sendTo(data, udp_addr) catch return TransportError.IoError;
+            },
         }
     }
 
     pub fn recvFrom(self: Transport, buf: []u8) TransportError!RecvResult {
         return switch (self) {
             .mock => |t| try t.recvFrom(buf),
+            .udp => |t| {
+                const result = t.recvFrom(buf) catch return TransportError.IoError;
+                return RecvResult{
+                    .bytes_read = result.bytes_read,
+                    .from_addr = Addr{ .udp = result.from },
+                };
+            },
         };
     }
 
     pub fn close(self: Transport) void {
         switch (self) {
             .mock => |t| t.close(),
+            .udp => |t| t.close(),
         }
     }
 
     pub fn localAddr(self: Transport) Addr {
         return switch (self) {
             .mock => |t| t.localAddr(),
+            .udp => |t| Addr{ .udp = t.getLocalAddr() },
         };
     }
 
@@ -121,6 +152,18 @@ pub const Transport = union(enum) {
     pub fn setReadDeadline(self: Transport, deadline_ns: ?i128) TransportError!void {
         switch (self) {
             .mock => |t| try t.setReadDeadline(deadline_ns),
+            .udp => |t| {
+                if (deadline_ns) |ns| {
+                    const now = std.time.nanoTimestamp();
+                    const timeout_ns = ns - now;
+                    if (timeout_ns > 0) {
+                        const timeout_ms: u32 = @intCast(@divFloor(timeout_ns, 1_000_000));
+                        t.setRecvTimeout(timeout_ms) catch return TransportError.IoError;
+                    }
+                } else {
+                    t.setRecvTimeout(0) catch return TransportError.IoError;
+                }
+            },
         }
     }
 
@@ -129,6 +172,18 @@ pub const Transport = union(enum) {
     pub fn setWriteDeadline(self: Transport, deadline_ns: ?i128) TransportError!void {
         switch (self) {
             .mock => |t| try t.setWriteDeadline(deadline_ns),
+            .udp => |t| {
+                if (deadline_ns) |ns| {
+                    const now = std.time.nanoTimestamp();
+                    const timeout_ns = ns - now;
+                    if (timeout_ns > 0) {
+                        const timeout_ms: u32 = @intCast(@divFloor(timeout_ns, 1_000_000));
+                        t.setSendTimeout(timeout_ms) catch return TransportError.IoError;
+                    }
+                } else {
+                    t.setSendTimeout(0) catch return TransportError.IoError;
+                }
+            },
         }
     }
 };
