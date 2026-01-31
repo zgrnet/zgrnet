@@ -3,6 +3,7 @@ package noise
 import (
 	"errors"
 	"sync"
+	"time"
 )
 
 // MockAddr is a simple address for testing.
@@ -124,6 +125,11 @@ func (t *MockTransport) Close() error {
 // LocalAddr returns the local address.
 func (t *MockTransport) LocalAddr() Addr {
 	return t.localAddr
+}
+
+// SetReadDeadline sets the read deadline (no-op for mock transport).
+func (t *MockTransport) SetReadDeadline(_ time.Time) error {
+	return nil
 }
 
 // InjectPacket injects a packet into the transport's inbox.

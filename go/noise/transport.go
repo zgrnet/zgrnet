@@ -1,5 +1,7 @@
 package noise
 
+import "time"
+
 // Addr represents a transport-layer address.
 // This abstraction allows the connection layer to work with different
 // underlying transports (UDP, QUIC, etc.) without modification.
@@ -28,4 +30,9 @@ type Transport interface {
 
 	// LocalAddr returns the local address of the transport.
 	LocalAddr() Addr
+
+	// SetReadDeadline sets the deadline for future RecvFrom calls.
+	// A zero value means RecvFrom will not time out.
+	// Returns an error if the transport does not support deadlines.
+	SetReadDeadline(t time.Time) error
 }

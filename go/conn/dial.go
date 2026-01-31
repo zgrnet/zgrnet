@@ -131,60 +131,79 @@ func (c *Conn) dialWithRetry(ctx context.Context) error {
 }
 
 // waitForHandshakeResponse waits for a handshake response with RekeyTimeout.
+// Uses transport's SetReadDeadline to implement timeout instead of goroutines
+// to avoid race conditions and goroutine leaks.
 func (c *Conn) waitForHandshakeResponse(ctx context.Context, hs *noise.HandshakeState) (*noise.HandshakeRespMessage, error) {
-	// Create a timeout context for this receive attempt
-	recvCtx, cancel := context.WithTimeout(ctx, RekeyTimeout)
-	defer cancel()
+	deadline := time.Now().Add(RekeyTimeout)
 
-	// Channel for receive result
-	type recvResult struct {
-		data []byte
-		err  error
+	// Check if parent context has earlier deadline
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
 	}
-	resultCh := make(chan recvResult, 1)
 
-	go func() {
-		buf := make([]byte, noise.MaxPacketSize)
-		n, _, err := c.transport.RecvFrom(buf)
-		if err != nil {
-			resultCh <- recvResult{nil, err}
-			return
+	// Set read deadline on transport
+	if err := c.transport.SetReadDeadline(deadline); err != nil {
+		// If transport doesn't support deadlines, fall back to context check
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
 		}
-		resultCh <- recvResult{buf[:n], nil}
-	}()
-
-	select {
-	case <-recvCtx.Done():
-		return nil, ErrHandshakeTimeout
-	case result := <-resultCh:
-		if result.err != nil {
-			return nil, result.err
-		}
-
-		// Parse response
-		resp, err := noise.ParseHandshakeResp(result.data)
-		if err != nil {
-			return nil, err
-		}
-
-		// Verify receiver index
-		c.mu.RLock()
-		localIdx := c.localIdx
-		c.mu.RUnlock()
-
-		if resp.ReceiverIndex != localIdx {
-			return nil, ErrInvalidReceiverIndex
-		}
-
-		// Process the response
-		noiseMsg := make([]byte, noise.KeySize+16)
-		copy(noiseMsg[:noise.KeySize], resp.Ephemeral[:])
-		copy(noiseMsg[noise.KeySize:], resp.Empty)
-
-		if _, err := hs.ReadMessage(noiseMsg); err != nil {
-			return nil, err
-		}
-
-		return resp, nil
 	}
+
+	// Read response (will timeout based on deadline)
+	buf := make([]byte, noise.MaxPacketSize)
+	n, _, err := c.transport.RecvFrom(buf)
+
+	// Clear deadline
+	_ = c.transport.SetReadDeadline(time.Time{})
+
+	if err != nil {
+		// Check if it's a timeout error
+		if isTimeoutError(err) {
+			return nil, ErrHandshakeTimeout
+		}
+		return nil, err
+	}
+
+	// Parse response
+	resp, err := noise.ParseHandshakeResp(buf[:n])
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify receiver index
+	c.mu.RLock()
+	localIdx := c.localIdx
+	c.mu.RUnlock()
+
+	if resp.ReceiverIndex != localIdx {
+		return nil, ErrInvalidReceiverIndex
+	}
+
+	// Process the response
+	noiseMsg := make([]byte, noise.KeySize+16)
+	copy(noiseMsg[:noise.KeySize], resp.Ephemeral[:])
+	copy(noiseMsg[noise.KeySize:], resp.Empty)
+
+	if _, err := hs.ReadMessage(noiseMsg); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// isTimeoutError checks if an error is a timeout error.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for net.Error timeout
+	type timeoutError interface {
+		Timeout() bool
+	}
+	if te, ok := err.(timeoutError); ok {
+		return te.Timeout()
+	}
+	return false
 }

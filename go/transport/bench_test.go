@@ -563,6 +563,10 @@ func (t *benchServerTransport) LocalAddr() noise.Addr {
 	return &benchServerAddr{t.conn.LocalAddr().(*net.UDPAddr)}
 }
 
+func (t *benchServerTransport) SetReadDeadline(deadline time.Time) error {
+	return t.conn.SetReadDeadline(deadline)
+}
+
 type benchServerAddr struct {
 	*net.UDPAddr
 }

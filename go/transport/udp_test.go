@@ -370,6 +370,10 @@ func (t *udpServerTransport) LocalAddr() noise.Addr {
 	return &udpServerAddr{t.conn.LocalAddr().(*net.UDPAddr)}
 }
 
+func (t *udpServerTransport) SetReadDeadline(deadline time.Time) error {
+	return t.conn.SetReadDeadline(deadline)
+}
+
 type udpServerAddr struct {
 	*net.UDPAddr
 }

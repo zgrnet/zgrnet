@@ -51,8 +51,13 @@ func (s ConnState) String() string {
 //
 // The connection follows WireGuard's timer model:
 // - Tick() is called periodically to handle time-based actions
-// - Send() queues data if no session and triggers handshake
+// - Send() queues data if no session is established
 // - Recv() processes incoming messages and updates state
+//
+// Concurrency: Conn is safe for concurrent use by multiple goroutines,
+// EXCEPT for Recv() which must only be called from a single goroutine.
+// For server-side connections managed by Listener, this is handled
+// automatically via the inbound channel.
 type Conn struct {
 	mu sync.RWMutex
 
@@ -310,11 +315,9 @@ func (c *Conn) sendPayload(plaintext []byte, isKeepalive bool) error {
 			return ErrNotEstablished
 		}
 
-		// Queue the packet
+		// Queue the packet (plaintext is already a new allocation from EncodePayload)
 		if plaintext != nil {
-			pktCopy := make([]byte, len(plaintext))
-			copy(pktCopy, plaintext)
-			c.pendingPackets = append(c.pendingPackets, pktCopy)
+			c.pendingPackets = append(c.pendingPackets, plaintext)
 		}
 
 		// Trigger handshake if not already in progress
@@ -407,6 +410,10 @@ func (c *Conn) flushPendingPackets() {
 //
 // When receiving data on an old session (initiator only), Recv may
 // trigger a rekey in the background.
+//
+// IMPORTANT: Recv is NOT safe for concurrent calls from multiple goroutines.
+// Only one goroutine should call Recv at a time. For server-side connections
+// managed by Listener, this is handled automatically via the inbound channel.
 func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 	c.mu.RLock()
 	state := c.state
@@ -551,50 +558,69 @@ func (c *Conn) handleTransportMessage(msg *noise.TransportMessage) (byte, []byte
 // handleHandshakeResponse processes an incoming handshake response.
 // This is called when we're the initiator and receive a response during rekey.
 func (c *Conn) handleHandshakeResponse(resp *noise.HandshakeRespMessage, fromAddr noise.Addr) (byte, []byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Copy necessary data under lock, then release for crypto operations
+	c.mu.RLock()
+	hsState := c.hsState
+	localIdx := c.localIdx
+	remotePK := c.remotePK
+	c.mu.RUnlock()
 
 	// Verify we have a pending handshake and this is for us
-	if c.hsState == nil {
+	if hsState == nil {
 		return 0, nil, ErrInvalidConnState
 	}
 
-	if resp.ReceiverIndex != c.localIdx {
+	if resp.ReceiverIndex != localIdx {
 		return 0, nil, ErrInvalidReceiverIndex
 	}
 
+	// Perform crypto operations outside lock
 	// Reconstruct noise message: ephemeral(32) + encrypted_nothing(16) = 48 bytes
 	noiseMsg := make([]byte, noise.KeySize+16)
 	copy(noiseMsg[:noise.KeySize], resp.Ephemeral[:])
 	copy(noiseMsg[noise.KeySize:], resp.Empty)
 
 	// Read handshake response
-	if _, err := c.hsState.ReadMessage(noiseMsg); err != nil {
+	if _, err := hsState.ReadMessage(noiseMsg); err != nil {
+		c.mu.Lock()
 		c.resetHandshakeStateLocked()
+		c.mu.Unlock()
 		return 0, nil, err
 	}
 
 	// Get transport keys
-	sendCS, recvCS, err := c.hsState.Split()
+	sendCS, recvCS, err := hsState.Split()
 	if err != nil {
+		c.mu.Lock()
 		c.resetHandshakeStateLocked()
+		c.mu.Unlock()
 		return 0, nil, err
 	}
 
 	// Create new session
 	session, err := noise.NewSession(noise.SessionConfig{
-		LocalIndex:  c.localIdx,
+		LocalIndex:  localIdx,
 		RemoteIndex: resp.SenderIndex,
 		SendKey:     sendCS.Key(),
 		RecvKey:     recvCS.Key(),
-		RemotePK:    c.remotePK,
+		RemotePK:    remotePK,
 	})
 	if err != nil {
+		c.mu.Lock()
 		c.resetHandshakeStateLocked()
+		c.mu.Unlock()
 		return 0, nil, err
 	}
 
+	// Now acquire lock to update state
 	now := time.Now()
+	c.mu.Lock()
+
+	// Double-check hsState hasn't changed (another goroutine might have completed)
+	if c.hsState != hsState {
+		c.mu.Unlock()
+		return 0, nil, ErrInvalidConnState
+	}
 
 	// Rotate sessions
 	if c.current != nil {
@@ -616,6 +642,7 @@ func (c *Conn) handleHandshakeResponse(resp *noise.HandshakeRespMessage, fromAdd
 	if fromAddr != nil {
 		c.remoteAddr = fromAddr
 	}
+	c.mu.Unlock()
 
 	// Return empty payload to indicate handshake completion
 	// Caller should continue receiving to get actual data
@@ -827,13 +854,9 @@ func (c *Conn) Tick() error {
 				needsRekey = true
 			}
 
-			// Message-based rekey trigger
-			if session != nil {
-				sendNonce := session.SendNonce()
-				recvNonce := session.RecvMaxNonce()
-				if sendNonce > RekeyAfterMessages || recvNonce > RekeyAfterMessages {
-					needsRekey = true
-				}
+			// Message-based rekey trigger (based on send nonce only, per WireGuard design)
+			if session != nil && session.SendNonce() > RekeyAfterMessages {
+				needsRekey = true
 			}
 
 			if needsRekey {
