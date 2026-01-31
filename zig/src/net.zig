@@ -49,15 +49,6 @@ pub const PeerState = enum {
     }
 };
 
-/// Information about the local host.
-pub const HostInfo = struct {
-    public_key: Key,
-    port: u16,
-    peer_count: usize,
-    rx_bytes: u64,
-    tx_bytes: u64,
-    last_seen_ns: i64, // nanoseconds, 0 means never
-};
 
 /// Information about a peer.
 pub const PeerInfo = struct {
@@ -290,24 +281,31 @@ pub const UDP = struct {
         }
     }
 
-    /// Returns information about the local host.
-    pub noinline fn hostInfo(self: *UDP, out: *HostInfo) void {
+    /// Returns the local public key.
+    pub fn publicKey(self: *UDP) Key {
+        return self.local_key.public;
+    }
+
+    /// Returns the local port.
+    pub fn port(self: *UDP) u16 {
+        return self.local_port;
+    }
+
+    /// Returns the peer count.
+    pub fn peerCount(self: *UDP) usize {
         self.peers_mutex.lock();
-        const peer_count = self.peers_map.count();
-        self.peers_mutex.unlock();
+        defer self.peers_mutex.unlock();
+        return self.peers_map.count();
+    }
 
-        const last_seen_val = self.last_seen.load(.seq_cst);
-        // Convert i128 to i64 for simpler struct
-        const last_seen_ns: i64 = if (last_seen_val == 0) 0 else @as(i64, @truncate(@mod(last_seen_val, std.math.maxInt(i64))));
+    /// Returns the total received bytes.
+    pub fn rxBytes(self: *UDP) u64 {
+        return self.total_rx.load(.seq_cst);
+    }
 
-        out.* = .{
-            .public_key = self.local_key.public,
-            .port = self.local_port,
-            .peer_count = peer_count,
-            .rx_bytes = self.total_rx.load(.seq_cst),
-            .tx_bytes = self.total_tx.load(.seq_cst),
-            .last_seen_ns = last_seen_ns,
-        };
+    /// Returns the total transmitted bytes.
+    pub fn txBytes(self: *UDP) u64 {
+        return self.total_tx.load(.seq_cst);
     }
 
     /// Returns information about a specific peer.
@@ -868,14 +866,12 @@ test "remove peer" {
     try std.testing.expect(udp.peerInfo(&peer_key.public) == null);
 }
 
-test "host info" {
+test "host info methods" {
     const allocator = std.testing.allocator;
     const key = KeyPair.generate();
     const udp = try UDP.init(allocator, key, .{});
     defer udp.deinit();
 
-    var info: HostInfo = undefined;
-    udp.hostInfo(&info);
-    try std.testing.expect(std.mem.eql(u8, &info.public_key.data, &key.public.data));
-    try std.testing.expectEqual(@as(usize, 0), info.peer_count);
+    try std.testing.expect(std.mem.eql(u8, &udp.publicKey().data, &key.public.data));
+    try std.testing.expectEqual(@as(usize, 0), udp.peerCount());
 }

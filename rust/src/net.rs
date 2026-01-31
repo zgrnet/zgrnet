@@ -514,10 +514,7 @@ impl UDP {
         }
 
         // Get the remote's public key
-        let remote_pk = match hs.remote_static() {
-            Some(k) => k,
-            None => return,
-        };
+        let remote_pk = *hs.remote_static();
 
         // Check if peer is known or if we allow unknown peers
         {

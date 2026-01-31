@@ -82,9 +82,8 @@ pub const MuxConfig = stream.MuxConfig;
 pub const UDP = net.UDP;
 pub const UdpOptions = net.UdpOptions;
 pub const UdpError = net.UdpError;
-pub const HostInfo = net.HostInfo;
 pub const PeerInfo = net.PeerInfo;
-pub const PeerState = net.PeerState;
+pub const NetPeerState = net.PeerState;
 pub const NetPeer = net.Peer;
 
 // Re-export constants
