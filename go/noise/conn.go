@@ -448,6 +448,18 @@ func (c *Conn) Session() *Session {
 	return c.session
 }
 
+// SetSession sets the session (for roaming/migration).
+// This also updates the state to Established.
+func (c *Conn) SetSession(s *Session) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.session = s
+	if s != nil {
+		c.state = ConnStateEstablished
+		c.localIdx = s.LocalIndex()
+	}
+}
+
 // SetRemoteAddr updates the remote address (for NAT traversal).
 func (c *Conn) SetRemoteAddr(addr Addr) {
 	c.mu.Lock()

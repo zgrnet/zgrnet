@@ -23,6 +23,8 @@ pub const message = @import("message.zig");
 pub const transport = @import("transport.zig");
 pub const conn = @import("conn.zig");
 pub const udp = @import("udp.zig");
+// Net layer (unified UDP)
+pub const net = @import("net.zig");
 
 // KCP multiplexing
 pub const kcp = @import("kcp.zig");
@@ -76,6 +78,14 @@ pub const StreamError = stream.StreamError;
 pub const Mux = stream.Mux;
 pub const MuxConfig = stream.MuxConfig;
 
+// Net layer types
+pub const UDP = net.UDP;
+pub const UdpOptions = net.UdpOptions;
+pub const UdpError = net.UdpError;
+pub const PeerInfo = net.PeerInfo;
+pub const NetPeerState = net.PeerState;
+pub const NetPeer = net.Peer;
+
 // Re-export constants
 pub const key_size = keypair.key_size;
 pub const tag_size = crypto.tag_size;
@@ -102,4 +112,5 @@ test {
     _ = udp;
     _ = kcp;
     _ = stream;
+    _ = net;
 }

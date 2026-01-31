@@ -19,19 +19,3 @@ go_test(
     srcs = glob(["noise/*_test.go"]),
     embed = [":noise"],
 )
-
-# Transport layer implementations
-go_library(
-    name = "transport",
-    srcs = glob(["transport/*.go"], exclude = ["transport/*_test.go"]),
-    importpath = "github.com/vibing/zgrnet/transport",
-    visibility = ["//visibility:public"],
-    deps = [":noise"],
-)
-
-go_test(
-    name = "transport_test",
-    srcs = glob(["transport/*_test.go"]),
-    embed = [":transport"],
-    deps = [":noise"],
-)
