@@ -6,6 +6,7 @@
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// Address trait for transport-layer addresses.
 pub trait Addr: Send + Sync + std::fmt::Debug {
@@ -84,6 +85,14 @@ pub trait Transport: Send + Sync {
 
     /// Returns the local address.
     fn local_addr(&self) -> Box<dyn Addr>;
+
+    /// Sets the deadline for future recv_from calls.
+    /// None means recv_from will not time out.
+    fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()>;
+
+    /// Sets the deadline for future send_to calls.
+    /// None means send_to will not time out.
+    fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()>;
 }
 
 /// Implement Transport for Arc<T> where T: Transport.
@@ -102,6 +111,14 @@ impl<T: Transport> Transport for Arc<T> {
 
     fn local_addr(&self) -> Box<dyn Addr> {
         (**self).local_addr()
+    }
+
+    fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
+        (**self).set_read_deadline(deadline)
+    }
+
+    fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
+        (**self).set_write_deadline(deadline)
     }
 }
 
@@ -241,6 +258,16 @@ impl Transport for MockTransport {
 
     fn local_addr(&self) -> Box<dyn Addr> {
         Box::new(self.local_addr.clone())
+    }
+
+    fn set_read_deadline(&self, _deadline: Option<Instant>) -> Result<()> {
+        // No-op for mock transport
+        Ok(())
+    }
+
+    fn set_write_deadline(&self, _deadline: Option<Instant>) -> Result<()> {
+        // No-op for mock transport
+        Ok(())
     }
 }
 

@@ -132,6 +132,11 @@ func (t *MockTransport) SetReadDeadline(_ time.Time) error {
 	return nil
 }
 
+// SetWriteDeadline sets the write deadline (no-op for mock transport).
+func (t *MockTransport) SetWriteDeadline(_ time.Time) error {
+	return nil
+}
+
 // InjectPacket injects a packet into the transport's inbox.
 // This is useful for testing without a connected peer.
 func (t *MockTransport) InjectPacket(data []byte, from Addr) error {

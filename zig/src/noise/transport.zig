@@ -115,6 +115,22 @@ pub const Transport = union(enum) {
             .mock => |t| t.localAddr(),
         };
     }
+
+    /// Sets the deadline for future recvFrom calls.
+    /// null means recvFrom will not time out.
+    pub fn setReadDeadline(self: Transport, deadline_ns: ?i128) TransportError!void {
+        switch (self) {
+            .mock => |t| try t.setReadDeadline(deadline_ns),
+        }
+    }
+
+    /// Sets the deadline for future sendTo calls.
+    /// null means sendTo will not time out.
+    pub fn setWriteDeadline(self: Transport, deadline_ns: ?i128) TransportError!void {
+        switch (self) {
+            .mock => |t| try t.setWriteDeadline(deadline_ns),
+        }
+    }
 };
 
 // =============================================================================
@@ -229,6 +245,20 @@ pub const MockTransport = struct {
     /// Returns the local address.
     pub fn localAddr(self: *MockTransport) Addr {
         return Addr{ .mock = MockAddr.init(self.local_addr_name) };
+    }
+
+    /// Sets the read deadline (no-op for mock transport).
+    pub fn setReadDeadline(self: *MockTransport, deadline_ns: ?i128) TransportError!void {
+        _ = self;
+        _ = deadline_ns;
+        // No-op for mock transport
+    }
+
+    /// Sets the write deadline (no-op for mock transport).
+    pub fn setWriteDeadline(self: *MockTransport, deadline_ns: ?i128) TransportError!void {
+        _ = self;
+        _ = deadline_ns;
+        // No-op for mock transport
     }
 
     /// Injects a packet directly into the inbox.

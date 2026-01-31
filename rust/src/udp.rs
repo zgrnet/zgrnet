@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::Instant;
 
 use crate::noise::transport::{Addr, Result, Transport, TransportError};
 
@@ -152,6 +153,20 @@ impl Transport for Udp {
         // UDP sockets don't need explicit close in Rust
         // Drop will handle it
         Ok(())
+    }
+
+    fn set_read_deadline(&self, deadline: Option<Instant>) -> Result<()> {
+        let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        self.socket
+            .set_read_timeout(timeout)
+            .map_err(TransportError::Io)
+    }
+
+    fn set_write_deadline(&self, deadline: Option<Instant>) -> Result<()> {
+        let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        self.socket
+            .set_write_timeout(timeout)
+            .map_err(TransportError::Io)
     }
 }
 

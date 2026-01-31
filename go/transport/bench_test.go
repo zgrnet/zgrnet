@@ -567,6 +567,10 @@ func (t *benchServerTransport) SetReadDeadline(deadline time.Time) error {
 	return t.conn.SetReadDeadline(deadline)
 }
 
+func (t *benchServerTransport) SetWriteDeadline(deadline time.Time) error {
+	return t.conn.SetWriteDeadline(deadline)
+}
+
 type benchServerAddr struct {
 	*net.UDPAddr
 }

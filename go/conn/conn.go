@@ -279,12 +279,21 @@ func (c *Conn) failHandshake(err error) error {
 // Send sends an encrypted message to the remote peer.
 // The protocol byte indicates the type of payload.
 //
-// If the connection is not established, the packet is queued and
-// a handshake will be triggered (if not already in progress).
+// Send performs connection health checks (via tick) before sending:
+//   - Checks for connection timeout
+//   - Triggers rekey if session is too old (initiator only)
 //
-// If the session is too old, the packet is sent but a rekey is
-// also triggered in the background.
+// If the connection is not established, the packet is queued.
 func (c *Conn) Send(protocol byte, payload []byte) error {
+	// Perform health check first (skip keepalive since we're sending data)
+	if err := c.tick(true); err != nil {
+		// If connection is dead, still try to queue the packet for later
+		if err != ErrNotEstablished && err != ErrConnClosed {
+			// Other errors (timeout, expired) are fatal
+			return err
+		}
+	}
+
 	plaintext := noise.EncodePayload(protocol, payload)
 	return c.sendPayload(plaintext, false)
 }
@@ -299,6 +308,8 @@ func (c *Conn) SendKeepalive() error {
 // sendPayload encrypts and sends a payload to the remote peer.
 // This is the common implementation for Send and SendKeepalive.
 // If isKeepalive is true, the message is not queued if no session is available.
+//
+// Note: Rekey logic is handled by tick() which is called from Send().
 func (c *Conn) sendPayload(plaintext []byte, isKeepalive bool) error {
 	c.mu.Lock()
 
@@ -333,10 +344,7 @@ func (c *Conn) sendPayload(plaintext []byte, isKeepalive bool) error {
 	}
 
 	session := c.current
-	sessionCreated := c.sessionCreated
 	remoteAddr := c.remoteAddr
-	isInitiator := c.isInitiator
-	rekeyTriggered := c.rekeyTriggered
 	c.mu.Unlock()
 
 	// Encrypt
@@ -354,35 +362,9 @@ func (c *Conn) sendPayload(plaintext []byte, isKeepalive bool) error {
 	}
 
 	// Update last sent time
-	now := time.Now()
 	c.mu.Lock()
-	c.lastSent = now
+	c.lastSent = time.Now()
 	c.mu.Unlock()
-
-	// Check if rekey is needed (initiator only, session too old or message count)
-	// Only trigger once per session
-	if isInitiator && !rekeyTriggered {
-		needRekey := false
-
-		// Check time-based rekey
-		if !sessionCreated.IsZero() && now.Sub(sessionCreated) > RekeyAfterTime {
-			needRekey = true
-		}
-
-		// Check message-count-based rekey
-		if counter >= RekeyAfterMessages {
-			needRekey = true
-		}
-
-		if needRekey {
-			// Trigger rekey in background (non-blocking)
-			go func() {
-				if err := c.initiateRekey(); err != nil {
-					log.Printf("conn: background rekey on send failed: %v", err)
-				}
-			}()
-		}
-	}
 
 	return nil
 }
@@ -396,7 +378,9 @@ func (c *Conn) flushPendingPackets() {
 	c.mu.Unlock()
 
 	for _, pkt := range packets {
-		_ = c.sendPayload(pkt, false)
+		if err := c.sendPayload(pkt, false); err != nil {
+			log.Printf("conn: failed to flush pending packet: %v", err)
+		}
 	}
 }
 
@@ -763,6 +747,12 @@ func (c *Conn) handleHandshakeInit(init *noise.HandshakeInitMessage, fromAddr no
 //   - ErrHandshakeTimeout: handshake attempt exceeded RekeyAttemptTime (90s)
 //   - ErrConnClosed: connection was closed
 func (c *Conn) Tick() error {
+	return c.tick(false)
+}
+
+// tick is the internal implementation of Tick.
+// If skipKeepalive is true, the keepalive sending is skipped (used by Send).
+func (c *Conn) tick(skipKeepalive bool) error {
 	now := time.Now()
 
 	c.mu.RLock()
@@ -869,11 +859,14 @@ func (c *Conn) Tick() error {
 
 		// Passive keepalive: send empty message if we haven't sent recently
 		// but have received data recently (peer is active)
-		sentDelta := now.Sub(lastSent)
-		recvDelta := now.Sub(lastReceived)
-		if sentDelta > KeepaliveTimeout && recvDelta < KeepaliveTimeout {
-			if err := c.SendKeepalive(); err != nil {
-				return err
+		// Skip if called from Send (we're about to send data anyway)
+		if !skipKeepalive {
+			sentDelta := now.Sub(lastSent)
+			recvDelta := now.Sub(lastReceived)
+			if sentDelta > KeepaliveTimeout && recvDelta < KeepaliveTimeout {
+				if err := c.SendKeepalive(); err != nil {
+					return err
+				}
 			}
 		}
 

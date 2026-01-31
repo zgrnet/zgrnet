@@ -35,4 +35,9 @@ type Transport interface {
 	// A zero value means RecvFrom will not time out.
 	// Returns an error if the transport does not support deadlines.
 	SetReadDeadline(t time.Time) error
+
+	// SetWriteDeadline sets the deadline for future SendTo calls.
+	// A zero value means SendTo will not time out.
+	// Returns an error if the transport does not support deadlines.
+	SetWriteDeadline(t time.Time) error
 }

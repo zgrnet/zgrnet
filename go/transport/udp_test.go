@@ -374,6 +374,10 @@ func (t *udpServerTransport) SetReadDeadline(deadline time.Time) error {
 	return t.conn.SetReadDeadline(deadline)
 }
 
+func (t *udpServerTransport) SetWriteDeadline(deadline time.Time) error {
+	return t.conn.SetWriteDeadline(deadline)
+}
+
 type udpServerAddr struct {
 	*net.UDPAddr
 }

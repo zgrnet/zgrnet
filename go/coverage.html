@@ -1,0 +1,1519 @@
+
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>conn: Go Coverage Report</title>
+		<style>
+			body {
+				background: black;
+				color: rgb(80, 80, 80);
+			}
+			body, pre, #legend span {
+				font-family: Menlo, monospace;
+				font-weight: bold;
+			}
+			#topbar {
+				background: black;
+				position: fixed;
+				top: 0; left: 0; right: 0;
+				height: 42px;
+				border-bottom: 1px solid rgb(80, 80, 80);
+			}
+			#content {
+				margin-top: 50px;
+			}
+			#nav, #legend {
+				float: left;
+				margin-left: 10px;
+			}
+			#legend {
+				margin-top: 12px;
+			}
+			#nav {
+				margin-top: 10px;
+			}
+			#legend span {
+				margin: 0 5px;
+			}
+			.cov0 { color: rgb(192, 0, 0) }
+.cov1 { color: rgb(128, 128, 128) }
+.cov2 { color: rgb(116, 140, 131) }
+.cov3 { color: rgb(104, 152, 134) }
+.cov4 { color: rgb(92, 164, 137) }
+.cov5 { color: rgb(80, 176, 140) }
+.cov6 { color: rgb(68, 188, 143) }
+.cov7 { color: rgb(56, 200, 146) }
+.cov8 { color: rgb(44, 212, 149) }
+.cov9 { color: rgb(32, 224, 152) }
+.cov10 { color: rgb(20, 236, 155) }
+
+		</style>
+	</head>
+	<body>
+		<div id="topbar">
+			<div id="nav">
+				<select id="files">
+				
+				<option value="file0">github.com/vibing/zgrnet/conn/conn.go (86.2%)</option>
+				
+				<option value="file1">github.com/vibing/zgrnet/conn/dial.go (72.9%)</option>
+				
+				<option value="file2">github.com/vibing/zgrnet/conn/listener.go (68.1%)</option>
+				
+				</select>
+			</div>
+			<div id="legend">
+				<span>not tracked</span>
+			
+				<span class="cov0">not covered</span>
+				<span class="cov8">covered</span>
+			
+			</div>
+		</div>
+		<div id="content">
+		
+		<pre class="file" id="file0" style="display: none">package conn
+
+import (
+        "sync"
+        "time"
+
+        "github.com/vibing/zgrnet/noise"
+)
+
+// recvBufferPool is a pool for receive buffers to reduce allocations.
+var recvBufferPool = sync.Pool{
+        New: func() any <span class="cov8" title="1">{
+                buf := make([]byte, noise.MaxPacketSize)
+                return &amp;buf
+        }</span>,
+}
+
+// ConnState represents the state of a connection.
+type ConnState int
+
+const (
+        // ConnStateNew indicates a newly created connection.
+        ConnStateNew ConnState = iota
+        // ConnStateHandshaking indicates the connection is performing handshake.
+        ConnStateHandshaking
+        // ConnStateEstablished indicates the connection is ready for data transfer.
+        ConnStateEstablished
+        // ConnStateClosed indicates the connection has been closed.
+        ConnStateClosed
+)
+
+func (s ConnState) String() string <span class="cov8" title="1">{
+        switch s </span>{
+        case ConnStateNew:<span class="cov8" title="1">
+                return "new"</span>
+        case ConnStateHandshaking:<span class="cov8" title="1">
+                return "handshaking"</span>
+        case ConnStateEstablished:<span class="cov8" title="1">
+                return "established"</span>
+        case ConnStateClosed:<span class="cov8" title="1">
+                return "closed"</span>
+        default:<span class="cov8" title="1">
+                return "unknown"</span>
+        }
+}
+
+// Conn represents a connection to a remote peer.
+// It manages the session and provides a simple API
+// for sending and receiving encrypted messages.
+//
+// The connection follows WireGuard's timer model:
+// - Tick() is called periodically to handle time-based actions
+// - Send() queues data if no session and triggers handshake
+// - Recv() processes incoming messages and updates state
+type Conn struct {
+        mu sync.RWMutex
+
+        // Configuration
+        localKey   *noise.KeyPair
+        remotePK   noise.PublicKey
+        transport  noise.Transport
+        remoteAddr noise.Addr
+
+        // Connection state
+        state    ConnState
+        localIdx uint32
+
+        // Session management (WireGuard-style rotation)
+        // current: active session for sending
+        // previous: previous session (for receiving delayed packets)
+        current  *noise.Session
+        previous *noise.Session
+
+        // Handshake state
+        hsState             *noise.HandshakeState
+        handshakeStarted    time.Time // When current handshake attempt started
+        handshakeAttemptStart time.Time // When we first started trying to handshake (for 90s timeout)
+        lastHandshakeSent   time.Time // When we last sent a handshake message
+        isInitiator         bool      // Whether we initiated the current/pending session
+
+        // Timestamps
+        createdAt      time.Time
+        sessionCreated time.Time // When current session was established
+        lastSent       time.Time
+        lastReceived   time.Time
+
+        // Pending packets waiting for session establishment
+        pendingPackets [][]byte
+
+        // Rekey state
+        rekeyTriggered bool // Whether we've already triggered rekey for current session age
+
+        // Inbound channel for listener-managed connections
+        // When set, Recv() reads from this channel instead of the transport
+        inbound chan inboundPacket
+}
+
+// inboundPacket represents a parsed transport message from the listener
+type inboundPacket struct {
+        msg  *noise.TransportMessage
+        addr noise.Addr
+}
+
+// newConn creates a new connection (internal use only).
+// Use Dial() or Listener.Accept() to create connections.
+func newConn(localKey *noise.KeyPair, transport noise.Transport, remoteAddr noise.Addr, remotePK noise.PublicKey) (*Conn, error) <span class="cov8" title="1">{
+        if localKey == nil </span><span class="cov8" title="1">{
+                return nil, ErrMissingLocalKey
+        }</span>
+        <span class="cov8" title="1">if transport == nil </span><span class="cov8" title="1">{
+                return nil, ErrMissingTransport
+        }</span>
+
+        <span class="cov8" title="1">localIdx, err := noise.GenerateIndex()
+        if err != nil </span><span class="cov0" title="0">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">now := time.Now()
+        return &amp;Conn{
+                localKey:       localKey,
+                remotePK:       remotePK,
+                transport:      transport,
+                remoteAddr:     remoteAddr,
+                state:          ConnStateNew,
+                localIdx:       localIdx,
+                createdAt:      now,
+                lastSent:       now,
+                lastReceived:   now,
+                pendingPackets: make([][]byte, 0),
+        }, nil</span>
+}
+
+// accept processes an incoming handshake initiation and completes the handshake.
+// This is used by the Listener to accept incoming connections.
+// Returns the handshake response to send back.
+func (c *Conn) accept(msg *noise.HandshakeInitMessage) ([]byte, error) <span class="cov8" title="1">{
+        c.mu.Lock()
+        if c.state != ConnStateNew </span><span class="cov8" title="1">{
+                c.mu.Unlock()
+                return nil, ErrInvalidConnState
+        }</span>
+
+        <span class="cov8" title="1">c.state = ConnStateHandshaking
+        c.handshakeStarted = time.Now()
+
+        // Create handshake state (IK pattern - responder)
+        hs, err := noise.NewHandshakeState(noise.Config{
+                Pattern:     noise.PatternIK,
+                Initiator:   false,
+                LocalStatic: c.localKey,
+        })
+        if err != nil </span><span class="cov0" title="0">{
+                c.state = ConnStateNew
+                c.mu.Unlock()
+                return nil, err
+        }</span>
+        <span class="cov8" title="1">c.hsState = hs
+        c.mu.Unlock()
+
+        // Reconstruct the noise message: ephemeral(32) + static_enc(48) = 80 bytes
+        noiseMsg := make([]byte, noise.KeySize+48)
+        copy(noiseMsg[:noise.KeySize], msg.Ephemeral[:])
+        copy(noiseMsg[noise.KeySize:], msg.Static)
+
+        if _, err := hs.ReadMessage(noiseMsg); err != nil </span><span class="cov0" title="0">{
+                return nil, c.failHandshake(err)
+        }</span>
+
+        // Get remote public key from handshake
+        <span class="cov8" title="1">remotePK := hs.RemoteStatic()
+
+        // Generate response
+        msg2, err := hs.WriteMessage(nil)
+        if err != nil </span><span class="cov0" title="0">{
+                return nil, c.failHandshake(err)
+        }</span>
+
+        // Store initiator's index as remote index
+        <span class="cov8" title="1">remoteIdx := msg.SenderIndex
+
+        // Complete handshake (updates remotePK atomically with state)
+        if err := c.completeHandshake(remoteIdx, &amp;remotePK); err != nil </span><span class="cov0" title="0">{
+                return nil, err
+        }</span>
+
+        // Build wire response message
+        <span class="cov8" title="1">return noise.BuildHandshakeResp(c.localIdx, remoteIdx, hs.LocalEphemeral(), msg2[noise.KeySize:]), nil</span>
+}
+
+// completeHandshake finalizes the handshake and creates the session.
+// If remotePK is not nil, it will be set atomically with the state transition.
+func (c *Conn) completeHandshake(remoteIdx uint32, remotePK *noise.PublicKey) error <span class="cov8" title="1">{
+        c.mu.Lock()
+
+        if c.hsState == nil || !c.hsState.IsFinished() </span><span class="cov8" title="1">{
+                c.mu.Unlock()
+                return ErrHandshakeIncomplete
+        }</span>
+
+        // Get transport keys
+        <span class="cov8" title="1">sendCS, recvCS, err := c.hsState.Split()
+        if err != nil </span><span class="cov0" title="0">{
+                c.resetHandshakeStateLocked()
+                c.mu.Unlock()
+                return err
+        }</span>
+
+        // Update remotePK if provided (for responder case)
+        <span class="cov8" title="1">if remotePK != nil </span><span class="cov8" title="1">{
+                c.remotePK = *remotePK
+        }</span>
+
+        // Create session
+        <span class="cov8" title="1">session, err := noise.NewSession(noise.SessionConfig{
+                LocalIndex:  c.localIdx,
+                RemoteIndex: remoteIdx,
+                SendKey:     sendCS.Key(),
+                RecvKey:     recvCS.Key(),
+                RemotePK:    c.remotePK,
+        })
+        if err != nil </span><span class="cov0" title="0">{
+                c.resetHandshakeStateLocked()
+                c.mu.Unlock()
+                return err
+        }</span>
+
+        <span class="cov8" title="1">now := time.Now()
+
+        // Rotate sessions: current -&gt; previous
+        if c.current != nil </span><span class="cov0" title="0">{
+                c.previous = c.current
+        }</span>
+
+        <span class="cov8" title="1">c.current = session
+        c.sessionCreated = now
+        c.hsState = nil // Clear handshake state
+        c.handshakeStarted = time.Time{}
+        c.handshakeAttemptStart = time.Time{}
+        c.lastHandshakeSent = time.Time{}
+        c.state = ConnStateEstablished
+        c.lastSent = now
+        c.lastReceived = now
+        c.rekeyTriggered = false // Reset rekey trigger for new session
+
+        // Get pending packets count before unlocking
+        hasPending := len(c.pendingPackets) &gt; 0
+        c.mu.Unlock()
+
+        // Flush pending packets (outside the lock)
+        if hasPending </span><span class="cov8" title="1">{
+                c.flushPendingPackets()
+        }</span>
+
+        <span class="cov8" title="1">return nil</span>
+}
+
+// resetHandshakeStateLocked resets the connection to new state.
+// Must be called with c.mu held.
+func (c *Conn) resetHandshakeStateLocked() <span class="cov8" title="1">{
+        c.state = ConnStateNew
+        c.hsState = nil
+}</span>
+
+// failHandshake handles handshake failure.
+func (c *Conn) failHandshake(err error) error <span class="cov8" title="1">{
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        c.resetHandshakeStateLocked()
+        return err
+}</span>
+
+// Send sends an encrypted message to the remote peer.
+// The protocol byte indicates the type of payload.
+//
+// If the connection is not established, the packet is queued and
+// a handshake will be triggered (if not already in progress).
+//
+// If the session is too old, the packet is sent but a rekey is
+// also triggered in the background.
+func (c *Conn) Send(protocol byte, payload []byte) error <span class="cov8" title="1">{
+        plaintext := noise.EncodePayload(protocol, payload)
+        return c.sendPayload(plaintext, false)
+}</span>
+
+// SendKeepalive sends an empty keepalive message to maintain the connection.
+// Keepalive messages are only sent if the connection is established;
+// they are not queued.
+func (c *Conn) SendKeepalive() error <span class="cov8" title="1">{
+        return c.sendPayload(nil, true)
+}</span>
+
+// sendPayload encrypts and sends a payload to the remote peer.
+// This is the common implementation for Send and SendKeepalive.
+// If isKeepalive is true, the message is not queued if no session is available.
+func (c *Conn) sendPayload(plaintext []byte, isKeepalive bool) error <span class="cov8" title="1">{
+        c.mu.Lock()
+
+        // Check connection state
+        if c.state == ConnStateClosed </span><span class="cov8" title="1">{
+                c.mu.Unlock()
+                return ErrConnClosed
+        }</span>
+
+        // If no valid session, queue the packet (unless it's a keepalive)
+        <span class="cov8" title="1">if c.current == nil || c.state != ConnStateEstablished </span><span class="cov8" title="1">{
+                if isKeepalive </span><span class="cov8" title="1">{
+                        c.mu.Unlock()
+                        return ErrNotEstablished
+                }</span>
+
+                // Queue the packet
+                <span class="cov8" title="1">if plaintext != nil </span><span class="cov8" title="1">{
+                        pktCopy := make([]byte, len(plaintext))
+                        copy(pktCopy, plaintext)
+                        c.pendingPackets = append(c.pendingPackets, pktCopy)
+                }</span>
+
+                // Trigger handshake if not already in progress
+                <span class="cov8" title="1">needHandshake := c.hsState == nil &amp;&amp; c.state == ConnStateNew
+                c.mu.Unlock()
+
+                if needHandshake </span><span class="cov8" title="1">{
+                        // This will be handled by the external dialer or listener
+                        // For now, return an error indicating the packet is queued
+                        return ErrNotEstablished
+                }</span>
+                <span class="cov8" title="1">return nil</span>
+        }
+
+        <span class="cov8" title="1">session := c.current
+        sessionCreated := c.sessionCreated
+        remoteAddr := c.remoteAddr
+        isInitiator := c.isInitiator
+        rekeyTriggered := c.rekeyTriggered
+        c.mu.Unlock()
+
+        // Encrypt
+        ciphertext, counter, err := session.Encrypt(plaintext)
+        if err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        // Build wire message
+        <span class="cov8" title="1">msg := noise.BuildTransportMessage(session.RemoteIndex(), counter, ciphertext)
+
+        // Send
+        if err := c.transport.SendTo(msg, remoteAddr); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        // Update last sent time
+        <span class="cov8" title="1">now := time.Now()
+        c.mu.Lock()
+        c.lastSent = now
+        c.mu.Unlock()
+
+        // Check if rekey is needed (initiator only, session too old or message count)
+        // Only trigger once per session
+        if isInitiator &amp;&amp; !rekeyTriggered </span><span class="cov8" title="1">{
+                needRekey := false
+
+                // Check time-based rekey
+                if !sessionCreated.IsZero() &amp;&amp; now.Sub(sessionCreated) &gt; RekeyAfterTime </span><span class="cov8" title="1">{
+                        needRekey = true
+                }</span>
+
+                // Check message-count-based rekey
+                <span class="cov8" title="1">if counter &gt;= RekeyAfterMessages </span><span class="cov0" title="0">{
+                        needRekey = true
+                }</span>
+
+                <span class="cov8" title="1">if needRekey </span><span class="cov8" title="1">{
+                        // Trigger rekey in background (non-blocking)
+                        go func() </span><span class="cov8" title="1">{
+                                _ = c.initiateRekey()
+                        }</span>()
+                }
+        }
+
+        <span class="cov8" title="1">return nil</span>
+}
+
+// flushPendingPackets sends all queued packets after session establishment.
+// This should be called after a successful handshake completion.
+func (c *Conn) flushPendingPackets() <span class="cov8" title="1">{
+        c.mu.Lock()
+        packets := c.pendingPackets
+        c.pendingPackets = nil
+        c.mu.Unlock()
+
+        for _, pkt := range packets </span><span class="cov8" title="1">{
+                _ = c.sendPayload(pkt, false)
+        }</span>
+}
+
+// Recv receives and decrypts a message from the remote peer.
+// Returns the protocol byte and decrypted payload.
+// This is a blocking call.
+//
+// Recv handles multiple message types:
+//   - Transport messages: decrypted and returned
+//   - Handshake responses: processed to complete rekey (returns empty payload)
+//
+// When receiving data on an old session (initiator only), Recv may
+// trigger a rekey in the background.
+func (c *Conn) Recv() (protocol byte, payload []byte, err error) <span class="cov8" title="1">{
+        c.mu.RLock()
+        state := c.state
+        inbound := c.inbound
+        current := c.current
+        hsState := c.hsState
+        c.mu.RUnlock()
+
+        // Check basic state
+        if state == ConnStateClosed </span><span class="cov8" title="1">{
+                return 0, nil, ErrConnClosed
+        }</span>
+
+        // For new connections with no session and no pending handshake, return early
+        // This prevents blocking on RecvFrom when there's nothing to receive
+        <span class="cov8" title="1">if state == ConnStateNew &amp;&amp; current == nil &amp;&amp; hsState == nil </span><span class="cov8" title="1">{
+                return 0, nil, ErrNotEstablished
+        }</span>
+
+        <span class="cov8" title="1">var data []byte
+        var fromAddr noise.Addr
+
+        if inbound != nil </span><span class="cov0" title="0">{
+                // Listener-managed connection: read pre-parsed message from inbound channel
+                pkt, ok := &lt;-inbound
+                if !ok </span><span class="cov0" title="0">{
+                        return 0, nil, ErrConnClosed
+                }</span>
+                // For listener-managed connections, we receive pre-parsed transport messages
+                <span class="cov0" title="0">return c.handleTransportMessage(pkt.msg)</span>
+        }
+
+        // Direct connection: read from transport using pooled buffer
+        <span class="cov8" title="1">bufPtr := recvBufferPool.Get().(*[]byte)
+        defer recvBufferPool.Put(bufPtr)
+        buf := *bufPtr
+
+        n, addr, err := c.transport.RecvFrom(buf)
+        if err != nil </span><span class="cov0" title="0">{
+                return 0, nil, err
+        }</span>
+
+        <span class="cov8" title="1">data = buf[:n]
+        fromAddr = addr
+
+        // Get message type
+        msgType, err := noise.GetMessageType(data)
+        if err != nil </span><span class="cov0" title="0">{
+                return 0, nil, err
+        }</span>
+
+        <span class="cov8" title="1">switch msgType </span>{
+        case noise.MessageTypeTransport:<span class="cov8" title="1">
+                msg, err := noise.ParseTransportMessage(data)
+                if err != nil </span><span class="cov0" title="0">{
+                        return 0, nil, err
+                }</span>
+                // Copy ciphertext before buffer is reused
+                <span class="cov8" title="1">cipherCopy := make([]byte, len(msg.Ciphertext))
+                copy(cipherCopy, msg.Ciphertext)
+                msg.Ciphertext = cipherCopy
+                return c.handleTransportMessage(msg)</span>
+
+        case noise.MessageTypeHandshakeResp:<span class="cov8" title="1">
+                resp, err := noise.ParseHandshakeResp(data)
+                if err != nil </span><span class="cov0" title="0">{
+                        return 0, nil, err
+                }</span>
+                <span class="cov8" title="1">return c.handleHandshakeResponse(resp, fromAddr)</span>
+
+        case noise.MessageTypeHandshakeInit:<span class="cov8" title="1">
+                // For direct connections acting as responder during rekey
+                // This is unusual for Dial'd connections but possible
+                init, err := noise.ParseHandshakeInit(data)
+                if err != nil </span><span class="cov0" title="0">{
+                        return 0, nil, err
+                }</span>
+                <span class="cov8" title="1">return c.handleHandshakeInit(init, fromAddr)</span>
+
+        default:<span class="cov8" title="1">
+                return 0, nil, noise.ErrInvalidMessageType</span>
+        }
+}
+
+// handleTransportMessage processes an incoming transport message.
+func (c *Conn) handleTransportMessage(msg *noise.TransportMessage) (byte, []byte, error) <span class="cov8" title="1">{
+        c.mu.RLock()
+        current := c.current
+        previous := c.previous
+        sessionCreated := c.sessionCreated
+        isInitiator := c.isInitiator
+        rekeyTriggered := c.rekeyTriggered
+        c.mu.RUnlock()
+
+        if current == nil </span><span class="cov0" title="0">{
+                return 0, nil, ErrNotEstablished
+        }</span>
+
+        // Try to find the right session based on receiver index
+        <span class="cov8" title="1">var session *noise.Session
+        if msg.ReceiverIndex == current.LocalIndex() </span><span class="cov8" title="1">{
+                session = current
+        }</span> else<span class="cov8" title="1"> if previous != nil &amp;&amp; msg.ReceiverIndex == previous.LocalIndex() </span><span class="cov8" title="1">{
+                session = previous
+        }</span> else<span class="cov8" title="1"> {
+                return 0, nil, ErrInvalidReceiverIndex
+        }</span>
+
+        // Decrypt
+        <span class="cov8" title="1">plaintext, err := session.Decrypt(msg.Ciphertext, msg.Counter)
+        if err != nil </span><span class="cov0" title="0">{
+                return 0, nil, err
+        }</span>
+
+        // Update last received time
+        <span class="cov8" title="1">now := time.Now()
+        c.mu.Lock()
+        c.lastReceived = now
+        c.mu.Unlock()
+
+        // Check if we should trigger rekey on receive (initiator only)
+        // WireGuard: trigger at RekeyOnRecvThreshold (165s) if not already triggered
+        if isInitiator &amp;&amp; !rekeyTriggered &amp;&amp; !sessionCreated.IsZero() </span><span class="cov8" title="1">{
+                if now.Sub(sessionCreated) &gt; RekeyOnRecvThreshold </span><span class="cov8" title="1">{
+                        go func() </span><span class="cov8" title="1">{
+                                _ = c.initiateRekey()
+                        }</span>()
+                }
+        }
+
+        // Handle keepalive (empty payload)
+        <span class="cov8" title="1">if len(plaintext) == 0 </span><span class="cov8" title="1">{
+                return 0, nil, nil
+        }</span>
+
+        // Decode protocol and payload
+        <span class="cov8" title="1">return noise.DecodePayload(plaintext)</span>
+}
+
+// handleHandshakeResponse processes an incoming handshake response.
+// This is called when we're the initiator and receive a response during rekey.
+func (c *Conn) handleHandshakeResponse(resp *noise.HandshakeRespMessage, fromAddr noise.Addr) (byte, []byte, error) <span class="cov8" title="1">{
+        c.mu.Lock()
+        defer c.mu.Unlock()
+
+        // Verify we have a pending handshake and this is for us
+        if c.hsState == nil </span><span class="cov8" title="1">{
+                return 0, nil, ErrInvalidConnState
+        }</span>
+
+        <span class="cov8" title="1">if resp.ReceiverIndex != c.localIdx </span><span class="cov8" title="1">{
+                return 0, nil, ErrInvalidReceiverIndex
+        }</span>
+
+        // Reconstruct noise message: ephemeral(32) + encrypted_nothing(16) = 48 bytes
+        <span class="cov8" title="1">noiseMsg := make([]byte, noise.KeySize+16)
+        copy(noiseMsg[:noise.KeySize], resp.Ephemeral[:])
+        copy(noiseMsg[noise.KeySize:], resp.Empty)
+
+        // Read handshake response
+        if _, err := c.hsState.ReadMessage(noiseMsg); err != nil </span><span class="cov0" title="0">{
+                c.resetHandshakeStateLocked()
+                return 0, nil, err
+        }</span>
+
+        // Get transport keys
+        <span class="cov8" title="1">sendCS, recvCS, err := c.hsState.Split()
+        if err != nil </span><span class="cov0" title="0">{
+                c.resetHandshakeStateLocked()
+                return 0, nil, err
+        }</span>
+
+        // Create new session
+        <span class="cov8" title="1">session, err := noise.NewSession(noise.SessionConfig{
+                LocalIndex:  c.localIdx,
+                RemoteIndex: resp.SenderIndex,
+                SendKey:     sendCS.Key(),
+                RecvKey:     recvCS.Key(),
+                RemotePK:    c.remotePK,
+        })
+        if err != nil </span><span class="cov0" title="0">{
+                c.resetHandshakeStateLocked()
+                return 0, nil, err
+        }</span>
+
+        <span class="cov8" title="1">now := time.Now()
+
+        // Rotate sessions
+        if c.current != nil </span><span class="cov8" title="1">{
+                c.previous = c.current
+        }</span>
+
+        <span class="cov8" title="1">c.current = session
+        c.sessionCreated = now
+        c.hsState = nil
+        c.handshakeStarted = time.Time{}
+        c.handshakeAttemptStart = time.Time{}
+        c.lastHandshakeSent = time.Time{}
+        c.state = ConnStateEstablished
+        c.lastReceived = now
+        c.rekeyTriggered = false
+        c.isInitiator = true
+
+        // Update remote address if it changed (NAT traversal)
+        if fromAddr != nil </span><span class="cov8" title="1">{
+                c.remoteAddr = fromAddr
+        }</span>
+
+        // Return empty payload to indicate handshake completion
+        // Caller should continue receiving to get actual data
+        <span class="cov8" title="1">return 0, nil, nil</span>
+}
+
+// handleHandshakeInit processes an incoming handshake initiation.
+// This is called when the peer initiates a rekey.
+func (c *Conn) handleHandshakeInit(init *noise.HandshakeInitMessage, fromAddr noise.Addr) (byte, []byte, error) <span class="cov8" title="1">{
+        c.mu.Lock()
+
+        // Create new handshake state as responder
+        hs, err := noise.NewHandshakeState(noise.Config{
+                Pattern:     noise.PatternIK,
+                Initiator:   false,
+                LocalStatic: c.localKey,
+        })
+        if err != nil </span><span class="cov0" title="0">{
+                c.mu.Unlock()
+                return 0, nil, err
+        }</span>
+
+        // Reconstruct noise message: ephemeral(32) + static_enc(48) = 80 bytes
+        <span class="cov8" title="1">noiseMsg := make([]byte, noise.KeySize+48)
+        copy(noiseMsg[:noise.KeySize], init.Ephemeral[:])
+        copy(noiseMsg[noise.KeySize:], init.Static)
+
+        if _, err := hs.ReadMessage(noiseMsg); err != nil </span><span class="cov0" title="0">{
+                c.mu.Unlock()
+                return 0, nil, err
+        }</span>
+
+        // Generate response
+        <span class="cov8" title="1">msg2, err := hs.WriteMessage(nil)
+        if err != nil </span><span class="cov0" title="0">{
+                c.mu.Unlock()
+                return 0, nil, err
+        }</span>
+
+        // Generate new local index for the new session
+        <span class="cov8" title="1">newIdx, err := noise.GenerateIndex()
+        if err != nil </span><span class="cov0" title="0">{
+                c.mu.Unlock()
+                return 0, nil, err
+        }</span>
+
+        // Build wire response
+        <span class="cov8" title="1">wireResp := noise.BuildHandshakeResp(newIdx, init.SenderIndex, hs.LocalEphemeral(), msg2[noise.KeySize:])
+
+        // Get transport keys
+        sendCS, recvCS, err := hs.Split()
+        if err != nil </span><span class="cov0" title="0">{
+                c.mu.Unlock()
+                return 0, nil, err
+        }</span>
+
+        // Verify remote public key matches
+        <span class="cov8" title="1">remotePK := hs.RemoteStatic()
+        if c.remotePK != remotePK </span><span class="cov8" title="1">{
+                c.mu.Unlock()
+                return 0, nil, ErrInvalidRemotePK
+        }</span>
+
+        // Create new session
+        <span class="cov8" title="1">session, err := noise.NewSession(noise.SessionConfig{
+                LocalIndex:  newIdx,
+                RemoteIndex: init.SenderIndex,
+                SendKey:     sendCS.Key(),
+                RecvKey:     recvCS.Key(),
+                RemotePK:    c.remotePK,
+        })
+        if err != nil </span><span class="cov0" title="0">{
+                c.mu.Unlock()
+                return 0, nil, err
+        }</span>
+
+        <span class="cov8" title="1">now := time.Now()
+
+        // Rotate sessions
+        if c.current != nil </span><span class="cov8" title="1">{
+                c.previous = c.current
+        }</span>
+
+        <span class="cov8" title="1">c.current = session
+        c.localIdx = newIdx
+        c.sessionCreated = now
+        c.state = ConnStateEstablished
+        c.lastReceived = now
+        c.rekeyTriggered = false
+        c.isInitiator = false
+
+        // Update remote address if it changed
+        if fromAddr != nil </span><span class="cov8" title="1">{
+                c.remoteAddr = fromAddr
+        }</span>
+
+        <span class="cov8" title="1">transport := c.transport
+        remoteAddr := c.remoteAddr
+        c.mu.Unlock()
+
+        // Send response
+        if err := transport.SendTo(wireResp, remoteAddr); err != nil </span><span class="cov0" title="0">{
+                return 0, nil, err
+        }</span>
+
+        <span class="cov8" title="1">c.mu.Lock()
+        c.lastSent = time.Now()
+        c.mu.Unlock()
+
+        // Return empty payload to indicate handshake completion
+        return 0, nil, nil</span>
+}
+
+// Tick performs periodic maintenance on the connection.
+// This method should be called periodically by the connection manager.
+//
+// Tick directly executes time-based actions:
+//   - Sends keepalive if we haven't sent anything recently but have received data
+//   - Retransmits handshake initiation if waiting for response
+//   - Triggers rekey if session is too old (initiator only)
+//
+// Returns nil on success. Returns an error if:
+//   - ErrConnTimeout: connection timed out (no data received for RejectAfterTime)
+//   - ErrHandshakeTimeout: handshake attempt exceeded RekeyAttemptTime (90s)
+//   - ErrConnClosed: connection was closed
+func (c *Conn) Tick() error <span class="cov8" title="1">{
+        now := time.Now()
+
+        c.mu.RLock()
+        state := c.state
+        lastSent := c.lastSent
+        lastReceived := c.lastReceived
+        sessionCreated := c.sessionCreated
+        isInitiator := c.isInitiator
+        handshakeAttemptStart := c.handshakeAttemptStart
+        lastHandshakeSent := c.lastHandshakeSent
+        hsState := c.hsState
+        c.mu.RUnlock()
+
+        switch state </span>{
+        case ConnStateNew:<span class="cov8" title="1">
+                // Nothing to do for new connections
+                return nil</span>
+
+        case ConnStateHandshaking:<span class="cov8" title="1">
+                // Check if handshake attempt has exceeded RekeyAttemptTime (90s)
+                if !handshakeAttemptStart.IsZero() &amp;&amp; now.Sub(handshakeAttemptStart) &gt; RekeyAttemptTime </span><span class="cov8" title="1">{
+                        return ErrHandshakeTimeout
+                }</span>
+
+                // Check if we need to retransmit handshake (every RekeyTimeout = 5s)
+                <span class="cov8" title="1">if hsState != nil &amp;&amp; !lastHandshakeSent.IsZero() &amp;&amp; now.Sub(lastHandshakeSent) &gt; RekeyTimeout </span><span class="cov8" title="1">{
+                        // Retransmit handshake initiation
+                        if err := c.retransmitHandshake(); err != nil </span><span class="cov0" title="0">{
+                                return err
+                        }</span>
+                }
+                <span class="cov8" title="1">return nil</span>
+
+        case ConnStateEstablished:<span class="cov8" title="1">
+                // Check if connection has timed out (no messages received)
+                if now.Sub(lastReceived) &gt; RejectAfterTime </span><span class="cov8" title="1">{
+                        return ErrConnTimeout
+                }</span>
+
+                // Check if we're waiting for rekey response
+                <span class="cov8" title="1">if hsState != nil </span><span class="cov8" title="1">{
+                        // Check if handshake attempt has exceeded RekeyAttemptTime (90s)
+                        if !handshakeAttemptStart.IsZero() &amp;&amp; now.Sub(handshakeAttemptStart) &gt; RekeyAttemptTime </span><span class="cov8" title="1">{
+                                return ErrHandshakeTimeout
+                        }</span>
+
+                        // Check if we need to retransmit handshake (every RekeyTimeout = 5s)
+                        <span class="cov8" title="1">if !lastHandshakeSent.IsZero() &amp;&amp; now.Sub(lastHandshakeSent) &gt; RekeyTimeout </span><span class="cov8" title="1">{
+                                if err := c.retransmitHandshake(); err != nil </span><span class="cov0" title="0">{
+                                        return err
+                                }</span>
+                        }
+                        <span class="cov8" title="1">return nil</span>
+                }
+
+                // Check if rekey is needed (session too old, initiator only)
+                // Only trigger once per session (rekeyTriggered is reset when new session is established)
+                <span class="cov8" title="1">c.mu.RLock()
+                rekeyTriggered := c.rekeyTriggered
+                c.mu.RUnlock()
+
+                if isInitiator &amp;&amp; !rekeyTriggered &amp;&amp; !sessionCreated.IsZero() &amp;&amp; now.Sub(sessionCreated) &gt; RekeyAfterTime </span><span class="cov8" title="1">{
+                        if err := c.initiateRekey(); err != nil </span><span class="cov0" title="0">{
+                                return err
+                        }</span>
+                        <span class="cov8" title="1">return nil</span>
+                }
+
+                // Passive keepalive: send empty message if we haven't sent recently
+                // but have received data recently (peer is active)
+                <span class="cov8" title="1">sentDelta := now.Sub(lastSent)
+                recvDelta := now.Sub(lastReceived)
+                if sentDelta &gt; KeepaliveTimeout &amp;&amp; recvDelta &lt; KeepaliveTimeout </span><span class="cov8" title="1">{
+                        if err := c.SendKeepalive(); err != nil </span><span class="cov0" title="0">{
+                                return err
+                        }</span>
+                }
+
+                <span class="cov8" title="1">return nil</span>
+
+        case ConnStateClosed:<span class="cov8" title="1">
+                return ErrConnClosed</span>
+
+        default:<span class="cov8" title="1">
+                return ErrInvalidConnState</span>
+        }
+}
+
+// initiateRekey starts a new handshake to rekey the connection.
+// This is called when the current session is too old.
+func (c *Conn) initiateRekey() error <span class="cov8" title="1">{
+        c.mu.Lock()
+        defer c.mu.Unlock()
+
+        // Already have a pending handshake
+        if c.hsState != nil </span><span class="cov8" title="1">{
+                return nil
+        }</span>
+
+        // Generate new local index for the new session
+        <span class="cov8" title="1">newIdx, err := noise.GenerateIndex()
+        if err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        // Create handshake state (IK pattern - initiator)
+        <span class="cov8" title="1">hs, err := noise.NewHandshakeState(noise.Config{
+                Pattern:      noise.PatternIK,
+                Initiator:    true,
+                LocalStatic:  c.localKey,
+                RemoteStatic: &amp;c.remotePK,
+        })
+        if err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        // Generate handshake initiation message
+        <span class="cov8" title="1">msg1, err := hs.WriteMessage(nil)
+        if err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        // Build wire message
+        <span class="cov8" title="1">wireMsg := noise.BuildHandshakeInit(newIdx, hs.LocalEphemeral(), msg1[noise.KeySize:])
+
+        // Send
+        if err := c.transport.SendTo(wireMsg, c.remoteAddr); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        <span class="cov8" title="1">now := time.Now()
+        c.hsState = hs
+        c.localIdx = newIdx
+        c.handshakeStarted = now
+        c.handshakeAttemptStart = now
+        c.lastHandshakeSent = now
+        c.isInitiator = true
+        c.rekeyTriggered = true
+
+        return nil</span>
+}
+
+// retransmitHandshake resends the handshake initiation with a new ephemeral key.
+// According to WireGuard, each retransmit generates new ephemeral keys.
+func (c *Conn) retransmitHandshake() error <span class="cov8" title="1">{
+        c.mu.Lock()
+        defer c.mu.Unlock()
+
+        if c.hsState == nil </span><span class="cov0" title="0">{
+                return nil
+        }</span>
+
+        // Create a new handshake state with fresh ephemeral keys
+        <span class="cov8" title="1">hs, err := noise.NewHandshakeState(noise.Config{
+                Pattern:      noise.PatternIK,
+                Initiator:    true,
+                LocalStatic:  c.localKey,
+                RemoteStatic: &amp;c.remotePK,
+        })
+        if err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        // Generate handshake initiation message
+        <span class="cov8" title="1">msg1, err := hs.WriteMessage(nil)
+        if err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        // Build wire message with current local index
+        <span class="cov8" title="1">wireMsg := noise.BuildHandshakeInit(c.localIdx, hs.LocalEphemeral(), msg1[noise.KeySize:])
+
+        // Send
+        if err := c.transport.SendTo(wireMsg, c.remoteAddr); err != nil </span><span class="cov0" title="0">{
+                return err
+        }</span>
+
+        <span class="cov8" title="1">c.hsState = hs
+        c.lastHandshakeSent = time.Now()
+
+        return nil</span>
+}
+
+// Close closes the connection.
+func (c *Conn) Close() error <span class="cov8" title="1">{
+        c.mu.Lock()
+        defer c.mu.Unlock()
+
+        if c.state == ConnStateClosed </span><span class="cov8" title="1">{
+                return nil
+        }</span>
+
+        <span class="cov8" title="1">c.state = ConnStateClosed
+
+        // Expire all sessions
+        if c.current != nil </span><span class="cov8" title="1">{
+                c.current.Expire()
+        }</span>
+        <span class="cov8" title="1">if c.previous != nil </span><span class="cov8" title="1">{
+                c.previous.Expire()
+        }</span>
+
+        // Clear pending packets
+        <span class="cov8" title="1">c.pendingPackets = nil
+
+        return nil</span>
+}
+
+// State returns the current connection state.
+func (c *Conn) State() ConnState <span class="cov8" title="1">{
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        return c.state
+}</span>
+
+// RemotePublicKey returns the remote peer's public key.
+func (c *Conn) RemotePublicKey() noise.PublicKey <span class="cov8" title="1">{
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        return c.remotePK
+}</span>
+
+// RemoteAddr returns the remote peer's address.
+func (c *Conn) RemoteAddr() noise.Addr <span class="cov8" title="1">{
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        return c.remoteAddr
+}</span>
+
+// LocalIndex returns the local session index.
+func (c *Conn) LocalIndex() uint32 <span class="cov8" title="1">{
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        return c.localIdx
+}</span>
+
+// Session returns the underlying current session (nil if not established).
+func (c *Conn) Session() *noise.Session <span class="cov8" title="1">{
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        return c.current
+}</span>
+
+// SetRemoteAddr updates the remote address (for NAT traversal).
+func (c *Conn) SetRemoteAddr(addr noise.Addr) <span class="cov8" title="1">{
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        c.remoteAddr = addr
+}</span>
+
+// LastSent returns when the last message was sent.
+func (c *Conn) LastSent() time.Time <span class="cov8" title="1">{
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        return c.lastSent
+}</span>
+
+// LastReceived returns when the last message was received.
+func (c *Conn) LastReceived() time.Time <span class="cov8" title="1">{
+        c.mu.RLock()
+        defer c.mu.RUnlock()
+        return c.lastReceived
+}</span>
+
+// setInbound sets up the inbound channel for listener-managed connections.
+// This should only be called by Listener before the connection is returned.
+func (c *Conn) setInbound(ch chan inboundPacket) <span class="cov8" title="1">{
+        c.mu.Lock()
+        defer c.mu.Unlock()
+        c.inbound = ch
+}</span>
+
+// deliverPacket delivers a parsed transport message to the connection's inbound channel.
+// Returns false if the channel is full or the connection is closed.
+func (c *Conn) deliverPacket(msg *noise.TransportMessage, addr noise.Addr) bool <span class="cov8" title="1">{
+        c.mu.RLock()
+        inbound := c.inbound
+        state := c.state
+        c.mu.RUnlock()
+
+        if inbound == nil || state == ConnStateClosed </span><span class="cov8" title="1">{
+                return false
+        }</span>
+
+        <span class="cov8" title="1">select </span>{
+        case inbound &lt;- inboundPacket{msg: msg, addr: addr}:<span class="cov8" title="1">
+                return true</span>
+        default:<span class="cov8" title="1">
+                return false</span>
+        }
+}
+</pre>
+		
+		<pre class="file" id="file1" style="display: none">package conn
+
+import (
+        "time"
+
+        "github.com/vibing/zgrnet/noise"
+)
+
+// Dial establishes a connection to a remote peer.
+// It performs the Noise IK handshake and returns an established connection.
+//
+// Parameters:
+//   - transport: the underlying datagram transport (e.g., UDP)
+//   - addr: the remote peer's address
+//   - remotePK: the remote peer's public key (required for IK pattern)
+//   - localKey: the local key pair for authentication
+//
+// Returns an established connection ready for Send/Recv, or an error.
+func Dial(transport noise.Transport, addr noise.Addr, remotePK noise.PublicKey, localKey *noise.KeyPair) (*Conn, error) <span class="cov8" title="1">{
+        if localKey == nil </span><span class="cov8" title="1">{
+                return nil, ErrMissingLocalKey
+        }</span>
+        <span class="cov8" title="1">if transport == nil </span><span class="cov8" title="1">{
+                return nil, ErrMissingTransport
+        }</span>
+        <span class="cov8" title="1">if remotePK.IsZero() </span><span class="cov8" title="1">{
+                return nil, ErrMissingRemotePK
+        }</span>
+        <span class="cov8" title="1">if addr == nil </span><span class="cov8" title="1">{
+                return nil, ErrMissingRemoteAddr
+        }</span>
+
+        // Create a new connection
+        <span class="cov8" title="1">c, err := newConn(localKey, transport, addr, remotePK)
+        if err != nil </span><span class="cov0" title="0">{
+                return nil, err
+        }</span>
+
+        // Perform the handshake
+        <span class="cov8" title="1">if err := c.dial(); err != nil </span><span class="cov0" title="0">{
+                return nil, err
+        }</span>
+
+        <span class="cov8" title="1">return c, nil</span>
+}
+
+// dial performs the initiator side of the Noise IK handshake.
+func (c *Conn) dial() error <span class="cov8" title="1">{
+        c.mu.Lock()
+        if c.state != ConnStateNew </span><span class="cov0" title="0">{
+                c.mu.Unlock()
+                return ErrInvalidConnState
+        }</span>
+
+        <span class="cov8" title="1">c.state = ConnStateHandshaking
+        c.handshakeStarted = time.Now()
+
+        // Create handshake state (IK pattern - we know remote's public key)
+        hs, err := noise.NewHandshakeState(noise.Config{
+                Pattern:      noise.PatternIK,
+                Initiator:    true,
+                LocalStatic:  c.localKey,
+                RemoteStatic: &amp;c.remotePK,
+        })
+        if err != nil </span><span class="cov0" title="0">{
+                c.state = ConnStateNew
+                c.mu.Unlock()
+                return err
+        }</span>
+        <span class="cov8" title="1">c.hsState = hs
+        c.mu.Unlock()
+
+        // Generate and send handshake initiation
+        msg1, err := hs.WriteMessage(nil)
+        if err != nil </span><span class="cov0" title="0">{
+                return c.failHandshake(err)
+        }</span>
+
+        // msg1 format: ephemeral(32) + encrypted_static(48) = 80 bytes
+        // Build wire message
+        <span class="cov8" title="1">wireMsg := noise.BuildHandshakeInit(c.localIdx, hs.LocalEphemeral(), msg1[noise.KeySize:])
+        if err := c.transport.SendTo(wireMsg, c.remoteAddr); err != nil </span><span class="cov0" title="0">{
+                return c.failHandshake(err)
+        }</span>
+
+        // Wait for handshake response
+        <span class="cov8" title="1">buf := make([]byte, noise.MaxPacketSize)
+        n, _, err := c.transport.RecvFrom(buf)
+        if err != nil </span><span class="cov0" title="0">{
+                return c.failHandshake(err)
+        }</span>
+
+        // Parse response
+        <span class="cov8" title="1">resp, err := noise.ParseHandshakeResp(buf[:n])
+        if err != nil </span><span class="cov0" title="0">{
+                return c.failHandshake(err)
+        }</span>
+
+        // Verify receiver index matches our sender index
+        <span class="cov8" title="1">if resp.ReceiverIndex != c.localIdx </span><span class="cov0" title="0">{
+                return c.failHandshake(ErrInvalidReceiverIndex)
+        }</span>
+
+        // Reconstruct the noise message and process
+        <span class="cov8" title="1">noiseMsg := make([]byte, noise.KeySize+16)
+        copy(noiseMsg[:noise.KeySize], resp.Ephemeral[:])
+        copy(noiseMsg[noise.KeySize:], resp.Empty)
+
+        if _, err := hs.ReadMessage(noiseMsg); err != nil </span><span class="cov0" title="0">{
+                return c.failHandshake(err)
+        }</span>
+
+        // Complete handshake
+        <span class="cov8" title="1">return c.completeHandshake(resp.SenderIndex, nil)</span>
+}
+</pre>
+		
+		<pre class="file" id="file2" style="display: none">package conn
+
+import (
+        "sync"
+
+        "github.com/vibing/zgrnet/noise"
+)
+
+// Listener listens for incoming connections on a transport.
+// It handles the handshake process for incoming connections
+// and provides accepted connections through the Accept() method.
+type Listener struct {
+        mu sync.Mutex
+
+        localKey  *noise.KeyPair
+        transport noise.Transport
+
+        // Active connections indexed by local session index
+        conns map[uint32]*Conn
+
+        // Completed connections ready to be accepted
+        ready chan *Conn
+
+        // Session manager for established sessions
+        manager *noise.SessionManager
+
+        // Closed flag
+        closed bool
+        done   chan struct{}
+}
+
+// ListenerConfig contains the configuration for creating a listener.
+type ListenerConfig struct {
+        // LocalKey is the local static key pair.
+        LocalKey *noise.KeyPair
+        // Transport is the underlying datagram transport.
+        Transport noise.Transport
+        // AcceptQueueSize is the size of the accept queue (default: 16).
+        AcceptQueueSize int
+}
+
+// NewListener creates a new listener with the given configuration.
+func NewListener(cfg ListenerConfig) (*Listener, error) <span class="cov8" title="1">{
+        if cfg.LocalKey == nil </span><span class="cov8" title="1">{
+                return nil, ErrMissingLocalKey
+        }</span>
+        <span class="cov8" title="1">if cfg.Transport == nil </span><span class="cov8" title="1">{
+                return nil, ErrMissingTransport
+        }</span>
+
+        <span class="cov8" title="1">queueSize := cfg.AcceptQueueSize
+        if queueSize &lt;= 0 </span><span class="cov8" title="1">{
+                queueSize = 16
+        }</span>
+
+        <span class="cov8" title="1">l := &amp;Listener{
+                localKey:  cfg.LocalKey,
+                transport: cfg.Transport,
+                conns:     make(map[uint32]*Conn),
+                ready:     make(chan *Conn, queueSize),
+                manager:   noise.NewSessionManager(),
+                done:      make(chan struct{}),
+        }
+
+        // Start the receive loop
+        go l.receiveLoop()
+
+        return l, nil</span>
+}
+
+// Accept waits for and returns the next incoming connection.
+// This is a blocking call.
+func (l *Listener) Accept() (*Conn, error) <span class="cov8" title="1">{
+        select </span>{
+        case conn := &lt;-l.ready:<span class="cov8" title="1">
+                return conn, nil</span>
+        case &lt;-l.done:<span class="cov8" title="1">
+                return nil, ErrListenerClosed</span>
+        }
+}
+
+// Close closes the listener.
+func (l *Listener) Close() error <span class="cov8" title="1">{
+        l.mu.Lock()
+        if l.closed </span><span class="cov8" title="1">{
+                l.mu.Unlock()
+                return nil
+        }</span>
+
+        <span class="cov8" title="1">l.closed = true
+        close(l.done)
+
+        // Close all connections
+        for idx, conn := range l.conns </span><span class="cov8" title="1">{
+                if conn.inbound != nil </span><span class="cov8" title="1">{
+                        close(conn.inbound)
+                }</span>
+                <span class="cov8" title="1">conn.Close()
+                delete(l.conns, idx)</span>
+        }
+        <span class="cov8" title="1">l.mu.Unlock()
+
+        return l.transport.Close()</span>
+}
+
+// RemoveConn removes a connection from the listener.
+// This should be called when a connection is closed.
+func (l *Listener) RemoveConn(localIdx uint32) <span class="cov0" title="0">{
+        l.mu.Lock()
+        defer l.mu.Unlock()
+        delete(l.conns, localIdx)
+}</span>
+
+// LocalAddr returns the local address of the listener.
+func (l *Listener) LocalAddr() noise.Addr <span class="cov8" title="1">{
+        return l.transport.LocalAddr()
+}</span>
+
+// LocalPublicKey returns the local public key.
+func (l *Listener) LocalPublicKey() noise.PublicKey <span class="cov8" title="1">{
+        return l.localKey.Public
+}</span>
+
+// SessionManager returns the session manager.
+func (l *Listener) SessionManager() *noise.SessionManager <span class="cov8" title="1">{
+        return l.manager
+}</span>
+
+// receiveLoop handles incoming packets.
+func (l *Listener) receiveLoop() <span class="cov8" title="1">{
+        buf := make([]byte, noise.MaxPacketSize)
+
+        for </span><span class="cov8" title="1">{
+                select </span>{
+                case &lt;-l.done:<span class="cov8" title="1">
+                        return</span>
+                default:<span class="cov8" title="1"></span>
+                }
+
+                <span class="cov8" title="1">n, addr, err := l.transport.RecvFrom(buf)
+                if err != nil </span><span class="cov8" title="1">{
+                        // Check if closed
+                        l.mu.Lock()
+                        closed := l.closed
+                        l.mu.Unlock()
+                        if closed </span><span class="cov8" title="1">{
+                                return
+                        }</span>
+                        <span class="cov0" title="0">continue</span>
+                }
+
+                <span class="cov8" title="1">if n &lt; 1 </span><span class="cov8" title="1">{
+                        continue</span>
+                }
+
+                <span class="cov8" title="1">msgType := buf[0]
+
+                switch msgType </span>{
+                case noise.MessageTypeHandshakeInit:<span class="cov8" title="1">
+                        l.handleHandshakeInit(buf[:n], addr)</span>
+
+                case noise.MessageTypeTransport:<span class="cov0" title="0">
+                        l.handleTransport(buf[:n], addr)</span>
+
+                // TODO: Handle other message types
+                default:<span class="cov8" title="1"></span>
+                        // Unknown message type, ignore
+                }
+        }
+}
+
+// handleHandshakeInit processes an incoming handshake initiation.
+func (l *Listener) handleHandshakeInit(data []byte, addr noise.Addr) <span class="cov8" title="1">{
+        msg, err := noise.ParseHandshakeInit(data)
+        if err != nil </span><span class="cov8" title="1">{
+                return
+        }</span>
+
+        // Create a new connection for this peer
+        <span class="cov8" title="1">conn, err := newConn(l.localKey, l.transport, addr, noise.PublicKey{})
+        if err != nil </span><span class="cov0" title="0">{
+                return
+        }</span>
+
+        // Set up inbound channel for the connection
+        <span class="cov8" title="1">inbound := make(chan inboundPacket, 64)
+        conn.setInbound(inbound)
+
+        // Process the handshake
+        resp, err := conn.accept(msg)
+        if err != nil </span><span class="cov0" title="0">{
+                close(inbound)
+                return
+        }</span>
+
+        // Send the response
+        <span class="cov8" title="1">if err := l.transport.SendTo(resp, addr); err != nil </span><span class="cov0" title="0">{
+                close(inbound)
+                return
+        }</span>
+
+        // Register the connection and session
+        <span class="cov8" title="1">l.mu.Lock()
+        l.conns[conn.LocalIndex()] = conn
+        l.mu.Unlock()
+
+        if conn.Session() != nil </span><span class="cov8" title="1">{
+                l.manager.RegisterSession(conn.Session())
+        }</span>
+
+        // Queue the connection for acceptance
+        <span class="cov8" title="1">select </span>{
+        case l.ready &lt;- conn:<span class="cov8" title="1"></span>
+        default:<span class="cov0" title="0">
+                // Accept queue full, drop connection and clean up resources
+                l.mu.Lock()
+                delete(l.conns, conn.LocalIndex())
+                l.mu.Unlock()
+                if conn.Session() != nil </span><span class="cov0" title="0">{
+                        l.manager.RemoveSession(conn.Session().LocalIndex())
+                }</span>
+                <span class="cov0" title="0">close(inbound)
+                conn.Close()</span>
+        }
+}
+
+// handleTransport processes an incoming transport message.
+func (l *Listener) handleTransport(data []byte, addr noise.Addr) <span class="cov0" title="0">{
+        msg, err := noise.ParseTransportMessage(data)
+        if err != nil </span><span class="cov0" title="0">{
+                return
+        }</span>
+
+        // Look up connection by receiver index
+        <span class="cov0" title="0">l.mu.Lock()
+        conn := l.conns[msg.ReceiverIndex]
+        l.mu.Unlock()
+
+        if conn == nil </span><span class="cov0" title="0">{
+                return // Unknown connection
+        }</span>
+
+        // Route the parsed message to the connection
+        // Copy ciphertext since the buffer will be reused
+        <span class="cov0" title="0">cipherCopy := make([]byte, len(msg.Ciphertext))
+        copy(cipherCopy, msg.Ciphertext)
+        msgCopy := &amp;noise.TransportMessage{
+                ReceiverIndex: msg.ReceiverIndex,
+                Counter:       msg.Counter,
+                Ciphertext:    cipherCopy,
+        }
+        if !conn.deliverPacket(msgCopy, addr) </span>{<span class="cov0" title="0">
+                // Packet dropped due to full buffer or closed connection
+                // This is expected under high load, the application should
+                // handle retransmissions at a higher level
+        }</span>
+}
+
+// SendTo sends data through the listener's transport.
+// This is useful for sending responses without a Conn.
+func (l *Listener) SendTo(data []byte, addr noise.Addr) error <span class="cov8" title="1">{
+        return l.transport.SendTo(data, addr)
+}</span>
+</pre>
+		
+		</div>
+	</body>
+	<script>
+	(function() {
+		var files = document.getElementById('files');
+		var visible;
+		files.addEventListener('change', onChange, false);
+		function select(part) {
+			if (visible)
+				visible.style.display = 'none';
+			visible = document.getElementById(part);
+			if (!visible)
+				return;
+			files.value = part;
+			visible.style.display = 'block';
+			location.hash = part;
+		}
+		function onChange() {
+			select(files.value);
+			window.scrollTo(0, 0);
+		}
+		if (location.hash != "") {
+			select(location.hash.substr(1));
+		}
+		if (!visible) {
+			select("file0");
+		}
+	})();
+	</script>
+</html>
