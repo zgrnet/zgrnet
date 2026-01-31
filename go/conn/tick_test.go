@@ -692,3 +692,52 @@ func TestTickEstablishedNoSessionNoPanic(t *testing.T) {
 	// May or may not error, but should not panic
 	_ = err
 }
+
+// TestTickMessageBasedRekey tests rekey triggered by message count
+func TestTickMessageBasedRekey(t *testing.T) {
+	clientTransport := noise.NewMockTransport("client")
+	serverTransport := noise.NewMockTransport("server")
+	clientTransport.Connect(serverTransport)
+	defer clientTransport.Close()
+	defer serverTransport.Close()
+
+	clientKey, _ := noise.GenerateKeyPair()
+	serverKey, _ := noise.GenerateKeyPair()
+
+	sendKey := [32]byte{1, 2, 3}
+	recvKey := [32]byte{4, 5, 6}
+
+	session, _ := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  1,
+		RemoteIndex: 2,
+		SendKey:     sendKey,
+		RecvKey:     recvKey,
+		RemotePK:    serverKey.Public,
+	})
+
+	conn, _ := newConn(clientKey, clientTransport, serverTransport.LocalAddr(), serverKey.Public)
+
+	conn.mu.Lock()
+	conn.state = ConnStateEstablished
+	conn.current = session
+	conn.isInitiator = true
+	conn.lastSent = time.Now()
+	conn.lastReceived = time.Now()
+	conn.sessionCreated = time.Now() // Recent session (no time-based rekey)
+	conn.mu.Unlock()
+
+	// Tick should check session nonces but not trigger rekey for fresh session
+	err := conn.Tick()
+	if err != nil {
+		t.Errorf("Tick() error = %v", err)
+	}
+
+	// Verify no rekey was triggered (nonces are low)
+	conn.mu.RLock()
+	hasHsState := conn.hsState != nil
+	conn.mu.RUnlock()
+
+	if hasHsState {
+		t.Error("Should not trigger rekey for fresh session with low nonces")
+	}
+}

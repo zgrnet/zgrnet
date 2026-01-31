@@ -748,6 +748,7 @@ func (c *Conn) Tick() error {
 	handshakeAttemptStart := c.handshakeAttemptStart
 	lastHandshakeSent := c.lastHandshakeSent
 	hsState := c.hsState
+	session := c.current
 	c.mu.RUnlock()
 
 	switch state {
@@ -776,6 +777,15 @@ func (c *Conn) Tick() error {
 			return ErrConnTimeout
 		}
 
+		// Check message-based rejection (nonce exhaustion)
+		if session != nil {
+			sendNonce := session.SendNonce()
+			recvNonce := session.RecvMaxNonce()
+			if sendNonce > RejectAfterMessages || recvNonce > RejectAfterMessages {
+				return ErrSessionExpired
+			}
+		}
+
 		// Check if we're waiting for rekey response
 		if hsState != nil {
 			// Check if handshake attempt has exceeded RekeyAttemptTime (90s)
@@ -792,17 +802,35 @@ func (c *Conn) Tick() error {
 			return nil
 		}
 
-		// Check if rekey is needed (session too old, initiator only)
+		// Check if rekey is needed (session too old or too many messages, initiator only)
 		// Only trigger once per session (rekeyTriggered is reset when new session is established)
 		c.mu.RLock()
 		rekeyTriggered := c.rekeyTriggered
 		c.mu.RUnlock()
 
-		if isInitiator && !rekeyTriggered && !sessionCreated.IsZero() && now.Sub(sessionCreated) > RekeyAfterTime {
-			if err := c.initiateRekey(); err != nil {
-				return err
+		if isInitiator && !rekeyTriggered {
+			needsRekey := false
+
+			// Time-based rekey trigger
+			if !sessionCreated.IsZero() && now.Sub(sessionCreated) > RekeyAfterTime {
+				needsRekey = true
 			}
-			return nil
+
+			// Message-based rekey trigger
+			if session != nil {
+				sendNonce := session.SendNonce()
+				recvNonce := session.RecvMaxNonce()
+				if sendNonce > RekeyAfterMessages || recvNonce > RekeyAfterMessages {
+					needsRekey = true
+				}
+			}
+
+			if needsRekey {
+				if err := c.initiateRekey(); err != nil {
+					return err
+				}
+				return nil
+			}
 		}
 
 		// Passive keepalive: send empty message if we haven't sent recently
