@@ -14,7 +14,7 @@ use crate::noise::{
     Key, KeyPair, KEY_SIZE,
     // Message
     build_handshake_init, build_handshake_resp, build_transport_message, encode_payload,
-    parse_handshake_resp, parse_transport_message, HandshakeInit, MAX_PACKET_SIZE,
+    parse_transport_message, HandshakeInit, MAX_PACKET_SIZE,
     // Session
     generate_index, Session, SessionConfig, SessionError,
     // Transport
@@ -90,6 +90,8 @@ pub enum ConnError {
     HandshakeTimeout,
     /// Session expired (too old or too many messages).
     SessionExpired,
+    /// Handshake failed.
+    HandshakeFailed,
     /// Handshake error.
     Handshake(HandshakeError),
     /// Session error.
@@ -114,6 +116,7 @@ impl std::fmt::Display for ConnError {
             Self::ConnTimeout => write!(f, "connection timed out"),
             Self::HandshakeTimeout => write!(f, "handshake timeout"),
             Self::SessionExpired => write!(f, "session expired"),
+            Self::HandshakeFailed => write!(f, "handshake failed"),
             Self::Handshake(e) => write!(f, "handshake error: {}", e),
             Self::Session(e) => write!(f, "session error: {}", e),
             Self::Message(e) => write!(f, "message error: {}", e),
@@ -187,10 +190,14 @@ pub struct Conn<T: Transport + 'static> {
     // current: active session for sending
     // previous: previous session (for receiving delayed packets)
     current: RwLock<Option<Session>>,
+    #[allow(dead_code)] // Reserved for session rotation (rekey)
     previous: RwLock<Option<Session>>,
 
+    // Handshake state (for pending rekey)
+    hs_state: RwLock<Option<HandshakeState>>,
+    handshake_started: RwLock<Option<Instant>>,
+
     // Timestamps
-    created_at: Instant,
     session_created: RwLock<Option<Instant>>,
     last_sent: RwLock<Option<Instant>>,
     last_received: RwLock<Option<Instant>>,
@@ -213,7 +220,6 @@ impl<T: Transport + 'static> Conn<T> {
     /// Creates a new connection with the given configuration.
     pub fn new(cfg: ConnConfig<T>) -> Result<Self> {
         let local_idx = generate_index();
-        let now = Instant::now();
 
         Ok(Self {
             local_key: cfg.local_key,
@@ -224,7 +230,8 @@ impl<T: Transport + 'static> Conn<T> {
             local_idx,
             current: RwLock::new(None),
             previous: RwLock::new(None),
-            created_at: now,
+            hs_state: RwLock::new(None),
+            handshake_started: RwLock::new(None),
             session_created: RwLock::new(None),
             last_sent: RwLock::new(None),
             last_received: RwLock::new(None),
@@ -371,7 +378,16 @@ impl<T: Transport + 'static> Conn<T> {
         let msg = build_transport_message(remote_index, counter, &ciphertext);
         self.transport.send_to(&msg, remote_addr.as_ref())?;
 
+        // Update last sent time
+        *self.last_sent.write().unwrap() = Some(Instant::now());
+
         Ok(())
+    }
+
+    /// Sends an empty keepalive message to the remote peer.
+    /// This is used to keep NAT mappings alive and to signal liveness.
+    pub fn send_keepalive(&self) -> Result<()> {
+        self.send(0, &[])
     }
 
     /// Receives and decrypts a message from the remote peer.
@@ -472,6 +488,91 @@ impl<T: Transport + 'static> Conn<T> {
         Ok((protocol, plaintext))
     }
 
+    /// Initiates a rekey by starting a new handshake.
+    /// This is called when the current session is too old or has too many messages.
+    fn initiate_rekey(&self) -> Result<()> {
+        // Check if already have pending handshake
+        {
+            let hs = self.hs_state.read().unwrap();
+            if hs.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Get necessary data
+        let remote_pk = *self.remote_pk.read().unwrap();
+        let remote_addr = self.remote_addr.read().unwrap();
+        let remote_addr = remote_addr.as_ref().ok_or(ConnError::MissingRemoteAddr)?;
+
+        // Create new handshake state
+        let new_idx = generate_index();
+        let mut hs = HandshakeState::new(Config {
+            pattern: Some(Pattern::IK),
+            initiator: true,
+            local_static: Some(self.local_key.clone()),
+            remote_static: Some(remote_pk),
+            prologue: Vec::new(),
+            preshared_key: None,
+        })?;
+
+        // Generate and send handshake init message
+        let msg1 = hs.write_message(&[])?;
+        let ephemeral = hs.local_ephemeral().ok_or(ConnError::HandshakeFailed)?;
+        let wire_msg = build_handshake_init(new_idx, &ephemeral, &msg1[KEY_SIZE..]);
+        self.transport.send_to(&wire_msg, remote_addr.as_ref())?;
+
+        // Update state
+        let now = Instant::now();
+        *self.hs_state.write().unwrap() = Some(hs);
+        *self.handshake_started.write().unwrap() = Some(now);
+        *self.handshake_attempt_start.write().unwrap() = Some(now);
+        *self.last_handshake_sent.write().unwrap() = Some(now);
+        *self.is_initiator.write().unwrap() = true;
+        *self.rekey_triggered.write().unwrap() = true;
+
+        Ok(())
+    }
+
+    /// Retransmits the handshake initiation with a new ephemeral key.
+    /// According to WireGuard, each retransmit generates new ephemeral keys.
+    fn retransmit_handshake(&self) -> Result<()> {
+        // Check if we have a pending handshake
+        {
+            let hs = self.hs_state.read().unwrap();
+            if hs.is_none() {
+                return Ok(());
+            }
+        }
+
+        // Get necessary data
+        let remote_pk = *self.remote_pk.read().unwrap();
+        let remote_addr = self.remote_addr.read().unwrap();
+        let remote_addr = remote_addr.as_ref().ok_or(ConnError::MissingRemoteAddr)?;
+
+        // Create new handshake state with new ephemeral key
+        let mut hs = HandshakeState::new(Config {
+            pattern: Some(Pattern::IK),
+            initiator: true,
+            local_static: Some(self.local_key.clone()),
+            remote_static: Some(remote_pk),
+            prologue: Vec::new(),
+            preshared_key: None,
+        })?;
+
+        // Generate and send handshake init message
+        let msg1 = hs.write_message(&[])?;
+        let ephemeral = hs.local_ephemeral().ok_or(ConnError::HandshakeFailed)?;
+        let wire_msg = build_handshake_init(self.local_idx, &ephemeral, &msg1[KEY_SIZE..]);
+        self.transport.send_to(&wire_msg, remote_addr.as_ref())?;
+
+        // Update state
+        let now = Instant::now();
+        *self.hs_state.write().unwrap() = Some(hs);
+        *self.last_handshake_sent.write().unwrap() = Some(now);
+
+        Ok(())
+    }
+
     /// Performs periodic maintenance on the connection.
     /// This method should be called periodically by the connection manager.
     ///
@@ -499,6 +600,17 @@ impl<T: Transport + 'static> Conn<T> {
                         return Err(ConnError::HandshakeTimeout);
                     }
                 }
+
+                // Check if we need to retransmit handshake (every RekeyTimeout = 5s)
+                let has_hs_state = self.hs_state.read().unwrap().is_some();
+                if has_hs_state {
+                    if let Some(last_sent) = *self.last_handshake_sent.read().unwrap() {
+                        if now.duration_since(last_sent) > REKEY_TIMEOUT {
+                            self.retransmit_handshake()?;
+                        }
+                    }
+                }
+
                 Ok(())
             }
             ConnState::Established => {
@@ -518,8 +630,40 @@ impl<T: Transport + 'static> Conn<T> {
                     }
                 }
 
-                // Check if rekey is needed (session too old or too many messages, initiator only)
+                // Check if we're waiting for rekey response (have pending handshake)
+                let has_hs_state = self.hs_state.read().unwrap().is_some();
+                if has_hs_state {
+                    // Check if handshake attempt has exceeded RekeyAttemptTime (90s)
+                    if let Some(start) = *self.handshake_attempt_start.read().unwrap() {
+                        if now.duration_since(start) > REKEY_ATTEMPT_TIME {
+                            return Err(ConnError::HandshakeTimeout);
+                        }
+                    }
+
+                    // Check if we need to retransmit handshake (every RekeyTimeout = 5s)
+                    if let Some(last_sent) = *self.last_handshake_sent.read().unwrap() {
+                        if now.duration_since(last_sent) > REKEY_TIMEOUT {
+                            self.retransmit_handshake()?;
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // Disconnection detection (WireGuard Section 5):
+                // If no packets received for KeepaliveTimeout + RekeyTimeout (15s),
+                // initiate a new handshake to re-establish connection
                 let is_initiator = *self.is_initiator.read().unwrap();
+                let disconnection_threshold = KEEPALIVE_TIMEOUT + REKEY_TIMEOUT;
+                if is_initiator {
+                    if let Some(last_recv) = *self.last_received.read().unwrap() {
+                        if now.duration_since(last_recv) > disconnection_threshold {
+                            self.initiate_rekey()?;
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // Check if rekey is needed (session too old or too many messages, initiator only)
                 let rekey_triggered = *self.rekey_triggered.read().unwrap();
 
                 if is_initiator && !rekey_triggered {
@@ -535,16 +679,14 @@ impl<T: Transport + 'static> Conn<T> {
                     // Message-based rekey trigger
                     if let Some(ref session) = *self.current.read().unwrap() {
                         let send_nonce = session.send_nonce();
-                        let recv_nonce = session.recv_max_nonce();
-                        if send_nonce > REKEY_AFTER_MESSAGES || recv_nonce > REKEY_AFTER_MESSAGES {
+                        if send_nonce > REKEY_AFTER_MESSAGES {
                             needs_rekey = true;
                         }
                     }
 
                     if needs_rekey {
-                        *self.rekey_triggered.write().unwrap() = true;
-                        // Note: Actual rekey initiation would happen here
-                        // For now, we just mark that rekey is needed
+                        self.initiate_rekey()?;
+                        return Ok(());
                     }
                 }
 
@@ -557,8 +699,7 @@ impl<T: Transport + 'static> Conn<T> {
                     let sent_delta = now.duration_since(last_sent_time);
                     let recv_delta = now.duration_since(last_recv_time);
                     if sent_delta > KEEPALIVE_TIMEOUT && recv_delta < KEEPALIVE_TIMEOUT {
-                        // Send keepalive (empty data message)
-                        let _ = self.send(0, &[]);
+                        let _ = self.send_keepalive();
                     }
                 }
 
@@ -796,5 +937,346 @@ mod tests {
         let (proto, payload) = initiator.recv().unwrap();
         assert_eq!(proto, crate::noise::protocol::RPC);
         assert_eq!(payload, b"Hello from responder!");
+    }
+
+    // ============================================
+    // Tick tests
+    // ============================================
+
+    #[test]
+    fn test_tick_new_conn() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: None,
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        // Tick on new connection should succeed
+        assert!(conn.tick().is_ok());
+    }
+
+    #[test]
+    fn test_tick_closed_conn() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: None,
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        conn.close().unwrap();
+
+        // Tick on closed connection should fail
+        let err = conn.tick().unwrap_err();
+        assert!(matches!(err, ConnError::InvalidState));
+    }
+
+    #[test]
+    fn test_tick_conn_timeout() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        let server_key = KeyPair::generate();
+
+        let session = Session::new(SessionConfig {
+            local_index: 1,
+            remote_index: 2,
+            send_key: Key::from([1u8; KEY_SIZE]),
+            recv_key: Key::from([2u8; KEY_SIZE]),
+            remote_pk: server_key.public,
+        });
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: Some(server_key.public),
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        // Manually set established state with old lastReceived
+        *conn.state.write().unwrap() = ConnState::Established;
+        *conn.current.write().unwrap() = Some(session);
+        *conn.last_sent.write().unwrap() = Some(Instant::now());
+        *conn.last_received.write().unwrap() = Some(Instant::now() - REJECT_AFTER_TIME - std::time::Duration::from_secs(1));
+        *conn.session_created.write().unwrap() = Some(Instant::now());
+
+        let err = conn.tick().unwrap_err();
+        assert!(matches!(err, ConnError::ConnTimeout));
+    }
+
+    #[test]
+    fn test_tick_handshake_timeout() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: None,
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        // Manually set handshaking state with expired attempt
+        *conn.state.write().unwrap() = ConnState::Handshaking;
+        *conn.handshake_attempt_start.write().unwrap() = Some(Instant::now() - REKEY_ATTEMPT_TIME - std::time::Duration::from_secs(1));
+
+        let err = conn.tick().unwrap_err();
+        assert!(matches!(err, ConnError::HandshakeTimeout));
+    }
+
+    #[test]
+    fn test_tick_no_action_when_recent() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        let server_key = KeyPair::generate();
+
+        let session = Session::new(SessionConfig {
+            local_index: 1,
+            remote_index: 2,
+            send_key: Key::from([1u8; KEY_SIZE]),
+            recv_key: Key::from([2u8; KEY_SIZE]),
+            remote_pk: server_key.public,
+        });
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: Some(server_key.public),
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        let now = Instant::now();
+        *conn.state.write().unwrap() = ConnState::Established;
+        *conn.current.write().unwrap() = Some(session);
+        *conn.last_sent.write().unwrap() = Some(now);
+        *conn.last_received.write().unwrap() = Some(now);
+        *conn.session_created.write().unwrap() = Some(now);
+
+        // Tick should succeed without any action
+        assert!(conn.tick().is_ok());
+    }
+
+    #[test]
+    fn test_tick_responder_no_rekey() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        let server_key = KeyPair::generate();
+
+        let session = Session::new(SessionConfig {
+            local_index: 1,
+            remote_index: 2,
+            send_key: Key::from([1u8; KEY_SIZE]),
+            recv_key: Key::from([2u8; KEY_SIZE]),
+            remote_pk: server_key.public,
+        });
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: Some(server_key.public),
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        let now = Instant::now();
+        *conn.state.write().unwrap() = ConnState::Established;
+        *conn.current.write().unwrap() = Some(session);
+        *conn.is_initiator.write().unwrap() = false; // Responder
+        *conn.last_sent.write().unwrap() = Some(now);
+        *conn.last_received.write().unwrap() = Some(now);
+        // Old session (past RekeyAfterTime)
+        *conn.session_created.write().unwrap() = Some(now - REKEY_AFTER_TIME - std::time::Duration::from_secs(1));
+
+        assert!(conn.tick().is_ok());
+
+        // Responder should NOT trigger rekey
+        assert!(conn.hs_state.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_tick_rekey_not_duplicate() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        let server_key = KeyPair::generate();
+
+        let session = Session::new(SessionConfig {
+            local_index: 1,
+            remote_index: 2,
+            send_key: Key::from([1u8; KEY_SIZE]),
+            recv_key: Key::from([2u8; KEY_SIZE]),
+            remote_pk: server_key.public,
+        });
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: Some(server_key.public),
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        let now = Instant::now();
+        *conn.state.write().unwrap() = ConnState::Established;
+        *conn.current.write().unwrap() = Some(session);
+        *conn.is_initiator.write().unwrap() = true;
+        *conn.rekey_triggered.write().unwrap() = true; // Already triggered
+        *conn.last_sent.write().unwrap() = Some(now);
+        *conn.last_received.write().unwrap() = Some(now);
+        *conn.session_created.write().unwrap() = Some(now - REKEY_AFTER_TIME - std::time::Duration::from_secs(1));
+
+        assert!(conn.tick().is_ok());
+
+        // Should NOT trigger rekey again when already triggered
+        assert!(conn.hs_state.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_tick_no_keepalive_when_no_recent_receive() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        let server_key = KeyPair::generate();
+
+        let session = Session::new(SessionConfig {
+            local_index: 1,
+            remote_index: 2,
+            send_key: Key::from([1u8; KEY_SIZE]),
+            recv_key: Key::from([2u8; KEY_SIZE]),
+            remote_pk: server_key.public,
+        });
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: Some(server_key.public),
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        let now = Instant::now();
+        let old_time = now - KEEPALIVE_TIMEOUT - std::time::Duration::from_secs(1);
+        
+        *conn.state.write().unwrap() = ConnState::Established;
+        *conn.current.write().unwrap() = Some(session);
+        // Both old -> no keepalive
+        *conn.last_sent.write().unwrap() = Some(old_time);
+        *conn.last_received.write().unwrap() = Some(old_time);
+        *conn.session_created.write().unwrap() = Some(now);
+
+        let original_last_sent = old_time;
+        assert!(conn.tick().is_ok());
+
+        // lastSent should NOT have been updated
+        let last_sent = conn.last_sent.read().unwrap().unwrap();
+        assert_eq!(last_sent, original_last_sent);
+    }
+
+    #[test]
+    fn test_send_keepalive_not_established() {
+        let key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: None,
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        // Send keepalive on non-established connection should fail
+        let err = conn.send_keepalive().unwrap_err();
+        assert!(matches!(err, ConnError::NotEstablished));
+    }
+
+    // ============================================
+    // Disconnection detection tests
+    // ============================================
+
+    #[test]
+    fn test_tick_disconnection_detection_initiator() {
+        // Test that initiator detects disconnection when no packets received
+        // for KeepaliveTimeout + RekeyTimeout (15s) and initiates new handshake
+        let key = KeyPair::generate();
+        let server_key = KeyPair::generate();
+
+        let client_transport = MockTransport::new("client");
+        let server_transport = MockTransport::new("server");
+        MockTransport::connect(&client_transport, &server_transport);
+
+        let session = Session::new(SessionConfig {
+            local_index: 1,
+            remote_index: 2,
+            send_key: Key::from([1u8; KEY_SIZE]),
+            recv_key: Key::from([2u8; KEY_SIZE]),
+            remote_pk: server_key.public,
+        });
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: Some(server_key.public),
+            transport: Arc::clone(&client_transport),
+            remote_addr: Some(Box::new(MockAddr::new("server"))),
+        }).unwrap();
+
+        // Set as initiator with no recent received data (past disconnection threshold)
+        let disconnection_threshold = KEEPALIVE_TIMEOUT + REKEY_TIMEOUT;
+        let now = Instant::now();
+        *conn.state.write().unwrap() = ConnState::Established;
+        *conn.current.write().unwrap() = Some(session);
+        *conn.is_initiator.write().unwrap() = true;
+        *conn.last_sent.write().unwrap() = Some(now);
+        *conn.last_received.write().unwrap() = Some(now - disconnection_threshold - std::time::Duration::from_secs(1));
+        *conn.session_created.write().unwrap() = Some(now);
+
+        // Tick should detect disconnection and initiate rekey
+        assert!(conn.tick().is_ok());
+
+        // Verify that a new handshake was initiated
+        assert!(conn.hs_state.read().unwrap().is_some(), 
+            "Initiator should initiate new handshake on disconnection detection");
+        assert!(*conn.rekey_triggered.read().unwrap(),
+            "rekeyTriggered should be set on disconnection detection");
+    }
+
+    #[test]
+    fn test_tick_disconnection_detection_responder_no_action() {
+        // Test that responder does NOT initiate handshake on disconnection
+        // (only initiator is responsible for re-establishing connection)
+        let key = KeyPair::generate();
+        let server_key = KeyPair::generate();
+        let transport = MockTransport::new("test");
+
+        let session = Session::new(SessionConfig {
+            local_index: 1,
+            remote_index: 2,
+            send_key: Key::from([1u8; KEY_SIZE]),
+            recv_key: Key::from([2u8; KEY_SIZE]),
+            remote_pk: server_key.public,
+        });
+        
+        let conn = Conn::new(ConnConfig {
+            local_key: key,
+            remote_pk: Some(server_key.public),
+            transport: Arc::clone(&transport),
+            remote_addr: None,
+        }).unwrap();
+
+        // Set as responder with no recent received data
+        let disconnection_threshold = KEEPALIVE_TIMEOUT + REKEY_TIMEOUT;
+        let now = Instant::now();
+        *conn.state.write().unwrap() = ConnState::Established;
+        *conn.current.write().unwrap() = Some(session);
+        *conn.is_initiator.write().unwrap() = false; // Responder
+        *conn.last_sent.write().unwrap() = Some(now);
+        *conn.last_received.write().unwrap() = Some(now - disconnection_threshold - std::time::Duration::from_secs(1));
+        *conn.session_created.write().unwrap() = Some(now);
+
+        assert!(conn.tick().is_ok());
+
+        // Responder should NOT initiate handshake
+        assert!(conn.hs_state.read().unwrap().is_none(),
+            "Responder should NOT initiate handshake on disconnection");
     }
 }

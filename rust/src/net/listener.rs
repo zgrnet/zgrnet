@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
@@ -14,7 +14,7 @@ use crate::noise::{
     message::message_type,
 };
 
-use super::conn::{Conn, ConnConfig, ConnError, ConnState, InboundPacket};
+use super::conn::{Conn, ConnConfig, ConnError, InboundPacket};
 use super::manager::SessionManager;
 
 /// Result type for listener operations.
@@ -90,6 +90,7 @@ pub struct Listener<T: Transport + Send + Sync + 'static> {
     transport: Arc<T>,
 
     // Active connections indexed by local session index
+    #[allow(clippy::type_complexity)]
     conns: Arc<RwLock<HashMap<u32, Arc<Conn<Arc<T>>>>>>,
 
     // Completed connections ready to be accepted
@@ -312,6 +313,7 @@ impl<T: Transport + Send + Sync + 'static> Listener<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::conn::ConnState;
     use crate::net::dial::{dial, DialOptions};
     use crate::net::UdpTransport;
     use std::thread;

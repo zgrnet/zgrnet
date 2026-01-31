@@ -741,3 +741,113 @@ func TestTickMessageBasedRekey(t *testing.T) {
 		t.Error("Should not trigger rekey for fresh session with low nonces")
 	}
 }
+
+// TestTickDisconnectionDetection tests that initiator detects disconnection
+// when no packets received for KeepaliveTimeout + RekeyTimeout (15s).
+// This should trigger a new handshake to re-establish connection.
+func TestTickDisconnectionDetection(t *testing.T) {
+	// Create two connected transports
+	clientTransport := NewMockTransport("client")
+	serverTransport := NewMockTransport("server")
+	clientTransport.Connect(serverTransport)
+	defer clientTransport.Close()
+	defer serverTransport.Close()
+
+	clientKey, _ := noise.GenerateKeyPair()
+	serverKey, _ := noise.GenerateKeyPair()
+
+	// Create a mock session
+	sendKey := [32]byte{1, 2, 3}
+	recvKey := [32]byte{4, 5, 6}
+
+	session, _ := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  1,
+		RemoteIndex: 2,
+		SendKey:     sendKey,
+		RecvKey:     recvKey,
+		RemotePK:    serverKey.Public,
+	})
+
+	conn, _ := newConn(clientKey, clientTransport, serverTransport.LocalAddr(), serverKey.Public)
+
+	// Set as initiator with no recent received data (past disconnection threshold)
+	disconnectionThreshold := KeepaliveTimeout + RekeyTimeout
+	conn.mu.Lock()
+	conn.state = ConnStateEstablished
+	conn.current = session
+	conn.isInitiator = true
+	conn.lastSent = time.Now()
+	conn.lastReceived = time.Now().Add(-disconnectionThreshold - time.Second) // Past 15s
+	conn.sessionCreated = time.Now()
+	conn.mu.Unlock()
+
+	// Tick should detect disconnection and initiate rekey
+	err := conn.Tick()
+	if err != nil {
+		t.Errorf("Tick() error = %v", err)
+	}
+
+	// Give the rekey a moment to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify that a new handshake was initiated
+	conn.mu.RLock()
+	hasHsState := conn.hsState != nil
+	rekeyTriggered := conn.rekeyTriggered
+	conn.mu.RUnlock()
+
+	if !hasHsState {
+		t.Error("Tick() should initiate new handshake on disconnection detection")
+	}
+	if !rekeyTriggered {
+		t.Error("Tick() should set rekeyTriggered on disconnection detection")
+	}
+}
+
+// TestTickDisconnectionResponderNoAction tests that responder does NOT
+// initiate handshake on disconnection detection (only initiator does).
+func TestTickDisconnectionResponderNoAction(t *testing.T) {
+	key, _ := noise.GenerateKeyPair()
+	transport := NewMockTransport("test")
+	defer transport.Close()
+
+	serverKey, _ := noise.GenerateKeyPair()
+
+	sendKey := [32]byte{1, 2, 3}
+	recvKey := [32]byte{4, 5, 6}
+
+	session, _ := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  1,
+		RemoteIndex: 2,
+		SendKey:     sendKey,
+		RecvKey:     recvKey,
+		RemotePK:    serverKey.Public,
+	})
+
+	conn, _ := newConn(key, transport, nil, serverKey.Public)
+
+	// Set as responder with no recent received data
+	disconnectionThreshold := KeepaliveTimeout + RekeyTimeout
+	conn.mu.Lock()
+	conn.state = ConnStateEstablished
+	conn.current = session
+	conn.isInitiator = false // Responder
+	conn.lastSent = time.Now()
+	conn.lastReceived = time.Now().Add(-disconnectionThreshold - time.Second) // Past 15s
+	conn.sessionCreated = time.Now()
+	conn.mu.Unlock()
+
+	err := conn.Tick()
+	if err != nil {
+		t.Errorf("Tick() error = %v", err)
+	}
+
+	// Responder should NOT initiate handshake
+	conn.mu.RLock()
+	hasHsState := conn.hsState != nil
+	conn.mu.RUnlock()
+
+	if hasHsState {
+		t.Error("Responder should NOT initiate handshake on disconnection")
+	}
+}

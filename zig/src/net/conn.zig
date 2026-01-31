@@ -70,6 +70,8 @@ pub const ConnError = error{
     InvalidReceiverIndex,
     /// Handshake not complete.
     HandshakeIncomplete,
+    /// Handshake failed.
+    HandshakeFailed,
     /// Connection timed out (no data received for too long).
     ConnTimeout,
     /// Handshake attempt exceeded maximum duration.
@@ -155,8 +157,11 @@ pub const Conn = struct {
     current: ?Session = null,
     previous: ?Session = null,
 
+    // Handshake state (for pending rekey)
+    hs_state: ?HandshakeState = null,
+    handshake_started: ?i128 = null,
+
     // Timestamps (in nanoseconds from std.time.nanoTimestamp)
-    created_at: i128,
     session_created: ?i128 = null,
     last_sent: ?i128 = null,
     last_received: ?i128 = null,
@@ -183,7 +188,6 @@ pub const Conn = struct {
             .transport = cfg.transport,
             .remote_addr = cfg.remote_addr,
             .local_idx = session_mod.generateIndex(),
-            .created_at = std.time.nanoTimestamp(),
         };
     }
 
@@ -317,6 +321,18 @@ pub const Conn = struct {
 
         // Phase 2: Send (without lock)
         self.transport.sendTo(msg, remote_addr) catch return ConnError.TransportError;
+
+        // Update last sent time
+        self.mutex.lock();
+        self.last_sent = std.time.nanoTimestamp();
+        self.mutex.unlock();
+    }
+
+    /// Sends an empty keepalive message to the remote peer.
+    /// This is used to keep NAT mappings alive and to signal liveness.
+    pub fn sendKeepalive(self: *Conn) ConnError!void {
+        // Protocol 0 is used for keepalive (empty message)
+        return self.send(@enumFromInt(0), &.{});
     }
 
     /// Receives and decrypts a message from the remote peer.
@@ -436,6 +452,114 @@ pub const Conn = struct {
         };
     }
 
+    /// Initiates a rekey by starting a new handshake.
+    /// This is called when the current session is too old or has too many messages.
+    /// Note: Must be called WITHOUT holding the mutex.
+    fn initiateRekey(self: *Conn) ConnError!void {
+        // Get necessary data with lock
+        var remote_addr: Addr = undefined;
+        var new_idx: u32 = undefined;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Check if already have pending handshake
+            if (self.hs_state != null) {
+                return;
+            }
+
+            remote_addr = self.remote_addr orelse return ConnError.MissingRemoteAddr;
+            new_idx = session_mod.generateIndex();
+        }
+
+        // Create new handshake state (outside lock)
+        var hs = HandshakeState.init(.{
+            .pattern = .IK,
+            .initiator = true,
+            .local_static = self.local_key,
+            .remote_static = self.remote_pk,
+        }) catch return ConnError.HandshakeFailed;
+
+        // Generate handshake init message
+        var msg_buf: [message.max_packet_size]u8 = undefined;
+        const msg_len = hs.writeMessage(&.{}, &msg_buf) catch return ConnError.HandshakeFailed;
+        _ = msg_len;
+
+        const ephemeral = hs.local_ephemeral orelse return ConnError.HandshakeFailed;
+        // static_encrypted is 48 bytes: 32 bytes encrypted static public key + 16 bytes tag
+        const wire_msg = message.buildHandshakeInit(new_idx, &ephemeral.public, msg_buf[key_size .. key_size + 48]);
+
+        // Send message
+        self.transport.sendTo(&wire_msg, remote_addr) catch return ConnError.TransportError;
+
+        // Update state with lock
+        const now = std.time.nanoTimestamp();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Double-check no one else started a handshake
+        if (self.hs_state != null) {
+            return;
+        }
+
+        self.hs_state = hs;
+        self.local_idx = new_idx;
+        self.handshake_started = now;
+        self.handshake_attempt_start = now;
+        self.last_handshake_sent = now;
+        self.is_initiator = true;
+        self.rekey_triggered = true;
+    }
+
+    /// Retransmits the handshake initiation with a new ephemeral key.
+    /// According to WireGuard, each retransmit generates new ephemeral keys.
+    /// Note: Must be called WITHOUT holding the mutex.
+    fn retransmitHandshake(self: *Conn) ConnError!void {
+        // Get necessary data with lock
+        var remote_addr: Addr = undefined;
+        var local_idx: u32 = undefined;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Check if we have a pending handshake
+            if (self.hs_state == null) {
+                return;
+            }
+
+            remote_addr = self.remote_addr orelse return ConnError.MissingRemoteAddr;
+            local_idx = self.local_idx;
+        }
+
+        // Create new handshake state with new ephemeral key (outside lock)
+        var hs = HandshakeState.init(.{
+            .pattern = .IK,
+            .initiator = true,
+            .local_static = self.local_key,
+            .remote_static = self.remote_pk,
+        }) catch return ConnError.HandshakeFailed;
+
+        // Generate handshake init message
+        var msg_buf: [message.max_packet_size]u8 = undefined;
+        const msg_len = hs.writeMessage(&.{}, &msg_buf) catch return ConnError.HandshakeFailed;
+        _ = msg_len;
+
+        const ephemeral = hs.local_ephemeral orelse return ConnError.HandshakeFailed;
+        // static_encrypted is 48 bytes: 32 bytes encrypted static public key + 16 bytes tag
+        const wire_msg = message.buildHandshakeInit(local_idx, &ephemeral.public, msg_buf[key_size .. key_size + 48]);
+
+        // Send message
+        self.transport.sendTo(&wire_msg, remote_addr) catch return ConnError.TransportError;
+
+        // Update state with lock
+        const now = std.time.nanoTimestamp();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.hs_state = hs;
+        self.last_handshake_sent = now;
+    }
+
     /// Performs periodic maintenance on the connection.
     /// This method should be called periodically by the connection manager.
     ///
@@ -448,29 +572,69 @@ pub const Conn = struct {
     /// - HandshakeTimeout: handshake attempt exceeded RekeyAttemptTime (90s)
     /// - SessionExpired: session expired (too many messages)
     pub fn tick(self: *Conn) ConnError!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         const now: i128 = std.time.nanoTimestamp();
 
-        switch (self.state) {
+        // Read state under lock
+        var state: ConnState = undefined;
+        var last_sent_time: ?i128 = null;
+        var last_recv_time: ?i128 = null;
+        var session_created_time: ?i128 = null;
+        var handshake_attempt_start_time: ?i128 = null;
+        var last_handshake_sent_time: ?i128 = null;
+        var is_initiator: bool = false;
+        var rekey_triggered: bool = false;
+        var has_hs_state: bool = false;
+        var send_nonce: u64 = 0;
+        var recv_nonce: u64 = 0;
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            state = self.state;
+            last_sent_time = self.last_sent;
+            last_recv_time = self.last_received;
+            session_created_time = self.session_created;
+            handshake_attempt_start_time = self.handshake_attempt_start;
+            last_handshake_sent_time = self.last_handshake_sent;
+            is_initiator = self.is_initiator;
+            rekey_triggered = self.rekey_triggered;
+            has_hs_state = self.hs_state != null;
+
+            if (self.current) |*session| {
+                send_nonce = session.send_nonce.load(.acquire);
+                recv_nonce = session.recvMaxNonce();
+            }
+        }
+
+        switch (state) {
             .new => {
                 // Nothing to do for new connections
                 return;
             },
             .handshaking => {
                 // Check if handshake attempt has exceeded RekeyAttemptTime (90s)
-                if (self.handshake_attempt_start) |start| {
+                if (handshake_attempt_start_time) |start| {
                     const elapsed: u64 = @intCast(now - start);
                     if (elapsed > consts.rekey_attempt_time_ns) {
                         return ConnError.HandshakeTimeout;
+                    }
+                }
+
+                // Check if we need to retransmit handshake (every RekeyTimeout = 5s)
+                if (has_hs_state) {
+                    if (last_handshake_sent_time) |last_sent| {
+                        const elapsed: u64 = @intCast(now - last_sent);
+                        if (elapsed > consts.rekey_timeout_ns) {
+                            try self.retransmitHandshake();
+                        }
                     }
                 }
                 return;
             },
             .established => {
                 // Check if connection has timed out (no messages received)
-                if (self.last_received) |last_recv| {
+                if (last_recv_time) |last_recv| {
                     const elapsed: u64 = @intCast(now - last_recv);
                     if (elapsed > consts.reject_after_time_ns) {
                         return ConnError.ConnTimeout;
@@ -478,20 +642,50 @@ pub const Conn = struct {
                 }
 
                 // Check message-based rejection (nonce exhaustion)
-                if (self.current) |*session| {
-                    const send_nonce = session.send_nonce;
-                    const recv_nonce = session.recv_max_nonce;
-                    if (send_nonce > consts.reject_after_messages or recv_nonce > consts.reject_after_messages) {
-                        return ConnError.SessionExpired;
+                if (send_nonce > consts.reject_after_messages or recv_nonce > consts.reject_after_messages) {
+                    return ConnError.SessionExpired;
+                }
+
+                // Check if we're waiting for rekey response (have pending handshake)
+                if (has_hs_state) {
+                    // Check if handshake attempt has exceeded RekeyAttemptTime (90s)
+                    if (handshake_attempt_start_time) |start| {
+                        const elapsed: u64 = @intCast(now - start);
+                        if (elapsed > consts.rekey_attempt_time_ns) {
+                            return ConnError.HandshakeTimeout;
+                        }
+                    }
+
+                    // Check if we need to retransmit handshake (every RekeyTimeout = 5s)
+                    if (last_handshake_sent_time) |last_sent| {
+                        const elapsed: u64 = @intCast(now - last_sent);
+                        if (elapsed > consts.rekey_timeout_ns) {
+                            try self.retransmitHandshake();
+                        }
+                    }
+                    return;
+                }
+
+                // Disconnection detection (WireGuard Section 5):
+                // If no packets received for KeepaliveTimeout + RekeyTimeout (15s),
+                // initiate a new handshake to re-establish connection
+                const disconnection_threshold_ns = consts.keepalive_timeout_ns + consts.rekey_timeout_ns;
+                if (is_initiator) {
+                    if (last_recv_time) |last_recv| {
+                        const elapsed: u64 = @intCast(now - last_recv);
+                        if (elapsed > disconnection_threshold_ns) {
+                            try self.initiateRekey();
+                            return;
+                        }
                     }
                 }
 
                 // Check if rekey is needed (session too old or too many messages, initiator only)
-                if (self.is_initiator and !self.rekey_triggered) {
+                if (is_initiator and !rekey_triggered) {
                     var needs_rekey = false;
 
                     // Time-based rekey trigger
-                    if (self.session_created) |session_time| {
+                    if (session_created_time) |session_time| {
                         const elapsed: u64 = @intCast(now - session_time);
                         if (elapsed > consts.rekey_after_time_ns) {
                             needs_rekey = true;
@@ -499,31 +693,24 @@ pub const Conn = struct {
                     }
 
                     // Message-based rekey trigger
-                    if (self.current) |*session| {
-                        const send_nonce = session.send_nonce;
-                        const recv_nonce = session.recv_max_nonce;
-                        if (send_nonce > consts.rekey_after_messages or recv_nonce > consts.rekey_after_messages) {
-                            needs_rekey = true;
-                        }
+                    if (send_nonce > consts.rekey_after_messages) {
+                        needs_rekey = true;
                     }
 
                     if (needs_rekey) {
-                        self.rekey_triggered = true;
-                        // Note: Actual rekey initiation would happen here
-                        // For now, we just mark that rekey is needed
+                        try self.initiateRekey();
+                        return;
                     }
                 }
 
                 // Passive keepalive: send empty message if we haven't sent recently
                 // but have received data recently (peer is active)
-                if (self.last_sent) |last_sent_time| {
-                    if (self.last_received) |last_recv_time| {
-                        const sent_delta: u64 = @intCast(now - last_sent_time);
-                        const recv_delta: u64 = @intCast(now - last_recv_time);
+                if (last_sent_time) |last_sent| {
+                    if (last_recv_time) |last_recv| {
+                        const sent_delta: u64 = @intCast(now - last_sent);
+                        const recv_delta: u64 = @intCast(now - last_recv);
                         if (sent_delta > consts.keepalive_timeout_ns and recv_delta < consts.keepalive_timeout_ns) {
-                            // Send keepalive (empty data message)
-                            // Note: We can't call send() here because we hold the mutex
-                            // This would need to be handled differently in a real implementation
+                            _ = self.sendKeepalive() catch {};
                         }
                     }
                 }
@@ -783,4 +970,303 @@ test "conn handshake and communication" {
     const recv_result2 = try initiator.recv(&recv_buf);
     try std.testing.expectEqual(recv_result2.protocol, .rpc);
     try std.testing.expectEqualStrings(recv_buf[0..recv_result2.bytes_read], "Hello from responder!");
+}
+
+// ============================================
+// Tick tests
+// ============================================
+
+test "tick new conn" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .transport = Transport{ .mock = transport },
+    });
+
+    // Tick on new connection should succeed
+    try conn.tick();
+}
+
+test "tick closed conn" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .transport = Transport{ .mock = transport },
+    });
+
+    conn.close();
+
+    // Tick on closed connection should fail
+    const result = conn.tick();
+    try std.testing.expectError(ConnError.InvalidState, result);
+}
+
+test "tick conn timeout" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const server_key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    const session = Session.init(.{
+        .local_index = 1,
+        .remote_index = 2,
+        .send_key = Key{ .data = [_]u8{1} ** 32 },
+        .recv_key = Key{ .data = [_]u8{2} ** 32 },
+        .remote_pk = server_key.public,
+    });
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .remote_pk = server_key.public,
+        .transport = Transport{ .mock = transport },
+    });
+
+    // Manually set established state with old lastReceived
+    const now = std.time.nanoTimestamp();
+    conn.state = .established;
+    conn.current = session;
+    conn.last_sent = now;
+    conn.last_received = now - @as(i128, consts.reject_after_time_ns) - std.time.ns_per_s;
+    conn.session_created = now;
+
+    const result = conn.tick();
+    try std.testing.expectError(ConnError.ConnTimeout, result);
+}
+
+test "tick handshake timeout" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .transport = Transport{ .mock = transport },
+    });
+
+    // Manually set handshaking state with expired attempt
+    const now = std.time.nanoTimestamp();
+    conn.state = .handshaking;
+    conn.handshake_attempt_start = now - @as(i128, consts.rekey_attempt_time_ns) - std.time.ns_per_s;
+
+    const result = conn.tick();
+    try std.testing.expectError(ConnError.HandshakeTimeout, result);
+}
+
+test "tick no action when recent" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const server_key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    const session = Session.init(.{
+        .local_index = 1,
+        .remote_index = 2,
+        .send_key = Key{ .data = [_]u8{1} ** 32 },
+        .recv_key = Key{ .data = [_]u8{2} ** 32 },
+        .remote_pk = server_key.public,
+    });
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .remote_pk = server_key.public,
+        .transport = Transport{ .mock = transport },
+    });
+
+    const now = std.time.nanoTimestamp();
+    conn.state = .established;
+    conn.current = session;
+    conn.last_sent = now;
+    conn.last_received = now;
+    conn.session_created = now;
+
+    // Tick should succeed without any action
+    try conn.tick();
+}
+
+test "tick responder no rekey" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const server_key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    const session = Session.init(.{
+        .local_index = 1,
+        .remote_index = 2,
+        .send_key = Key{ .data = [_]u8{1} ** 32 },
+        .recv_key = Key{ .data = [_]u8{2} ** 32 },
+        .remote_pk = server_key.public,
+    });
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .remote_pk = server_key.public,
+        .transport = Transport{ .mock = transport },
+    });
+
+    const now = std.time.nanoTimestamp();
+    conn.state = .established;
+    conn.current = session;
+    conn.is_initiator = false; // Responder
+    conn.last_sent = now;
+    conn.last_received = now;
+    // Old session (past RekeyAfterTime)
+    conn.session_created = now - @as(i128, consts.rekey_after_time_ns) - std.time.ns_per_s;
+
+    try conn.tick();
+
+    // Responder should NOT trigger rekey
+    try std.testing.expect(conn.hs_state == null);
+}
+
+test "tick rekey not duplicate" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const server_key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    const session = Session.init(.{
+        .local_index = 1,
+        .remote_index = 2,
+        .send_key = Key{ .data = [_]u8{1} ** 32 },
+        .recv_key = Key{ .data = [_]u8{2} ** 32 },
+        .remote_pk = server_key.public,
+    });
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .remote_pk = server_key.public,
+        .transport = Transport{ .mock = transport },
+    });
+
+    const now = std.time.nanoTimestamp();
+    conn.state = .established;
+    conn.current = session;
+    conn.is_initiator = true;
+    conn.rekey_triggered = true; // Already triggered
+    conn.last_sent = now;
+    conn.last_received = now;
+    conn.session_created = now - @as(i128, consts.rekey_after_time_ns) - std.time.ns_per_s;
+
+    try conn.tick();
+
+    // Should NOT trigger rekey again when already triggered
+    try std.testing.expect(conn.hs_state == null);
+}
+
+test "send keepalive not established" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .transport = Transport{ .mock = transport },
+    });
+
+    // Send keepalive on non-established connection should fail
+    const result = conn.sendKeepalive();
+    try std.testing.expectError(ConnError.NotEstablished, result);
+}
+
+// ============================================
+// Disconnection detection tests
+// ============================================
+
+test "tick disconnection detection initiator" {
+    // Test that initiator detects disconnection when no packets received
+    // for KeepaliveTimeout + RekeyTimeout (15s) and initiates new handshake
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const server_key = KeyPair.generate();
+
+    const client_transport = try transport_mod.MockTransport.init(allocator, "client");
+    defer client_transport.deinit();
+    const server_transport = try transport_mod.MockTransport.init(allocator, "server");
+    defer server_transport.deinit();
+    transport_mod.MockTransport.connect(client_transport, server_transport);
+
+    const session = Session.init(.{
+        .local_index = 1,
+        .remote_index = 2,
+        .send_key = Key{ .data = [_]u8{1} ** 32 },
+        .recv_key = Key{ .data = [_]u8{2} ** 32 },
+        .remote_pk = server_key.public,
+    });
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .remote_pk = server_key.public,
+        .transport = Transport{ .mock = client_transport },
+        .remote_addr = Addr{ .mock = transport_mod.MockAddr.init("server") },
+    });
+
+    // Set as initiator with no recent received data (past disconnection threshold)
+    const disconnection_threshold_ns = consts.keepalive_timeout_ns + consts.rekey_timeout_ns;
+    const now = std.time.nanoTimestamp();
+    conn.state = .established;
+    conn.current = session;
+    conn.is_initiator = true;
+    conn.last_sent = now;
+    conn.last_received = now - @as(i128, disconnection_threshold_ns) - std.time.ns_per_s;
+    conn.session_created = now;
+
+    // Tick should detect disconnection and initiate rekey
+    try conn.tick();
+
+    // Verify that a new handshake was initiated
+    try std.testing.expect(conn.hs_state != null);
+    try std.testing.expect(conn.rekey_triggered == true);
+}
+
+test "tick disconnection detection responder no action" {
+    // Test that responder does NOT initiate handshake on disconnection
+    // (only initiator is responsible for re-establishing connection)
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const server_key = KeyPair.generate();
+    const transport = try transport_mod.MockTransport.init(allocator, "test");
+    defer transport.deinit();
+
+    const session = Session.init(.{
+        .local_index = 1,
+        .remote_index = 2,
+        .send_key = Key{ .data = [_]u8{1} ** 32 },
+        .recv_key = Key{ .data = [_]u8{2} ** 32 },
+        .remote_pk = server_key.public,
+    });
+
+    var conn = Conn.init(allocator, .{
+        .local_key = key,
+        .remote_pk = server_key.public,
+        .transport = Transport{ .mock = transport },
+    });
+
+    // Set as responder with no recent received data
+    const disconnection_threshold_ns = consts.keepalive_timeout_ns + consts.rekey_timeout_ns;
+    const now = std.time.nanoTimestamp();
+    conn.state = .established;
+    conn.current = session;
+    conn.is_initiator = false; // Responder
+    conn.last_sent = now;
+    conn.last_received = now - @as(i128, disconnection_threshold_ns) - std.time.ns_per_s;
+    conn.session_created = now;
+
+    try conn.tick();
+
+    // Responder should NOT initiate handshake
+    try std.testing.expect(conn.hs_state == null);
 }
