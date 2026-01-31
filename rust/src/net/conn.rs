@@ -80,6 +80,8 @@ pub enum ConnError {
     InvalidState,
     /// Connection not established.
     NotEstablished,
+    /// Connection closed.
+    ConnClosed,
     /// Invalid receiver index.
     InvalidReceiverIndex,
     /// Handshake not complete.
@@ -111,6 +113,7 @@ impl std::fmt::Display for ConnError {
             Self::MissingRemoteAddr => write!(f, "missing remote address"),
             Self::InvalidState => write!(f, "invalid connection state"),
             Self::NotEstablished => write!(f, "connection not established"),
+            Self::ConnClosed => write!(f, "connection closed"),
             Self::InvalidReceiverIndex => write!(f, "invalid receiver index"),
             Self::HandshakeIncomplete => write!(f, "handshake not complete"),
             Self::ConnTimeout => write!(f, "connection timed out"),
@@ -210,6 +213,9 @@ pub struct Conn<T: Transport + 'static> {
     // Rekey state
     rekey_triggered: RwLock<bool>,
 
+    // Pending packets waiting for session establishment
+    pending_packets: Mutex<Vec<Vec<u8>>>,
+
     // Inbound channel for listener-managed connections
     // When set, recv() reads from this channel instead of the transport
     inbound_tx: Mutex<Option<Sender<InboundPacket>>>,
@@ -239,6 +245,7 @@ impl<T: Transport + 'static> Conn<T> {
             last_handshake_sent: RwLock::new(None),
             is_initiator: RwLock::new(false),
             rekey_triggered: RwLock::new(false),
+            pending_packets: Mutex::new(Vec::new()),
             inbound_tx: Mutex::new(None),
             inbound_rx: Mutex::new(None),
         })
@@ -342,8 +349,30 @@ impl<T: Transport + 'static> Conn<T> {
             let mut state = self.state.write().unwrap();
             *state = ConnState::Established;
         }
+        {
+            *self.session_created.write().unwrap() = Some(Instant::now());
+            *self.last_sent.write().unwrap() = Some(Instant::now());
+            *self.last_received.write().unwrap() = Some(Instant::now());
+            *self.rekey_triggered.write().unwrap() = false;
+        }
+
+        // Flush any pending packets (outside locks)
+        self.flush_pending_packets();
 
         Ok(())
+    }
+
+    /// Flushes pending packets after session establishment.
+    fn flush_pending_packets(&self) {
+        let packets: Vec<Vec<u8>> = {
+            let mut pending = self.pending_packets.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+
+        for pkt in packets {
+            // Ignore errors - best effort delivery
+            let _ = self.send_payload(pkt, false);
+        }
     }
 
     /// Handles handshake failure.
@@ -353,19 +382,50 @@ impl<T: Transport + 'static> Conn<T> {
     }
 
     /// Sends an encrypted message to the remote peer.
+    ///
+    /// If the connection is not established, the packet is queued and
+    /// will be sent once the handshake completes. Returns `NotEstablished`
+    /// to indicate the packet was queued (not an error in this context).
     pub fn send(&self, protocol: u8, payload: &[u8]) -> Result<()> {
-        // Check state and get session info
-        let (ciphertext, counter, remote_index) = {
-            let state = self.state.read().unwrap();
-            if *state != ConnState::Established {
+        // Perform health check first (like Go's tick(true))
+        // Ignore NotEstablished/Closed errors - we'll queue the packet
+        if let Err(e) = self.tick() {
+            match e {
+                ConnError::NotEstablished | ConnError::ConnClosed => {}
+                _ => return Err(e), // Other errors (timeout, expired) are fatal
+            }
+        }
+
+        let plaintext = encode_payload(protocol, payload);
+        self.send_payload(plaintext, false)
+    }
+
+    /// Internal send implementation shared by send() and send_keepalive().
+    fn send_payload(&self, plaintext: Vec<u8>, is_keepalive: bool) -> Result<()> {
+        // Check state
+        let state = *self.state.read().unwrap();
+
+        if state == ConnState::Closed {
+            return Err(ConnError::ConnClosed);
+        }
+
+        // If no valid session, queue the packet (unless it's a keepalive)
+        if state != ConnState::Established {
+            if is_keepalive {
                 return Err(ConnError::NotEstablished);
             }
 
+            // Queue the packet for later delivery
+            self.pending_packets.lock().unwrap().push(plaintext);
+
+            // Return NotEstablished to indicate packet is queued
+            return Err(ConnError::NotEstablished);
+        }
+
+        // Get session and encrypt
+        let (ciphertext, counter, remote_index) = {
             let session_lock = self.current.read().unwrap();
             let session = session_lock.as_ref().unwrap();
-
-            // Encode and encrypt
-            let plaintext = encode_payload(protocol, payload);
             let (ciphertext, counter) = session.encrypt(&plaintext)?;
             (ciphertext, counter, session.remote_index())
         };
@@ -386,8 +446,9 @@ impl<T: Transport + 'static> Conn<T> {
 
     /// Sends an empty keepalive message to the remote peer.
     /// This is used to keep NAT mappings alive and to signal liveness.
+    /// Keepalives are not queued - they return an error if not established.
     pub fn send_keepalive(&self) -> Result<()> {
-        self.send(0, &[])
+        self.send_payload(Vec::new(), true)
     }
 
     /// Receives and decrypts a message from the remote peer.

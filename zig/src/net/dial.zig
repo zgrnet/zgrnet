@@ -149,13 +149,17 @@ pub fn dial(opts: DialOptions) DialError!*Conn {
         const read_deadline = @min(rekey_deadline, deadline);
 
         // Set read deadline on transport
-        opts.transport.setReadDeadline(read_deadline) catch {};
+        opts.transport.setReadDeadline(read_deadline) catch {
+            conn.setState(.new);
+            opts.allocator.destroy(conn);
+            return DialError.TransportError;
+        };
 
         // Wait for handshake response
         var buf: [message.max_packet_size]u8 = undefined;
         const recv_result = opts.transport.recvFrom(&buf);
 
-        // Clear deadline
+        // Clear deadline (ignore errors - best effort)
         opts.transport.setReadDeadline(null) catch {};
 
         // Handle receive result
