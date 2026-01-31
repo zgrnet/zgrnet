@@ -19,6 +19,8 @@ Thumbs.db
 # Go
 **/bin/
 **/pkg/
+coverage.out
+coverage.html
 
 # Zig
 **/.zig-cache/

@@ -2,13 +2,10 @@
 //!
 //! Usage:
 //!   zig build && ./zig-out/bin/host_test --name zig
-//!
-//! Or run test directly:
-//!   cd zig && zig run examples/host_test.zig -- --name zig
 
 const std = @import("std");
 const posix = std.posix;
-const noise = @import("../src/noise.zig");
+const noise = @import("noise");
 
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
@@ -63,22 +60,24 @@ pub fn main() !void {
     };
 
     // Parse private key
-    var priv_key: Key = undefined;
-    _ = std.fmt.hexToBytes(&priv_key, info.private_key) catch {
+    var priv_key_bytes: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&priv_key_bytes, info.private_key) catch {
         std.debug.print("Invalid private key\n", .{});
         return;
     };
+    const priv_key = Key.fromBytes(priv_key_bytes);
 
     const key_pair = KeyPair.fromPrivate(priv_key);
 
-    std.debug.print("[{s}] Public key: {s}\n", .{ host_name, std.fmt.fmtSliceHexLower(&key_pair.public) });
+    // Print first 8 bytes of public key for identification
+    std.debug.print("[{s}] Public key: {x}\n", .{ host_name, key_pair.public.data[0..8].* });
 
     // Pre-calculate peer keypairs for efficient lookups
     var peer_keypairs: [hosts.len]KeyPair = undefined;
     for (hosts, 0..) |h, i| {
-        var pk: Key = undefined;
-        _ = std.fmt.hexToBytes(&pk, h.private_key) catch continue;
-        peer_keypairs[i] = KeyPair.fromPrivate(pk);
+        var pk_bytes: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&pk_bytes, h.private_key) catch continue;
+        peer_keypairs[i] = KeyPair.fromPrivate(Key.fromBytes(pk_bytes));
     }
 
     // Create UDP
@@ -99,23 +98,23 @@ pub fn main() !void {
             continue;
         }
 
-        var peer_priv: Key = undefined;
-        _ = std.fmt.hexToBytes(&peer_priv, h.private_key) catch continue;
-        const peer_kp = KeyPair.fromPrivate(peer_priv);
+        var peer_priv_bytes: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&peer_priv_bytes, h.private_key) catch continue;
+        const peer_kp = KeyPair.fromPrivate(Key.fromBytes(peer_priv_bytes));
 
         var endpoint: posix.sockaddr.in = .{
             .family = posix.AF.INET,
             .port = std.mem.nativeToBig(u16, h.port),
-            .addr = 0x7F000001, // 127.0.0.1
+            .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1 in network byte order
         };
 
-        udp.setPeerEndpoint(peer_kp.public, @ptrCast(&endpoint).*, @sizeOf(posix.sockaddr.in));
+        udp.setPeerEndpoint(peer_kp.public, @as(*posix.sockaddr, @ptrCast(&endpoint)).*, @sizeOf(posix.sockaddr.in));
         std.debug.print("[{s}] Added peer {s} at port {d}\n", .{ host_name, h.name, h.port });
     }
 
     // Wait for other hosts to start
     std.debug.print("[{s}] Waiting 2 seconds for other hosts...\n", .{host_name});
-    std.time.sleep(2 * std.time.ns_per_s);
+    std.Thread.sleep(2 * std.time.ns_per_s);
 
     // Start receive thread
     const RecvContext = struct {
@@ -165,9 +164,9 @@ pub fn main() !void {
             continue;
         }
 
-        var peer_priv: Key = undefined;
-        _ = std.fmt.hexToBytes(&peer_priv, h.private_key) catch continue;
-        const peer_kp = KeyPair.fromPrivate(peer_priv);
+        var peer_priv_bytes: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&peer_priv_bytes, h.private_key) catch continue;
+        const peer_kp = KeyPair.fromPrivate(Key.fromBytes(peer_priv_bytes));
 
         std.debug.print("[{s}] Connecting to {s}...\n", .{ host_name, h.name });
 
@@ -193,7 +192,7 @@ pub fn main() !void {
     std.debug.print("[{s}] Running... Press Ctrl+C to exit\n", .{host_name});
 
     // Wait a bit for messages then exit
-    std.time.sleep(5 * std.time.ns_per_s);
+    std.Thread.sleep(5 * std.time.ns_per_s);
     running.store(false, .seq_cst);
     udp.close();
     recv_thread.join();
@@ -202,7 +201,7 @@ pub fn main() !void {
 /// Find peer name using pre-calculated keypairs for O(1) key derivation.
 fn findPeerNameCached(pubkey: *const Key, keypairs: *const [hosts.len]KeyPair) []const u8 {
     for (hosts, 0..) |h, i| {
-        if (std.mem.eql(u8, &keypairs[i].public, pubkey)) {
+        if (std.mem.eql(u8, &keypairs[i].public.data, &pubkey.data)) {
             return h.name;
         }
     }

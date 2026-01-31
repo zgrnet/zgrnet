@@ -131,25 +131,8 @@ func BenchmarkTransport1KB(b *testing.B) {
 }
 
 // =============================================================================
-// Concurrent Session Benchmarks
+// Concurrent Benchmarks
 // =============================================================================
-
-// BenchmarkConcurrentSessionCreate benchmarks concurrent session creation
-func BenchmarkConcurrentSessionCreate(b *testing.B) {
-	manager := NewSessionManager()
-
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			kp, _ := GenerateKeyPair()
-			sendKey := Hash([]byte("send"))
-			recvKey := Hash([]byte("recv"))
-			session, _ := manager.CreateSession(kp.Public, sendKey, recvKey)
-			if session != nil {
-				manager.RemoveSession(session.LocalIndex())
-			}
-		}
-	})
-}
 
 // BenchmarkConcurrentHandshake benchmarks concurrent IK handshakes
 func BenchmarkConcurrentHandshake(b *testing.B) {
@@ -267,45 +250,6 @@ func BenchmarkConcurrentMultiSession(b *testing.B) {
 		for pb.Next() {
 			idx := int(counter.Add(1)) % numSessions
 			sessions[idx].Encrypt(plaintext)
-		}
-	})
-}
-
-// BenchmarkSessionManagerConcurrent benchmarks concurrent manager operations
-func BenchmarkSessionManagerConcurrent(b *testing.B) {
-	manager := NewSessionManager()
-
-	// Pre-create some sessions
-	for i := 0; i < 100; i++ {
-		kp, _ := GenerateKeyPair()
-		sendKey := Hash([]byte("send"))
-		recvKey := Hash([]byte("recv"))
-		manager.CreateSession(kp.Public, sendKey, recvKey)
-	}
-
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			// Mix of operations
-			kp, _ := GenerateKeyPair()
-			sendKey := Hash([]byte("send"))
-			recvKey := Hash([]byte("recv"))
-
-			// Create
-			session, _ := manager.CreateSession(kp.Public, sendKey, recvKey)
-			if session == nil {
-				continue
-			}
-
-			// Lookup by index
-			manager.GetByIndex(session.LocalIndex())
-
-			// Lookup by pubkey
-			manager.GetByPubkey(kp.Public)
-
-			// Remove
-			manager.RemoveSession(session.LocalIndex())
 		}
 	})
 }

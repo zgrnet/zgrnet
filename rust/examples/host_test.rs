@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use noise::{Key, KeyPair};
-use noise::{UDP, UdpOptions};
+use zgrnet::{Key, KeyPair};
+use zgrnet::{UDP, UdpOptions, UdpError};
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -36,18 +36,24 @@ fn main() {
         .position(|x| x == "--name")
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
-        .expect("Usage: --name <name>");
+        .expect("Usage: --name <name> --config <path>");
 
-    // Load config - try CONFIG_PATH env var first, then use path relative to crate manifest
-    let config_path = env::var("CONFIG_PATH").unwrap_or_else(|_| {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        std::path::Path::new(manifest_dir)
-            .parent()
-            .unwrap() // Move up to repo root from rust/
-            .join("examples/host_test/config.json")
-            .to_string_lossy()
-            .to_string()
-    });
+    // Load config - try --config flag first, then CONFIG_PATH env var, then default path
+    let config_path = args
+        .iter()
+        .position(|x| x == "--config")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.to_string())
+        .or_else(|| env::var("CONFIG_PATH").ok())
+        .unwrap_or_else(|| {
+            let manifest_dir = env!("CARGO_MANIFEST_DIR");
+            std::path::Path::new(manifest_dir)
+                .parent()
+                .unwrap() // Move up to repo root from rust/
+                .join("examples/net_test/config.json")
+                .to_string_lossy()
+                .to_string()
+        });
     let config_data = fs::read_to_string(&config_path)
         .unwrap_or_else(|e| panic!("Failed to read config {}: {}", config_path, e));
     let config: Config = serde_json::from_str(&config_data)
@@ -127,7 +133,7 @@ fn main() {
                         let _ = udp_recv.write_to(&from_pk, reply.as_bytes());
                     }
                 }
-                Err(noise::UdpError::Closed) => {
+                Err(UdpError::Closed) => {
                     println!("[{}] UDP closed", recv_name);
                     break;
                 }
