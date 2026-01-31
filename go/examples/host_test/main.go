@@ -11,23 +11,15 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
+	stdnet "net"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/vibing/zgrnet/host"
+	"github.com/vibing/zgrnet/net"
 	"github.com/vibing/zgrnet/noise"
-	"github.com/vibing/zgrnet/transport"
 )
-
-// PeerInfo describes a peer to connect to.
-type PeerInfo struct {
-	Name      string `json:"name"`
-	PublicKey string `json:"public_key"` // hex encoded
-	Address   string `json:"address"`    // host:port
-}
 
 // Config is the test configuration.
 type Config struct {
@@ -77,17 +69,7 @@ func main() {
 	}
 
 	// Parse private key
-	privKeyBytes, err := hex.DecodeString(myHost.PrivateKey)
-	if err != nil {
-		log.Fatalf("Invalid private key: %v", err)
-	}
-	if len(privKeyBytes) != 32 {
-		log.Fatalf("Private key must be 32 bytes, got %d", len(privKeyBytes))
-	}
-
-	var privKey noise.Key
-	copy(privKey[:], privKeyBytes)
-	keyPair, err := noise.NewKeyPair(privKey)
+	keyPair, err := keyPairFromHex(myHost.PrivateKey)
 	if err != nil {
 		log.Fatalf("Failed to create key pair: %v", err)
 	}
@@ -97,27 +79,15 @@ func main() {
 	// Pre-calculate peer name map for efficient lookups
 	peerNames := buildPeerNameMap(config)
 
-	// Create UDP transport
-	bindAddr := fmt.Sprintf(":%d", myHost.Port)
-	udp, err := transport.NewUDPListener(bindAddr)
+	// Create UDP network
+	bindAddr := fmt.Sprintf("127.0.0.1:%d", myHost.Port)
+	udp, err := net.NewUDP(keyPair, net.WithBindAddr(bindAddr), net.WithAllowUnknown(true))
 	if err != nil {
-		log.Fatalf("Failed to create UDP listener: %v", err)
+		log.Fatalf("Failed to create UDP: %v", err)
 	}
 	defer udp.Close()
 
-	log.Printf("[%s] Listening on port %d", *name, udp.Port())
-
-	// Create Host
-	h, err := host.NewHost(host.HostConfig{
-		PrivateKey:        keyPair,
-		Transport:         udp,
-		AllowUnknownPeers: true,
-		MTU:               1280,
-	})
-	if err != nil {
-		log.Fatalf("Failed to create host: %v", err)
-	}
-	defer h.Close()
+	log.Printf("[%s] Listening on %s", *name, udp.HostInfo().Addr.String())
 
 	// Add other hosts as peers
 	for _, hi := range config.Hosts {
@@ -125,52 +95,44 @@ func main() {
 			continue // Skip self
 		}
 
-		privKeySeedBytes, err := hex.DecodeString(hi.PrivateKey)
-		if err != nil {
-			log.Printf("Warning: invalid key for %s: %v", hi.Name, err)
-			continue
-		}
-		var peerPrivKey noise.Key
-		copy(peerPrivKey[:], privKeySeedBytes)
-		peerKP, err := noise.NewKeyPair(peerPrivKey)
+		peerKP, err := keyPairFromHex(hi.PrivateKey)
 		if err != nil {
 			log.Printf("Warning: failed to derive key for %s: %v", hi.Name, err)
 			continue
 		}
 
-		addr := &transport.UDPAddr{
-			UDPAddr: &net.UDPAddr{
-				IP:   net.ParseIP("127.0.0.1"),
-				Port: hi.Port,
-			},
+		addr := &stdnet.UDPAddr{
+			IP:   stdnet.ParseIP("127.0.0.1"),
+			Port: hi.Port,
 		}
 
-		h.AddPeer(peerKP.Public, addr)
+		udp.SetPeerEndpoint(peerKP.Public, addr)
 		log.Printf("[%s] Added peer %s at port %d", *name, hi.Name, hi.Port)
 	}
 
 	// Handle incoming messages in background
 	go func() {
+		buf := make([]byte, 65535)
 		for {
-			msg, err := h.RecvTimeout(time.Second)
+			pk, n, err := udp.ReadFrom(buf)
 			if err != nil {
-				if err == host.ErrHostClosed {
+				if err == net.ErrClosed {
 					return
 				}
 				continue
 			}
 
-			fromName := peerNames[msg.From]
+			fromName := peerNames[pk]
 			if fromName == "" {
-				fromName = hex.EncodeToString(msg.From[:8]) + "..."
+				fromName = hex.EncodeToString(pk[:8]) + "..."
 			}
-			log.Printf("[%s] Received from %s: protocol=%d, data=%q",
-				*name, fromName, msg.Protocol, string(msg.Data))
+			log.Printf("[%s] Received from %s: data=%q",
+				*name, fromName, string(buf[:n]))
 
 			// Only echo back if it's not already an ACK (avoid infinite loop)
-			if len(msg.Data) < 3 || string(msg.Data[:3]) != "ACK" {
-				reply := fmt.Sprintf("ACK from %s: %s", *name, string(msg.Data))
-				if err := h.Send(msg.From, msg.Protocol, []byte(reply)); err != nil {
+			if n < 3 || string(buf[:3]) != "ACK" {
+				reply := fmt.Sprintf("ACK from %s: %s", *name, string(buf[:n]))
+				if err := udp.WriteTo(pk, []byte(reply)); err != nil {
 					log.Printf("[%s] Failed to send reply: %v", *name, err)
 				}
 			}
@@ -187,21 +149,14 @@ func main() {
 			continue
 		}
 
-		privKeySeedBytes, err := hex.DecodeString(hi.PrivateKey)
-		if err != nil {
-			log.Printf("[%s] Failed to decode private key for %s: %v", *name, hi.Name, err)
-			continue
-		}
-		var peerPrivKey noise.Key
-		copy(peerPrivKey[:], privKeySeedBytes)
-		peerKP, err := noise.NewKeyPair(peerPrivKey)
+		peerKP, err := keyPairFromHex(hi.PrivateKey)
 		if err != nil {
 			log.Printf("[%s] Failed to derive key for %s: %v", *name, hi.Name, err)
 			continue
 		}
 
 		log.Printf("[%s] Connecting to %s...", *name, hi.Name)
-		if err := h.Connect(peerKP.Public); err != nil {
+		if err := udp.Connect(peerKP.Public); err != nil {
 			log.Printf("[%s] Failed to connect to %s: %v", *name, hi.Name, err)
 			continue
 		}
@@ -209,7 +164,7 @@ func main() {
 
 		// Send test message
 		testMsg := fmt.Sprintf("Hello from %s to %s!", *name, hi.Name)
-		if err := h.Send(peerKP.Public, noise.ProtocolChat, []byte(testMsg)); err != nil {
+		if err := udp.WriteTo(peerKP.Public, []byte(testMsg)); err != nil {
 			log.Printf("[%s] Failed to send to %s: %v", *name, hi.Name, err)
 		} else {
 			log.Printf("[%s] Sent message to %s", *name, hi.Name)
@@ -239,17 +194,25 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
+// keyPairFromHex creates a KeyPair from a hex-encoded private key seed.
+func keyPairFromHex(privateKeyHex string) (*noise.KeyPair, error) {
+	privKeyBytes, err := hex.DecodeString(privateKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid private key hex: %w", err)
+	}
+	if len(privKeyBytes) != 32 {
+		return nil, fmt.Errorf("private key must be 32 bytes, got %d", len(privKeyBytes))
+	}
+	var privKey noise.Key
+	copy(privKey[:], privKeyBytes)
+	return noise.NewKeyPair(privKey)
+}
+
 // buildPeerNameMap creates a map of public keys to host names for efficient lookups.
 func buildPeerNameMap(config *Config) map[noise.PublicKey]string {
 	m := make(map[noise.PublicKey]string)
 	for _, h := range config.Hosts {
-		pubKeyBytes, err := hex.DecodeString(h.PrivateKey)
-		if err != nil {
-			continue
-		}
-		var privKey noise.Key
-		copy(privKey[:], pubKeyBytes)
-		kp, err := noise.NewKeyPair(privKey)
+		kp, err := keyPairFromHex(h.PrivateKey)
 		if err != nil {
 			continue
 		}

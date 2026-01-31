@@ -158,23 +158,15 @@ impl<T: Transport + 'static> PeerManager<T> {
         let endpoint = peer.endpoint().ok_or(PeerManagerError::NoEndpoint)?;
 
         // Start async handshake
-        let rx = self.dial_async(peer.clone(), endpoint)?;
+        let (rx, local_idx) = self.dial_async(peer.clone(), endpoint)?;
 
         // Wait for completion or timeout
         match rx.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Clean up pending handshake
+                // Clean up pending handshake using the exact local_idx
                 let mut inner = self.inner.write().unwrap();
-                let to_remove: Vec<u32> = inner
-                    .pending
-                    .iter()
-                    .filter(|(_, p)| Arc::ptr_eq(&p.peer, &peer))
-                    .map(|(idx, _)| *idx)
-                    .collect();
-                for idx in to_remove {
-                    inner.pending.remove(&idx);
-                }
+                inner.pending.remove(&local_idx);
                 peer.set_state(PeerState::Failed);
                 Err(PeerManagerError::HandshakeTimeout)
             }
@@ -186,11 +178,13 @@ impl<T: Transport + 'static> PeerManager<T> {
     }
 
     /// Starts a handshake without blocking.
+    /// Returns a channel for completion notification and the local_idx used
+    /// to identify this handshake attempt.
     fn dial_async(
         &self,
         peer: Arc<Peer>,
         endpoint: Box<dyn Addr>,
-    ) -> Result<mpsc::Receiver<Result<()>>> {
+    ) -> Result<(mpsc::Receiver<Result<()>>, u32)> {
         peer.set_state(PeerState::Connecting);
 
         let local_idx = generate_index();
@@ -237,7 +231,7 @@ impl<T: Transport + 'static> PeerManager<T> {
             return Err(e.into());
         }
 
-        Ok(rx)
+        Ok((rx, local_idx))
     }
 
     /// Handles an incoming handshake response.

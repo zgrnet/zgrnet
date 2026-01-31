@@ -176,7 +176,11 @@ impl<T: Transport + Send + Sync + 'static> Host<T> {
                                         protocol,
                                         data,
                                     };
-                                    let _ = inbox.try_send(msg);
+                                    if let Err(e) = inbox.try_send(msg) {
+                                        if e.is_full() {
+                                            eprintln!("host: inbox full, dropping message");
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     eprintln!("Transport error: {}", e);

@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "net",
+    srcs = ["udp.go"],
+    importpath = "github.com/vibing/zgrnet/net",
+    visibility = ["//visibility:public"],
+    deps = ["//go:noise"],
+)
+
+go_test(
+    name = "net_test",
+    srcs = ["udp_test.go"],
+    embed = [":net"],
+    deps = ["//go:noise"],
+)
