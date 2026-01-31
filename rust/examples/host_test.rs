@@ -12,10 +12,10 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 
-use noise::keypair::{Key, KeyPair};
-use noise::host::{Host, HostConfig};
+use noise::{Key, KeyPair};
+use noise::{Host, HostConfig};
 use noise::message::protocol;
-use noise::udp_listener::UdpListener;
+use noise::UdpListener;
 use noise::udp::UdpAddr;
 
 #[derive(serde::Deserialize)]
