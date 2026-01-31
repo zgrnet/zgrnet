@@ -91,8 +91,6 @@ pub fn main() !void {
     };
     defer udp.deinit();
 
-    const host_info = udp.hostInfo();
-    _ = host_info;
     std.debug.print("[{s}] Listening on port {d}\n", .{ host_name, info.port });
 
     // Add other hosts as peers

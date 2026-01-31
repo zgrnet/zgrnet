@@ -576,16 +576,13 @@ impl UDP {
             Err(_) => return,
         };
 
-        let session = match Session::new(SessionConfig {
+        let session = Session::new(SessionConfig {
             local_index: local_idx,
             remote_index: msg.sender_index,
             send_key: *send_cs.key(),
             recv_key: *recv_cs.key(),
             remote_pk,
-        }) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
+        });
 
         // Update peer state
         let peers = self.peers.read().unwrap();
@@ -645,19 +642,13 @@ impl UDP {
             }
         };
 
-        let session = match Session::new(SessionConfig {
+        let session = Session::new(SessionConfig {
             local_index: pending.local_idx,
             remote_index: msg.sender_index,
             send_key: *send_cs.key(),
             recv_key: *recv_cs.key(),
             remote_pk: pending.peer_pk,
-        }) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = pending.done.send(Err(UdpError::HandshakeFailed));
-                return;
-            }
-        };
+        });
 
         // Update peer state
         let peers = self.peers.read().unwrap();

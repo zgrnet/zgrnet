@@ -287,7 +287,7 @@ pub const UDP = struct {
     }
 
     /// Returns information about the local host.
-    pub fn hostInfo(self: *UDP) HostInfo {
+    pub fn hostInfo(self: *UDP, out: *HostInfo) void {
         self.peers_mutex.lock();
         const peer_count = self.peers_map.count();
         self.peers_mutex.unlock();
@@ -295,7 +295,7 @@ pub const UDP = struct {
         const last_seen_val = self.last_seen.load(.seq_cst);
         const last_seen = if (last_seen_val == 0) null else last_seen_val;
 
-        return .{
+        out.* = .{
             .public_key = self.local_key.public,
             .addr = self.local_addr,
             .addr_len = self.local_addr_len,
@@ -846,7 +846,8 @@ test "host info" {
     const udp = try UDP.init(allocator, key, .{});
     defer udp.deinit();
 
-    const info = udp.hostInfo();
+    var info: HostInfo = undefined;
+    udp.hostInfo(&info);
     try std.testing.expect(std.mem.eql(u8, &info.public_key.data, &key.public.data));
     try std.testing.expectEqual(@as(usize, 0), info.peer_count);
 }
