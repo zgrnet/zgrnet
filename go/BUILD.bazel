@@ -19,3 +19,38 @@ go_test(
     srcs = glob(["noise/*_test.go"]),
     embed = [":noise"],
 )
+
+# Connection layer - manages connections with Dial/Accept, Tick for timers
+go_library(
+    name = "conn",
+    srcs = glob(["conn/*.go"], exclude = ["conn/*_test.go"]),
+    importpath = "github.com/vibing/zgrnet/conn",
+    visibility = ["//visibility:public"],
+    deps = [":noise"],
+)
+
+go_test(
+    name = "conn_test",
+    srcs = glob(["conn/*_test.go"]),
+    embed = [":conn"],
+    deps = [":noise"],
+)
+
+# Transport layer implementations
+go_library(
+    name = "transport",
+    srcs = glob(["transport/*.go"], exclude = ["transport/*_test.go"]),
+    importpath = "github.com/vibing/zgrnet/transport",
+    visibility = ["//visibility:public"],
+    deps = [":noise"],
+)
+
+go_test(
+    name = "transport_test",
+    srcs = glob(["transport/*_test.go"]),
+    embed = [":transport"],
+    deps = [
+        ":conn",
+        ":noise",
+    ],
+)

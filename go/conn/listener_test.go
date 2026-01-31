@@ -1,14 +1,16 @@
-package noise
+package conn
 
 import (
 	"bytes"
 	"testing"
 	"time"
+
+	"github.com/vibing/zgrnet/noise"
 )
 
 func TestNewListenerMissingLocalKey(t *testing.T) {
 	_, err := NewListener(ListenerConfig{
-		Transport: NewMockTransport("test"),
+		Transport: noise.NewMockTransport("test"),
 	})
 	if err != ErrMissingLocalKey {
 		t.Errorf("NewListener() error = %v, want ErrMissingLocalKey", err)
@@ -16,7 +18,7 @@ func TestNewListenerMissingLocalKey(t *testing.T) {
 }
 
 func TestNewListenerMissingTransport(t *testing.T) {
-	key, _ := GenerateKeyPair()
+	key, _ := noise.GenerateKeyPair()
 	_, err := NewListener(ListenerConfig{
 		LocalKey: key,
 	})
@@ -26,8 +28,8 @@ func TestNewListenerMissingTransport(t *testing.T) {
 }
 
 func TestNewListenerSuccess(t *testing.T) {
-	key, _ := GenerateKeyPair()
-	transport := NewMockTransport("test")
+	key, _ := noise.GenerateKeyPair()
+	transport := noise.NewMockTransport("test")
 
 	listener, err := NewListener(ListenerConfig{
 		LocalKey:  key,
@@ -48,8 +50,8 @@ func TestNewListenerSuccess(t *testing.T) {
 }
 
 func TestListenerClose(t *testing.T) {
-	key, _ := GenerateKeyPair()
-	transport := NewMockTransport("test")
+	key, _ := noise.GenerateKeyPair()
+	transport := noise.NewMockTransport("test")
 
 	listener, _ := NewListener(ListenerConfig{
 		LocalKey:  key,
@@ -68,8 +70,8 @@ func TestListenerClose(t *testing.T) {
 }
 
 func TestListenerAcceptAfterClose(t *testing.T) {
-	key, _ := GenerateKeyPair()
-	transport := NewMockTransport("test")
+	key, _ := noise.GenerateKeyPair()
+	transport := noise.NewMockTransport("test")
 
 	listener, _ := NewListener(ListenerConfig{
 		LocalKey:  key,
@@ -86,8 +88,8 @@ func TestListenerAcceptAfterClose(t *testing.T) {
 
 func TestListenerAcceptConnection(t *testing.T) {
 	// Create listener
-	serverKey, _ := GenerateKeyPair()
-	serverTransport := NewMockTransport("server")
+	serverKey, _ := noise.GenerateKeyPair()
+	serverTransport := noise.NewMockTransport("server")
 
 	listener, err := NewListener(ListenerConfig{
 		LocalKey:  serverKey,
@@ -99,22 +101,18 @@ func TestListenerAcceptConnection(t *testing.T) {
 	defer listener.Close()
 
 	// Create client
-	clientKey, _ := GenerateKeyPair()
-	clientTransport := NewMockTransport("client")
+	clientKey, _ := noise.GenerateKeyPair()
+	clientTransport := noise.NewMockTransport("client")
 	clientTransport.Connect(serverTransport)
 	defer clientTransport.Close()
 
-	clientConn, _ := NewConn(ConnConfig{
-		LocalKey:   clientKey,
-		RemotePK:   serverKey.Public,
-		Transport:  clientTransport,
-		RemoteAddr: serverTransport.LocalAddr(),
-	})
-
 	// Start client dial in goroutine
 	done := make(chan error)
+	var clientConn *Conn
 	go func() {
-		done <- clientConn.Open()
+		var err error
+		clientConn, err = Dial(clientTransport, serverTransport.LocalAddr(), serverKey.Public, clientKey)
+		done <- err
 	}()
 
 	// Accept connection on server
@@ -143,18 +141,12 @@ func TestListenerAcceptConnection(t *testing.T) {
 	if serverConn.RemotePublicKey() != clientKey.Public {
 		t.Error("Server remote public key mismatch")
 	}
-
-	// Note: Communication testing is done in conn_test.go
-	// The listener's receive loop and Conn.Recv compete for the same transport,
-	// so we don't test Send/Recv here. In production, you would either:
-	// 1. Use separate transports per connection, or
-	// 2. Have the listener route packets to the appropriate connection
 }
 
 func TestListenerMultipleConnections(t *testing.T) {
 	// Create listener
-	serverKey, _ := GenerateKeyPair()
-	serverTransport := NewMockTransport("server")
+	serverKey, _ := noise.GenerateKeyPair()
+	serverTransport := noise.NewMockTransport("server")
 
 	listener, _ := NewListener(ListenerConfig{
 		LocalKey:  serverKey,
@@ -165,26 +157,20 @@ func TestListenerMultipleConnections(t *testing.T) {
 	// Connect multiple clients
 	numClients := 3
 	clients := make([]*Conn, numClients)
-	clientTransports := make([]*MockTransport, numClients)
+	clientTransports := make([]*noise.MockTransport, numClients)
 
 	for i := 0; i < numClients; i++ {
-		clientKey, _ := GenerateKeyPair()
-		clientTransport := NewMockTransport("client")
+		clientKey, _ := noise.GenerateKeyPair()
+		clientTransport := noise.NewMockTransport("client")
 		clientTransport.Connect(serverTransport)
 		clientTransports[i] = clientTransport
-
-		clientConn, _ := NewConn(ConnConfig{
-			LocalKey:   clientKey,
-			RemotePK:   serverKey.Public,
-			Transport:  clientTransport,
-			RemoteAddr: serverTransport.LocalAddr(),
-		})
-		clients[i] = clientConn
 
 		// Dial and accept
 		done := make(chan error)
 		go func() {
-			done <- clientConn.Open()
+			var err error
+			clients[i], err = Dial(clientTransport, serverTransport.LocalAddr(), serverKey.Public, clientKey)
+			done <- err
 		}()
 
 		serverConn, err := listener.Accept()
@@ -210,8 +196,8 @@ func TestListenerMultipleConnections(t *testing.T) {
 }
 
 func TestListenerSessionManager(t *testing.T) {
-	serverKey, _ := GenerateKeyPair()
-	serverTransport := NewMockTransport("server")
+	serverKey, _ := noise.GenerateKeyPair()
+	serverTransport := noise.NewMockTransport("server")
 
 	listener, _ := NewListener(ListenerConfig{
 		LocalKey:  serverKey,
@@ -230,21 +216,15 @@ func TestListenerSessionManager(t *testing.T) {
 	}
 
 	// Connect a client
-	clientKey, _ := GenerateKeyPair()
-	clientTransport := NewMockTransport("client")
+	clientKey, _ := noise.GenerateKeyPair()
+	clientTransport := noise.NewMockTransport("client")
 	clientTransport.Connect(serverTransport)
 	defer clientTransport.Close()
 
-	clientConn, _ := NewConn(ConnConfig{
-		LocalKey:   clientKey,
-		RemotePK:   serverKey.Public,
-		Transport:  clientTransport,
-		RemoteAddr: serverTransport.LocalAddr(),
-	})
-
 	done := make(chan error)
 	go func() {
-		done <- clientConn.Open()
+		_, err := Dial(clientTransport, serverTransport.LocalAddr(), serverKey.Public, clientKey)
+		done <- err
 	}()
 
 	listener.Accept()
@@ -263,8 +243,8 @@ func TestListenerSessionManager(t *testing.T) {
 }
 
 func TestListenerSendTo(t *testing.T) {
-	key, _ := GenerateKeyPair()
-	transport := NewMockTransport("server")
+	key, _ := noise.GenerateKeyPair()
+	transport := noise.NewMockTransport("server")
 
 	listener, _ := NewListener(ListenerConfig{
 		LocalKey:  key,
@@ -273,7 +253,7 @@ func TestListenerSendTo(t *testing.T) {
 	defer listener.Close()
 
 	// Create a peer transport to receive
-	peerTransport := NewMockTransport("peer")
+	peerTransport := noise.NewMockTransport("peer")
 	transport.Connect(peerTransport)
 	defer peerTransport.Close()
 
@@ -296,8 +276,8 @@ func TestListenerSendTo(t *testing.T) {
 }
 
 func TestListenerIgnoresInvalidMessages(t *testing.T) {
-	key, _ := GenerateKeyPair()
-	transport := NewMockTransport("server")
+	key, _ := noise.GenerateKeyPair()
+	transport := noise.NewMockTransport("server")
 
 	listener, _ := NewListener(ListenerConfig{
 		LocalKey:  key,
@@ -306,7 +286,7 @@ func TestListenerIgnoresInvalidMessages(t *testing.T) {
 	defer listener.Close()
 
 	// Inject invalid messages
-	from := NewMockAddr("attacker")
+	from := noise.NewMockAddr("attacker")
 
 	// Too short
 	transport.InjectPacket([]byte{}, from)
@@ -315,27 +295,23 @@ func TestListenerIgnoresInvalidMessages(t *testing.T) {
 	transport.InjectPacket([]byte{99, 1, 2, 3}, from)
 
 	// Truncated handshake init
-	transport.InjectPacket([]byte{MessageTypeHandshakeInit, 1, 2, 3}, from)
+	transport.InjectPacket([]byte{noise.MessageTypeHandshakeInit, 1, 2, 3}, from)
 
 	// Give listener time to process
 	time.Sleep(50 * time.Millisecond)
 
 	// Listener should still be working - try a valid connection
-	clientKey, _ := GenerateKeyPair()
-	clientTransport := NewMockTransport("client")
+	clientKey, _ := noise.GenerateKeyPair()
+	clientTransport := noise.NewMockTransport("client")
 	clientTransport.Connect(transport)
 	defer clientTransport.Close()
 
-	clientConn, _ := NewConn(ConnConfig{
-		LocalKey:   clientKey,
-		RemotePK:   key.Public,
-		Transport:  clientTransport,
-		RemoteAddr: transport.LocalAddr(),
-	})
-
 	done := make(chan error)
+	var clientConn *Conn
 	go func() {
-		done <- clientConn.Open()
+		var err error
+		clientConn, err = Dial(clientTransport, transport.LocalAddr(), key.Public, clientKey)
+		done <- err
 	}()
 
 	// Should still be able to accept valid connections

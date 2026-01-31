@@ -1,8 +1,9 @@
-package noise
+package conn
 
 import (
-	"errors"
 	"sync"
+
+	"github.com/vibing/zgrnet/noise"
 )
 
 // Listener listens for incoming connections on a transport.
@@ -11,8 +12,8 @@ import (
 type Listener struct {
 	mu sync.Mutex
 
-	localKey  *KeyPair
-	transport Transport
+	localKey  *noise.KeyPair
+	transport noise.Transport
 
 	// Active connections indexed by local session index
 	conns map[uint32]*Conn
@@ -21,7 +22,7 @@ type Listener struct {
 	ready chan *Conn
 
 	// Session manager for established sessions
-	manager *SessionManager
+	manager *noise.SessionManager
 
 	// Closed flag
 	closed bool
@@ -31,9 +32,9 @@ type Listener struct {
 // ListenerConfig contains the configuration for creating a listener.
 type ListenerConfig struct {
 	// LocalKey is the local static key pair.
-	LocalKey *KeyPair
+	LocalKey *noise.KeyPair
 	// Transport is the underlying datagram transport.
-	Transport Transport
+	Transport noise.Transport
 	// AcceptQueueSize is the size of the accept queue (default: 16).
 	AcceptQueueSize int
 }
@@ -57,7 +58,7 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		transport: cfg.Transport,
 		conns:     make(map[uint32]*Conn),
 		ready:     make(chan *Conn, queueSize),
-		manager:   NewSessionManager(),
+		manager:   noise.NewSessionManager(),
 		done:      make(chan struct{}),
 	}
 
@@ -111,23 +112,23 @@ func (l *Listener) RemoveConn(localIdx uint32) {
 }
 
 // LocalAddr returns the local address of the listener.
-func (l *Listener) LocalAddr() Addr {
+func (l *Listener) LocalAddr() noise.Addr {
 	return l.transport.LocalAddr()
 }
 
 // LocalPublicKey returns the local public key.
-func (l *Listener) LocalPublicKey() PublicKey {
+func (l *Listener) LocalPublicKey() noise.PublicKey {
 	return l.localKey.Public
 }
 
 // SessionManager returns the session manager.
-func (l *Listener) SessionManager() *SessionManager {
+func (l *Listener) SessionManager() *noise.SessionManager {
 	return l.manager
 }
 
 // receiveLoop handles incoming packets.
 func (l *Listener) receiveLoop() {
-	buf := make([]byte, MaxPacketSize)
+	buf := make([]byte, noise.MaxPacketSize)
 
 	for {
 		select {
@@ -155,10 +156,10 @@ func (l *Listener) receiveLoop() {
 		msgType := buf[0]
 
 		switch msgType {
-		case MessageTypeHandshakeInit:
+		case noise.MessageTypeHandshakeInit:
 			l.handleHandshakeInit(buf[:n], addr)
 
-		case MessageTypeTransport:
+		case noise.MessageTypeTransport:
 			l.handleTransport(buf[:n], addr)
 
 		// TODO: Handle other message types
@@ -169,18 +170,14 @@ func (l *Listener) receiveLoop() {
 }
 
 // handleHandshakeInit processes an incoming handshake initiation.
-func (l *Listener) handleHandshakeInit(data []byte, addr Addr) {
-	msg, err := ParseHandshakeInit(data)
+func (l *Listener) handleHandshakeInit(data []byte, addr noise.Addr) {
+	msg, err := noise.ParseHandshakeInit(data)
 	if err != nil {
 		return
 	}
 
 	// Create a new connection for this peer
-	conn, err := NewConn(ConnConfig{
-		LocalKey:   l.localKey,
-		Transport:  l.transport,
-		RemoteAddr: addr,
-	})
+	conn, err := newConn(l.localKey, l.transport, addr, noise.PublicKey{})
 	if err != nil {
 		return
 	}
@@ -190,7 +187,7 @@ func (l *Listener) handleHandshakeInit(data []byte, addr Addr) {
 	conn.setInbound(inbound)
 
 	// Process the handshake
-	resp, err := conn.Accept(msg)
+	resp, err := conn.accept(msg)
 	if err != nil {
 		close(inbound)
 		return
@@ -228,8 +225,8 @@ func (l *Listener) handleHandshakeInit(data []byte, addr Addr) {
 }
 
 // handleTransport processes an incoming transport message.
-func (l *Listener) handleTransport(data []byte, addr Addr) {
-	msg, err := ParseTransportMessage(data)
+func (l *Listener) handleTransport(data []byte, addr noise.Addr) {
+	msg, err := noise.ParseTransportMessage(data)
 	if err != nil {
 		return
 	}
@@ -247,7 +244,7 @@ func (l *Listener) handleTransport(data []byte, addr Addr) {
 	// Copy ciphertext since the buffer will be reused
 	cipherCopy := make([]byte, len(msg.Ciphertext))
 	copy(cipherCopy, msg.Ciphertext)
-	msgCopy := &TransportMessage{
+	msgCopy := &noise.TransportMessage{
 		ReceiverIndex: msg.ReceiverIndex,
 		Counter:       msg.Counter,
 		Ciphertext:    cipherCopy,
@@ -261,11 +258,6 @@ func (l *Listener) handleTransport(data []byte, addr Addr) {
 
 // SendTo sends data through the listener's transport.
 // This is useful for sending responses without a Conn.
-func (l *Listener) SendTo(data []byte, addr Addr) error {
+func (l *Listener) SendTo(data []byte, addr noise.Addr) error {
 	return l.transport.SendTo(data, addr)
 }
-
-// Listener errors.
-var (
-	ErrListenerClosed = errors.New("noise: listener closed")
-)
