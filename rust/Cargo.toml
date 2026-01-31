@@ -34,7 +34,7 @@ name = "noise_bench"
 harness = false
 
 [lib]
-name = "noise"
+name = "zgrnet"
 path = "src/lib.rs"
 
 [[example]]

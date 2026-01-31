@@ -11,18 +11,18 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# Rust SDK - Noise Protocol implementation
+# Rust SDK - zgrnet library
 rust_library(
-    name = "noise",
+    name = "zgrnet",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "noise",
+    crate_name = "zgrnet",
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = all_crate_deps() + [":kcp_c"],
 )
 
 rust_test(
-    name = "noise_test",
-    crate = ":noise",
+    name = "zgrnet_test",
+    crate = ":zgrnet",
     deps = all_crate_deps(normal_dev = True) + [":kcp_c"],
 )

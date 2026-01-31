@@ -1,8 +1,8 @@
 //! CipherState and SymmetricState for Noise Protocol.
 
-use crate::cipher;
-use crate::cipher::{Hash, HASH_SIZE, TAG_SIZE};
-use crate::keypair::{Key, KEY_SIZE};
+use super::cipher;
+use super::cipher::{Hash, HASH_SIZE, TAG_SIZE};
+use super::keypair::{Key, KEY_SIZE};
 use ring::aead::{LessSafeKey, UnboundKey, Nonce, Aad, CHACHA20_POLY1305};
 
 /// Manages encryption for one direction of communication.

@@ -22,7 +22,7 @@ type Listener struct {
 	ready chan *Conn
 
 	// Session manager for established sessions
-	manager *noise.SessionManager
+	manager *SessionManager
 
 	// Closed flag
 	closed bool
@@ -58,7 +58,7 @@ func NewListener(cfg ListenerConfig) (*Listener, error) {
 		transport: cfg.Transport,
 		conns:     make(map[uint32]*Conn),
 		ready:     make(chan *Conn, queueSize),
-		manager:   noise.NewSessionManager(),
+		manager:   NewSessionManager(),
 		done:      make(chan struct{}),
 	}
 
@@ -122,7 +122,7 @@ func (l *Listener) LocalPublicKey() noise.PublicKey {
 }
 
 // SessionManager returns the session manager.
-func (l *Listener) SessionManager() *noise.SessionManager {
+func (l *Listener) SessionManager() *SessionManager {
 	return l.manager
 }
 

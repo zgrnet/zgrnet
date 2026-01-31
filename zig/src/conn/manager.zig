@@ -4,12 +4,11 @@ const std = @import("std");
 const Mutex = std.Thread.Mutex;
 const Allocator = std.mem.Allocator;
 
-const keypair = @import("keypair.zig");
-const session_mod = @import("session.zig");
+const noise = @import("../noise/root.zig");
 
-pub const Key = keypair.Key;
-pub const Session = session_mod.Session;
-pub const SessionConfig = session_mod.SessionConfig;
+pub const Key = noise.Key;
+pub const Session = noise.Session;
+pub const SessionConfig = noise.SessionConfig;
 
 /// Manager errors.
 pub const ManagerError = error{

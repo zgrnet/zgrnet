@@ -6,7 +6,6 @@
 const std = @import("std");
 const posix = std.posix;
 const net = std.net;
-const transport = @import("transport.zig");
 
 /// UDP address wrapper.
 pub const UdpAddr = struct {
@@ -46,11 +45,6 @@ pub const UdpAddr = struct {
         var stream = std.io.fixedBufferStream(buf);
         try self.inner.format(&[_]u8{}, stream.writer());
         return stream.getWritten();
-    }
-
-    /// Convert to transport.Addr.
-    pub fn toAddr(self: Self) transport.Addr {
-        return .{ .udp = self };
     }
 };
 
@@ -156,47 +150,6 @@ pub const Udp = struct {
     /// Set send buffer size.
     pub fn setSendBufferSize(self: Self, size: u32) !void {
         try posix.setsockopt(self.fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&size));
-    }
-
-    // =========================================================================
-    // Transport interface implementation
-    // =========================================================================
-
-    /// Send via Transport interface.
-    pub fn transportSend(self: *Self, data: []const u8, _: transport.Addr) transport.TransportError!void {
-        _ = self.send(data) catch return error.IoError;
-    }
-
-    /// Receive via Transport interface.
-    pub fn transportRecv(self: *Self, buf: []u8) transport.TransportError!transport.RecvResult {
-        const n = self.recv(buf) catch return error.IoError;
-        return .{
-            .bytes_read = n,
-            .from_addr = self.remote_addr.toAddr(),
-        };
-    }
-
-    /// Get local address via Transport interface.
-    pub fn transportLocalAddr(self: *Self) transport.Addr {
-        return self.local_addr.toAddr();
-    }
-
-    /// Close via Transport interface.
-    pub fn transportClose(self: *Self) transport.TransportError!void {
-        self.close();
-    }
-
-    /// Get Transport vtable.
-    pub fn asTransport(self: *Self) transport.Transport {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .send = @ptrCast(&transportSend),
-                .recv = @ptrCast(&transportRecv),
-                .local_addr = @ptrCast(&transportLocalAddr),
-                .close = @ptrCast(&transportClose),
-            },
-        };
     }
 };
 

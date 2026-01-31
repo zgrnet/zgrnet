@@ -6,7 +6,7 @@
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
-use crate::transport::{Addr, Transport, TransportError, Result};
+use crate::noise::transport::{Addr, Result, Transport, TransportError};
 
 /// UDP address wrapper.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

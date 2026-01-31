@@ -1,8 +1,8 @@
 //! Noise handshake patterns (IK, XX, NN).
 
-use crate::cipher::{HASH_SIZE, TAG_SIZE};
-use crate::keypair::{Key, KeyPair, KEY_SIZE};
-use crate::state::{CipherState, SymmetricState};
+use super::cipher::{HASH_SIZE, TAG_SIZE};
+use super::keypair::{Key, KeyPair, KEY_SIZE};
+use super::state::{CipherState, SymmetricState};
 use thiserror::Error;
 
 /// Handshake pattern.

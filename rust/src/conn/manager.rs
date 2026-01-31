@@ -1,7 +1,6 @@
 //! Session manager for multiple peers.
 
-use crate::keypair::Key;
-use crate::session::{Session, SessionConfig};
+use crate::noise::{Key, Session, SessionConfig};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -235,7 +234,7 @@ impl std::error::Error for ManagerError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keypair::KEY_SIZE;
+    use crate::noise::KEY_SIZE;
 
     #[test]
     fn test_create_session() {

@@ -55,10 +55,10 @@ pub fn build(b: *std.Build) void {
     // Helper to add ARM64 ASM files
     const addArm64AsmFiles = struct {
         fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
-            compile.addAssemblyFile(builder.path("src/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"));
+            compile.addAssemblyFile(builder.path("src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"));
             compile.addCSourceFile(.{
-                .file = builder.path("src/chacha20_poly1305/aarch64/chacha20_poly1305_wrapper.c"),
-                .flags = &.{ "-O3", "-I", "src/chacha20_poly1305/aarch64" },
+                .file = builder.path("src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_wrapper.c"),
+                .flags = &.{ "-O3", "-I", "src/noise/chacha20_poly1305/aarch64" },
             });
         }
     }.add;
@@ -67,9 +67,9 @@ pub fn build(b: *std.Build) void {
     const addX86AsmFiles = struct {
         fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
             compile.linkLibC();
-            compile.addAssemblyFile(builder.path("src/chacha20_poly1305/x86_64/chacha20_poly1305_x86_64.S"));
+            compile.addAssemblyFile(builder.path("src/noise/chacha20_poly1305/x86_64/chacha20_poly1305_x86_64.S"));
             compile.addCSourceFile(.{
-                .file = builder.path("src/chacha20_poly1305/x86_64/chacha20_poly1305_wrapper.c"),
+                .file = builder.path("src/noise/chacha20_poly1305/x86_64/chacha20_poly1305_wrapper.c"),
                 .flags = &.{ "-O3", "-mavx2", "-mbmi2" },
             });
         }

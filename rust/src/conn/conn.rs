@@ -4,15 +4,28 @@
 //! and provides a simple API for sending and receiving encrypted messages.
 
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
-use crate::handshake::{Config, HandshakeState, Pattern};
-use crate::keypair::{Key, KeyPair};
-use crate::message::{
+use crate::noise::{
+    // Handshake
+    Config, HandshakeState, Pattern,
+    // Keypair
+    Key, KeyPair, KEY_SIZE,
+    // Message
     build_handshake_init, build_handshake_resp, build_transport_message, encode_payload,
-    parse_handshake_resp, parse_transport_message, HandshakeInit, KEY_SIZE, MAX_PACKET_SIZE,
+    parse_handshake_resp, parse_transport_message, HandshakeInit, MAX_PACKET_SIZE,
+    // Session
+    generate_index, Session, SessionConfig, SessionError,
+    // Transport
+    Addr, Transport, TransportError,
+    // Error
+    Error as HandshakeError,
 };
-use crate::session::{generate_index, Session, SessionConfig};
-use crate::transport::{Addr, Transport, TransportError};
+
+use super::consts::{
+    KEEPALIVE_TIMEOUT, REKEY_AFTER_MESSAGES, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME,
+    REKEY_TIMEOUT, REJECT_AFTER_MESSAGES, REJECT_AFTER_TIME,
+};
 
 /// Connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,12 +70,18 @@ pub enum ConnError {
     InvalidReceiverIndex,
     /// Handshake not complete.
     HandshakeIncomplete,
+    /// Connection timed out (no data received for too long).
+    ConnTimeout,
+    /// Handshake attempt exceeded maximum duration.
+    HandshakeTimeout,
+    /// Session expired (too old or too many messages).
+    SessionExpired,
     /// Handshake error.
-    Handshake(crate::handshake::Error),
+    Handshake(HandshakeError),
     /// Session error.
-    Session(crate::session::SessionError),
+    Session(SessionError),
     /// Message error.
-    Message(crate::message::MessageError),
+    Message(crate::noise::MessageError),
     /// Transport error.
     Transport(TransportError),
 }
@@ -78,6 +97,9 @@ impl std::fmt::Display for ConnError {
             Self::NotEstablished => write!(f, "connection not established"),
             Self::InvalidReceiverIndex => write!(f, "invalid receiver index"),
             Self::HandshakeIncomplete => write!(f, "handshake not complete"),
+            Self::ConnTimeout => write!(f, "connection timed out"),
+            Self::HandshakeTimeout => write!(f, "handshake timeout"),
+            Self::SessionExpired => write!(f, "session expired"),
             Self::Handshake(e) => write!(f, "handshake error: {}", e),
             Self::Session(e) => write!(f, "session error: {}", e),
             Self::Message(e) => write!(f, "message error: {}", e),
@@ -88,20 +110,20 @@ impl std::fmt::Display for ConnError {
 
 impl std::error::Error for ConnError {}
 
-impl From<crate::handshake::Error> for ConnError {
-    fn from(e: crate::handshake::Error) -> Self {
+impl From<HandshakeError> for ConnError {
+    fn from(e: HandshakeError) -> Self {
         Self::Handshake(e)
     }
 }
 
-impl From<crate::session::SessionError> for ConnError {
-    fn from(e: crate::session::SessionError) -> Self {
+impl From<SessionError> for ConnError {
+    fn from(e: SessionError) -> Self {
         Self::Session(e)
     }
 }
 
-impl From<crate::message::MessageError> for ConnError {
-    fn from(e: crate::message::MessageError) -> Self {
+impl From<crate::noise::MessageError> for ConnError {
+    fn from(e: crate::noise::MessageError) -> Self {
         Self::Message(e)
     }
 }
@@ -131,6 +153,11 @@ pub struct ConnConfig<T: Transport + 'static> {
 ///
 /// Manages the handshake process and provides a simple API
 /// for sending and receiving encrypted messages.
+///
+/// The connection follows WireGuard's timer model:
+/// - `tick()` is called periodically to handle time-based actions
+/// - `send()` queues data if no session and triggers handshake
+/// - `recv()` processes incoming messages and updates state
 pub struct Conn<T: Transport + 'static> {
     // Configuration
     local_key: KeyPair,
@@ -140,14 +167,34 @@ pub struct Conn<T: Transport + 'static> {
 
     // State
     state: RwLock<ConnState>,
-    session: RwLock<Option<Session>>,
     local_idx: u32,
+
+    // Session management (WireGuard-style rotation)
+    // current: active session for sending
+    // previous: previous session (for receiving delayed packets)
+    current: RwLock<Option<Session>>,
+    previous: RwLock<Option<Session>>,
+
+    // Timestamps
+    created_at: Instant,
+    session_created: RwLock<Option<Instant>>,
+    last_sent: RwLock<Option<Instant>>,
+    last_received: RwLock<Option<Instant>>,
+    handshake_attempt_start: RwLock<Option<Instant>>,
+    last_handshake_sent: RwLock<Option<Instant>>,
+
+    // Role
+    is_initiator: RwLock<bool>,
+
+    // Rekey state
+    rekey_triggered: RwLock<bool>,
 }
 
 impl<T: Transport + 'static> Conn<T> {
     /// Creates a new connection with the given configuration.
     pub fn new(cfg: ConnConfig<T>) -> Result<Self> {
         let local_idx = generate_index();
+        let now = Instant::now();
 
         Ok(Self {
             local_key: cfg.local_key,
@@ -155,8 +202,17 @@ impl<T: Transport + 'static> Conn<T> {
             transport: cfg.transport,
             remote_addr: RwLock::new(cfg.remote_addr),
             state: RwLock::new(ConnState::New),
-            session: RwLock::new(None),
             local_idx,
+            current: RwLock::new(None),
+            previous: RwLock::new(None),
+            created_at: now,
+            session_created: RwLock::new(None),
+            last_sent: RwLock::new(None),
+            last_received: RwLock::new(None),
+            handshake_attempt_start: RwLock::new(None),
+            last_handshake_sent: RwLock::new(None),
+            is_initiator: RwLock::new(false),
+            rekey_triggered: RwLock::new(false),
         })
     }
 
@@ -355,7 +411,7 @@ impl<T: Transport + 'static> Conn<T> {
 
         // Update state
         {
-            let mut session_lock = self.session.write().unwrap();
+            let mut session_lock = self.current.write().unwrap();
             *session_lock = Some(session);
         }
         {
@@ -381,7 +437,7 @@ impl<T: Transport + 'static> Conn<T> {
                 return Err(ConnError::NotEstablished);
             }
 
-            let session_lock = self.session.read().unwrap();
+            let session_lock = self.current.read().unwrap();
             let session = session_lock.as_ref().unwrap();
 
             // Encode and encrypt
@@ -458,7 +514,7 @@ impl<T: Transport + 'static> Conn<T> {
 
         // Decrypt
         let plaintext = {
-            let session_lock = self.session.read().unwrap();
+            let session_lock = self.current.read().unwrap();
             let session = session_lock.as_ref().unwrap();
             session.decrypt(msg.ciphertext, msg.counter)?
         };
@@ -466,6 +522,102 @@ impl<T: Transport + 'static> Conn<T> {
         // Return protocol and full plaintext (including protocol byte)
         let protocol = plaintext.first().copied().unwrap_or(0);
         Ok((protocol, plaintext))
+    }
+
+    /// Performs periodic maintenance on the connection.
+    /// This method should be called periodically by the connection manager.
+    ///
+    /// Tick directly executes time-based actions:
+    /// - Sends keepalive if we haven't sent anything recently but have received data
+    /// - Triggers rekey if session is too old (initiator only)
+    ///
+    /// Returns Ok(()) on success. Returns an error if:
+    /// - `ConnTimeout`: connection timed out (no data received for RejectAfterTime)
+    /// - `HandshakeTimeout`: handshake attempt exceeded RekeyAttemptTime (90s)
+    /// - `SessionExpired`: session expired (too many messages)
+    pub fn tick(&self) -> Result<()> {
+        let now = Instant::now();
+        let state = *self.state.read().unwrap();
+
+        match state {
+            ConnState::New => {
+                // Nothing to do for new connections
+                Ok(())
+            }
+            ConnState::Handshaking => {
+                // Check if handshake attempt has exceeded RekeyAttemptTime (90s)
+                if let Some(start) = *self.handshake_attempt_start.read().unwrap() {
+                    if now.duration_since(start) > REKEY_ATTEMPT_TIME {
+                        return Err(ConnError::HandshakeTimeout);
+                    }
+                }
+                Ok(())
+            }
+            ConnState::Established => {
+                // Check if connection has timed out (no messages received)
+                if let Some(last_recv) = *self.last_received.read().unwrap() {
+                    if now.duration_since(last_recv) > REJECT_AFTER_TIME {
+                        return Err(ConnError::ConnTimeout);
+                    }
+                }
+
+                // Check message-based rejection (nonce exhaustion)
+                if let Some(ref session) = *self.current.read().unwrap() {
+                    let send_nonce = session.send_nonce();
+                    let recv_nonce = session.recv_max_nonce();
+                    if send_nonce > REJECT_AFTER_MESSAGES || recv_nonce > REJECT_AFTER_MESSAGES {
+                        return Err(ConnError::SessionExpired);
+                    }
+                }
+
+                // Check if rekey is needed (session too old or too many messages, initiator only)
+                let is_initiator = *self.is_initiator.read().unwrap();
+                let rekey_triggered = *self.rekey_triggered.read().unwrap();
+
+                if is_initiator && !rekey_triggered {
+                    let mut needs_rekey = false;
+
+                    // Time-based rekey trigger
+                    if let Some(session_time) = *self.session_created.read().unwrap() {
+                        if now.duration_since(session_time) > REKEY_AFTER_TIME {
+                            needs_rekey = true;
+                        }
+                    }
+
+                    // Message-based rekey trigger
+                    if let Some(ref session) = *self.current.read().unwrap() {
+                        let send_nonce = session.send_nonce();
+                        let recv_nonce = session.recv_max_nonce();
+                        if send_nonce > REKEY_AFTER_MESSAGES || recv_nonce > REKEY_AFTER_MESSAGES {
+                            needs_rekey = true;
+                        }
+                    }
+
+                    if needs_rekey {
+                        *self.rekey_triggered.write().unwrap() = true;
+                        // Note: Actual rekey initiation would happen here
+                        // For now, we just mark that rekey is needed
+                    }
+                }
+
+                // Passive keepalive: send empty message if we haven't sent recently
+                // but have received data recently (peer is active)
+                if let (Some(last_sent_time), Some(last_recv_time)) = (
+                    *self.last_sent.read().unwrap(),
+                    *self.last_received.read().unwrap(),
+                ) {
+                    let sent_delta = now.duration_since(last_sent_time);
+                    let recv_delta = now.duration_since(last_recv_time);
+                    if sent_delta > KEEPALIVE_TIMEOUT && recv_delta < KEEPALIVE_TIMEOUT {
+                        // Send keepalive (empty data message)
+                        let _ = self.send(0, &[]);
+                    }
+                }
+
+                Ok(())
+            }
+            ConnState::Closed => Err(ConnError::InvalidState),
+        }
     }
 
     /// Closes the connection.
@@ -476,7 +628,7 @@ impl<T: Transport + 'static> Conn<T> {
         }
 
         *state = ConnState::Closed;
-        if let Some(session) = self.session.write().unwrap().as_mut() {
+        if let Some(session) = self.current.write().unwrap().as_mut() {
             session.expire();
         }
 
@@ -508,8 +660,7 @@ impl<T: Transport + 'static> Conn<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::parse_handshake_init;
-    use crate::transport::MockTransport;
+    use crate::noise::{parse_handshake_init, MockTransport, MockAddr};
     use std::sync::Arc;
 
     #[test]
@@ -545,7 +696,7 @@ mod tests {
             local_key: key,
             remote_pk: None,
             transport: Arc::clone(&transport),
-            remote_addr: Some(Box::new(crate::transport::MockAddr::new("peer"))),
+            remote_addr: Some(Box::new(MockAddr::new("peer"))),
         }).unwrap();
 
         let err = conn.open().unwrap_err();
@@ -633,14 +784,14 @@ mod tests {
             local_key: initiator_key,
             remote_pk: Some(responder_key.public),
             transport: Arc::clone(&initiator_transport),
-            remote_addr: Some(Box::new(crate::transport::MockAddr::new("responder"))),
+            remote_addr: Some(Box::new(MockAddr::new("responder"))),
         }).unwrap();
 
         let responder = Conn::new(ConnConfig {
             local_key: responder_key,
             remote_pk: None,
             transport: Arc::clone(&responder_transport),
-            remote_addr: Some(Box::new(crate::transport::MockAddr::new("initiator"))),
+            remote_addr: Some(Box::new(MockAddr::new("initiator"))),
         }).unwrap();
 
         // Spawn responder thread
@@ -652,7 +803,7 @@ mod tests {
 
             // Process and respond
             let resp = responder.accept(&init_msg).unwrap();
-            responder_transport.send_to(&resp, &crate::transport::MockAddr::new("initiator")).unwrap();
+            responder_transport.send_to(&resp, &MockAddr::new("initiator")).unwrap();
 
             responder
         });
@@ -670,15 +821,15 @@ mod tests {
         assert_eq!(responder.state(), ConnState::Established);
 
         // Test communication: initiator -> responder
-        initiator.send(crate::message::protocol::CHAT, b"Hello from initiator!").unwrap();
+        initiator.send(crate::noise::protocol::CHAT, b"Hello from initiator!").unwrap();
         let (proto, payload) = responder.recv().unwrap();
-        assert_eq!(proto, crate::message::protocol::CHAT);
+        assert_eq!(proto, crate::noise::protocol::CHAT);
         assert_eq!(payload, b"Hello from initiator!");
 
         // Test communication: responder -> initiator
-        responder.send(crate::message::protocol::RPC, b"Hello from responder!").unwrap();
+        responder.send(crate::noise::protocol::RPC, b"Hello from responder!").unwrap();
         let (proto, payload) = initiator.recv().unwrap();
-        assert_eq!(proto, crate::message::protocol::RPC);
+        assert_eq!(proto, crate::noise::protocol::RPC);
         assert_eq!(payload, b"Hello from responder!");
     }
 }

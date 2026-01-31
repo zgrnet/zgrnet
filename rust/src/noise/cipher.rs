@@ -3,7 +3,7 @@
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use blake2::digest::{Mac, KeyInit};
 use ring::aead::{LessSafeKey, UnboundKey, Nonce, Aad, CHACHA20_POLY1305};
-use crate::keypair::Key;
+use super::keypair::Key;
 
 /// Hash output size (BLAKE2s-256).
 pub const HASH_SIZE: usize = 32;
@@ -173,7 +173,7 @@ impl std::error::Error for DecryptError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keypair::KEY_SIZE;
+    use crate::noise::keypair::KEY_SIZE;
 
     #[test]
     fn test_hash() {

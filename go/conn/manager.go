@@ -1,9 +1,11 @@
-package noise
+package conn
 
 import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/vibing/zgrnet/noise"
 )
 
 // SessionManager manages multiple sessions with different peers.
@@ -12,10 +14,10 @@ type SessionManager struct {
 	mu sync.RWMutex
 
 	// Sessions indexed by local index
-	byIndex map[uint32]*Session
+	byIndex map[uint32]*noise.Session
 
 	// Sessions indexed by remote public key
-	byPubkey map[PublicKey]*Session
+	byPubkey map[noise.PublicKey]*noise.Session
 
 	// Index allocator
 	nextIndex uint32
@@ -24,15 +26,15 @@ type SessionManager struct {
 // NewSessionManager creates a new session manager.
 func NewSessionManager() *SessionManager {
 	return &SessionManager{
-		byIndex:   make(map[uint32]*Session),
-		byPubkey:  make(map[PublicKey]*Session),
+		byIndex:   make(map[uint32]*noise.Session),
+		byPubkey:  make(map[noise.PublicKey]*noise.Session),
 		nextIndex: 1, // Start from 1, 0 is reserved
 	}
 }
 
 // CreateSession creates and registers a new session.
 // If a session already exists for the given public key, it is replaced.
-func (m *SessionManager) CreateSession(remotePK PublicKey, sendKey, recvKey Key) (*Session, error) {
+func (m *SessionManager) CreateSession(remotePK noise.PublicKey, sendKey, recvKey noise.Key) (*noise.Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -43,7 +45,7 @@ func (m *SessionManager) CreateSession(remotePK PublicKey, sendKey, recvKey Key)
 	}
 
 	// Create the session
-	session, err := NewSession(SessionConfig{
+	session, err := noise.NewSession(noise.SessionConfig{
 		LocalIndex: localIndex,
 		SendKey:    sendKey,
 		RecvKey:    recvKey,
@@ -67,7 +69,7 @@ func (m *SessionManager) CreateSession(remotePK PublicKey, sendKey, recvKey Key)
 
 // RegisterSession registers an externally created session.
 // This is useful when the handshake is performed separately.
-func (m *SessionManager) RegisterSession(session *Session) error {
+func (m *SessionManager) RegisterSession(session *noise.Session) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -93,7 +95,7 @@ func (m *SessionManager) RegisterSession(session *Session) error {
 
 // GetByIndex retrieves a session by its local index.
 // Returns nil if not found.
-func (m *SessionManager) GetByIndex(index uint32) *Session {
+func (m *SessionManager) GetByIndex(index uint32) *noise.Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.byIndex[index]
@@ -101,7 +103,7 @@ func (m *SessionManager) GetByIndex(index uint32) *Session {
 
 // GetByPubkey retrieves a session by the remote peer's public key.
 // Returns nil if not found.
-func (m *SessionManager) GetByPubkey(pk PublicKey) *Session {
+func (m *SessionManager) GetByPubkey(pk noise.PublicKey) *noise.Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.byPubkey[pk]
@@ -122,7 +124,7 @@ func (m *SessionManager) RemoveSession(index uint32) {
 }
 
 // RemoveByPubkey removes a session by the remote peer's public key.
-func (m *SessionManager) RemoveByPubkey(pk PublicKey) {
+func (m *SessionManager) RemoveByPubkey(pk noise.PublicKey) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -142,7 +144,7 @@ func (m *SessionManager) ExpireSessions() int {
 	defer m.mu.Unlock()
 
 	// Store session pointers directly to avoid second lookup
-	var expired []*Session
+	var expired []*noise.Session
 	for _, session := range m.byIndex {
 		if session.IsExpired() {
 			expired = append(expired, session)
@@ -166,11 +168,11 @@ func (m *SessionManager) Count() int {
 
 // Sessions returns a snapshot of all sessions.
 // The returned slice is safe to iterate while the manager is modified.
-func (m *SessionManager) Sessions() []*Session {
+func (m *SessionManager) Sessions() []*noise.Session {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	sessions := make([]*Session, 0, len(m.byIndex))
+	sessions := make([]*noise.Session, 0, len(m.byIndex))
 	for _, session := range m.byIndex {
 		sessions = append(sessions, session)
 	}
@@ -179,7 +181,7 @@ func (m *SessionManager) Sessions() []*Session {
 
 // ForEach iterates over all sessions with a callback.
 // The callback should not modify the manager.
-func (m *SessionManager) ForEach(fn func(*Session)) {
+func (m *SessionManager) ForEach(fn func(*noise.Session)) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -193,8 +195,8 @@ func (m *SessionManager) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.byIndex = make(map[uint32]*Session)
-	m.byPubkey = make(map[PublicKey]*Session)
+	m.byIndex = make(map[uint32]*noise.Session)
+	m.byPubkey = make(map[noise.PublicKey]*noise.Session)
 }
 
 // allocateIndex generates a unique session index.
@@ -248,8 +250,8 @@ func (m *SessionManager) StartExpiryWorker(interval time.Duration) func() {
 	}
 }
 
-// Errors
+// Errors for SessionManager
 var (
-	ErrIndexInUse  = errors.New("noise: session index already in use")
-	ErrNoFreeIndex = errors.New("noise: no free session index available")
+	ErrIndexInUse  = errors.New("conn: session index already in use")
+	ErrNoFreeIndex = errors.New("conn: no free session index available")
 )

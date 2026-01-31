@@ -1,8 +1,8 @@
 //! Session management for transport phase.
 
-use crate::cipher::TAG_SIZE;
-use crate::keypair::Key;
-use crate::replay::ReplayFilter;
+use super::cipher::TAG_SIZE;
+use super::keypair::Key;
+use super::replay::ReplayFilter;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::sync::RwLock;
@@ -326,8 +326,8 @@ pub fn generate_index() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cipher;
-    use crate::keypair::KEY_SIZE;
+    use crate::noise::cipher;
+    use crate::noise::keypair::KEY_SIZE;
 
     fn create_test_sessions() -> (Session, Session) {
         let send_key = Key::new(cipher::hash(&[b"send key"]));

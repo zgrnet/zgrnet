@@ -1,17 +1,19 @@
-package noise
+package conn
 
 import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/vibing/zgrnet/noise"
 )
 
 func TestSessionManager_CreateSession(t *testing.T) {
 	m := NewSessionManager()
 
-	pk := PublicKey{1, 2, 3}
-	sendKey := Hash([]byte("send"))
-	recvKey := Hash([]byte("recv"))
+	pk := noise.PublicKey{1, 2, 3}
+	sendKey := noise.Hash([]byte("send"))
+	recvKey := noise.Hash([]byte("recv"))
 
 	session, err := m.CreateSession(pk, sendKey, recvKey)
 	if err != nil {
@@ -34,8 +36,8 @@ func TestSessionManager_CreateSession(t *testing.T) {
 func TestSessionManager_GetByIndex(t *testing.T) {
 	m := NewSessionManager()
 
-	pk := PublicKey{1, 2, 3}
-	session, _ := m.CreateSession(pk, Key{}, Key{})
+	pk := noise.PublicKey{1, 2, 3}
+	session, _ := m.CreateSession(pk, noise.Key{}, noise.Key{})
 
 	// Should find by index
 	found := m.GetByIndex(session.LocalIndex())
@@ -53,8 +55,8 @@ func TestSessionManager_GetByIndex(t *testing.T) {
 func TestSessionManager_GetByPubkey(t *testing.T) {
 	m := NewSessionManager()
 
-	pk := PublicKey{1, 2, 3}
-	session, _ := m.CreateSession(pk, Key{}, Key{})
+	pk := noise.PublicKey{1, 2, 3}
+	session, _ := m.CreateSession(pk, noise.Key{}, noise.Key{})
 
 	// Should find by pubkey
 	found := m.GetByPubkey(pk)
@@ -63,7 +65,7 @@ func TestSessionManager_GetByPubkey(t *testing.T) {
 	}
 
 	// Should not find unknown pubkey
-	notFound := m.GetByPubkey(PublicKey{9, 9, 9})
+	notFound := m.GetByPubkey(noise.PublicKey{9, 9, 9})
 	if notFound != nil {
 		t.Error("should not find unknown pubkey")
 	}
@@ -72,8 +74,8 @@ func TestSessionManager_GetByPubkey(t *testing.T) {
 func TestSessionManager_RemoveSession(t *testing.T) {
 	m := NewSessionManager()
 
-	pk := PublicKey{1, 2, 3}
-	session, _ := m.CreateSession(pk, Key{}, Key{})
+	pk := noise.PublicKey{1, 2, 3}
+	session, _ := m.CreateSession(pk, noise.Key{}, noise.Key{})
 	index := session.LocalIndex()
 
 	m.RemoveSession(index)
@@ -92,8 +94,8 @@ func TestSessionManager_RemoveSession(t *testing.T) {
 func TestSessionManager_RemoveByPubkey(t *testing.T) {
 	m := NewSessionManager()
 
-	pk := PublicKey{1, 2, 3}
-	session, _ := m.CreateSession(pk, Key{}, Key{})
+	pk := noise.PublicKey{1, 2, 3}
+	session, _ := m.CreateSession(pk, noise.Key{}, noise.Key{})
 	index := session.LocalIndex()
 
 	m.RemoveByPubkey(pk)
@@ -109,14 +111,14 @@ func TestSessionManager_RemoveByPubkey(t *testing.T) {
 func TestSessionManager_ReplaceExisting(t *testing.T) {
 	m := NewSessionManager()
 
-	pk := PublicKey{1, 2, 3}
+	pk := noise.PublicKey{1, 2, 3}
 
 	// Create first session
-	session1, _ := m.CreateSession(pk, Key{}, Key{})
+	session1, _ := m.CreateSession(pk, noise.Key{}, noise.Key{})
 	index1 := session1.LocalIndex()
 
 	// Create second session for same peer
-	session2, _ := m.CreateSession(pk, Key{1}, Key{1})
+	session2, _ := m.CreateSession(pk, noise.Key{1}, noise.Key{1})
 	index2 := session2.LocalIndex()
 
 	// First session should be gone
@@ -142,7 +144,7 @@ func TestSessionManager_ReplaceExisting(t *testing.T) {
 func TestSessionManager_MultiplePeers(t *testing.T) {
 	m := NewSessionManager()
 
-	peers := []PublicKey{
+	peers := []noise.PublicKey{
 		{1},
 		{2},
 		{3},
@@ -150,9 +152,9 @@ func TestSessionManager_MultiplePeers(t *testing.T) {
 		{5},
 	}
 
-	sessions := make([]*Session, len(peers))
+	sessions := make([]*noise.Session, len(peers))
 	for i, pk := range peers {
-		s, _ := m.CreateSession(pk, Key{byte(i)}, Key{byte(i)})
+		s, _ := m.CreateSession(pk, noise.Key{byte(i)}, noise.Key{byte(i)})
 		sessions[i] = s
 	}
 
@@ -174,11 +176,11 @@ func TestSessionManager_MultiplePeers(t *testing.T) {
 func TestSessionManager_ExpireSessions(t *testing.T) {
 	m := NewSessionManager()
 
-	pk1 := PublicKey{1}
-	pk2 := PublicKey{2}
+	pk1 := noise.PublicKey{1}
+	pk2 := noise.PublicKey{2}
 
-	session1, _ := m.CreateSession(pk1, Key{}, Key{})
-	session2, _ := m.CreateSession(pk2, Key{}, Key{})
+	session1, _ := m.CreateSession(pk1, noise.Key{}, noise.Key{})
+	session2, _ := m.CreateSession(pk2, noise.Key{}, noise.Key{})
 
 	// Expire session1
 	session1.Expire()
@@ -200,8 +202,8 @@ func TestSessionManager_Sessions(t *testing.T) {
 	m := NewSessionManager()
 
 	for i := 0; i < 5; i++ {
-		pk := PublicKey{byte(i)}
-		m.CreateSession(pk, Key{}, Key{})
+		pk := noise.PublicKey{byte(i)}
+		m.CreateSession(pk, noise.Key{}, noise.Key{})
 	}
 
 	sessions := m.Sessions()
@@ -214,12 +216,12 @@ func TestSessionManager_ForEach(t *testing.T) {
 	m := NewSessionManager()
 
 	for i := 0; i < 5; i++ {
-		pk := PublicKey{byte(i)}
-		m.CreateSession(pk, Key{}, Key{})
+		pk := noise.PublicKey{byte(i)}
+		m.CreateSession(pk, noise.Key{}, noise.Key{})
 	}
 
 	count := 0
-	m.ForEach(func(s *Session) {
+	m.ForEach(func(s *noise.Session) {
 		count++
 	})
 
@@ -232,8 +234,8 @@ func TestSessionManager_Clear(t *testing.T) {
 	m := NewSessionManager()
 
 	for i := 0; i < 5; i++ {
-		pk := PublicKey{byte(i)}
-		m.CreateSession(pk, Key{}, Key{})
+		pk := noise.PublicKey{byte(i)}
+		m.CreateSession(pk, noise.Key{}, noise.Key{})
 	}
 
 	m.Clear()
@@ -247,11 +249,11 @@ func TestSessionManager_RegisterSession(t *testing.T) {
 	m := NewSessionManager()
 
 	// Create a session externally
-	session, _ := NewSession(SessionConfig{
+	session, _ := noise.NewSession(noise.SessionConfig{
 		LocalIndex: 12345,
-		SendKey:    Key{},
-		RecvKey:    Key{},
-		RemotePK:   PublicKey{1, 2, 3},
+		SendKey:    noise.Key{},
+		RecvKey:    noise.Key{},
+		RemotePK:   noise.PublicKey{1, 2, 3},
 	})
 
 	err := m.RegisterSession(session)
@@ -263,7 +265,7 @@ func TestSessionManager_RegisterSession(t *testing.T) {
 	if m.GetByIndex(12345) != session {
 		t.Error("session not found by index")
 	}
-	if m.GetByPubkey(PublicKey{1, 2, 3}) != session {
+	if m.GetByPubkey(noise.PublicKey{1, 2, 3}) != session {
 		t.Error("session not found by pubkey")
 	}
 }
@@ -272,15 +274,15 @@ func TestSessionManager_RegisterSession_IndexCollision(t *testing.T) {
 	m := NewSessionManager()
 
 	// Create first session
-	pk1 := PublicKey{1}
-	session1, _ := m.CreateSession(pk1, Key{}, Key{})
+	pk1 := noise.PublicKey{1}
+	session1, _ := m.CreateSession(pk1, noise.Key{}, noise.Key{})
 
 	// Try to register a session with same index
-	session2, _ := NewSession(SessionConfig{
+	session2, _ := noise.NewSession(noise.SessionConfig{
 		LocalIndex: session1.LocalIndex(), // Collision!
-		SendKey:    Key{},
-		RecvKey:    Key{},
-		RemotePK:   PublicKey{2},
+		SendKey:    noise.Key{},
+		RecvKey:    noise.Key{},
+		RemotePK:   noise.PublicKey{2},
 	})
 
 	err := m.RegisterSession(session2)
@@ -298,8 +300,8 @@ func TestSessionManager_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			pk := PublicKey{byte(id)}
-			m.CreateSession(pk, Key{}, Key{})
+			pk := noise.PublicKey{byte(id)}
+			m.CreateSession(pk, noise.Key{}, noise.Key{})
 		}(i)
 	}
 
@@ -314,7 +316,7 @@ func TestSessionManager_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			pk := PublicKey{byte(id)}
+			pk := noise.PublicKey{byte(id)}
 			m.GetByPubkey(pk)
 		}(i)
 	}
@@ -326,7 +328,7 @@ func TestSessionManager_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			pk := PublicKey{byte(id)}
+			pk := noise.PublicKey{byte(id)}
 			m.RemoveByPubkey(pk)
 		}(i)
 	}
@@ -341,8 +343,8 @@ func TestSessionManager_Concurrent(t *testing.T) {
 func TestSessionManager_ExpiryWorker(t *testing.T) {
 	m := NewSessionManager()
 
-	pk := PublicKey{1}
-	session, _ := m.CreateSession(pk, Key{}, Key{})
+	pk := noise.PublicKey{1}
+	session, _ := m.CreateSession(pk, noise.Key{}, noise.Key{})
 	session.Expire()
 
 	// Start expiry worker
@@ -363,8 +365,8 @@ func TestSessionManager_IndexWrap(t *testing.T) {
 
 	// Create several sessions to trigger wrap
 	for i := 0; i < 10; i++ {
-		pk := PublicKey{byte(i)}
-		_, err := m.CreateSession(pk, Key{}, Key{})
+		pk := noise.PublicKey{byte(i)}
+		_, err := m.CreateSession(pk, noise.Key{}, noise.Key{})
 		if err != nil {
 			t.Fatalf("create session %d failed: %v", i, err)
 		}
@@ -380,8 +382,8 @@ func BenchmarkSessionManager_CreateSession(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		pk := PublicKey{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
-		m.CreateSession(pk, Key{}, Key{})
+		pk := noise.PublicKey{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)}
+		m.CreateSession(pk, noise.Key{}, noise.Key{})
 	}
 }
 
@@ -391,8 +393,8 @@ func BenchmarkSessionManager_GetByIndex(b *testing.B) {
 
 	// Pre-populate
 	for i := 0; i < 1000; i++ {
-		pk := PublicKey{byte(i >> 8), byte(i)}
-		s, _ := m.CreateSession(pk, Key{}, Key{})
+		pk := noise.PublicKey{byte(i >> 8), byte(i)}
+		s, _ := m.CreateSession(pk, noise.Key{}, noise.Key{})
 		indices = append(indices, s.LocalIndex())
 	}
 
@@ -404,12 +406,12 @@ func BenchmarkSessionManager_GetByIndex(b *testing.B) {
 
 func BenchmarkSessionManager_GetByPubkey(b *testing.B) {
 	m := NewSessionManager()
-	var pks []PublicKey
+	var pks []noise.PublicKey
 
 	// Pre-populate
 	for i := 0; i < 1000; i++ {
-		pk := PublicKey{byte(i >> 8), byte(i)}
-		m.CreateSession(pk, Key{}, Key{})
+		pk := noise.PublicKey{byte(i >> 8), byte(i)}
+		m.CreateSession(pk, noise.Key{}, noise.Key{})
 		pks = append(pks, pk)
 	}
 

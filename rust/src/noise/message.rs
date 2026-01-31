@@ -3,8 +3,8 @@
 //! This module defines the message formats for the Noise-based protocol,
 //! including handshake messages and transport messages.
 
-use crate::keypair::Key;
-use crate::cipher::TAG_SIZE;
+use super::keypair::Key;
+use super::cipher::TAG_SIZE;
 
 /// Message type constants for the wire protocol.
 pub mod message_type {
