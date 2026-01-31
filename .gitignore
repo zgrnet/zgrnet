@@ -33,3 +33,4 @@ Thumbs.db
 
 # Design docs (local only)
 docs/design/
+go/examples/host_test/host_test
