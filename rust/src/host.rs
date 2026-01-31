@@ -85,7 +85,6 @@ pub struct Host<T: Transport + Send + Sync + 'static> {
     peer_manager: Arc<PeerManager<T>>,
     config: HostConfigInner,
     inbox: crossbeam_channel::Receiver<Message>,
-    inbox_sender: crossbeam_channel::Sender<Message>,
     closed: Arc<AtomicBool>,
     recv_handle: Option<JoinHandle<()>>,
 }
@@ -127,7 +126,6 @@ impl<T: Transport + Send + Sync + 'static> Host<T> {
             peer_manager,
             config,
             inbox: receiver,
-            inbox_sender: sender,
             closed,
             recv_handle: Some(recv_handle),
         })
@@ -398,7 +396,7 @@ mod tests {
         .unwrap();
 
         assert!(!host.is_closed());
-        host.close();
+        let _ = host.close();
         assert!(host.is_closed());
     }
 
@@ -413,7 +411,7 @@ mod tests {
         })
         .unwrap();
 
-        host.close();
+        let _ = host.close();
 
         let result = host.recv();
         assert!(matches!(result, Err(HostError::Closed)));
