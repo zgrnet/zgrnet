@@ -25,19 +25,12 @@ echo "Building Go net_test..."
 cd "$GO_DIR"
 go build -o "$SCRIPT_DIR/net_go" ./examples/net_test
 
-# Build Rust (use bazel if cargo not available)
+# Build Rust
 echo "Building Rust host_test..."
-cd "$ROOT_DIR"
-if command -v cargo &> /dev/null; then
-    cd "$RUST_DIR"
-    cargo build --example host_test --release 2>/dev/null || cargo build --example host_test
-    cp target/release/examples/host_test "$SCRIPT_DIR/net_rust" 2>/dev/null || \
-    cp target/debug/examples/host_test "$SCRIPT_DIR/net_rust"
-else
-    echo "  (cargo not found, skipping Rust build - will use Go for rust identity)"
-    # Create a symlink so script doesn't break
-    RUST_AVAILABLE=false
-fi
+cd "$RUST_DIR"
+cargo build --example host_test --release 2>/dev/null || cargo build --example host_test
+cp target/release/examples/host_test "$SCRIPT_DIR/net_rust" 2>/dev/null || \
+cp target/debug/examples/host_test "$SCRIPT_DIR/net_rust"
 
 # Build Zig
 echo "Building Zig host_test..."
@@ -70,14 +63,8 @@ PID_GO=$!
 sleep 0.5
 
 echo "--- Starting Rust on port 10002 ---"
-if [ -f ./net_rust ]; then
-    CONFIG_PATH="$CONFIG" ./net_rust --name rust &
-    PID_RUST=$!
-else
-    # Fallback to Go binary with rust identity
-    ./net_go -name rust -config "$CONFIG" &
-    PID_RUST=$!
-fi
+CONFIG_PATH="$CONFIG" ./net_rust --name rust &
+PID_RUST=$!
 
 sleep 0.5
 
