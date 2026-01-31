@@ -72,11 +72,11 @@ type Conn struct {
 	previous *noise.Session
 
 	// Handshake state
-	hsState             *noise.HandshakeState
-	handshakeStarted    time.Time // When current handshake attempt started
+	hsState               *noise.HandshakeState
+	handshakeStarted      time.Time // When current handshake attempt started
 	handshakeAttemptStart time.Time // When we first started trying to handshake (for 90s timeout)
-	lastHandshakeSent   time.Time // When we last sent a handshake message
-	isInitiator         bool      // Whether we initiated the current/pending session
+	lastHandshakeSent     time.Time // When we last sent a handshake message
+	isInitiator           bool      // Whether we initiated the current/pending session
 
 	// Timestamps
 	createdAt      time.Time

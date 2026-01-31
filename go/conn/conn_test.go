@@ -622,9 +622,9 @@ func TestConnInvalidReceiverIndex(t *testing.T) {
 	// Create a properly encrypted message but with wrong receiver index
 	// We need a fake "peer" session to encrypt
 	fakePeerSession, _ := noise.NewSession(noise.SessionConfig{
-		LocalIndex:  999,           // Their local
-		RemoteIndex: 888,           // Wrong index - doesn't match our session
-		SendKey:     recvKey,       // Reversed keys
+		LocalIndex:  999,     // Their local
+		RemoteIndex: 888,     // Wrong index - doesn't match our session
+		SendKey:     recvKey, // Reversed keys
 		RecvKey:     sendKey,
 		RemotePK:    clientKey.Public,
 	})
