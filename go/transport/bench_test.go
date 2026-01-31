@@ -163,6 +163,7 @@ func BenchmarkUDP_WithNoise(b *testing.B) {
 
 	// Wait for listener to be ready
 	listener := <-listenerReady
+	defer listener.Close()
 
 	// Give server time to start listening
 	time.Sleep(10 * time.Millisecond)
@@ -223,7 +224,6 @@ func BenchmarkUDP_WithNoise(b *testing.B) {
 	clientConn.Close()
 	serverConn.Close()
 	wg.Wait()
-	_ = listener // Listener is closed when serverUDP is closed via defer
 }
 
 // BenchmarkUDP_ParallelSend benchmarks parallel UDP sends

@@ -228,42 +228,18 @@ func (c *Conn) failHandshake(err error) error {
 // Send sends an encrypted message to the remote peer.
 // The protocol byte indicates the type of payload.
 func (c *Conn) Send(protocol byte, payload []byte) error {
-	c.mu.RLock()
-	if c.state != ConnStateEstablished {
-		c.mu.RUnlock()
-		return ErrNotEstablished
-	}
-	session := c.session
-	remoteAddr := c.remoteAddr
-	c.mu.RUnlock()
-
-	// Encode payload with protocol byte
 	plaintext := noise.EncodePayload(protocol, payload)
-
-	// Encrypt
-	ciphertext, counter, err := session.Encrypt(plaintext)
-	if err != nil {
-		return err
-	}
-
-	// Build wire message
-	msg := noise.BuildTransportMessage(session.RemoteIndex(), counter, ciphertext)
-
-	// Send
-	if err := c.transport.SendTo(msg, remoteAddr); err != nil {
-		return err
-	}
-
-	// Update last sent time
-	c.mu.Lock()
-	c.lastSent = time.Now()
-	c.mu.Unlock()
-
-	return nil
+	return c.sendPayload(plaintext)
 }
 
 // SendKeepalive sends an empty keepalive message to maintain the connection.
 func (c *Conn) SendKeepalive() error {
+	return c.sendPayload(nil)
+}
+
+// sendPayload encrypts and sends a payload to the remote peer.
+// This is the common implementation for Send and SendKeepalive.
+func (c *Conn) sendPayload(plaintext []byte) error {
 	c.mu.RLock()
 	if c.state != ConnStateEstablished {
 		c.mu.RUnlock()
@@ -273,8 +249,8 @@ func (c *Conn) SendKeepalive() error {
 	remoteAddr := c.remoteAddr
 	c.mu.RUnlock()
 
-	// Encrypt empty payload
-	ciphertext, counter, err := session.Encrypt(nil)
+	// Encrypt
+	ciphertext, counter, err := session.Encrypt(plaintext)
 	if err != nil {
 		return err
 	}
