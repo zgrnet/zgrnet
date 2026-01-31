@@ -52,23 +52,23 @@ pub const PeerState = enum {
 /// Information about the local host.
 pub const HostInfo = struct {
     public_key: Key,
-    addr: posix.sockaddr,
-    addr_len: posix.socklen_t,
+    port: u16,
     peer_count: usize,
     rx_bytes: u64,
     tx_bytes: u64,
-    last_seen: ?i128,
+    last_seen_ns: i64, // nanoseconds, 0 means never
 };
 
 /// Information about a peer.
 pub const PeerInfo = struct {
     public_key: Key,
-    endpoint: ?posix.sockaddr,
-    endpoint_len: posix.socklen_t,
+    endpoint_port: u16,
+    endpoint_addr: u32, // IPv4 address in network byte order
+    has_endpoint: bool,
     state: PeerState,
     rx_bytes: u64,
     tx_bytes: u64,
-    last_seen: ?i128,
+    last_seen_ns: i64,
 };
 
 /// A peer with its info.
@@ -168,6 +168,7 @@ pub const UDP = struct {
     // Local address
     local_addr: posix.sockaddr,
     local_addr_len: posix.socklen_t,
+    local_port: u16,
 
     /// Creates a new UDP network.
     pub fn init(allocator: Allocator, key: KeyPair, opts: UdpOptions) UdpError!*UDP {
@@ -193,10 +194,12 @@ pub const UDP = struct {
 
         posix.bind(socket, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) catch return UdpError.BindFailed;
 
-        // Get actual bound address
-        var local_addr: posix.sockaddr = undefined;
-        var local_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-        posix.getsockname(socket, &local_addr, &local_addr_len) catch return UdpError.BindFailed;
+        // Get actual bound address (reuse addr which is properly aligned)
+        var bound_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        posix.getsockname(socket, @ptrCast(&addr), &bound_addr_len) catch return UdpError.BindFailed;
+
+        // Extract the actual port after binding
+        const local_port = std.mem.bigToNative(u16, addr.port);
 
         self.* = .{
             .allocator = allocator,
@@ -206,8 +209,9 @@ pub const UDP = struct {
             .peers_map = std.AutoHashMap(Key, *PeerStateInternal).init(allocator),
             .by_index = std.AutoHashMap(u32, Key).init(allocator),
             .pending = std.AutoHashMap(u32, *PendingHandshake).init(allocator),
-            .local_addr = local_addr,
-            .local_addr_len = local_addr_len,
+            .local_addr = @as(*posix.sockaddr, @ptrCast(&addr)).*,
+            .local_addr_len = bound_addr_len,
+            .local_port = local_port,
         };
 
         return self;
@@ -293,16 +297,16 @@ pub const UDP = struct {
         self.peers_mutex.unlock();
 
         const last_seen_val = self.last_seen.load(.seq_cst);
-        const last_seen = if (last_seen_val == 0) null else last_seen_val;
+        // Convert i128 to i64 for simpler struct
+        const last_seen_ns: i64 = if (last_seen_val == 0) 0 else @as(i64, @truncate(@mod(last_seen_val, std.math.maxInt(i64))));
 
         out.* = .{
             .public_key = self.local_key.public,
-            .addr = self.local_addr,
-            .addr_len = self.local_addr_len,
+            .port = self.local_port,
             .peer_count = peer_count,
             .rx_bytes = self.total_rx.load(.seq_cst),
             .tx_bytes = self.total_tx.load(.seq_cst),
-            .last_seen = last_seen,
+            .last_seen_ns = last_seen_ns,
         };
     }
 
@@ -318,14 +322,26 @@ pub const UDP = struct {
         peer.mutex.lock();
         defer peer.mutex.unlock();
 
+        var endpoint_port: u16 = 0;
+        var endpoint_addr: u32 = 0;
+        const has_endpoint = peer.endpoint != null;
+        if (peer.endpoint) |ep| {
+            const addr_in: *const posix.sockaddr.in = @ptrCast(@alignCast(&ep));
+            endpoint_port = std.mem.bigToNative(u16, addr_in.port);
+            endpoint_addr = addr_in.addr;
+        }
+
+        const last_seen_ns: i64 = if (peer.last_seen) |ls| @as(i64, @truncate(@mod(ls, std.math.maxInt(i64)))) else 0;
+
         return .{
             .public_key = peer.pk,
-            .endpoint = peer.endpoint,
-            .endpoint_len = peer.endpoint_len,
+            .endpoint_port = endpoint_port,
+            .endpoint_addr = endpoint_addr,
+            .has_endpoint = has_endpoint,
             .state = peer.state,
             .rx_bytes = peer.rx_bytes,
             .tx_bytes = peer.tx_bytes,
-            .last_seen = peer.last_seen,
+            .last_seen_ns = last_seen_ns,
         };
     }
 
@@ -343,15 +359,27 @@ pub const UDP = struct {
             peer.mutex.lock();
             defer peer.mutex.unlock();
 
+            var endpoint_port: u16 = 0;
+            var endpoint_addr: u32 = 0;
+            const has_endpoint = peer.endpoint != null;
+            if (peer.endpoint) |ep| {
+                const addr_in: *const posix.sockaddr.in = @ptrCast(&ep);
+                endpoint_port = std.mem.bigToNative(u16, addr_in.port);
+                endpoint_addr = addr_in.addr;
+            }
+
+            const last_seen_ns: i64 = if (peer.last_seen) |ls| @as(i64, @truncate(@mod(ls, std.math.maxInt(i64)))) else 0;
+
             try result.append(.{
                 .info = .{
                     .public_key = peer.pk,
-                    .endpoint = peer.endpoint,
-                    .endpoint_len = peer.endpoint_len,
+                    .endpoint_port = endpoint_port,
+                    .endpoint_addr = endpoint_addr,
+                    .has_endpoint = has_endpoint,
                     .state = peer.state,
                     .rx_bytes = peer.rx_bytes,
                     .tx_bytes = peer.tx_bytes,
-                    .last_seen = peer.last_seen,
+                    .last_seen_ns = last_seen_ns,
                 },
             });
         }

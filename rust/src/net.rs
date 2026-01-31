@@ -510,8 +510,7 @@ impl UDP {
         noise_msg[KEY_SIZE..].copy_from_slice(&msg.static_encrypted);
 
         // Read the handshake message
-        let mut payload_buf = [0u8; 64];
-        if hs.read_message(&noise_msg, &mut payload_buf).is_err() {
+        if hs.read_message(&noise_msg).is_err() {
             return;
         }
 
@@ -621,9 +620,8 @@ impl UDP {
         noise_msg[KEY_SIZE..].copy_from_slice(&msg.empty_encrypted);
 
         // Read the handshake response
-        let mut payload_buf = [0u8; 64];
         let mut hs = pending.hs_state;
-        if hs.read_message(&noise_msg, &mut payload_buf).is_err() {
+        if hs.read_message(&noise_msg).is_err() {
             let peers = self.peers.read().unwrap();
             if let Some(peer) = peers.get(&pending.peer_pk) {
                 let mut p = peer.lock().unwrap();
