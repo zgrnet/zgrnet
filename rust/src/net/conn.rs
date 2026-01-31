@@ -430,6 +430,9 @@ impl<T: Transport + 'static> Conn<T> {
             let pkt = rx.recv().map_err(|_| ConnError::InvalidState)?;
             drop(rx_guard); // Release lock before decryption
             
+            // Update remote address for NAT traversal
+            self.set_remote_addr(pkt.addr);
+            
             // Verify receiver index
             if pkt.receiver_index != self.local_idx {
                 return Err(ConnError::InvalidReceiverIndex);

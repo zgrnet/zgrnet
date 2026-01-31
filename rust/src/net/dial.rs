@@ -130,7 +130,7 @@ pub fn dial<T: Transport + 'static>(opts: DialOptions<T>) -> Result<Conn<T>> {
         let _ = conn.transport().set_read_deadline(None);
 
         // Handle receive result
-        let (n, _from) = match recv_result {
+        let (n, from_addr) = match recv_result {
             Ok(result) => result,
             Err(TransportError::Io(ref e)) if is_timeout_error(e) => {
                 // Timeout - retry with new ephemeral keys
@@ -141,6 +141,9 @@ pub fn dial<T: Transport + 'static>(opts: DialOptions<T>) -> Result<Conn<T>> {
                 return Err(e.into());
             }
         };
+        
+        // Update remote address for NAT traversal
+        conn.set_remote_addr(from_addr);
 
         // Parse response
         let resp = match parse_handshake_resp(&buf[..n]) {

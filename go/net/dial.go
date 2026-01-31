@@ -2,6 +2,7 @@ package net
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/vibing/zgrnet/noise"
@@ -136,17 +137,13 @@ func (c *Conn) waitForHandshakeResponse(ctx context.Context, hs *noise.Handshake
 
 	// Set read deadline on transport
 	if err := c.transport.SetReadDeadline(deadline); err != nil {
-		// If transport doesn't support deadlines, fall back to context check
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
+		// Transport doesn't support deadlines - required for DialContext timeouts
+		return nil, fmt.Errorf("transport does not support SetReadDeadline: %w", err)
 	}
 
 	// Read response (will timeout based on deadline)
 	buf := make([]byte, noise.MaxPacketSize)
-	n, _, err := c.transport.RecvFrom(buf)
+	n, fromAddr, err := c.transport.RecvFrom(buf)
 
 	// Clear deadline
 	_ = c.transport.SetReadDeadline(time.Time{})
@@ -181,6 +178,13 @@ func (c *Conn) waitForHandshakeResponse(ctx context.Context, hs *noise.Handshake
 
 	if _, err := hs.ReadMessage(noiseMsg); err != nil {
 		return nil, err
+	}
+
+	// Update remote address for NAT traversal (peer's address might have changed)
+	if fromAddr != nil {
+		c.mu.Lock()
+		c.remoteAddr = fromAddr
+		c.mu.Unlock()
 	}
 
 	return resp, nil

@@ -168,6 +168,9 @@ pub fn dial(opts: DialOptions) DialError!*Conn {
             opts.allocator.destroy(conn);
             return DialError.TransportError;
         };
+        
+        // Update remote address for NAT traversal
+        conn.setRemoteAddr(result.from_addr);
 
         // Parse response
         const resp = message.parseHandshakeResp(buf[0..result.bytes_read]) catch {

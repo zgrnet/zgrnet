@@ -349,6 +349,9 @@ pub const Conn = struct {
             // Pop packet from queue
             var pkt = queue.orderedRemove(0);
             defer pkt.deinit();
+            
+            // Update remote address for NAT traversal
+            self.remote_addr = pkt.addr;
 
             // Verify receiver index
             if (pkt.receiver_index != self.local_idx) {

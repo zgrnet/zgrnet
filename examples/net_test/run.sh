@@ -82,7 +82,7 @@ fi
 sleep 0.5
 
 echo "--- Starting Zig on port 10003 ---"
-./net_zig --name zig &
+./net_zig --name zig --config "$CONFIG" &
 PID_ZIG=$!
 
 echo ""

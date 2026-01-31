@@ -426,6 +426,12 @@ func (c *Conn) Recv() (protocol byte, payload []byte, err error) {
 		if !ok {
 			return 0, nil, ErrConnClosed
 		}
+		// Update remote address for NAT traversal
+		if pkt.addr != nil {
+			c.mu.Lock()
+			c.remoteAddr = pkt.addr
+			c.mu.Unlock()
+		}
 		// For listener-managed connections, we receive pre-parsed transport messages
 		return c.handleTransportMessage(pkt.msg)
 	}
