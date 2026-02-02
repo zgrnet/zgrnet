@@ -1,0 +1,26 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "kcp",
+    srcs = [
+        "frame.go",
+        "ikcp.c",
+        "ikcp.h",
+        "kcp.go",
+        "mux.go",
+        "stream.go",
+    ],
+    cgo = True,
+    importpath = "github.com/vibing/zgrnet/pkg/kcp",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "kcp_test",
+    srcs = [
+        "frame_test.go",
+        "kcp_test.go",
+        "mux_test.go",
+    ],
+    embed = [":kcp"],
+)

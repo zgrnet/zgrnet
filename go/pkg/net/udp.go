@@ -5,6 +5,7 @@ import (
 	"errors"
 	"iter"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,6 +84,65 @@ type protoPacket struct {
 	payload  []byte
 }
 
+// packet represents a packet in the processing pipeline.
+// It carries raw data and gets decrypted in parallel by workers.
+// Consumers wait on the ready channel before accessing decrypted data.
+type packet struct {
+	// Input (set by ioLoop)
+	data []byte       // buffer from pool (owns the memory)
+	n    int          // actual data length
+	from *net.UDPAddr // sender address
+
+	// Output (set by decryptWorker)
+	pk       noise.PublicKey // sender's public key (after decrypt)
+	protocol byte            // protocol byte
+	payload  []byte          // decrypted payload (slice into data or copy)
+	payloadN int             // payload length
+	err      error           // decrypt error (if any)
+
+	// Synchronization
+	ready chan struct{} // closed when decryption is complete
+}
+
+// bufferPool provides reusable buffers for receiving UDP packets.
+var bufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, noise.MaxPacketSize)
+	},
+}
+
+// packetPool provides reusable packet structs.
+var packetPool = sync.Pool{
+	New: func() any {
+		return &packet{
+			ready: make(chan struct{}),
+		}
+	},
+}
+
+// acquirePacket gets a packet from the pool and resets it.
+func acquirePacket() *packet {
+	p := packetPool.Get().(*packet)
+	p.data = bufferPool.Get().([]byte)
+	p.n = 0
+	p.pk = noise.PublicKey{}
+	p.protocol = 0
+	p.payload = nil
+	p.payloadN = 0
+	p.err = nil
+	p.ready = make(chan struct{})
+	return p
+}
+
+// releasePacket returns a packet to the pool.
+func releasePacket(p *packet) {
+	if p.data != nil {
+		bufferPool.Put(p.data)
+		p.data = nil
+	}
+	packetPool.Put(p)
+}
+
 // UDP represents a UDP-based network using the Noise Protocol.
 // It manages multiple peers, handles handshakes, and supports roaming.
 type UDP struct {
@@ -99,6 +159,12 @@ type UDP struct {
 
 	// Pending handshakes (as initiator)
 	pending map[uint32]*pendingHandshake
+
+	// Pipeline channels for async I/O processing
+	decryptChan chan *packet    // ioLoop -> decryptWorkers
+	outputChan  chan *packet    // ioLoop -> ReadFrom (same packet, wait for ready)
+	closeChan   chan struct{}   // signal to stop goroutines
+	wg          sync.WaitGroup  // tracks running goroutines
 
 	// Statistics
 	totalRx  atomic.Uint64
@@ -143,8 +209,9 @@ type pendingHandshake struct {
 type Option func(*options)
 
 type options struct {
-	bindAddr     string
-	allowUnknown bool
+	bindAddr       string
+	allowUnknown   bool
+	decryptWorkers int // 0 = runtime.NumCPU()
 }
 
 // WithBindAddr sets the local address to bind to.
@@ -159,6 +226,14 @@ func WithBindAddr(addr string) Option {
 func WithAllowUnknown(allow bool) Option {
 	return func(o *options) {
 		o.allowUnknown = allow
+	}
+}
+
+// WithDecryptWorkers sets the number of parallel decrypt workers.
+// Default is runtime.NumCPU().
+func WithDecryptWorkers(n int) Option {
+	return func(o *options) {
+		o.decryptWorkers = n
 	}
 }
 
@@ -194,8 +269,30 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		peers:        make(map[noise.PublicKey]*peerState),
 		byIndex:      make(map[uint32]*peerState),
 		pending:      make(map[uint32]*pendingHandshake),
+		decryptChan:  make(chan *packet, RawChanSize),
+		outputChan:   make(chan *packet, DecryptedChanSize),
+		closeChan:    make(chan struct{}),
 	}
 	u.lastSeen.Store(time.Time{})
+
+	// Determine number of decrypt workers
+	workers := o.decryptWorkers
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+
+	// Start pipeline goroutines
+	u.wg.Add(1 + workers)
+	go func() {
+		defer u.wg.Done()
+		u.ioLoop()
+	}()
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer u.wg.Done()
+			u.decryptWorker()
+		}()
+	}
 
 	return u, nil
 }
@@ -356,6 +453,7 @@ func (u *UDP) GetConn(pk noise.PublicKey) *Conn {
 }
 
 // WriteTo sends encrypted data to a peer.
+// Uses a default protocol byte (ProtocolRaw) for transport.
 func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 	if u.closed.Load() {
 		return ErrClosed
@@ -382,8 +480,11 @@ func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 		return ErrNoSession
 	}
 
+	// Encode with default protocol byte
+	payload := noise.EncodePayload(noise.ProtocolRaw, data)
+
 	// Encrypt the data
-	encrypted, nonce, err := session.Encrypt(data)
+	encrypted, nonce, err := session.Encrypt(payload)
 	if err != nil {
 		return err
 	}
@@ -410,57 +511,43 @@ func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 // It handles handshakes internally and only returns transport data.
 // Returns the sender's public key, number of bytes, and any error.
 func (u *UDP) ReadFrom(buf []byte) (pk noise.PublicKey, n int, err error) {
-	if u.closed.Load() {
-		return pk, 0, ErrClosed
-	}
-
-	recvBuf := make([]byte, noise.MaxPacketSize)
-
 	for {
 		if u.closed.Load() {
 			return pk, 0, ErrClosed
 		}
 
-		// Read from socket
-		nr, fromAddr, err := u.socket.ReadFromUDP(recvBuf)
-		if err != nil {
-			if u.closed.Load() {
+		// Get next packet from output queue
+		var pkt *packet
+		select {
+		case p, ok := <-u.outputChan:
+			if !ok {
 				return pk, 0, ErrClosed
 			}
-			return pk, 0, err
+			pkt = p
+		case <-u.closeChan:
+			return pk, 0, ErrClosed
 		}
 
-		if nr < 1 {
-			continue
+		// Wait for decryption to complete
+		select {
+		case <-pkt.ready:
+			// Decryption done
+		case <-u.closeChan:
+			releasePacket(pkt)
+			return pk, 0, ErrClosed
 		}
 
-		// Update stats
-		u.totalRx.Add(uint64(nr))
-		u.lastSeen.Store(time.Now())
-
-		// Parse message type
-		msgType := recvBuf[0]
-
-		switch msgType {
-		case noise.MessageTypeHandshakeInit:
-			u.handleHandshakeInit(recvBuf[:nr], fromAddr)
-			continue // Don't return handshake to caller
-
-		case noise.MessageTypeHandshakeResp:
-			u.handleHandshakeResp(recvBuf[:nr], fromAddr)
-			continue // Don't return handshake to caller
-
-		case noise.MessageTypeTransport:
-			pk, n, err = u.handleTransport(recvBuf[:nr], fromAddr, buf)
-			if err != nil {
-				continue // Try again on error
-			}
-			return pk, n, nil
-
-		default:
-			// Unknown message type, ignore
-			continue
+		// Check for errors (handshake, KCP routed internally, etc.)
+		if pkt.err != nil {
+			releasePacket(pkt)
+			continue // Try next packet
 		}
+
+		// Copy decrypted data to caller's buffer
+		n = copy(buf, pkt.payload[:pkt.payloadN])
+		pk = pkt.pk
+		releasePacket(pkt)
+		return pk, n, nil
 	}
 }
 
@@ -651,91 +738,6 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 	}
 }
 
-// handleTransport processes an incoming transport message.
-// It decrypts the message and routes it based on the protocol byte:
-// - KCP protocol (64): routed to the peer's Mux
-// - Other protocols: returned to caller or routed to inboundChan
-func (u *UDP) handleTransport(data []byte, from *net.UDPAddr, outBuf []byte) (pk noise.PublicKey, n int, err error) {
-	msg, err := noise.ParseTransportMessage(data)
-	if err != nil {
-		return pk, 0, err
-	}
-
-	// Find peer by receiver index
-	u.mu.RLock()
-	peer, exists := u.byIndex[msg.ReceiverIndex]
-	u.mu.RUnlock()
-
-	if !exists {
-		return pk, 0, ErrPeerNotFound
-	}
-
-	peer.mu.Lock()
-	session := peer.session
-	peer.mu.Unlock()
-
-	if session == nil {
-		return pk, 0, ErrNoSession
-	}
-
-	// Decrypt
-	plaintext, err := session.Decrypt(msg.Ciphertext, msg.Counter)
-	if err != nil {
-		return pk, 0, err
-	}
-
-	// Update peer state (roaming + stats)
-	peer.mu.Lock()
-	if peer.endpoint == nil || peer.endpoint.String() != from.String() {
-		peer.endpoint = from // Roaming
-	}
-	peer.rxBytes += uint64(len(data))
-	peer.lastSeen = time.Now()
-	muxInstance := peer.mux
-	inboundChan := peer.inboundChan
-	peer.mu.Unlock()
-
-	// Parse protocol byte
-	if len(plaintext) == 0 {
-		// Empty keepalive packet
-		return peer.pk, 0, nil
-	}
-
-	protocol, payload, err := noise.DecodePayload(plaintext)
-	if err != nil {
-		return pk, 0, err
-	}
-
-	// Route based on protocol
-	switch protocol {
-	case noise.ProtocolKCP:
-		// Route to Mux if initialized
-		if muxInstance != nil {
-			if err := muxInstance.Input(payload); err != nil {
-				// Log error but don't fail - Mux might be closed
-			}
-		}
-		// Return empty to caller since data was routed internally
-		return peer.pk, 0, nil
-
-	default:
-		// Try to route to inboundChan for Read() callers
-		if inboundChan != nil {
-			select {
-			case inboundChan <- protoPacket{protocol: protocol, payload: payload}:
-				// Return empty since data was routed to channel
-				return peer.pk, 0, nil
-			default:
-				// Channel full, fall through to return to ReadFrom caller
-			}
-		}
-
-		// Return to ReadFrom caller (legacy behavior)
-		n = copy(outBuf, plaintext)
-		return peer.pk, n, nil
-	}
-}
-
 // Connect initiates a handshake with a peer.
 // The peer must have an endpoint set via SetPeerEndpoint.
 // A receive loop (ReadFrom) must be running to process the handshake response.
@@ -836,5 +838,215 @@ func (u *UDP) Close() error {
 	if u.closed.Swap(true) {
 		return nil // Already closed
 	}
-	return u.socket.Close()
+
+	// Signal goroutines to stop
+	close(u.closeChan)
+
+	// Close socket (will unblock ioLoop)
+	err := u.socket.Close()
+
+	// Close channels to unblock waiters
+	close(u.decryptChan)
+	close(u.outputChan)
+
+	// Wait for all goroutines to finish
+	u.wg.Wait()
+
+	return err
+}
+
+// ioLoop reads packets from the socket and dispatches them.
+// Each packet goes to both decryptChan (for workers) and outputChan (for ReadFrom).
+// This goroutine only does I/O, no decryption, to maximize throughput.
+func (u *UDP) ioLoop() {
+	for {
+		// Acquire packet from pool
+		pkt := acquirePacket()
+
+		// Read from socket (blocking)
+		n, from, err := u.socket.ReadFromUDP(pkt.data)
+		if err != nil {
+			releasePacket(pkt)
+			if u.closed.Load() {
+				return
+			}
+			continue
+		}
+
+		if n < 1 {
+			releasePacket(pkt)
+			continue
+		}
+
+		pkt.n = n
+		pkt.from = from
+
+		// Update stats
+		u.totalRx.Add(uint64(n))
+		u.lastSeen.Store(time.Now())
+
+		// Send to both channels (non-blocking)
+		// decryptChan: for decrypt workers to process
+		// outputChan: for ReadFrom to wait and consume
+		select {
+		case u.decryptChan <- pkt:
+			// Sent to decrypt worker
+		case <-u.closeChan:
+			releasePacket(pkt)
+			return
+		default:
+			// Decrypt queue full, drop packet
+			releasePacket(pkt)
+			continue
+		}
+
+		select {
+		case u.outputChan <- pkt:
+			// Sent to output queue
+		case <-u.closeChan:
+			return
+		default:
+			// Output queue full, packet already in decrypt queue
+			// It will be processed but not delivered to ReadFrom
+		}
+	}
+}
+
+// decryptWorker processes packets from decryptChan.
+// Multiple workers run in parallel for higher throughput.
+// After processing, it signals ready so ReadFrom can consume.
+func (u *UDP) decryptWorker() {
+	for pkt := range u.decryptChan {
+		u.processPacket(pkt)
+		// Signal that decryption is complete
+		close(pkt.ready)
+	}
+}
+
+// processPacket handles a single packet - parses, decrypts, and fills result fields.
+// Called by decryptWorker. Sets pkt.err if processing fails.
+func (u *UDP) processPacket(pkt *packet) {
+	data := pkt.data[:pkt.n]
+	from := pkt.from
+
+	if len(data) < 1 {
+		pkt.err = ErrNoData
+		return
+	}
+
+	// Parse message type
+	msgType := data[0]
+
+	switch msgType {
+	case noise.MessageTypeHandshakeInit:
+		u.handleHandshakeInit(data, from)
+		pkt.err = ErrNoData // Not a data packet
+
+	case noise.MessageTypeHandshakeResp:
+		u.handleHandshakeResp(data, from)
+		pkt.err = ErrNoData // Not a data packet
+
+	case noise.MessageTypeTransport:
+		u.decryptTransport(pkt, data, from)
+
+	default:
+		pkt.err = ErrNoData
+	}
+}
+
+// decryptTransport decrypts a transport message and fills pkt fields.
+// Also routes KCP packets to mux and non-KCP to inboundChan.
+func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
+	msg, err := noise.ParseTransportMessage(data)
+	if err != nil {
+		pkt.err = err
+		return
+	}
+
+	// Find peer by receiver index
+	u.mu.RLock()
+	peer, exists := u.byIndex[msg.ReceiverIndex]
+	u.mu.RUnlock()
+
+	if !exists {
+		pkt.err = ErrPeerNotFound
+		return
+	}
+
+	peer.mu.Lock()
+	session := peer.session
+	peer.mu.Unlock()
+
+	if session == nil {
+		pkt.err = ErrNoSession
+		return
+	}
+
+	// Decrypt
+	plaintext, err := session.Decrypt(msg.Ciphertext, msg.Counter)
+	if err != nil {
+		pkt.err = err
+		return
+	}
+
+	// Update peer state (roaming + stats)
+	peer.mu.Lock()
+	if peer.endpoint == nil || peer.endpoint.String() != from.String() {
+		peer.endpoint = from // Roaming
+	}
+	peer.rxBytes += uint64(len(data))
+	peer.lastSeen = time.Now()
+	muxInstance := peer.mux
+	// Initialize inboundChan if needed (for Peer.Read callers)
+	if peer.inboundChan == nil {
+		peer.inboundChan = make(chan protoPacket, InboundChanSize)
+	}
+	inboundChan := peer.inboundChan
+	peer.mu.Unlock()
+
+	// Fill packet fields
+	pkt.pk = peer.pk
+
+	// Parse protocol byte
+	if len(plaintext) == 0 {
+		// Empty keepalive packet
+		pkt.err = ErrNoData
+		return
+	}
+
+	protocol, payload, err := noise.DecodePayload(plaintext)
+	if err != nil {
+		pkt.err = err
+		return
+	}
+
+	pkt.protocol = protocol
+	// Make a copy of payload since plaintext references the pool buffer
+	pkt.payload = make([]byte, len(payload))
+	copy(pkt.payload, payload)
+	pkt.payloadN = len(payload)
+
+	// Route based on protocol
+	switch protocol {
+	case noise.ProtocolKCP:
+		// Route to Mux if initialized
+		if muxInstance != nil {
+			muxInstance.Input(payload)
+		}
+		// Don't deliver KCP to ReadFrom
+		pkt.err = ErrNoData
+
+	default:
+		// Route to inboundChan for Peer.Read() callers (non-blocking)
+		if inboundChan != nil {
+			select {
+			case inboundChan <- protoPacket{protocol: protocol, payload: pkt.payload}:
+				// Delivered to Peer.Read
+			default:
+				// Channel full, drop for Peer.Read path
+			}
+		}
+		// Always leave pkt valid for ReadFrom callers
+		// pkt.err remains nil so ReadFrom can deliver it
+	}
 }
