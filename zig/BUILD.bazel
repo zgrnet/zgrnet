@@ -1,4 +1,5 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("//bazel/zig:defs.bzl", "zig_run")
 
 # BoringSSL benchmark (C)
 cc_binary(
@@ -6,4 +7,28 @@ cc_binary(
     srcs = ["bench_boringssl.c"],
     deps = ["@boringssl//:crypto"],
     copts = ["-O3"],
+)
+
+# Zig source files (for examples to depend on)
+filegroup(
+    name = "srcs",
+    srcs = glob([
+        "src/**/*.zig",
+        "src/**/*.S",
+        "src/**/*.c",
+        "src/**/*.h",
+    ]) + [
+        "build.zig",
+        "build.zig.zon",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Zig test
+# Usage: bazel run //zig:test
+zig_run(
+    name = "test",
+    srcs = [":srcs"],
+    build_args = ["test"],
+    zig_root = "zig",
 )

@@ -37,16 +37,15 @@ use_repo(
     "org_golang_x_crypto",
 )
 
-# Zig toolchain - disabled, rules_zig 0.6.0 incompatible with Bazel 9.0
-# Use native zig build instead: cd zig && zig build
-# bazel_dep(name = "rules_zig", version = "0.6.0")
-# zig = use_extension("@rules_zig//zig:extensions.bzl", "zig")
-# zig.toolchain(zig_version = "0.13.0")
-# use_repo(zig, "zig_toolchains")
-# register_toolchains("@zig_toolchains//:all")
+# Zig toolchain (custom rules, official Zig 0.15.2)
+zig_toolchain = use_extension("//:extensions.bzl", "zig_toolchain")
+use_repo(zig_toolchain, "zig_toolchain")
 
 # C/C++ rules
 bazel_dep(name = "rules_cc", version = "0.1.1")
+
+# Skylib for build settings
+bazel_dep(name = "bazel_skylib", version = "1.7.1")
 
 # BoringSSL
 bazel_dep(name = "boringssl", version = "0.20250212.0")
