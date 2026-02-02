@@ -1048,7 +1048,13 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 	// Route based on protocol
 	switch protocol {
 	case noise.ProtocolKCP:
-		// Route to Mux if initialized
+		// Auto-initialize mux on first KCP message (as server/responder)
+		if muxInstance == nil {
+			u.initMux(peer, false) // server mode - we're receiving
+			peer.mu.RLock()
+			muxInstance = peer.mux
+			peer.mu.RUnlock()
+		}
 		if muxInstance != nil {
 			muxInstance.Input(payload)
 		}
