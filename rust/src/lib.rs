@@ -59,6 +59,8 @@ pub use net::{
     UdpTransport,
     // High-level UDP API
     UDP, UdpOptions, UdpError, HostInfo, PeerInfo, Peer, PeerState,
+    // Async UDP pipeline API
+    AsyncUDP, AsyncUdpConfig, DecryptedPacket, RawPacket,
 };
 
 // KCP and stream multiplexing

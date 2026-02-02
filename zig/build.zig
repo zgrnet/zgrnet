@@ -48,9 +48,18 @@ pub fn build(b: *std.Build) void {
         .pure_zig => .native_zig,
     };
 
+    // OS backend selection
+    const OsBackend = enum { darwin, none };
+    const default_os_backend: OsBackend = switch (target_os) {
+        .macos, .ios, .tvos, .watchos => .darwin,
+        else => .none,
+    };
+    const os_backend = b.option(OsBackend, "os_backend", "OS backend: darwin (kqueue), none (single-threaded)") orelse default_os_backend;
+
     // Build options
     const options = b.addOptions();
     options.addOption(CipherBackend, "backend", cipher_backend);
+    options.addOption(OsBackend, "os_backend", os_backend);
 
     // Helper to add ARM64 ASM files
     const addArm64AsmFiles = struct {
@@ -172,4 +181,27 @@ pub fn build(b: *std.Build) void {
     }
     const host_test_step = b.step("host_test", "Run host test example");
     host_test_step.dependOn(&run_host_test.step);
+
+    // Throughput test example
+    const throughput_test_module = b.createModule(.{
+        .root_source_file = b.path("../examples/throughput/zig/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    throughput_test_module.addOptions("build_options", options);
+    throughput_test_module.addImport("noise", lib_module);
+
+    const throughput_test_exe = b.addExecutable(.{
+        .name = "throughput_test",
+        .root_module = throughput_test_module,
+    });
+    throughput_test_exe.linkLibrary(lib);
+    b.installArtifact(throughput_test_exe);
+
+    const run_throughput_test = b.addRunArtifact(throughput_test_exe);
+    if (b.args) |args| {
+        run_throughput_test.addArgs(args);
+    }
+    const throughput_test_step = b.step("throughput", "Run throughput test");
+    throughput_test_step.dependOn(&run_throughput_test.step);
 }
