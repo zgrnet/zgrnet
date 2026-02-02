@@ -611,7 +611,7 @@ impl UDP {
                 // Encrypt
                 let (ciphertext, nonce) = session
                     .encrypt(&payload)
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
                 // Build transport message
                 let msg = build_transport_message(session.remote_index(), nonce, &ciphertext);
