@@ -19,10 +19,10 @@ type Stream = kcp.Stream
 // initMux initializes the Mux for a peer (called lazily).
 func (u *UDP) initMux(peer *peerState, isClient bool) {
 	peer.muxOnce.Do(func() {
-		peer.acceptChan = make(chan *stream, 16)
-		peer.inboundChan = make(chan protoPacket, 64)
+		acceptChan := make(chan *stream, 16)
+		inboundChan := make(chan protoPacket, InboundChanSize)
 
-		peer.mux = kcp.NewMux(
+		m := kcp.NewMux(
 			kcp.DefaultConfig(),
 			isClient,
 			// Output function: send KCP frames through the encrypted session
@@ -36,7 +36,7 @@ func (u *UDP) initMux(peer *peerState, isClient bool) {
 			// OnNewStream: called when remote opens a new stream
 			func(s *stream) {
 				select {
-				case peer.acceptChan <- s:
+				case acceptChan <- s:
 				default:
 					// Accept queue full, close the stream
 					s.Close()
@@ -44,14 +44,25 @@ func (u *UDP) initMux(peer *peerState, isClient bool) {
 			},
 		)
 
+		// Assign under lock to avoid race with decryptTransport
+		peer.mu.Lock()
+		peer.acceptChan = acceptChan
+		peer.inboundChan = inboundChan
+		peer.mux = m
+		peer.mu.Unlock()
+
 		// Start the Mux update goroutine
-		go u.muxUpdateLoop(peer)
+		u.wg.Add(1)
+		go func() {
+			defer u.wg.Done()
+			u.muxUpdateLoop(peer)
+		}()
 	})
 }
 
 // muxUpdateLoop periodically updates the Mux for KCP retransmissions.
 func (u *UDP) muxUpdateLoop(peer *peerState) {
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -199,13 +210,20 @@ func (u *UDP) Read(pk noise.PublicKey, buf []byte) (proto byte, n int, err error
 		return 0, 0, ErrPeerNotFound
 	}
 
-	// Ensure inbound channel is initialized
-	peer.mu.Lock()
-	if peer.inboundChan == nil {
-		peer.inboundChan = make(chan protoPacket, 64)
-	}
+	// Get inbound channel (fast path: already initialized)
+	peer.mu.RLock()
 	inboundChan := peer.inboundChan
-	peer.mu.Unlock()
+	peer.mu.RUnlock()
+
+	// Slow path: initialize if needed
+	if inboundChan == nil {
+		peer.mu.Lock()
+		if peer.inboundChan == nil {
+			peer.inboundChan = make(chan protoPacket, InboundChanSize)
+		}
+		inboundChan = peer.inboundChan
+		peer.mu.Unlock()
+	}
 
 	select {
 	case pkt := <-inboundChan:
