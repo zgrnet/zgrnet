@@ -33,7 +33,7 @@ go build -o "$SCRIPT_DIR/kcp_go" ./examples/kcp_test
 # Build Rust
 echo "Building Rust kcp_interop..."
 cd "$RUST_DIR"
-cargo build --example kcp_interop --release 2>/dev/null || cargo build --example kcp_interop
+cargo build --example kcp_interop --release || cargo build --example kcp_interop
 cp target/release/examples/kcp_interop "$SCRIPT_DIR/kcp_rust" 2>/dev/null || \
 cp target/debug/examples/kcp_interop "$SCRIPT_DIR/kcp_rust"
 
