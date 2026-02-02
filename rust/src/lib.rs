@@ -26,7 +26,6 @@
 pub mod noise;
 pub mod net;
 pub mod kcp;
-pub mod stream;
 
 // Re-export commonly used types at crate root for convenience
 pub use noise::{
@@ -62,8 +61,8 @@ pub use net::{
     UDP, UdpOptions, UdpError, HostInfo, PeerInfo, Peer, PeerState,
 };
 
-// KCP multiplexing
-pub use kcp::{Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
-
-// Stream multiplexing
-pub use stream::{Stream, StreamState, StreamError, Mux, MuxConfig, MuxError};
+// KCP and stream multiplexing
+pub use kcp::{
+    Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE,
+    Stream, StreamState, StreamError, Mux, MuxConfig, MuxError,
+};

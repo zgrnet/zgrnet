@@ -3,7 +3,7 @@ package net
 import (
 	"sync"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 // Listener listens for incoming connections on a transport.

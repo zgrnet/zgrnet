@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 func TestDialMissingLocalKey(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 // PeerState represents the connection state of a peer.
@@ -74,7 +74,14 @@ var (
 	ErrNoEndpoint      = errors.New("net: peer has no endpoint")
 	ErrNoSession       = errors.New("net: peer has no established session")
 	ErrHandshakeFailed = errors.New("net: handshake failed")
+	ErrNoData          = errors.New("net: no data available")
 )
+
+// protoPacket represents a received packet with its protocol byte.
+type protoPacket struct {
+	protocol byte
+	payload  []byte
+}
 
 // UDP represents a UDP-based network using the Noise Protocol.
 // It manages multiple peers, handles handshakes, and supports roaming.
@@ -113,6 +120,14 @@ type peerState struct {
 	rxBytes  uint64
 	txBytes  uint64
 	lastSeen time.Time
+
+	// Stream multiplexing (initialized lazily on first OpenStream/AcceptStream)
+	mux        *mux
+	muxOnce    sync.Once
+	acceptChan chan *stream // incoming streams from remote
+
+	// Protocol routing for non-KCP packets
+	inboundChan chan protoPacket // incoming non-KCP packets
 }
 
 // pendingHandshake tracks an outgoing handshake.
@@ -637,6 +652,9 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 }
 
 // handleTransport processes an incoming transport message.
+// It decrypts the message and routes it based on the protocol byte:
+// - KCP protocol (64): routed to the peer's Mux
+// - Other protocols: returned to caller or routed to inboundChan
 func (u *UDP) handleTransport(data []byte, from *net.UDPAddr, outBuf []byte) (pk noise.PublicKey, n int, err error) {
 	msg, err := noise.ParseTransportMessage(data)
 	if err != nil {
@@ -666,9 +684,6 @@ func (u *UDP) handleTransport(data []byte, from *net.UDPAddr, outBuf []byte) (pk
 		return pk, 0, err
 	}
 
-	// Copy to output buffer
-	n = copy(outBuf, plaintext)
-
 	// Update peer state (roaming + stats)
 	peer.mu.Lock()
 	if peer.endpoint == nil || peer.endpoint.String() != from.String() {
@@ -676,9 +691,49 @@ func (u *UDP) handleTransport(data []byte, from *net.UDPAddr, outBuf []byte) (pk
 	}
 	peer.rxBytes += uint64(len(data))
 	peer.lastSeen = time.Now()
+	muxInstance := peer.mux
+	inboundChan := peer.inboundChan
 	peer.mu.Unlock()
 
-	return peer.pk, n, nil
+	// Parse protocol byte
+	if len(plaintext) == 0 {
+		// Empty keepalive packet
+		return peer.pk, 0, nil
+	}
+
+	protocol, payload, err := noise.DecodePayload(plaintext)
+	if err != nil {
+		return pk, 0, err
+	}
+
+	// Route based on protocol
+	switch protocol {
+	case noise.ProtocolKCP:
+		// Route to Mux if initialized
+		if muxInstance != nil {
+			if err := muxInstance.Input(payload); err != nil {
+				// Log error but don't fail - Mux might be closed
+			}
+		}
+		// Return empty to caller since data was routed internally
+		return peer.pk, 0, nil
+
+	default:
+		// Try to route to inboundChan for Read() callers
+		if inboundChan != nil {
+			select {
+			case inboundChan <- protoPacket{protocol: protocol, payload: payload}:
+				// Return empty since data was routed to channel
+				return peer.pk, 0, nil
+			default:
+				// Channel full, fall through to return to ReadFrom caller
+			}
+		}
+
+		// Return to ReadFrom caller (legacy behavior)
+		n = copy(outBuf, plaintext)
+		return peer.pk, n, nil
+	}
 }
 
 // Connect initiates a handshake with a peer.

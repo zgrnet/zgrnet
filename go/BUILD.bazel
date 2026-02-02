@@ -3,8 +3,8 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 # Go SDK - Noise Protocol implementation
 go_library(
     name = "noise",
-    srcs = glob(["noise/*.go"], exclude = ["noise/*_test.go"]),
-    importpath = "github.com/vibing/zgrnet/noise",
+    srcs = glob(["pkg/noise/*.go"], exclude = ["pkg/noise/*_test.go"]),
+    importpath = "github.com/vibing/zgrnet/pkg/noise",
     visibility = ["//visibility:public"],
     deps = [
         "@org_golang_x_crypto//blake2s",
@@ -16,8 +16,8 @@ go_library(
 
 go_test(
     name = "noise_test",
-    srcs = glob(["noise/*_test.go"]),
+    srcs = glob(["pkg/noise/*_test.go"]),
     embed = [":noise"],
 )
 
-# Net layer is built from go/net/BUILD.bazel
+# Net layer is built from go/pkg/net/BUILD.bazel

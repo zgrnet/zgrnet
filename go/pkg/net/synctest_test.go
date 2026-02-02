@@ -7,7 +7,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 // TestTickKeepaliveWithFakeTime tests keepalive using fake time.

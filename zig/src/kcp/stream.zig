@@ -1,8 +1,10 @@
 //! Stream - A multiplexed reliable stream over KCP.
 
 const std = @import("std");
-const kcp = @import("kcp.zig");
+const kcp_mod = @import("kcp.zig");
 const ring_buffer = @import("ring_buffer.zig");
+
+const kcp = kcp_mod;
 
 /// Re-export RingBuffer for convenience
 pub const RingBuffer = ring_buffer.RingBuffer;

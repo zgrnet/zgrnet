@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::kcp::{Cmd, Frame, Kcp, FRAME_HEADER_SIZE};
+use super::kcp::{Cmd, Frame, Kcp, FRAME_HEADER_SIZE};
 
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,7 @@ impl Stream {
     /// Create a new stream.
     pub(crate) fn new(
         id: u32,
-        output: crate::kcp::OutputFn,
+        output: super::kcp::OutputFn,
         fin_sender: Option<Box<dyn Fn() + Send + Sync>>,
         output_error: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
