@@ -20,6 +20,7 @@ const (
 // Protocol field values (inside encrypted payload).
 const (
 	// Transport layer protocols (0-63, matching IP protocol numbers)
+	ProtocolRaw  byte = 0  // Raw data (default for WriteTo)
 	ProtocolICMP byte = 1  // ICMP in ZigNet (no IP header)
 	ProtocolIP   byte = 4  // IP in ZigNet (complete IP packet)
 	ProtocolTCP  byte = 6  // TCP in ZigNet (no IP header)

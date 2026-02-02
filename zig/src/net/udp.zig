@@ -112,6 +112,35 @@ pub const ReadResult = struct {
     n: usize,
 };
 
+/// Raw packet from socket (for pipeline processing).
+/// The caller owns the data buffer and is responsible for freeing it.
+pub const RawPacket = struct {
+    /// Raw data buffer (caller-owned).
+    data: []u8,
+    /// Actual data length.
+    len: usize,
+    /// Sender's socket address.
+    from: posix.sockaddr,
+    /// Address length.
+    from_len: posix.socklen_t,
+};
+
+/// Decrypted packet ready for consumption (for pipeline processing).
+pub const DecryptedPacket = struct {
+    /// Sender's public key.
+    pk: Key,
+    /// Protocol byte.
+    protocol: u8,
+    /// Decrypted payload (slice into caller's buffer).
+    payload: []const u8,
+    /// Payload length.
+    len: usize,
+    /// True if this is a handshake packet (handled internally).
+    is_handshake: bool,
+    /// True if decryption was successful.
+    ok: bool,
+};
+
 /// Internal peer state.
 const PeerStateInternal = struct {
     mutex: Mutex = .{},
@@ -441,6 +470,146 @@ pub const UDP = struct {
         peer.tx_bytes += @intCast(n);
         peer.session = session;
     }
+
+    // ========== Pipeline API for high-throughput scenarios ==========
+    // These methods allow the caller to manage threads and queues externally.
+    // Usage pattern:
+    // 1. Call processIO() in an I/O thread to read raw packets
+    // 2. Call processDecrypt() in worker threads to decrypt packets
+    // 3. Consume DecryptedPacket results
+
+    /// Reads a raw packet from the socket (for pipeline processing).
+    /// The caller must provide a buffer and owns the returned data.
+    /// This is a blocking call that returns when a packet is received.
+    /// Returns RawPacket with data slice into the provided buffer.
+    pub fn processIO(self: *UDP, buf: []u8) UdpError!RawPacket {
+        if (self.closed.load(.seq_cst)) {
+            return UdpError.Closed;
+        }
+
+        var from_addr: posix.sockaddr.in = undefined;
+        var from_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+
+        const nr = posix.recvfrom(self.socket, buf, 0, @ptrCast(&from_addr), &from_addr_len) catch |err| {
+            if (err == error.WouldBlock) {
+                return UdpError.ReceiveFailed;
+            }
+            if (self.closed.load(.seq_cst)) {
+                return UdpError.Closed;
+            }
+            return UdpError.ReceiveFailed;
+        };
+
+        if (nr < 1) {
+            return UdpError.MessageTooShort;
+        }
+
+        // Update stats
+        _ = self.total_rx.fetchAdd(@intCast(nr), .seq_cst);
+        self.last_seen.store(std.time.nanoTimestamp(), .seq_cst);
+
+        return RawPacket{
+            .data = buf[0..nr],
+            .len = nr,
+            .from = @as(*posix.sockaddr, @ptrCast(&from_addr)).*,
+            .from_len = from_addr_len,
+        };
+    }
+
+    /// Decrypts a raw packet and returns the result (for pipeline processing).
+    /// The caller provides an output buffer for the decrypted payload.
+    /// Handshakes are handled internally.
+    pub fn processDecrypt(self: *UDP, raw: *const RawPacket, out_buf: []u8) DecryptedPacket {
+        var result = DecryptedPacket{
+            .pk = undefined,
+            .protocol = 0,
+            .payload = &[_]u8{},
+            .len = 0,
+            .is_handshake = false,
+            .ok = false,
+        };
+
+        if (raw.len < 1) {
+            return result;
+        }
+
+        // Parse message type
+        const msg_type: message.MessageType = @enumFromInt(raw.data[0]);
+
+        // Cast sockaddr to sockaddr.in for IPv4
+        const from_addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&raw.from));
+
+        switch (msg_type) {
+            .handshake_init => {
+                self.handleHandshakeInit(raw.data[0..raw.len], from_addr, raw.from_len);
+                result.is_handshake = true;
+                result.ok = true;
+                return result;
+            },
+            .handshake_resp => {
+                self.handleHandshakeResp(raw.data[0..raw.len], from_addr, raw.from_len);
+                result.is_handshake = true;
+                result.ok = true;
+                return result;
+            },
+            .transport => {
+                // Process transport message
+                if (self.processTransportPacket(raw.data[0..raw.len], from_addr, raw.from_len, out_buf)) |transport_result| {
+                    result.pk = transport_result.pk;
+                    result.payload = out_buf[0..transport_result.n];
+                    result.len = transport_result.n;
+                    result.ok = true;
+                }
+                return result;
+            },
+            else => return result,
+        }
+    }
+
+    /// Internal: process a transport packet for pipeline use.
+    fn processTransportPacket(self: *UDP, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t, out_buf: []u8) ?ReadResult {
+        _ = from_len;
+        // This is similar to handleTransport but returns the result instead of modifying buf
+        const msg = message.parseTransportMessage(data) catch return null;
+
+        // Find peer by receiver index (use peers_mutex for both maps)
+        self.peers_mutex.lock();
+        const pk_opt = self.by_index.get(msg.receiver_index);
+        const pk = pk_opt orelse {
+            self.peers_mutex.unlock();
+            return null;
+        };
+
+        const peer = self.peers_map.get(pk) orelse {
+            self.peers_mutex.unlock();
+            return null;
+        };
+
+        peer.mutex.lock();
+        defer peer.mutex.unlock();
+        self.peers_mutex.unlock();
+
+        var session = peer.session orelse return null;
+
+        // Decrypt directly into out_buf
+        const n = session.decrypt(msg.ciphertext, msg.counter, out_buf) catch return null;
+
+        // Update peer state
+        peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
+        peer.endpoint_len = @sizeOf(posix.sockaddr.in);
+        peer.endpoint_port = std.mem.bigToNative(u16, from.port);
+        peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
+        peer.rx_bytes += @intCast(data.len);
+        peer.last_seen = std.time.nanoTimestamp();
+        peer.session = session;
+
+        return ReadResult{
+            .pk = pk,
+            .n = n,
+        };
+    }
+
+    // ========== End Pipeline API ==========
 
     /// Reads the next decrypted message from any peer.
     /// Handles handshakes internally and only returns transport data.
@@ -1082,4 +1251,64 @@ test "multiple peers" {
     udp.removePeer(&peers[0].public);
     try std.testing.expectEqual(@as(usize, num_peers - 1), udp.peerCount());
     try std.testing.expect(udp.peerInfo(&peers[0].public) == null);
+}
+
+test "RawPacket and DecryptedPacket types" {
+    // Test that the pipeline types are correctly defined
+    var raw_buf: [1024]u8 = undefined;
+    const raw_pkt = RawPacket{
+        .data = &raw_buf,
+        .len = 100,
+        .from = undefined,
+        .from_len = @sizeOf(posix.sockaddr.in),
+    };
+    try std.testing.expectEqual(@as(usize, 100), raw_pkt.len);
+
+    const dec_pkt = DecryptedPacket{
+        .pk = undefined,
+        .protocol = 128,
+        .payload = &[_]u8{},
+        .len = 0,
+        .is_handshake = false,
+        .ok = true,
+    };
+    try std.testing.expectEqual(@as(u8, 128), dec_pkt.protocol);
+    try std.testing.expect(dec_pkt.ok);
+    try std.testing.expect(!dec_pkt.is_handshake);
+}
+
+test "processIO returns error when closed" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const udp = try UDP.init(allocator, key, .{});
+
+    // Close the UDP
+    udp.close();
+    defer udp.deinit();
+
+    // processIO should return Closed error
+    var buf: [1024]u8 = undefined;
+    const result = udp.processIO(&buf);
+    try std.testing.expectError(UdpError.Closed, result);
+}
+
+test "processDecrypt handles empty packet" {
+    const allocator = std.testing.allocator;
+    const key = KeyPair.generate();
+    const udp = try UDP.init(allocator, key, .{});
+    defer udp.deinit();
+
+    // Create an empty raw packet
+    var raw_buf: [1024]u8 = undefined;
+    const raw_pkt = RawPacket{
+        .data = raw_buf[0..0], // empty
+        .len = 0,
+        .from = undefined,
+        .from_len = @sizeOf(posix.sockaddr.in),
+    };
+
+    // processDecrypt should return not ok for empty packet
+    var out_buf: [1024]u8 = undefined;
+    const result = udp.processDecrypt(&raw_pkt, &out_buf);
+    try std.testing.expect(!result.ok);
 }

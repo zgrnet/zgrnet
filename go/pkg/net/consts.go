@@ -48,4 +48,16 @@ const (
 	// or received on a single session before it must be rekeyed.
 	// WireGuard: 2^64 - 2^13 - 1. This equals (2^64 - 1) - 2^13.
 	RejectAfterMessages = ^uint64(0) - (1 << 13)
+
+	// Pipeline queue sizes for async I/O processing.
+	// RawChanSize is the buffer size for raw packets from socket to decrypt worker.
+	// Large enough to absorb burst traffic.
+	RawChanSize = 4096
+
+	// DecryptedChanSize is the buffer size for decrypted packets to ReadFrom.
+	DecryptedChanSize = 256
+
+	// InboundChanSize is the buffer size for non-KCP packets routed to Peer.Read().
+	// This should be large enough to handle burst traffic while Peer.Read() catches up.
+	InboundChanSize = 8192
 )

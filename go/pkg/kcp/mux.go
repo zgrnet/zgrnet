@@ -26,8 +26,8 @@ type Config struct {
 // DefaultConfig returns the default configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		MaxFrameSize:      32 * 1024,
-		MaxReceiveBuffer:  256 * 1024,
+		MaxFrameSize:      64 * 1024,
+		MaxReceiveBuffer:  1024 * 1024,
 		KeepAliveInterval: 10 * time.Second,
 		KeepAliveTimeout:  30 * time.Second,
 	}

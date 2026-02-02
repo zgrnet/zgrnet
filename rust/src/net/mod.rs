@@ -10,6 +10,7 @@
 //!
 //! Timer constants based on WireGuard's timing parameters are also exported.
 
+mod async_udp;
 mod conn;
 mod consts;
 mod dial;
@@ -34,3 +35,6 @@ pub use transport_udp::UdpTransport;
 
 // High-level UDP API exports
 pub use udp::{HostInfo, Peer, PeerInfo, PeerState, UdpError, UdpOptions, UDP};
+
+// Async UDP exports
+pub use async_udp::{AsyncUDP, AsyncUdpConfig, DecryptedPacket, RawPacket};

@@ -154,6 +154,9 @@ func (s *Stream) Write(b []byte) (int, error) {
 		return 0, ErrKCPSendFailed
 	}
 
+	// Flush immediately for better throughput
+	s.kcp.Flush()
+
 	return n, nil
 }
 

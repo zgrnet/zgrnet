@@ -54,6 +54,10 @@ pub const HostInfo = udp.HostInfo;
 pub const PeerInfo = udp.PeerInfo;
 pub const ReadResult = udp.ReadResult;
 
+// Pipeline API types for high-throughput scenarios
+pub const RawPacket = udp.RawPacket;
+pub const DecryptedPacket = udp.DecryptedPacket;
+
 // Re-export constants
 pub const rekey_after_time_ns = consts.rekey_after_time_ns;
 pub const reject_after_time_ns = consts.reject_after_time_ns;
