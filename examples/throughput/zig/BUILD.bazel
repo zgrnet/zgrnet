@@ -1,0 +1,11 @@
+# Zig throughput test
+# Usage: bazel run //examples/throughput/zig:run
+
+load("//bazel/zig:defs.bzl", "zig_run")
+
+zig_run(
+    name = "run",
+    srcs = glob(["**/*"]) + ["//zig:srcs"],
+    build_args = ["throughput", "-Doptimize=ReleaseFast"],
+    zig_root = "zig",
+)
