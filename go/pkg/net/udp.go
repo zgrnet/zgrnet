@@ -842,10 +842,10 @@ func (u *UDP) Close() error {
 	// Signal goroutines to stop
 	close(u.closeChan)
 
-	// Close socket (will unblock ioLoop)
+	// Close socket (will unblock ioLoop's ReadFromUDP)
 	err := u.socket.Close()
 
-	// Close channels to unblock waiters
+	// Close channels to unblock workers (ioLoop uses select with closeChan)
 	close(u.decryptChan)
 	close(u.outputChan)
 
@@ -860,6 +860,11 @@ func (u *UDP) Close() error {
 // This goroutine only does I/O, no decryption, to maximize throughput.
 func (u *UDP) ioLoop() {
 	for {
+		// Check if closed before acquiring packet
+		if u.closed.Load() {
+			return
+		}
+
 		// Acquire packet from pool
 		pkt := acquirePacket()
 
@@ -873,6 +878,12 @@ func (u *UDP) ioLoop() {
 			continue
 		}
 
+		// Check again after blocking read
+		if u.closed.Load() {
+			releasePacket(pkt)
+			return
+		}
+
 		if n < 1 {
 			releasePacket(pkt)
 			continue
@@ -884,6 +895,14 @@ func (u *UDP) ioLoop() {
 		// Update stats
 		u.totalRx.Add(uint64(n))
 		u.lastSeen.Store(time.Now())
+
+		// Check if closing before sending to channels
+		select {
+		case <-u.closeChan:
+			releasePacket(pkt)
+			return
+		default:
+		}
 
 		// Send to both channels (non-blocking)
 		// decryptChan: for decrypt workers to process
