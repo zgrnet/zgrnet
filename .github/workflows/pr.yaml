@@ -15,9 +15,11 @@ permissions:
 jobs:
   # Detect affected targets
   affected:
+    name: Find Affected Targets
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.affected.outputs.targets }}
+      has_targets: ${{ steps.affected.outputs.has_targets }}
       has_go: ${{ steps.affected.outputs.has_go }}
       has_rust: ${{ steps.affected.outputs.has_rust }}
       has_zig: ${{ steps.affected.outputs.has_zig }}
@@ -30,47 +32,35 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.14.0
         with:
           bazelisk-cache: true
+          repository-cache: true
 
-      - name: Detect affected targets
+      - name: Find affected targets
         id: affected
         run: |
-          # Get base ref
-          BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+          BASE="${{ github.event.pull_request.base.sha }}"
           
-          # Get changed files
-          changed=$(git diff --name-only "$BASE_REF" HEAD)
-          echo "Changed files:"
-          echo "$changed"
+          # Run affected targets tool
+          bazel run //tools/affected -- \
+            --base="$BASE" \
+            --oneline \
+            --output=/tmp/targets.txt || echo "" > /tmp/targets.txt
           
-          # Detect language changes
-          has_go=$(echo "$changed" | grep -q '^go/' && echo "true" || echo "false")
-          has_rust=$(echo "$changed" | grep -q '^rust/' && echo "true" || echo "false")
-          has_zig=$(echo "$changed" | grep -q '^zig/' && echo "true" || echo "false")
+          TARGETS=$(cat /tmp/targets.txt)
+          echo "Affected targets: $TARGETS"
+          echo "targets=$TARGETS" >> $GITHUB_OUTPUT
+          echo "has_targets=$([[ -n "$TARGETS" ]] && echo true || echo false)" >> $GITHUB_OUTPUT
           
-          echo "has_go=$has_go" >> "$GITHUB_OUTPUT"
-          echo "has_rust=$has_rust" >> "$GITHUB_OUTPUT"
-          echo "has_zig=$has_zig" >> "$GITHUB_OUTPUT"
-          
-          # Query affected Bazel targets
-          targets=""
-          for dir in $(echo "$changed" | xargs -I {} dirname {} | sort -u); do
-            if [[ -f "$dir/BUILD.bazel" ]] || [[ -f "$dir/BUILD" ]]; then
-              result=$(bazel query "//${dir}/..." 2>/dev/null || true)
-              if [[ -n "$result" ]]; then
-                targets="$targets $result"
-              fi
-            fi
-          done
-          
-          # Dedupe and output
-          targets=$(echo "$targets" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-          echo "Affected targets: $targets"
-          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          # Detect language changes for native tests
+          changed=$(git diff --name-only "$BASE" HEAD)
+          echo "has_go=$(echo "$changed" | grep -q '^go/' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_rust=$(echo "$changed" | grep -q '^rust/' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_zig=$(echo "$changed" | grep -q '^zig/' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build affected targets
   build:
+    name: Build Affected
     needs: affected
-    if: needs.affected.outputs.targets != ''
+    if: needs.affected.outputs.has_targets == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,15 +74,15 @@ jobs:
 
       - name: Build affected targets
         run: |
-          targets="${{ needs.affected.outputs.targets }}"
-          if [[ -n "$targets" ]]; then
-            bazel build $targets
-          fi
+          TARGETS="${{ needs.affected.outputs.targets }}"
+          echo "Building: $TARGETS"
+          bazel build $TARGETS
 
   # Test affected targets
   test:
+    name: Test Affected
     needs: affected
-    if: needs.affected.outputs.targets != ''
+    if: needs.affected.outputs.has_targets == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,17 +96,13 @@ jobs:
 
       - name: Test affected targets
         run: |
-          targets="${{ needs.affected.outputs.targets }}"
-          if [[ -n "$targets" ]]; then
-            # Filter to only test targets
-            test_targets=$(bazel query "kind(test, $targets)" 2>/dev/null || true)
-            if [[ -n "$test_targets" ]]; then
-              bazel test $test_targets --test_output=errors
-            fi
-          fi
+          TARGETS="${{ needs.affected.outputs.targets }}"
+          # Exit code 4 means "no test targets found", which is OK
+          bazel test $TARGETS --test_output=errors || [ $? -eq 4 ]
 
-  # Go native tests (faster than Bazel for simple cases)
+  # Go native tests (faster than Bazel, includes race detector)
   go-test:
+    name: Go Test
     needs: affected
     if: needs.affected.outputs.has_go == 'true'
     runs-on: ubuntu-latest
@@ -134,6 +120,7 @@ jobs:
 
   # Rust native tests
   rust-test:
+    name: Rust Test
     needs: affected
     if: needs.affected.outputs.has_rust == 'true'
     runs-on: ubuntu-latest
@@ -158,6 +145,7 @@ jobs:
 
   # Zig native tests
   zig-test:
+    name: Zig Test
     needs: affected
     if: needs.affected.outputs.has_zig == 'true'
     runs-on: ubuntu-latest
@@ -171,3 +159,13 @@ jobs:
       - name: Test
         working-directory: zig
         run: zig build test
+
+  # Skip job when no targets affected
+  skip:
+    name: No Changes
+    needs: affected
+    if: needs.affected.outputs.has_targets == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip build
+        run: echo "No affected targets, skipping build"

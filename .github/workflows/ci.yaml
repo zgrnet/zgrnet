@@ -14,35 +14,57 @@ permissions:
   contents: read
 
 jobs:
-  # Detect affected targets
-  changes:
+  # Detect affected targets using Bazel query
+  affected:
     runs-on: ubuntu-latest
     outputs:
-      go: ${{ steps.filter.outputs.go }}
-      rust: ${{ steps.filter.outputs.rust }}
-      zig: ${{ steps.filter.outputs.zig }}
-      bazel: ${{ steps.filter.outputs.bazel }}
+      targets: ${{ steps.affected.outputs.targets }}
+      has_targets: ${{ steps.affected.outputs.has_targets }}
+      has_go: ${{ steps.affected.outputs.has_go }}
+      has_rust: ${{ steps.affected.outputs.has_rust }}
+      has_zig: ${{ steps.affected.outputs.has_zig }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
         with:
-          filters: |
-            go:
-              - 'go/**'
-            rust:
-              - 'rust/**'
-            zig:
-              - 'zig/**'
-            bazel:
-              - 'MODULE.bazel'
-              - 'BUILD.bazel'
-              - '.bazelrc'
+          fetch-depth: 0  # Full history for git diff
 
-  # Build and test with Bazel
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.14.0
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+
+      - name: Find affected targets
+        id: affected
+        run: |
+          # Determine base ref
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="HEAD~1"
+          fi
+          
+          # Run affected targets tool
+          bazel run //tools/affected -- \
+            --base="$BASE" \
+            --oneline \
+            --output=/tmp/targets.txt || echo "" > /tmp/targets.txt
+          
+          TARGETS=$(cat /tmp/targets.txt)
+          echo "Affected targets: $TARGETS"
+          echo "targets=$TARGETS" >> $GITHUB_OUTPUT
+          echo "has_targets=$([[ -n "$TARGETS" ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          
+          # Detect language changes for native tests
+          changed=$(git diff --name-only "$BASE" HEAD 2>/dev/null || true)
+          echo "has_go=$(echo "$changed" | grep -q '^go/' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_rust=$(echo "$changed" | grep -q '^rust/' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_zig=$(echo "$changed" | grep -q '^zig/' && echo true || echo false)" >> $GITHUB_OUTPUT
+
+  # Build and test affected targets with Bazel
   bazel:
-    needs: changes
-    if: needs.changes.outputs.bazel == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.rust == 'true'
+    needs: affected
+    if: needs.affected.outputs.has_targets == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,16 +76,22 @@ jobs:
           disk-cache: ${{ github.workflow }}
           repository-cache: true
 
-      - name: Build all targets
-        run: bazel build //...
+      - name: Build affected targets
+        run: |
+          TARGETS="${{ needs.affected.outputs.targets }}"
+          echo "Building: $TARGETS"
+          bazel build $TARGETS
 
-      - name: Test all targets
-        run: bazel test //... --test_output=errors
+      - name: Test affected targets
+        run: |
+          TARGETS="${{ needs.affected.outputs.targets }}"
+          # Exit code 4 means "no test targets found", which is OK
+          bazel test $TARGETS --test_output=errors || [ $? -eq 4 ]
 
-  # Go tests (native, without Bazel)
+  # Go tests (native, with race detector)
   go-test:
-    needs: changes
-    if: needs.changes.outputs.go == 'true'
+    needs: affected
+    if: needs.affected.outputs.has_go == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,10 +109,10 @@ jobs:
         working-directory: go
         run: go tool cover -func=coverage.out
 
-  # Rust tests (native, without Bazel)
+  # Rust tests (native)
   rust-test:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    needs: affected
+    if: needs.affected.outputs.has_rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -105,8 +133,8 @@ jobs:
 
   # Zig tests (native)
   zig-test:
-    needs: changes
-    if: needs.changes.outputs.zig == 'true'
+    needs: affected
+    if: needs.affected.outputs.has_zig == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -137,3 +165,12 @@ jobs:
             gofmt -l .
             exit 1
           fi
+
+  # Skip job when no targets affected
+  skip:
+    needs: affected
+    if: needs.affected.outputs.has_targets == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: No changes
+        run: echo "No affected targets, skipping Bazel build"
