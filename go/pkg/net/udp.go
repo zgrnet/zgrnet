@@ -326,9 +326,11 @@ func (u *UDP) SetPeerEndpoint(pk noise.PublicKey, endpoint net.Addr) {
 		u.peers[pk] = peer
 	}
 
-	peer.mu.Lock()
-	peer.endpoint = udpAddr
-	peer.mu.Unlock()
+	func() {
+		peer.mu.Lock()
+		defer peer.mu.Unlock()
+		peer.endpoint = udpAddr
+	}()
 }
 
 // RemovePeer removes a peer and its associated state.
@@ -343,10 +345,11 @@ func (u *UDP) RemovePeer(pk noise.PublicKey) {
 
 	// Remove from index map if has session
 	peer.mu.RLock()
-	if peer.session != nil {
-		delete(u.byIndex, peer.session.LocalIndex())
-	}
+	session := peer.session
 	peer.mu.RUnlock()
+	if session != nil {
+		delete(u.byIndex, session.LocalIndex())
+	}
 
 	delete(u.peers, pk)
 }
@@ -500,9 +503,11 @@ func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 
 	// Update stats
 	u.totalTx.Add(uint64(n))
-	peer.mu.Lock()
-	peer.txBytes += uint64(n)
-	peer.mu.Unlock()
+	func() {
+		peer.mu.Lock()
+		defer peer.mu.Unlock()
+		peer.txBytes += uint64(n)
+	}()
 
 	return nil
 }
@@ -992,9 +997,9 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	peer.mu.Lock()
+	peer.mu.RLock()
 	session := peer.session
-	peer.mu.Unlock()
+	peer.mu.RUnlock()
 
 	if session == nil {
 		pkt.err = ErrNoSession
@@ -1015,7 +1020,6 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 	}
 	peer.rxBytes += uint64(len(data))
 	peer.lastSeen = time.Now()
-	muxInstance := peer.mux
 	// Initialize inboundChan if needed (for Peer.Read callers)
 	if peer.inboundChan == nil {
 		peer.inboundChan = make(chan protoPacket, InboundChanSize)
@@ -1048,15 +1052,20 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 	// Route based on protocol
 	switch protocol {
 	case noise.ProtocolKCP:
+		// Re-read mux here instead of relying on value from 30 lines earlier
+		peer.mu.RLock()
+		mux := peer.mux
+		peer.mu.RUnlock()
+
 		// Auto-initialize mux on first KCP message (as server/responder)
-		if muxInstance == nil {
+		if mux == nil {
 			u.initMux(peer, false) // server mode - we're receiving
 			peer.mu.RLock()
-			muxInstance = peer.mux
+			mux = peer.mux
 			peer.mu.RUnlock()
 		}
-		if muxInstance != nil {
-			muxInstance.Input(payload)
+		if mux != nil {
+			mux.Input(payload)
 		}
 		// Don't deliver KCP to ReadFrom
 		pkt.err = ErrNoData
