@@ -326,11 +326,9 @@ func (u *UDP) SetPeerEndpoint(pk noise.PublicKey, endpoint net.Addr) {
 		u.peers[pk] = peer
 	}
 
-	func() {
-		peer.mu.Lock()
-		defer peer.mu.Unlock()
-		peer.endpoint = udpAddr
-	}()
+	peer.mu.Lock()
+	peer.endpoint = udpAddr
+	peer.mu.Unlock()
 }
 
 // RemovePeer removes a peer and its associated state.
@@ -503,11 +501,9 @@ func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 
 	// Update stats
 	u.totalTx.Add(uint64(n))
-	func() {
-		peer.mu.Lock()
-		defer peer.mu.Unlock()
-		peer.txBytes += uint64(n)
-	}()
+	peer.mu.Lock()
+	peer.txBytes += uint64(n)
+	peer.mu.Unlock()
 
 	return nil
 }
