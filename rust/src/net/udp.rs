@@ -9,15 +9,18 @@ use crate::noise::{
     build_handshake_init, build_handshake_resp, build_transport_message,
     parse_handshake_init, parse_handshake_resp, parse_transport_message,
     MAX_PACKET_SIZE, generate_index, Session, SessionConfig,
-    message,
+    message, encode_payload, decode_payload,
 };
+use crate::kcp::{Mux, MuxConfig, Stream as KcpStream};
 
+use crossbeam_channel::{bounded, Receiver, Sender};
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use std::thread;
 
 /// Peer connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +129,11 @@ struct PeerStateInternal {
     rx_bytes: u64,
     tx_bytes: u64,
     last_seen: Option<Instant>,
+
+    // KCP stream multiplexing (initialized when session is established)
+    mux: Option<Arc<Mux>>,
+    accept_tx: Option<Sender<Arc<KcpStream>>>,
+    accept_rx: Option<Receiver<Arc<KcpStream>>>,
 }
 
 /// Pending handshake tracking.
@@ -231,6 +239,9 @@ impl UDP {
                     rx_bytes: 0,
                     tx_bytes: 0,
                     last_seen: None,
+                    mux: None,
+                    accept_tx: None,
+                    accept_rx: None,
                 })),
             );
         }
@@ -329,6 +340,68 @@ impl UDP {
         p.tx_bytes += n as u64;
 
         Ok(())
+    }
+
+    /// Opens a new KCP stream to the specified peer.
+    /// The peer must be in established state with mux initialized.
+    pub fn open_stream(&self, pk: &Key) -> Result<Arc<KcpStream>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(UdpError::Closed);
+        }
+
+        // Get the mux without holding the peer lock during open_stream()
+        // This avoids deadlock since mux output callback also locks the peer
+        let mux = {
+            let peers = self.peers.read().unwrap();
+            let peer = peers.get(pk).ok_or(UdpError::PeerNotFound)?;
+            let p = peer.lock().unwrap();
+
+            if p.state != PeerState::Established {
+                return Err(UdpError::NoSession);
+            }
+
+            p.mux.as_ref().ok_or(UdpError::NoSession)?.clone()
+        };
+
+        mux.open_stream().map_err(|_| UdpError::NoSession)
+    }
+
+    /// Accepts an incoming KCP stream from the specified peer.
+    /// This blocks until a stream is available or the UDP is closed.
+    /// The peer must be in established state with mux initialized.
+    pub fn accept_stream(&self, pk: &Key) -> Result<Arc<KcpStream>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(UdpError::Closed);
+        }
+
+        // Get the accept receiver
+        let accept_rx = {
+            let peers = self.peers.read().unwrap();
+            let peer = peers.get(pk).ok_or(UdpError::PeerNotFound)?;
+            let p = peer.lock().unwrap();
+
+            if p.state != PeerState::Established {
+                return Err(UdpError::NoSession);
+            }
+
+            p.accept_rx.as_ref().ok_or(UdpError::NoSession)?.clone()
+        };
+
+        // Block until a stream is available
+        // Use recv_timeout to allow checking for close
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(UdpError::Closed);
+            }
+
+            match accept_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(stream) => return Ok(stream),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err(UdpError::Closed);
+                }
+            }
+        }
     }
 
     /// Reads the next decrypted message from any peer.
@@ -486,6 +559,142 @@ impl UDP {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Determines if we are the KCP client for a peer.
+    /// Uses deterministic rule: smaller public key is client (uses odd stream IDs).
+    fn is_kcp_client(&self, remote_pk: &Key) -> bool {
+        self.local_key.public.as_bytes() < remote_pk.as_bytes()
+    }
+
+    /// Sends protocol-tagged data to a peer.
+    fn send_to_peer_with_proto(&self, pk: &Key, protocol: u8, data: &[u8]) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(UdpError::Closed);
+        }
+
+        let peers = self.peers.read().unwrap();
+        let peer = peers.get(pk).ok_or(UdpError::PeerNotFound)?;
+        let mut p = peer.lock().unwrap();
+
+        let endpoint = p.endpoint.ok_or(UdpError::NoEndpoint)?;
+        let session = p.session.as_mut().ok_or(UdpError::NoSession)?;
+
+        // Encode payload with protocol byte
+        let payload = encode_payload(protocol, data);
+
+        // Encrypt
+        let (ciphertext, nonce) = session
+            .encrypt(&payload)
+            .map_err(|e| UdpError::Session(e.to_string()))?;
+
+        // Build transport message
+        let msg = build_transport_message(session.remote_index(), nonce, &ciphertext);
+
+        // Send
+        let n = self.socket.send_to(&msg, endpoint)?;
+
+        // Update stats
+        self.total_tx.fetch_add(n as u64, Ordering::SeqCst);
+        p.tx_bytes += n as u64;
+
+        Ok(())
+    }
+
+    /// Initializes the KCP Mux for a peer.
+    /// Called when session is established (handshake complete).
+    fn init_mux(&self, remote_pk: Key) {
+        let is_client = self.is_kcp_client(&remote_pk);
+
+        // Create channels for stream acceptance (capacity 16 like Go)
+        let (accept_tx, accept_rx) = bounded::<Arc<KcpStream>>(16);
+
+        // Get peer reference
+        let peer_arc = {
+            let peers = self.peers.read().unwrap();
+            match peers.get(&remote_pk) {
+                Some(p) => Arc::clone(p),
+                None => return,
+            }
+        };
+
+        // We need to clone self references for the closures
+        // Use weak-like pattern to avoid circular references
+        let socket = self.socket.try_clone().expect("Failed to clone socket");
+        let peers_for_output = Arc::clone(&self.peers.read().unwrap().get(&remote_pk).unwrap());
+        let _pk_for_output = remote_pk;
+        let accept_tx_for_mux = accept_tx.clone();
+
+        // Create Mux
+        let mux = Arc::new(Mux::new(
+            MuxConfig::default(),
+            is_client,
+            // Output function: send KCP frames through the encrypted session
+            Box::new(move |data| {
+                let mut p = peers_for_output.lock().unwrap();
+                let endpoint = match p.endpoint {
+                    Some(e) => e,
+                    None => return Err("no endpoint".into()),
+                };
+                let session = match p.session.as_mut() {
+                    Some(s) => s,
+                    None => return Err("no session".into()),
+                };
+
+                // Encode payload with KCP protocol byte
+                let payload = encode_payload(message::protocol::KCP, data);
+
+                // Encrypt
+                let (ciphertext, nonce) = session
+                    .encrypt(&payload)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+
+                // Build transport message
+                let msg = build_transport_message(session.remote_index(), nonce, &ciphertext);
+
+                // Send
+                socket.send_to(&msg, endpoint)?;
+
+                Ok(())
+            }),
+            // OnStreamData: called when a stream has data available
+            Box::new(|_stream_id| {
+                // Data availability is handled internally by Stream.read_data
+            }),
+            // OnNewStream: called when remote opens a new stream
+            Box::new(move |stream| {
+                let _ = accept_tx_for_mux.try_send(stream);
+            }),
+        ));
+
+        // Store mux in peer state
+        {
+            let mut p = peer_arc.lock().unwrap();
+            // Close existing mux if any
+            if let Some(ref old_mux) = p.mux {
+                old_mux.close();
+            }
+            p.mux = Some(Arc::clone(&mux));
+            p.accept_tx = Some(accept_tx);
+            p.accept_rx = Some(accept_rx);
+        }
+
+        // Start mux update loop in background thread
+        let mux_for_loop = Arc::clone(&mux);
+        thread::spawn(move || {
+            Self::mux_update_loop(mux_for_loop);
+        });
+    }
+
+    /// Background loop that updates KCP state for retransmissions.
+    fn mux_update_loop(mux: Arc<Mux>) {
+        let interval = Duration::from_millis(1); // 1ms update interval (same as Go)
+        let start = Instant::now();
+        while !mux.is_closed() {
+            let current = (start.elapsed().as_millis() & 0xFFFFFFFF) as u32;
+            mux.update(current);
+            thread::sleep(interval);
+        }
+    }
+
     // Internal: handle incoming handshake initiation
     fn handle_handshake_init(&self, data: &[u8], from: SocketAddr) {
         let msg = match parse_handshake_init(data) {
@@ -532,6 +741,9 @@ impl UDP {
                     rx_bytes: 0,
                     tx_bytes: 0,
                     last_seen: None,
+                    mux: None,
+                    accept_tx: None,
+                    accept_rx: None,
                 })));
             }
         }
@@ -577,18 +789,25 @@ impl UDP {
         });
 
         // Update peer state
-        let peers = self.peers.read().unwrap();
-        if let Some(peer) = peers.get(&remote_pk) {
-            let mut p = peer.lock().unwrap();
-            p.endpoint = Some(from);
-            p.session = Some(session);
-            p.state = PeerState::Established;
-            p.last_seen = Some(Instant::now());
+        {
+            let peers = self.peers.read().unwrap();
+            if let Some(peer) = peers.get(&remote_pk) {
+                let mut p = peer.lock().unwrap();
+                p.endpoint = Some(from);
+                p.session = Some(session);
+                p.state = PeerState::Established;
+                p.last_seen = Some(Instant::now());
+            }
         }
 
         // Register in index map
-        let mut by_index = self.by_index.write().unwrap();
-        by_index.insert(local_idx, remote_pk);
+        {
+            let mut by_index = self.by_index.write().unwrap();
+            by_index.insert(local_idx, remote_pk);
+        }
+
+        // Initialize KCP Mux for this peer
+        self.init_mux(remote_pk);
     }
 
     // Internal: handle incoming handshake response
@@ -633,27 +852,35 @@ impl UDP {
             }
         };
 
+        let peer_pk = pending.peer_pk;
         let session = Session::new(SessionConfig {
             local_index: pending.local_idx,
             remote_index: msg.sender_index,
             send_key: *send_cs.key(),
             recv_key: *recv_cs.key(),
-            remote_pk: pending.peer_pk,
+            remote_pk: peer_pk,
         });
 
         // Update peer state
-        let peers = self.peers.read().unwrap();
-        if let Some(peer) = peers.get(&pending.peer_pk) {
-            let mut p = peer.lock().unwrap();
-            p.endpoint = Some(from);
-            p.session = Some(session);
-            p.state = PeerState::Established;
-            p.last_seen = Some(Instant::now());
+        {
+            let peers = self.peers.read().unwrap();
+            if let Some(peer) = peers.get(&peer_pk) {
+                let mut p = peer.lock().unwrap();
+                p.endpoint = Some(from);
+                p.session = Some(session);
+                p.state = PeerState::Established;
+                p.last_seen = Some(Instant::now());
+            }
         }
 
         // Register in index map
-        let mut by_index = self.by_index.write().unwrap();
-        by_index.insert(pending.local_idx, pending.peer_pk);
+        {
+            let mut by_index = self.by_index.write().unwrap();
+            by_index.insert(pending.local_idx, peer_pk);
+        }
+
+        // Initialize KCP Mux for this peer
+        self.init_mux(peer_pk);
 
         // Signal completion
         let _ = pending.done.send(Ok(()));
@@ -674,29 +901,58 @@ impl UDP {
             *by_index.get(&msg.receiver_index).ok_or(UdpError::PeerNotFound)?
         };
 
-        let peers = self.peers.read().unwrap();
-        let peer = peers.get(&peer_pk).ok_or(UdpError::PeerNotFound)?;
-        let mut p = peer.lock().unwrap();
+        // Decrypt and process with peer lock, then release before mux operations
+        let (plaintext, mux) = {
+            let peers = self.peers.read().unwrap();
+            let peer = peers.get(&peer_pk).ok_or(UdpError::PeerNotFound)?;
+            let mut p = peer.lock().unwrap();
 
-        let session = p.session.as_mut().ok_or(UdpError::NoSession)?;
+            let session = p.session.as_mut().ok_or(UdpError::NoSession)?;
 
-        // Decrypt
-        let plaintext = session
-            .decrypt(msg.ciphertext, msg.counter)
-            .map_err(|e| UdpError::Session(e.to_string()))?;
+            // Decrypt
+            let plaintext = session
+                .decrypt(msg.ciphertext, msg.counter)
+                .map_err(|e| UdpError::Session(e.to_string()))?;
 
-        // Copy to output buffer
-        let n = plaintext.len().min(out_buf.len());
-        out_buf[..n].copy_from_slice(&plaintext[..n]);
+            // Update peer state (roaming + stats)
+            if p.endpoint.map(|e| e != from).unwrap_or(true) {
+                p.endpoint = Some(from);
+            }
+            p.rx_bytes += data.len() as u64;
+            p.last_seen = Some(Instant::now());
 
-        // Update peer state (roaming + stats)
-        if p.endpoint.map(|e| e != from).unwrap_or(true) {
-            p.endpoint = Some(from);
+            // Get mux clone if available
+            let mux = p.mux.clone();
+
+            (plaintext, mux)
+        };
+
+        // Decode protocol and payload
+        if plaintext.is_empty() {
+            // Keepalive message
+            return Ok((peer_pk, 0));
         }
-        p.rx_bytes += data.len() as u64;
-        p.last_seen = Some(Instant::now());
 
-        Ok((peer_pk, n))
+        let (protocol, payload) = decode_payload(&plaintext)
+            .map_err(|_| UdpError::Session("invalid payload".to_string()))?;
+
+        // Route based on protocol (without holding peer lock)
+        match protocol {
+            message::protocol::KCP => {
+                // Route to KCP Mux
+                if let Some(ref mux) = mux {
+                    let _ = mux.input(payload);
+                }
+                // Return 0 bytes - KCP data is handled internally
+                Ok((peer_pk, 0))
+            }
+            _ => {
+                // Non-KCP protocol, copy to output buffer
+                let n = payload.len().min(out_buf.len());
+                out_buf[..n].copy_from_slice(&payload[..n]);
+                Ok((peer_pk, n))
+            }
+        }
     }
 }
 
@@ -751,5 +1007,248 @@ mod tests {
         let info = udp.host_info();
         assert_eq!(info.public_key, key.public);
         assert_eq!(info.peer_count, 0);
+    }
+
+    // ==================== KCP Stream E2E Tests ====================
+
+    /// Helper: read from stream with polling since read_data() is non-blocking
+    fn read_with_poll(stream: &Arc<KcpStream>, buf: &mut [u8], timeout: Duration) -> usize {
+        let deadline = Instant::now() + timeout;
+        let mut total = 0;
+        while Instant::now() < deadline {
+            match stream.read_data(&mut buf[total..]) {
+                Ok(n) if n > 0 => {
+                    total += n;
+                    return total;
+                }
+                Ok(_) => thread::sleep(Duration::from_millis(1)),
+                Err(_) => break,
+            }
+        }
+        total
+    }
+
+    /// Helper: read all expected bytes from stream
+    fn read_all_with_poll(stream: &Arc<KcpStream>, expected: usize, timeout: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        let mut buf = vec![0u8; expected * 2];
+        let mut received = Vec::with_capacity(expected);
+        while received.len() < expected && Instant::now() < deadline {
+            match stream.read_data(&mut buf) {
+                Ok(n) if n > 0 => received.extend_from_slice(&buf[..n]),
+                Ok(_) => thread::sleep(Duration::from_millis(1)),
+                Err(_) => break,
+            }
+        }
+        received
+    }
+
+    /// Create a connected pair of UDP instances for testing
+    fn create_connected_pair() -> (Arc<UDP>, Arc<UDP>, KeyPair, KeyPair) {
+        let server_key = KeyPair::generate();
+        let client_key = KeyPair::generate();
+
+        let server = Arc::new(
+            UDP::new(server_key.clone(), UdpOptions::new().bind_addr("127.0.0.1:0").allow_unknown(true))
+                .expect("Failed to create server")
+        );
+        let client = Arc::new(
+            UDP::new(client_key.clone(), UdpOptions::new().bind_addr("127.0.0.1:0").allow_unknown(true))
+                .expect("Failed to create client")
+        );
+
+        let server_addr = server.host_info().addr;
+        let client_addr = client.host_info().addr;
+
+        server.set_peer_endpoint(client_key.public, client_addr);
+        client.set_peer_endpoint(server_key.public, server_addr);
+
+        // Start receive loops
+        let server_clone = Arc::clone(&server);
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            while !server_clone.is_closed() {
+                let _ = server_clone.read_from(&mut buf);
+            }
+        });
+
+        let client_clone = Arc::clone(&client);
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            while !client_clone.is_closed() {
+                let _ = client_clone.read_from(&mut buf);
+            }
+        });
+
+        // Connect
+        client.connect(&server_key.public).expect("Failed to connect");
+        thread::sleep(Duration::from_millis(100));
+
+        (server, client, server_key, client_key)
+    }
+
+    #[test]
+    fn test_kcp_stream_open_accept() {
+        let (server, client, server_key, client_key) = create_connected_pair();
+
+        // Server accepts in background
+        let server_clone = Arc::clone(&server);
+        let client_pub = client_key.public;
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let stream = server_clone.accept_stream(&client_pub);
+            let _ = tx.send(stream);
+        });
+
+        // Client opens stream
+        let client_stream = client.open_stream(&server_key.public).expect("Failed to open stream");
+        // Stream ID is assigned based on public key comparison (smaller key uses odd IDs)
+        // The first stream ID depends on which peer opens first and their key order
+
+        // Wait for server to accept
+        let server_stream = rx.recv_timeout(Duration::from_secs(2))
+            .expect("Timeout waiting for accept")
+            .expect("Server failed to accept");
+        assert_eq!(server_stream.id(), client_stream.id());
+
+        // Cleanup
+        client_stream.shutdown();
+        server_stream.shutdown();
+        server.close().unwrap();
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn test_kcp_stream_bidirectional() {
+        let (server, client, server_key, client_key) = create_connected_pair();
+
+        // Server accepts in background
+        let server_clone = Arc::clone(&server);
+        let client_pub = client_key.public;
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let stream = server_clone.accept_stream(&client_pub);
+            let _ = tx.send(stream);
+        });
+
+        // Client opens stream
+        let client_stream = client.open_stream(&server_key.public).unwrap();
+        let server_stream = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+
+        // Client sends
+        let client_msg = b"Hello from client!";
+        client_stream.write_data(client_msg).unwrap();
+
+        // Server receives
+        let received = read_all_with_poll(&server_stream, client_msg.len(), Duration::from_secs(2));
+        assert_eq!(received, client_msg);
+
+        // Server sends
+        let server_msg = b"Hello from server!";
+        server_stream.write_data(server_msg).unwrap();
+
+        // Client receives
+        let received = read_all_with_poll(&client_stream, server_msg.len(), Duration::from_secs(2));
+        assert_eq!(received, server_msg);
+
+        // Cleanup
+        client_stream.shutdown();
+        server_stream.shutdown();
+        server.close().unwrap();
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn test_kcp_stream_large_data() {
+        let (server, client, server_key, client_key) = create_connected_pair();
+
+        // Server accepts in background
+        let server_clone = Arc::clone(&server);
+        let client_pub = client_key.public;
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let stream = server_clone.accept_stream(&client_pub);
+            let _ = tx.send(stream);
+        });
+
+        let client_stream = client.open_stream(&server_key.public).unwrap();
+        let server_stream = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+
+        // Send 100KB of data
+        let test_data: Vec<u8> = (0..100 * 1024).map(|i| (i % 256) as u8).collect();
+
+        // Writer in background
+        let client_stream_clone = Arc::clone(&client_stream);
+        let test_data_clone = test_data.clone();
+        thread::spawn(move || {
+            let chunk_size = 8192;
+            let mut written = 0;
+            while written < test_data_clone.len() {
+                let end = (written + chunk_size).min(test_data_clone.len());
+                client_stream_clone.write_data(&test_data_clone[written..end]).unwrap();
+                written = end;
+            }
+        });
+
+        // Reader
+        let mut received = Vec::with_capacity(test_data.len());
+        let mut buf = vec![0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while received.len() < test_data.len() && Instant::now() < deadline {
+            match server_stream.read_data(&mut buf) {
+                Ok(n) if n > 0 => received.extend_from_slice(&buf[..n]),
+                Ok(_) => thread::sleep(Duration::from_millis(1)),
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(received.len(), test_data.len(), "Received {} bytes, expected {}", received.len(), test_data.len());
+        assert_eq!(received, test_data);
+
+        // Cleanup
+        client_stream.shutdown();
+        server_stream.shutdown();
+        server.close().unwrap();
+        client.close().unwrap();
+    }
+
+    #[test]
+    fn test_kcp_stream_multiple_streams() {
+        let (server, client, server_key, client_key) = create_connected_pair();
+
+        let num_streams = 5;
+        let (accept_tx, accept_rx) = std::sync::mpsc::channel();
+
+        // Server accepts streams
+        let server_clone = Arc::clone(&server);
+        let client_pub = client_key.public;
+        thread::spawn(move || {
+            for _ in 0..num_streams {
+                if let Ok(stream) = server_clone.accept_stream(&client_pub) {
+                    let _ = accept_tx.send(stream);
+                }
+            }
+        });
+
+        // Open multiple streams and send/receive
+        for i in 0..num_streams {
+            let client_stream = client.open_stream(&server_key.public).unwrap();
+            let server_stream = accept_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            // Exchange data
+            let msg = format!("Stream {} test", i);
+            client_stream.write_data(msg.as_bytes()).unwrap();
+
+            let received = read_all_with_poll(&server_stream, msg.len(), Duration::from_secs(2));
+            assert_eq!(String::from_utf8_lossy(&received), msg);
+
+            client_stream.shutdown();
+            server_stream.shutdown();
+        }
+
+        // Cleanup
+        server.close().unwrap();
+        client.close().unwrap();
     }
 }

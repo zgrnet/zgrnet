@@ -45,3 +45,11 @@ path = "examples/host_test.rs"
 [[example]]
 name = "throughput_rust"
 path = "../examples/throughput/rust/main.rs"
+
+[[example]]
+name = "stream_test"
+path = "examples/stream_test.rs"
+
+[[example]]
+name = "kcp_interop"
+path = "examples/kcp_interop.rs"
