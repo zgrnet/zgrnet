@@ -3,7 +3,6 @@
 //! Usage:
 //!   cargo run --example kcp_interop -- --name rust --config ../examples/kcp_test/config.json
 
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -12,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use zgrnet::{Key, KeyPair, Stream};
-use zgrnet::{UDP, UdpOptions, UdpError};
+use zgrnet::{UDP, UdpOptions};
 
 #[derive(serde::Deserialize)]
 struct Config {

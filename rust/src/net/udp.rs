@@ -929,7 +929,9 @@ impl UDP {
             message::protocol::KCP => {
                 // Route to KCP Mux
                 if let Some(ref mux) = mux {
-                    let _ = mux.input(payload);
+                    if let Err(e) = mux.input(payload) {
+                        eprintln!("[warn] KCP input error from peer {}: {}", peer_pk, e);
+                    }
                 }
                 // Return 0 bytes - KCP data is handled internally
                 Ok((peer_pk, 0))
