@@ -645,21 +645,41 @@ impl UDP {
             p.accept_rx = Some(accept_rx);
         }
 
-        // Start mux update loop in background task (tokio coroutine)
+        // Start mux update loop in background
+        // Use tokio coroutine if runtime available, otherwise fallback to thread
         let mux_for_loop = Arc::clone(&mux);
-        tokio::spawn(async move {
-            Self::mux_update_loop(mux_for_loop).await;
-        });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Running in tokio context - use async task
+            tokio::spawn(async move {
+                Self::mux_update_loop_async(mux_for_loop).await;
+            });
+        } else {
+            // No tokio runtime - fallback to thread (for sync tests)
+            thread::spawn(move || {
+                Self::mux_update_loop_sync(mux_for_loop);
+            });
+        }
     }
 
-    /// Background loop that updates KCP state for retransmissions.
-    async fn mux_update_loop(mux: Arc<Mux>) {
-        let mut interval = tokio_time::interval(Duration::from_millis(1)); // 1ms update interval (same as Go)
+    /// Background loop that updates KCP state (async version using tokio).
+    async fn mux_update_loop_async(mux: Arc<Mux>) {
+        let mut interval = tokio_time::interval(Duration::from_millis(1)); // 1ms update interval
         let start = Instant::now();
         while !mux.is_closed() {
             interval.tick().await;
             let current = (start.elapsed().as_millis() & 0xFFFFFFFF) as u32;
             mux.update(current);
+        }
+    }
+
+    /// Background loop that updates KCP state (sync version using thread).
+    fn mux_update_loop_sync(mux: Arc<Mux>) {
+        let interval = Duration::from_millis(1); // 1ms update interval
+        let start = Instant::now();
+        while !mux.is_closed() {
+            let current = (start.elapsed().as_millis() & 0xFFFFFFFF) as u32;
+            mux.update(current);
+            thread::sleep(interval);
         }
     }
 

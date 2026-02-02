@@ -10,6 +10,12 @@
 
 set -e
 
+# Check for required dependencies
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is not installed. Please install it to run this script." >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 GO_DIR="$ROOT_DIR/go"
