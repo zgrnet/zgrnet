@@ -667,7 +667,7 @@ impl UDP {
         let start = Instant::now();
         while !mux.is_closed() {
             interval.tick().await;
-            let current = (start.elapsed().as_millis() & 0xFFFFFFFF) as u32;
+            let current = start.elapsed().as_millis() as u32;
             mux.update(current);
         }
     }
@@ -677,7 +677,7 @@ impl UDP {
         let interval = Duration::from_millis(1); // 1ms update interval
         let start = Instant::now();
         while !mux.is_closed() {
-            let current = (start.elapsed().as_millis() & 0xFFFFFFFF) as u32;
+            let current = start.elapsed().as_millis() as u32;
             mux.update(current);
             thread::sleep(interval);
         }
