@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	znet "github.com/vibing/zgrnet/net"
-	"github.com/vibing/zgrnet/noise"
+	znet "github.com/vibing/zgrnet/pkg/net"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 // Config represents the test configuration.

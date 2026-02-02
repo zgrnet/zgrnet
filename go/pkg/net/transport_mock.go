@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 // MockAddr is a simple address for testing.

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 func TestNewUDP(t *testing.T) {

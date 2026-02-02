@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 // setupConnPair creates a pair of established connections for testing.

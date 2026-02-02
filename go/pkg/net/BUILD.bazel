@@ -13,7 +13,7 @@ go_library(
         "transport_udp.go",
         "udp.go",
     ],
-    importpath = "github.com/vibing/zgrnet/net",
+    importpath = "github.com/vibing/zgrnet/pkg/net",
     visibility = ["//visibility:public"],
     deps = ["//go:noise"],
 )

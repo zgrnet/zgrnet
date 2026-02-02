@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 // UDPAddr wraps net.UDPAddr to implement the noise.Addr interface.

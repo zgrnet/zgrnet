@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 // Dial establishes a connection to a remote peer with context support.

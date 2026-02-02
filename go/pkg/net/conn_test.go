@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vibing/zgrnet/noise"
+	"github.com/vibing/zgrnet/pkg/noise"
 )
 
 func TestConnStates(t *testing.T) {

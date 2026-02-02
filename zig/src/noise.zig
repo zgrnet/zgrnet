@@ -9,10 +9,11 @@ const std = @import("std");
 // Submodules
 pub const noise = @import("noise/mod.zig");
 pub const net = @import("net/mod.zig");
+pub const kcp_mod = @import("kcp/mod.zig");
 
-// KCP multiplexing
-pub const kcp = @import("kcp.zig");
-pub const stream = @import("stream.zig");
+// KCP multiplexing (re-export submodules)
+pub const kcp = kcp_mod.kcp;
+pub const stream = kcp_mod.stream;
 
 // Re-export noise types for convenience
 pub const Key = noise.Key;
@@ -88,6 +89,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = noise;
     _ = net;
-    _ = kcp;
-    _ = stream;
+    _ = kcp_mod;
 }
