@@ -187,9 +187,8 @@ type peerState struct {
 	txBytes  uint64
 	lastSeen time.Time
 
-	// Stream multiplexing (initialized lazily on first OpenStream/AcceptStream)
+	// Stream multiplexing (initialized when session is established)
 	mux        *mux
-	muxOnce    sync.Once
 	acceptChan chan *stream // incoming streams from remote
 
 	// Protocol routing for non-KCP packets
@@ -653,6 +652,9 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 	u.mu.Lock()
 	u.byIndex[localIdx] = peer
 	u.mu.Unlock()
+
+	// Initialize mux now that session is established
+	u.initMux(peer)
 }
 
 // handleHandshakeResp processes an incoming handshake response.
@@ -732,6 +734,9 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 	u.mu.Lock()
 	u.byIndex[pending.localIdx] = peer
 	u.mu.Unlock()
+
+	// Initialize mux now that session is established
+	u.initMux(peer)
 
 	// Signal completion
 	if pending.done != nil {
@@ -1009,7 +1014,7 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Update peer state (roaming + stats)
+	// Update peer state (roaming + stats) and get mux/inboundChan
 	peer.mu.Lock()
 	if peer.endpoint == nil || peer.endpoint.String() != from.String() {
 		peer.endpoint = from // Roaming
@@ -1021,6 +1026,7 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		peer.inboundChan = make(chan protoPacket, InboundChanSize)
 	}
 	inboundChan := peer.inboundChan
+	muxInstance := peer.mux
 	peer.mu.Unlock()
 
 	// Fill packet fields
@@ -1048,20 +1054,9 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 	// Route based on protocol
 	switch protocol {
 	case noise.ProtocolKCP:
-		// Re-read mux here instead of relying on value from 30 lines earlier
-		peer.mu.RLock()
-		mux := peer.mux
-		peer.mu.RUnlock()
-
-		// Auto-initialize mux on first KCP message (as server/responder)
-		if mux == nil {
-			u.initMux(peer, false) // server mode - we're receiving
-			peer.mu.RLock()
-			mux = peer.mux
-			peer.mu.RUnlock()
-		}
-		if mux != nil {
-			mux.Input(payload)
+		// mux is initialized when session is established (handshake complete)
+		if muxInstance != nil {
+			muxInstance.Input(payload)
 		}
 		// Don't deliver KCP to ReadFrom
 		pkt.err = ErrNoData

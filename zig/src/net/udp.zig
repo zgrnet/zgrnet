@@ -873,24 +873,30 @@ pub const UDP = struct {
             .remote_pk = remote_pk,
         });
 
+        // Find peer (release peers_mutex before acquiring peer.mutex)
+        const peer_opt: ?*PeerStateInternal = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(remote_pk);
+        };
+
         // Update peer state
+        if (peer_opt) |peer| {
+            peer.mutex.lock();
+            defer peer.mutex.unlock();
+            peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
+            peer.endpoint_len = from_len;
+            peer.endpoint_port = std.mem.bigToNative(u16, from.port);
+            peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
+            peer.session = session;
+            peer.state = .established;
+            peer.last_seen = std.time.nanoTimestamp();
+        }
+
+        // Register in index map
         {
             self.peers_mutex.lock();
             defer self.peers_mutex.unlock();
-
-            if (self.peers_map.get(remote_pk)) |peer| {
-                peer.mutex.lock();
-                defer peer.mutex.unlock();
-                peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
-                peer.endpoint_len = from_len;
-                peer.endpoint_port = std.mem.bigToNative(u16, from.port);
-                peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
-                peer.session = session;
-                peer.state = .established;
-                peer.last_seen = std.time.nanoTimestamp();
-            }
-
-            // Register in index map
             self.by_index.put(local_idx, remote_pk) catch {};
         }
     }
@@ -914,14 +920,16 @@ pub const UDP = struct {
         // Read the handshake response
         var payload_buf: [64]u8 = undefined;
         _ = pending.hs_state.readMessage(&noise_msg, &payload_buf) catch {
-            {
+            // Find peer (release peers_mutex before acquiring peer.mutex)
+            const peer_opt: ?*PeerStateInternal = blk: {
                 self.peers_mutex.lock();
                 defer self.peers_mutex.unlock();
-                if (self.peers_map.get(pending.peer_pk)) |peer| {
-                    peer.mutex.lock();
-                    defer peer.mutex.unlock();
-                    peer.state = .failed;
-                }
+                break :blk self.peers_map.get(pending.peer_pk);
+            };
+            if (peer_opt) |peer| {
+                peer.mutex.lock();
+                defer peer.mutex.unlock();
+                peer.state = .failed;
             }
             pending.done = true;
             pending.result = UdpError.HandshakeFailed;
@@ -945,24 +953,30 @@ pub const UDP = struct {
             .remote_pk = pending.peer_pk,
         });
 
+        // Find peer (release peers_mutex before acquiring peer.mutex)
+        const peer_opt: ?*PeerStateInternal = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(pending.peer_pk);
+        };
+
         // Update peer state
+        if (peer_opt) |peer| {
+            peer.mutex.lock();
+            defer peer.mutex.unlock();
+            peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
+            peer.endpoint_len = from_len;
+            peer.endpoint_port = std.mem.bigToNative(u16, from.port);
+            peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
+            peer.session = session;
+            peer.state = .established;
+            peer.last_seen = std.time.nanoTimestamp();
+        }
+
+        // Register in index map
         {
             self.peers_mutex.lock();
             defer self.peers_mutex.unlock();
-
-            if (self.peers_map.get(pending.peer_pk)) |peer| {
-                peer.mutex.lock();
-                defer peer.mutex.unlock();
-                peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
-                peer.endpoint_len = from_len;
-                peer.endpoint_port = std.mem.bigToNative(u16, from.port);
-                peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
-                peer.session = session;
-                peer.state = .established;
-                peer.last_seen = std.time.nanoTimestamp();
-            }
-
-            // Register in index map
             self.by_index.put(pending.local_idx, pending.peer_pk) catch {};
         }
 

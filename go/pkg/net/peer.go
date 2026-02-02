@@ -1,6 +1,7 @@
 package net
 
 import (
+	"bytes"
 	"time"
 
 	"github.com/vibing/zgrnet/pkg/kcp"
@@ -16,48 +17,65 @@ type mux = kcp.Mux
 // Stream is a multiplexed reliable stream over KCP.
 type Stream = kcp.Stream
 
-// initMux initializes the Mux for a peer (called lazily).
-func (u *UDP) initMux(peer *peerState, isClient bool) {
-	peer.muxOnce.Do(func() {
-		acceptChan := make(chan *stream, 16)
-		inboundChan := make(chan protoPacket, InboundChanSize)
+// isKCPClient determines if we are the KCP client for a peer.
+// Uses deterministic rule: smaller public key is client (uses odd stream IDs).
+// This ensures consistent stream ID allocation regardless of who initiated the connection.
+func (u *UDP) isKCPClient(remotePK noise.PublicKey) bool {
+	return bytes.Compare(u.localKey.Public[:], remotePK[:]) < 0
+}
 
-		m := kcp.NewMux(
-			kcp.DefaultConfig(),
-			isClient,
-			// Output function: send KCP frames through the encrypted session
-			func(data []byte) error {
-				return u.sendToPeer(peer, noise.ProtocolKCP, data)
-			},
-			// OnStreamData: called when a stream has data available
-			func(streamID uint32) {
-				// This is handled internally by Stream.Read
-			},
-			// OnNewStream: called when remote opens a new stream
-			func(s *stream) {
-				select {
-				case acceptChan <- s:
-				default:
-					// Accept queue full, close the stream
-					s.Close()
-				}
-			},
-		)
+// initMux initializes the Mux for a peer.
+// Called when session is established (handshake complete).
+// If mux already exists, it will be closed and recreated.
+func (u *UDP) initMux(peer *peerState) {
+	// Close existing mux if any
+	peer.mu.Lock()
+	if peer.mux != nil {
+		peer.mux.Close()
+	}
+	peer.mu.Unlock()
 
-		// Assign under lock to avoid race with decryptTransport
-		peer.mu.Lock()
-		peer.acceptChan = acceptChan
-		peer.inboundChan = inboundChan
-		peer.mux = m
-		peer.mu.Unlock()
+	// Determine client/server role based on public key comparison
+	isClient := u.isKCPClient(peer.pk)
 
-		// Start the Mux update goroutine
-		u.wg.Add(1)
-		go func() {
-			defer u.wg.Done()
-			u.muxUpdateLoop(peer)
-		}()
-	})
+	acceptChan := make(chan *stream, 16)
+	inboundChan := make(chan protoPacket, InboundChanSize)
+
+	m := kcp.NewMux(
+		kcp.DefaultConfig(),
+		isClient,
+		// Output function: send KCP frames through the encrypted session
+		func(data []byte) error {
+			return u.sendToPeer(peer, noise.ProtocolKCP, data)
+		},
+		// OnStreamData: called when a stream has data available
+		func(streamID uint32) {
+			// This is handled internally by Stream.Read
+		},
+		// OnNewStream: called when remote opens a new stream
+		func(s *stream) {
+			select {
+			case acceptChan <- s:
+			default:
+				// Accept queue full, close the stream
+				s.Close()
+			}
+		},
+	)
+
+	// Assign under lock
+	peer.mu.Lock()
+	peer.acceptChan = acceptChan
+	peer.inboundChan = inboundChan
+	peer.mux = m
+	peer.mu.Unlock()
+
+	// Start the Mux update goroutine
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		u.muxUpdateLoop(peer)
+	}()
 }
 
 // muxUpdateLoop periodically updates the Mux for KCP retransmissions.
@@ -126,7 +144,7 @@ func (u *UDP) sendToPeer(peer *peerState, protocol byte, data []byte) error {
 }
 
 // OpenStream opens a new KCP stream to the specified peer.
-// The peer must be in established state.
+// The peer must be in established state with mux initialized.
 func (u *UDP) OpenStream(pk noise.PublicKey) (*Stream, error) {
 	if u.closed.Load() {
 		return nil, ErrClosed
@@ -142,20 +160,23 @@ func (u *UDP) OpenStream(pk noise.PublicKey) (*Stream, error) {
 
 	peer.mu.RLock()
 	state := peer.state
+	m := peer.mux
 	peer.mu.RUnlock()
 
 	if state != PeerStateEstablished {
 		return nil, ErrNoSession
 	}
 
-	// Initialize Mux if not already done (as client - we initiate streams)
-	u.initMux(peer, true)
+	if m == nil {
+		return nil, ErrNoSession
+	}
 
-	return peer.mux.OpenStream()
+	return m.OpenStream()
 }
 
 // AcceptStream accepts an incoming KCP stream from the specified peer.
 // This blocks until a stream is available or the UDP is closed.
+// The peer must be in established state with mux initialized.
 func (u *UDP) AcceptStream(pk noise.PublicKey) (*Stream, error) {
 	if u.closed.Load() {
 		return nil, ErrClosed
@@ -169,11 +190,16 @@ func (u *UDP) AcceptStream(pk noise.PublicKey) (*Stream, error) {
 		return nil, ErrPeerNotFound
 	}
 
-	// Initialize Mux if not already done (as server - we accept streams)
-	u.initMux(peer, false)
+	peer.mu.RLock()
+	acceptChan := peer.acceptChan
+	peer.mu.RUnlock()
+
+	if acceptChan == nil {
+		return nil, ErrNoSession
+	}
 
 	select {
-	case s := <-peer.acceptChan:
+	case s := <-acceptChan:
 		return s, nil
 	case <-u.closedChan():
 		return nil, ErrClosed
@@ -256,9 +282,9 @@ func (u *UDP) Write(pk noise.PublicKey, proto byte, data []byte) (n int, err err
 	return len(data), nil
 }
 
-// GetMux returns the Mux for a peer, initializing it if necessary.
-// isClient determines stream ID allocation.
-func (u *UDP) GetMux(pk noise.PublicKey, isClient bool) (*mux, error) {
+// GetMux returns the Mux for a peer.
+// Returns nil if mux is not initialized (session not established).
+func (u *UDP) GetMux(pk noise.PublicKey) (*mux, error) {
 	if u.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -271,6 +297,13 @@ func (u *UDP) GetMux(pk noise.PublicKey, isClient bool) (*mux, error) {
 		return nil, ErrPeerNotFound
 	}
 
-	u.initMux(peer, isClient)
-	return peer.mux, nil
+	peer.mu.RLock()
+	m := peer.mux
+	peer.mu.RUnlock()
+
+	if m == nil {
+		return nil, ErrNoSession
+	}
+
+	return m, nil
 }
