@@ -619,8 +619,7 @@ impl UDP {
         // We need to clone self references for the closures
         // Use weak-like pattern to avoid circular references
         let socket = self.socket.try_clone().expect("Failed to clone socket");
-        let peers_for_output = Arc::clone(&self.peers.read().unwrap().get(&remote_pk).unwrap());
-        let _pk_for_output = remote_pk;
+        let peers_for_output = Arc::clone(&peer_arc);
         let accept_tx_for_mux = accept_tx.clone();
 
         // Create Mux
@@ -661,7 +660,9 @@ impl UDP {
             }),
             // OnNewStream: called when remote opens a new stream
             Box::new(move |stream| {
-                let _ = accept_tx_for_mux.try_send(stream);
+                if accept_tx_for_mux.try_send(stream).is_err() {
+                    eprintln!("[warn] accept queue full, stream dropped");
+                }
             }),
         ));
 

@@ -48,9 +48,9 @@ trap cleanup EXIT
 # Start instances
 cd "$SCRIPT_DIR"
 
-# Read roles from config (using jq if available, fallback to grep)
-GO_ROLE=$(grep -A3 '"name": "go"' "$CONFIG" | grep '"role"' | sed 's/.*"role".*"\(.*\)".*/\1/' | tr -d ' ,')
-RUST_ROLE=$(grep -A3 '"name": "rust"' "$CONFIG" | grep '"role"' | sed 's/.*"role".*"\(.*\)".*/\1/' | tr -d ' ,')
+# Read roles from config using jq
+GO_ROLE=$(jq -r '.hosts[] | select(.name=="go") | .role' "$CONFIG")
+RUST_ROLE=$(jq -r '.hosts[] | select(.name=="rust") | .role' "$CONFIG")
 
 echo "Go role: $GO_ROLE, Rust role: $RUST_ROLE"
 

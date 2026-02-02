@@ -321,26 +321,3 @@ fn read_with_timeout(stream: &Arc<Stream>, timeout: Duration) -> Result<Vec<u8>,
 
     Err(format!("Read timeout after {:?}", timeout))
 }
-
-/// Read data into buffer with timeout.
-fn read_data_with_timeout(stream: &Arc<Stream>, buf: &mut [u8], timeout: Duration) -> Result<usize, String> {
-    let deadline = Instant::now() + timeout;
-    let mut spin_count = 0u32;
-
-    while Instant::now() < deadline {
-        match stream.read_data(buf) {
-            Ok(n) if n > 0 => return Ok(n),
-            Ok(_) => {
-                spin_count = spin_count.saturating_add(1);
-                if spin_count > 10000 {
-                    thread::sleep(Duration::from_micros(50));
-                } else {
-                    std::hint::spin_loop();
-                }
-            }
-            Err(e) => return Err(format!("{:?}", e)),
-        }
-    }
-
-    Err(format!("Read timeout after {:?}", timeout))
-}

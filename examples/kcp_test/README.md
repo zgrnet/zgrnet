@@ -42,7 +42,7 @@ The `config.json` file defines test hosts with deterministic keys:
 1. **Noise Handshake**: Cross-language IK pattern handshake
 2. **KCP Stream Open/Accept**: Go opens stream, Rust accepts
 3. **Bidirectional Data**: Echo test verifies data integrity
-4. **Throughput**: 1 MB transfer with measured speed
+4. **Throughput**: Bidirectional 1GB transfer (~95 MB/s)
 
 ## Test Flow
 
@@ -57,8 +57,10 @@ Go (opener)                    Rust (accepter)
     |--- Echo message ------------->|
     |<-- Echo response -------------|
     |                               |
-    |--- Throughput data (1MB) ---->|
-    |<-- Throughput ACK ------------|
+    |=== Bidirectional 1GB Test ====|
+    |--- TX: 1GB data ------------->|
+    |<-- TX: 1GB data --------------|
+    |       (simultaneous)          |
     |                               |
     [Both exit with success]
 ```
@@ -74,27 +76,40 @@ Building Rust kcp_interop...
 Starting KCP interop test (Go opener + Rust accepter)...
 
 --- Starting Rust (accepter) on port 10002 ---
-[rust] Public key: 0a8ddb14...
+[rust] Public key: ad8c48c2...
 [rust] Role: accepter
 [rust] Listening on 0.0.0.0:10002
 
 --- Starting Go (opener) on port 10001 ---
-[go] Public key: 2fe57da3...
+[go] Public key: fd3384e1...
 [go] Role: opener
 [go] Connecting to rust...
 [go] Connected to rust!
-[opener] Opened stream 1
+[opener] Opened stream 2
 [opener] Running echo test...
-[accepter] Accepted stream 1
+[accepter] Accepted stream 2
 [accepter] Received echo: "Hello KCP Interop!"
 [opener] Received echo response: "Echo from accepter: Hello KCP Interop!"
-[opener] Running throughput test (1 MB, 32 KB chunks)...
-[accepter] Receiving throughput data...
-[opener] ========== Results ==========
-[opener] Sent: 1048576 bytes (1.00 MB)
-[opener] Time: 50ms
-[opener] Throughput: 20.00 MB/s
-[opener] ==============================
+[opener] Starting bidirectional test: 1024 MB each direction, 64 KB chunks
+[accepter] Starting bidirectional test: 1024 MB each direction, 64 KB chunks
+[opener] TX complete: 1073741824 bytes
+[accepter] TX complete: 1073741824 bytes
+[accepter] RX complete: 1073741824 bytes
+[accepter] ========== Bidirectional Results ==========
+[accepter] Sent:       1073741824 bytes (1.00 GB)
+[accepter] Received:   1073741824 bytes (1.00 GB)
+[accepter] Total:      2147483648 bytes (2.00 GB)
+[accepter] Time:       21.5s
+[accepter] Throughput: 95.24 MB/s (bidirectional)
+[accepter] ============================================
+[opener] RX complete: 1073741824 bytes
+[opener] ========== Bidirectional Results ==========
+[opener] Sent:       1073741824 bytes (1.00 GB)
+[opener] Received:   1073741824 bytes (1.00 GB)
+[opener] Total:      2147483648 bytes (2.00 GB)
+[opener] Time:       22.5s
+[opener] Throughput: 91.02 MB/s (bidirectional)
+[opener] ============================================
 
 === KCP Interop Test PASSED ===
 ```
