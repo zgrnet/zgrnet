@@ -70,31 +70,28 @@ func (u *UDP) initMux(peer *peerState) {
 	peer.mux = m
 	peer.mu.Unlock()
 
-	// Start the Mux update goroutine
+	// Start the Mux update goroutine with reference to this specific mux
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
-		u.muxUpdateLoop(peer)
+		u.muxUpdateLoop(m)
 	}()
 }
 
 // muxUpdateLoop periodically updates the Mux for KCP retransmissions.
-func (u *UDP) muxUpdateLoop(peer *peerState) {
+// It takes a reference to the specific mux it's responsible for, so it exits
+// correctly when that mux is closed (even if peer.mux is replaced with a new one).
+func (u *UDP) muxUpdateLoop(m *mux) {
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			peer.mu.RLock()
-			m := peer.mux
-			peer.mu.RUnlock()
-
-			if m != nil && !m.IsClosed() {
-				m.Update(uint32(time.Now().UnixMilli()))
-			} else {
+			if m.IsClosed() {
 				return
 			}
+			m.Update(uint32(time.Now().UnixMilli()))
 		}
 
 		// Check if UDP is closed
