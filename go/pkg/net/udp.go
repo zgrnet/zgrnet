@@ -187,9 +187,8 @@ type peerState struct {
 	txBytes  uint64
 	lastSeen time.Time
 
-	// Stream multiplexing (initialized lazily on first OpenStream/AcceptStream)
+	// Stream multiplexing (initialized when session is established)
 	mux        *mux
-	muxOnce    sync.Once
 	acceptChan chan *stream // incoming streams from remote
 
 	// Protocol routing for non-KCP packets
@@ -343,10 +342,11 @@ func (u *UDP) RemovePeer(pk noise.PublicKey) {
 
 	// Remove from index map if has session
 	peer.mu.RLock()
-	if peer.session != nil {
-		delete(u.byIndex, peer.session.LocalIndex())
-	}
+	session := peer.session
 	peer.mu.RUnlock()
+	if session != nil {
+		delete(u.byIndex, session.LocalIndex())
+	}
 
 	delete(u.peers, pk)
 }
@@ -652,6 +652,9 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 	u.mu.Lock()
 	u.byIndex[localIdx] = peer
 	u.mu.Unlock()
+
+	// Initialize mux now that session is established
+	u.initMux(peer)
 }
 
 // handleHandshakeResp processes an incoming handshake response.
@@ -731,6 +734,9 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 	u.mu.Lock()
 	u.byIndex[pending.localIdx] = peer
 	u.mu.Unlock()
+
+	// Initialize mux now that session is established
+	u.initMux(peer)
 
 	// Signal completion
 	if pending.done != nil {
@@ -992,9 +998,9 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	peer.mu.Lock()
+	peer.mu.RLock()
 	session := peer.session
-	peer.mu.Unlock()
+	peer.mu.RUnlock()
 
 	if session == nil {
 		pkt.err = ErrNoSession
@@ -1008,19 +1014,19 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Update peer state (roaming + stats)
+	// Update peer state (roaming + stats) and get mux/inboundChan
 	peer.mu.Lock()
 	if peer.endpoint == nil || peer.endpoint.String() != from.String() {
 		peer.endpoint = from // Roaming
 	}
 	peer.rxBytes += uint64(len(data))
 	peer.lastSeen = time.Now()
-	muxInstance := peer.mux
 	// Initialize inboundChan if needed (for Peer.Read callers)
 	if peer.inboundChan == nil {
 		peer.inboundChan = make(chan protoPacket, InboundChanSize)
 	}
 	inboundChan := peer.inboundChan
+	muxInstance := peer.mux
 	peer.mu.Unlock()
 
 	// Fill packet fields
@@ -1048,7 +1054,7 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 	// Route based on protocol
 	switch protocol {
 	case noise.ProtocolKCP:
-		// Route to Mux if initialized
+		// mux is initialized when session is established (handshake complete)
 		if muxInstance != nil {
 			muxInstance.Input(payload)
 		}

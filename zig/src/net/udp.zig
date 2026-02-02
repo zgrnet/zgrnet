@@ -334,11 +334,13 @@ pub const UDP = struct {
 
         if (self.peers_map.fetchRemove(pk.*)) |kv| {
             const peer = kv.value;
-            peer.mutex.lock();
-            if (peer.session) |*session| {
-                _ = self.by_index.remove(session.localIndex());
+            {
+                peer.mutex.lock();
+                defer peer.mutex.unlock();
+                if (peer.session) |*session| {
+                    _ = self.by_index.remove(session.localIndex());
+                }
             }
-            peer.mutex.unlock();
             self.allocator.destroy(peer);
         }
     }
@@ -372,12 +374,11 @@ pub const UDP = struct {
 
     /// Returns information about a specific peer.
     pub fn peerInfo(self: *UDP, pk: *const Key) ?PeerInfo {
-        self.peers_mutex.lock();
-        const peer = self.peers_map.get(pk.*) orelse {
-            self.peers_mutex.unlock();
-            return null;
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(pk.*) orelse return null;
         };
-        self.peers_mutex.unlock();
 
         peer.mutex.lock();
         defer peer.mutex.unlock();
@@ -437,12 +438,11 @@ pub const UDP = struct {
             return UdpError.Closed;
         }
 
-        self.peers_mutex.lock();
-        const peer = self.peers_map.get(pk.*) orelse {
-            self.peers_mutex.unlock();
-            return UdpError.PeerNotFound;
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(pk.*) orelse return UdpError.PeerNotFound;
         };
-        self.peers_mutex.unlock();
 
         peer.mutex.lock();
         defer peer.mutex.unlock();
@@ -572,22 +572,16 @@ pub const UDP = struct {
         // This is similar to handleTransport but returns the result instead of modifying buf
         const msg = message.parseTransportMessage(data) catch return null;
 
-        // Find peer by receiver index (use peers_mutex for both maps)
-        self.peers_mutex.lock();
-        const pk_opt = self.by_index.get(msg.receiver_index);
-        const pk = pk_opt orelse {
-            self.peers_mutex.unlock();
-            return null;
-        };
-
-        const peer = self.peers_map.get(pk) orelse {
-            self.peers_mutex.unlock();
-            return null;
+        // Find peer by receiver index
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            const pk = self.by_index.get(msg.receiver_index) orelse return null;
+            break :blk self.peers_map.get(pk) orelse return null;
         };
 
         peer.mutex.lock();
         defer peer.mutex.unlock();
-        self.peers_mutex.unlock();
 
         var session = peer.session orelse return null;
 
@@ -604,7 +598,7 @@ pub const UDP = struct {
         peer.session = session;
 
         return ReadResult{
-            .pk = pk,
+            .pk = peer.pk,
             .n = n,
         };
     }
@@ -685,21 +679,20 @@ pub const UDP = struct {
             return UdpError.Closed;
         }
 
-        self.peers_mutex.lock();
-        const peer = self.peers_map.get(pk.*) orelse {
-            self.peers_mutex.unlock();
-            return UdpError.PeerNotFound;
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(pk.*) orelse return UdpError.PeerNotFound;
         };
-        self.peers_mutex.unlock();
 
-        peer.mutex.lock();
-        const endpoint = peer.endpoint orelse {
-            peer.mutex.unlock();
-            return UdpError.NoEndpoint;
+        const endpoint, const endpoint_len = blk: {
+            peer.mutex.lock();
+            defer peer.mutex.unlock();
+            const ep = peer.endpoint orelse return UdpError.NoEndpoint;
+            const ep_len = peer.endpoint_len;
+            peer.state = .connecting;
+            break :blk .{ ep, ep_len };
         };
-        const endpoint_len = peer.endpoint_len;
-        peer.state = .connecting;
-        peer.mutex.unlock();
 
         // Generate local index
         const local_idx = noise.session.generateIndex();
@@ -731,19 +724,20 @@ pub const UDP = struct {
             .created_at = std.time.nanoTimestamp(),
         };
 
-        self.pending_mutex.lock();
-        self.pending.put(local_idx, pending) catch {
-            self.pending_mutex.unlock();
-            self.allocator.destroy(pending);
-            return UdpError.OutOfMemory;
-        };
-        self.pending_mutex.unlock();
+        {
+            self.pending_mutex.lock();
+            defer self.pending_mutex.unlock();
+            self.pending.put(local_idx, pending) catch {
+                self.allocator.destroy(pending);
+                return UdpError.OutOfMemory;
+            };
+        }
 
         // Send handshake initiation
         _ = posix.sendto(self.socket, &wire_msg, 0, &endpoint, endpoint_len) catch {
             self.pending_mutex.lock();
+            defer self.pending_mutex.unlock();
             _ = self.pending.remove(local_idx);
-            self.pending_mutex.unlock();
             self.allocator.destroy(pending);
             return UdpError.SendFailed;
         };
@@ -879,10 +873,17 @@ pub const UDP = struct {
             .remote_pk = remote_pk,
         });
 
+        // Find peer (release peers_mutex before acquiring peer.mutex)
+        const peer_opt: ?*PeerStateInternal = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(remote_pk);
+        };
+
         // Update peer state
-        self.peers_mutex.lock();
-        if (self.peers_map.get(remote_pk)) |peer| {
+        if (peer_opt) |peer| {
             peer.mutex.lock();
+            defer peer.mutex.unlock();
             peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
             peer.endpoint_len = from_len;
             peer.endpoint_port = std.mem.bigToNative(u16, from.port);
@@ -890,12 +891,14 @@ pub const UDP = struct {
             peer.session = session;
             peer.state = .established;
             peer.last_seen = std.time.nanoTimestamp();
-            peer.mutex.unlock();
         }
 
         // Register in index map
-        self.by_index.put(local_idx, remote_pk) catch {};
-        self.peers_mutex.unlock();
+        {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            self.by_index.put(local_idx, remote_pk) catch {};
+        }
     }
 
     // Internal: handle incoming handshake response
@@ -903,12 +906,11 @@ pub const UDP = struct {
         const msg = message.parseHandshakeResp(data) catch return;
 
         // Find the pending handshake
-        self.pending_mutex.lock();
-        const pending = self.pending.get(msg.receiver_index) orelse {
-            self.pending_mutex.unlock();
-            return;
+        const pending = blk: {
+            self.pending_mutex.lock();
+            defer self.pending_mutex.unlock();
+            break :blk self.pending.get(msg.receiver_index) orelse return;
         };
-        self.pending_mutex.unlock();
 
         // Build Noise message from wire format
         var noise_msg: [key_size + 16]u8 = undefined;
@@ -918,13 +920,17 @@ pub const UDP = struct {
         // Read the handshake response
         var payload_buf: [64]u8 = undefined;
         _ = pending.hs_state.readMessage(&noise_msg, &payload_buf) catch {
-            self.peers_mutex.lock();
-            if (self.peers_map.get(pending.peer_pk)) |peer| {
+            // Find peer (release peers_mutex before acquiring peer.mutex)
+            const peer_opt: ?*PeerStateInternal = blk: {
+                self.peers_mutex.lock();
+                defer self.peers_mutex.unlock();
+                break :blk self.peers_map.get(pending.peer_pk);
+            };
+            if (peer_opt) |peer| {
                 peer.mutex.lock();
+                defer peer.mutex.unlock();
                 peer.state = .failed;
-                peer.mutex.unlock();
             }
-            self.peers_mutex.unlock();
             pending.done = true;
             pending.result = UdpError.HandshakeFailed;
             return;
@@ -947,10 +953,17 @@ pub const UDP = struct {
             .remote_pk = pending.peer_pk,
         });
 
+        // Find peer (release peers_mutex before acquiring peer.mutex)
+        const peer_opt: ?*PeerStateInternal = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(pending.peer_pk);
+        };
+
         // Update peer state
-        self.peers_mutex.lock();
-        if (self.peers_map.get(pending.peer_pk)) |peer| {
+        if (peer_opt) |peer| {
             peer.mutex.lock();
+            defer peer.mutex.unlock();
             peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
             peer.endpoint_len = from_len;
             peer.endpoint_port = std.mem.bigToNative(u16, from.port);
@@ -958,12 +971,14 @@ pub const UDP = struct {
             peer.session = session;
             peer.state = .established;
             peer.last_seen = std.time.nanoTimestamp();
-            peer.mutex.unlock();
         }
 
         // Register in index map
-        self.by_index.put(pending.local_idx, pending.peer_pk) catch {};
-        self.peers_mutex.unlock();
+        {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            self.by_index.put(pending.local_idx, pending.peer_pk) catch {};
+        }
 
         // Signal completion
         pending.done = true;
@@ -975,16 +990,12 @@ pub const UDP = struct {
         const msg = message.parseTransportMessage(data) catch return null;
 
         // Find peer by receiver index
-        self.peers_mutex.lock();
-        const peer_pk = self.by_index.get(msg.receiver_index) orelse {
-            self.peers_mutex.unlock();
-            return null;
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            const peer_pk = self.by_index.get(msg.receiver_index) orelse return null;
+            break :blk self.peers_map.get(peer_pk) orelse return null;
         };
-        const peer = self.peers_map.get(peer_pk) orelse {
-            self.peers_mutex.unlock();
-            return null;
-        };
-        self.peers_mutex.unlock();
 
         peer.mutex.lock();
         defer peer.mutex.unlock();
@@ -1003,7 +1014,7 @@ pub const UDP = struct {
         peer.last_seen = std.time.nanoTimestamp();
         peer.session = session;
 
-        return .{ .pk = peer_pk, .n = n };
+        return .{ .pk = peer.pk, .n = n };
     }
 };
 
