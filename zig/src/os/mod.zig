@@ -126,15 +126,18 @@ pub fn OsLayer(comptime Impl: type) type {
     };
 }
 
-/// Default OS layer based on build option (-Dos_backend=darwin|none)
-pub const Os = OsLayer(Darwin);  // Note: None requires allocator, use None(alloc) directly
+/// Default OS layer based on build option and target OS.
+/// Falls back to None on non-Darwin platforms.
+pub const Os = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos => OsLayer(Darwin),
+    else => OsLayer(None(std.heap.page_allocator)),
+};
 
 test "OsLayer comptime validation" {
-    // This just checks that Darwin implements all required interfaces
-    const TestOs = OsLayer(Darwin);
-    _ = TestOs.Reactor;
-    _ = TestOs.Event;
-    _ = TestOs.Channel;
-    _ = TestOs.Mutex;
-    _ = TestOs.Semaphore;
+    // This checks that the selected platform implements all required interfaces
+    _ = Os.Reactor;
+    _ = Os.Event;
+    _ = Os.Channel;
+    _ = Os.Mutex;
+    _ = Os.Semaphore;
 }
