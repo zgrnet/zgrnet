@@ -28,13 +28,6 @@ func (u *UDP) isKCPClient(remotePK noise.PublicKey) bool {
 // Called when session is established (handshake complete).
 // If mux already exists, it will be closed and recreated.
 func (u *UDP) initMux(peer *peerState) {
-	// Close existing mux if any
-	peer.mu.Lock()
-	if peer.mux != nil {
-		peer.mux.Close()
-	}
-	peer.mu.Unlock()
-
 	// Determine client/server role based on public key comparison
 	isClient := u.isKCPClient(peer.pk)
 
@@ -63,8 +56,11 @@ func (u *UDP) initMux(peer *peerState) {
 		},
 	)
 
-	// Assign under lock
+	// Close existing mux and assign new fields under a single lock
 	peer.mu.Lock()
+	if peer.mux != nil {
+		peer.mux.Close()
+	}
 	peer.acceptChan = acceptChan
 	peer.inboundChan = inboundChan
 	peer.mux = m
