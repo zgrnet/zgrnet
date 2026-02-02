@@ -34,8 +34,11 @@ go build -o "$SCRIPT_DIR/kcp_go" ./examples/kcp_test
 echo "Building Rust kcp_interop..."
 cd "$RUST_DIR"
 cargo build --example kcp_interop --release || cargo build --example kcp_interop
-cp target/release/examples/kcp_interop "$SCRIPT_DIR/kcp_rust" 2>/dev/null || \
-cp target/debug/examples/kcp_interop "$SCRIPT_DIR/kcp_rust"
+if [ -f target/release/examples/kcp_interop ]; then
+    cp target/release/examples/kcp_interop "$SCRIPT_DIR/kcp_rust"
+else
+    cp target/debug/examples/kcp_interop "$SCRIPT_DIR/kcp_rust"
+fi
 
 echo ""
 echo "Starting KCP interop test (Go opener + Rust accepter)..."

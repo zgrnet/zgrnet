@@ -126,7 +126,10 @@ func main() {
 	}
 
 	// Add peer endpoint
-	endpoint, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", peerInfo.Port))
+	endpoint, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", peerInfo.Port))
+	if err != nil {
+		log.Fatalf("Failed to resolve peer address: %v", err)
+	}
 	udp.SetPeerEndpoint(peerKey, endpoint)
 	log.Printf("[%s] Added peer %s at %s", *name, peerInfo.Name, endpoint)
 
