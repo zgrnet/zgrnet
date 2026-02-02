@@ -161,10 +161,10 @@ type UDP struct {
 	pending map[uint32]*pendingHandshake
 
 	// Pipeline channels for async I/O processing
-	decryptChan chan *packet    // ioLoop -> decryptWorkers
-	outputChan  chan *packet    // ioLoop -> ReadFrom (same packet, wait for ready)
-	closeChan   chan struct{}   // signal to stop goroutines
-	wg          sync.WaitGroup  // tracks running goroutines
+	decryptChan chan *packet   // ioLoop -> decryptWorkers
+	outputChan  chan *packet   // ioLoop -> ReadFrom (same packet, wait for ready)
+	closeChan   chan struct{}  // signal to stop goroutines
+	wg          sync.WaitGroup // tracks running goroutines
 
 	// Statistics
 	totalRx  atomic.Uint64

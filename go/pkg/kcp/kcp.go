@@ -275,7 +275,7 @@ func GetConv(data []byte) uint32 {
 
 // DefaultConfig sets KCP to fast mode with reasonable defaults.
 func (k *KCP) DefaultConfig() {
-	k.SetNodelay(1, 1, 2, 1)   // Fast mode with 1ms interval
-	k.SetWndSize(4096, 4096)   // Large window for high throughput
-	k.SetMTU(1400)             // Standard MTU
+	k.SetNodelay(1, 1, 2, 1) // Fast mode with 1ms interval
+	k.SetWndSize(4096, 4096) // Large window for high throughput
+	k.SetMTU(1400)           // Standard MTU
 }
