@@ -91,6 +91,7 @@ impl Stream {
     }
 
     /// Write data to the stream.
+    /// Returns the number of bytes written on success.
     pub fn write_data(&self, data: &[u8]) -> Result<usize, StreamError> {
         let state = self.state();
         if state == StreamState::Closed || state == StreamState::LocalClose {
@@ -98,12 +99,13 @@ impl Stream {
         }
 
         let mut kcp = self.kcp.lock().unwrap();
-        let n = kcp.send(data);
-        if n < 0 {
+        let ret = kcp.send(data);
+        if ret < 0 {
             return Err(StreamError::KcpSendFailed);
         }
 
-        Ok(n as usize)
+        // kcp.send returns 0 on success, so return data.len() as bytes written
+        Ok(data.len())
     }
 
     /// Read data from the stream (non-blocking).
