@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use std::thread;
+use tokio::time as tokio_time;
 
 /// Peer connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,40 +566,6 @@ impl UDP {
         self.local_key.public.as_bytes() < remote_pk.as_bytes()
     }
 
-    /// Sends protocol-tagged data to a peer.
-    fn send_to_peer_with_proto(&self, pk: &Key, protocol: u8, data: &[u8]) -> Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(UdpError::Closed);
-        }
-
-        let peers = self.peers.read().unwrap();
-        let peer = peers.get(pk).ok_or(UdpError::PeerNotFound)?;
-        let mut p = peer.lock().unwrap();
-
-        let endpoint = p.endpoint.ok_or(UdpError::NoEndpoint)?;
-        let session = p.session.as_mut().ok_or(UdpError::NoSession)?;
-
-        // Encode payload with protocol byte
-        let payload = encode_payload(protocol, data);
-
-        // Encrypt
-        let (ciphertext, nonce) = session
-            .encrypt(&payload)
-            .map_err(|e| UdpError::Session(e.to_string()))?;
-
-        // Build transport message
-        let msg = build_transport_message(session.remote_index(), nonce, &ciphertext);
-
-        // Send
-        let n = self.socket.send_to(&msg, endpoint)?;
-
-        // Update stats
-        self.total_tx.fetch_add(n as u64, Ordering::SeqCst);
-        p.tx_bytes += n as u64;
-
-        Ok(())
-    }
-
     /// Initializes the KCP Mux for a peer.
     /// Called when session is established (handshake complete).
     fn init_mux(&self, remote_pk: Key) {
@@ -678,21 +645,21 @@ impl UDP {
             p.accept_rx = Some(accept_rx);
         }
 
-        // Start mux update loop in background thread
+        // Start mux update loop in background task (tokio coroutine)
         let mux_for_loop = Arc::clone(&mux);
-        thread::spawn(move || {
-            Self::mux_update_loop(mux_for_loop);
+        tokio::spawn(async move {
+            Self::mux_update_loop(mux_for_loop).await;
         });
     }
 
     /// Background loop that updates KCP state for retransmissions.
-    fn mux_update_loop(mux: Arc<Mux>) {
-        let interval = Duration::from_millis(1); // 1ms update interval (same as Go)
+    async fn mux_update_loop(mux: Arc<Mux>) {
+        let mut interval = tokio_time::interval(Duration::from_millis(1)); // 1ms update interval (same as Go)
         let start = Instant::now();
         while !mux.is_closed() {
+            interval.tick().await;
             let current = (start.elapsed().as_millis() & 0xFFFFFFFF) as u32;
             mux.update(current);
-            thread::sleep(interval);
         }
     }
 

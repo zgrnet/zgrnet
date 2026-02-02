@@ -31,8 +31,8 @@ The `config.json` file defines test hosts with deterministic keys:
   ],
   "test": {
     "echo_message": "Hello KCP Interop!",
-    "throughput_mb": 1,
-    "chunk_kb": 32
+    "throughput_mb": 1024,
+    "chunk_kb": 64
   }
 }
 ```
