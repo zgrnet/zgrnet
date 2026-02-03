@@ -358,6 +358,9 @@ fn runBidirectionalTest(allocator: std.mem.Allocator, stream: *Stream, role: []c
                 if (n > 0) {
                     recv += n;
                     ctx.recv.store(recv, .seq_cst);
+                } else {
+                    // Yield to avoid busy-waiting
+                    std.Thread.sleep(1 * std.time.ns_per_ms);
                 }
             }
         }

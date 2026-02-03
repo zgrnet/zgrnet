@@ -140,7 +140,7 @@ pub const Stream = struct {
     /// Receive data directly from KCP into user-provided buffer (zero-copy fast path).
     /// Returns the number of bytes received, or 0 if no data available.
     /// This bypasses the internal recv_buf for lower latency when caller can process immediately.
-    /// Lock order: recv_mutex -> kcp_mutex (if needed).
+    /// Lock order: kcp_mutex -> recv_mutex (if both needed).
     pub fn recvIntoBuffer(self: *Stream, buffer: []u8) StreamError!usize {
         // First drain any buffered data (recv_mutex only)
         self.recv_mutex.lock();
@@ -348,6 +348,7 @@ pub const OnNewStreamFn = *const fn (stream: *Stream, user_data: ?*anyopaque) vo
 pub const OutputFn = *const fn (data: []const u8, user_data: ?*anyopaque) anyerror!void;
 
 /// Mux multiplexes multiple streams over a single connection.
+/// Thread-safe: all public methods are protected by mutex.
 pub const Mux = struct {
     config: MuxConfig,
     output_fn: OutputFn,
@@ -359,6 +360,7 @@ pub const Mux = struct {
     next_id: u32,
     closed: bool,
     allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex,
 
     /// Initialize a new Mux.
     pub fn init(
@@ -384,6 +386,7 @@ pub const Mux = struct {
             .next_id = if (is_client) 1 else 2, // Client: odd, Server: even
             .closed = false,
             .allocator = allocator,
+            .mutex = .{},
         };
 
         return self;
@@ -391,6 +394,9 @@ pub const Mux = struct {
 
     /// Deinitialize the Mux.
     pub fn deinit(self: *Mux) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Close all streams
         var iter = self.streams.valueIterator();
         while (iter.next()) |stream| {
@@ -402,6 +408,9 @@ pub const Mux = struct {
 
     /// Open a new stream.
     pub fn openStream(self: *Mux) !*Stream {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.closed) return error.MuxClosed;
 
         const id = self.next_id;
@@ -413,43 +422,54 @@ pub const Mux = struct {
         try self.streams.put(id, stream);
         errdefer _ = self.streams.remove(id); // Remove from map before deinit to avoid dangling pointer
 
-        // Send SYN
-        try self.sendSyn(id);
+        // Send SYN (unlocked - output_fn may need to acquire other locks)
+        self.mutex.unlock();
+        defer self.mutex.lock();
+        try self.sendSynUnlocked(id);
 
         return stream;
     }
 
     /// Get number of active streams.
-    pub fn numStreams(self: *const Mux) usize {
+    pub fn numStreams(self: *Mux) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.streams.count();
     }
 
     /// Check if closed.
-    pub fn isClosed(self: *const Mux) bool {
+    pub fn isClosed(self: *Mux) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.closed;
     }
 
     /// Close the Mux.
     pub fn closeMux(self: *Mux) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.closed = true;
     }
 
     /// Input a frame.
     pub fn input(self: *Mux, data: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.closed) return error.MuxClosed;
 
         const frame = try kcp.Frame.decode(data);
 
         switch (frame.cmd) {
-            .syn => try self.handleSyn(frame.stream_id),
-            .fin => self.handleFin(frame.stream_id),
-            .psh => self.handlePsh(frame.stream_id, frame.payload),
+            .syn => try self.handleSynLocked(frame.stream_id),
+            .fin => self.handleFinLocked(frame.stream_id),
+            .psh => self.handlePshLocked(frame.stream_id, frame.payload),
             .nop => {}, // Keepalive, nothing to do
         }
     }
 
-    /// Handle SYN (stream open request).
-    fn handleSyn(self: *Mux, id: u32) !void {
+    /// Handle SYN (stream open request). Must be called with mutex held.
+    fn handleSynLocked(self: *Mux, id: u32) !void {
         if (self.streams.contains(id)) return; // Duplicate SYN
 
         const stream = try Stream.init(self.allocator, id, self);
@@ -457,30 +477,35 @@ pub const Mux = struct {
 
         try self.streams.put(id, stream);
 
-        // Notify via callback
+        // Notify via callback (unlock to avoid deadlock)
+        self.mutex.unlock();
+        defer self.mutex.lock();
         self.on_new_stream(stream, self.user_data);
     }
 
-    /// Handle FIN (stream close).
-    fn handleFin(self: *Mux, id: u32) void {
+    /// Handle FIN (stream close). Must be called with mutex held.
+    fn handleFinLocked(self: *Mux, id: u32) void {
         if (self.streams.get(id)) |stream| {
             stream.handleFin();
         }
     }
 
-    /// Handle PSH (data).
-    fn handlePsh(self: *Mux, id: u32, payload: []const u8) void {
+    /// Handle PSH (data). Must be called with mutex held.
+    fn handlePshLocked(self: *Mux, id: u32, payload: []const u8) void {
         if (self.streams.get(id)) |stream| {
             stream.kcpInput(payload);
             if (stream.kcpRecv()) {
+                // Unlock before callback to avoid deadlock
+                self.mutex.unlock();
+                defer self.mutex.lock();
                 self.on_stream_data(id, self.user_data);
             }
         }
     }
 
-    /// Send a SYN frame.
-    fn sendSyn(self: *Mux, id: u32) !void {
-        try self.sendFrame(.{
+    /// Send a SYN frame (unlocked version for use when mutex is temporarily released).
+    fn sendSynUnlocked(self: *Mux, id: u32) !void {
+        try self.sendFrameUnlocked(.{
             .cmd = .syn,
             .stream_id = id,
             .payload = &[_]u8{},
@@ -489,7 +514,9 @@ pub const Mux = struct {
 
     /// Send a FIN frame.
     pub fn sendFin(self: *Mux, id: u32) !void {
-        try self.sendFrame(.{
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.sendFrameUnlocked(.{
             .cmd = .fin,
             .stream_id = id,
             .payload = &[_]u8{},
@@ -498,15 +525,17 @@ pub const Mux = struct {
 
     /// Send a PSH frame.
     pub fn sendPsh(self: *Mux, id: u32, payload: []const u8) !void {
-        try self.sendFrame(.{
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.sendFrameUnlocked(.{
             .cmd = .psh,
             .stream_id = id,
             .payload = payload,
         });
     }
 
-    /// Send a frame.
-    fn sendFrame(self: *Mux, frame: kcp.Frame) !void {
+    /// Send a frame (must NOT hold mutex - output_fn may acquire other locks).
+    fn sendFrameUnlocked(self: *Mux, frame: kcp.Frame) !void {
         if (self.closed) return error.MuxClosed;
 
         const required_size = kcp.FrameHeaderSize + frame.payload.len;
@@ -527,24 +556,34 @@ pub const Mux = struct {
 
     /// Remove a stream from the Mux.
     pub fn removeStream(self: *Mux, id: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         _ = self.streams.remove(id);
     }
 
     /// Update all streams.
     pub fn update(self: *Mux, current: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var iter = self.streams.iterator();
         while (iter.next()) |entry| {
             const id = entry.key_ptr.*;
             const stream = entry.value_ptr.*;
             stream.kcpUpdate(current);
             if (stream.kcpRecv()) {
+                // Unlock before callback to avoid deadlock
+                self.mutex.unlock();
                 self.on_stream_data(id, self.user_data);
+                self.mutex.lock();
             }
         }
     }
 
     /// Get a stream by ID.
     pub fn getStream(self: *Mux, id: u32) ?*Stream {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.streams.get(id);
     }
 };

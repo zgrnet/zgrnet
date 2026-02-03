@@ -902,6 +902,7 @@ pub const UDP = struct {
     };
 
     /// Initializes the KCP Mux for a peer after handshake completes.
+    /// Thread-safe: acquires peer.mutex internally.
     fn initMux(self: *UDP, peer: *PeerStateInternal) void {
         const is_client = self.isKcpClient(peer.pk);
 
@@ -911,9 +912,6 @@ pub const UDP = struct {
             .udp = self,
             .peer = peer,
         };
-
-        // Store UDP pointer for reference
-        peer.udp_ptr = self;
 
         // Create Mux with callbacks that use the context
         const mux = Mux.init(
@@ -928,6 +926,13 @@ pub const UDP = struct {
             self.allocator.destroy(ctx);
             return;
         };
+
+        // Lock peer to update mux (protects against concurrent initMux calls)
+        peer.mutex.lock();
+        defer peer.mutex.unlock();
+
+        // Store UDP pointer for reference
+        peer.udp_ptr = self;
 
         // Close existing mux if any (and free its context)
         if (peer.mux) |old_mux| {
