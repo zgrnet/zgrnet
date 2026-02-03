@@ -975,15 +975,24 @@ pub const UDP = struct {
     }
 
     /// Mux new stream callback - adds stream to accept queue.
+    /// Called when a new incoming stream is created via SYN.
+    /// Stream arrives with ref=1 (Mux's ref). We must:
+    /// - If accepted: retain() to add user's ref, then push to queue
+    /// - If rejected: removeStream() to release Mux's ref and free the stream
     fn muxOnNewStream(stream: *Stream, user_data: ?*anyopaque) void {
         const ctx: *MuxContext = @ptrCast(@alignCast(user_data orelse return));
         ctx.peer.mutex.lock();
         defer ctx.peer.mutex.unlock();
 
-        // Add to accept queue
-        if (!ctx.peer.accept_queue.push(stream)) {
-            // Queue full, close the stream
+        // Try to add to accept queue
+        if (ctx.peer.accept_queue.push(stream)) {
+            // Successfully queued - add user's reference (user will call close() when done)
+            stream.retain();
+        } else {
+            // Queue full - reject stream and clean up properly
             stream.shutdown();
+            // Remove from Mux and release Mux's reference (will free since ref=1)
+            stream.mux.removeStream(stream.id);
         }
     }
 

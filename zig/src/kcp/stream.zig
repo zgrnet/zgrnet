@@ -29,6 +29,13 @@ pub const StreamError = error{
 /// - kcp_mutex: protects KCP operations (send/recv/update)
 /// - recv_mutex: protects recv_buf only
 /// - state/output_error: atomic for lock-free reads
+///
+/// Reference counting:
+/// - Stream uses reference counting to allow safe re-handshake without use-after-free.
+/// - Mux holds one reference (via streams map).
+/// - User holds one reference (via openStream return or on_new_stream callback).
+/// - Call release() to decrement ref count. When it reaches 0, memory is freed.
+/// - For convenience, close() handles shutdown + removeStream + release.
 pub const Stream = struct {
     id: u32,
     mux: *Mux,
@@ -43,6 +50,9 @@ pub const Stream = struct {
     // Atomic state for lock-free reads
     state: std.atomic.Value(StreamState),
     output_error: std.atomic.Value(bool),
+
+    // Reference counting for safe memory management during re-handshake
+    ref_count: std.atomic.Value(u32),
 
     /// Initialize a new stream.
     pub fn init(allocator: std.mem.Allocator, id: u32, mux: *Mux) !*Stream {
@@ -59,6 +69,7 @@ pub const Stream = struct {
             .recv_mutex = .{},
             .state = std.atomic.Value(StreamState).init(.open),
             .output_error = std.atomic.Value(bool).init(false),
+            .ref_count = std.atomic.Value(u32).init(1), // Mux's reference
         };
 
         // Create KCP with output callback that routes data through the Mux
@@ -71,13 +82,50 @@ pub const Stream = struct {
         return self;
     }
 
-    /// Deinitialize the stream.
-    pub fn deinit(self: *Stream) void {
+    /// Increment reference count.
+    /// Call this when passing stream to another owner.
+    pub fn retain(self: *Stream) void {
+        _ = self.ref_count.fetchAdd(1, .seq_cst);
+    }
+
+    /// Decrement reference count and free if it reaches zero.
+    /// Returns true if memory was freed.
+    pub fn release(self: *Stream) bool {
+        const old = self.ref_count.fetchSub(1, .seq_cst);
+        if (old == 1) {
+            // Was 1, now 0 - we were the last reference, free memory
+            self.deinitInternal();
+            return true;
+        }
+        return false;
+    }
+
+    /// Close the stream (user-facing API).
+    /// This handles: shutdown + remove from Mux + release user's reference.
+    /// After calling close(), do not use the stream pointer anymore.
+    pub fn close(self: *Stream) void {
+        // Mark as closing and send FIN if needed
+        self.shutdown();
+        // Remove from Mux's streams map (releases Mux's reference)
+        self.mux.removeStream(self.id);
+        // Release user's reference
+        _ = self.release();
+    }
+
+    /// Internal deinitialization - actually frees memory.
+    /// Only called when ref_count reaches 0.
+    fn deinitInternal(self: *Stream) void {
         if (self.kcp_instance) |*k| {
             k.deinit();
         }
         self.recv_buf.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Deinitialize the stream (deprecated - use close() or release() instead).
+    /// Kept for backward compatibility but prefer close() for user code.
+    pub fn deinit(self: *Stream) void {
+        self.deinitInternal();
     }
 
     /// Get stream ID.
@@ -406,20 +454,31 @@ pub const Mux = struct {
     }
 
     /// Deinitialize the Mux.
+    /// Releases Mux's reference to all streams. Streams with user references
+    /// will remain valid (but non-functional) until user calls release().
     pub fn deinit(self: *Mux) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
 
-        // Close all streams
+        // Mark as closed and collect streams to release
+        self.closed = true;
+
+        // Release Mux's reference to all streams
+        // If user still holds a reference, stream remains valid but operations return errors
         var iter = self.streams.valueIterator();
         while (iter.next()) |stream| {
-            stream.*.deinit();
+            // Mark stream as closed so operations return errors
+            stream.*.state.store(.closed, .seq_cst);
+            // Release Mux's reference (may free if user has no reference)
+            _ = stream.*.release();
         }
         self.streams.deinit();
+        self.mutex.unlock();
         self.allocator.destroy(self);
     }
 
     /// Open a new stream.
+    /// Returns a stream with user's reference. Caller must call stream.close()
+    /// or stream.release() when done to avoid memory leaks.
     pub fn openStream(self: *Mux) !*Stream {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -434,6 +493,9 @@ pub const Mux = struct {
 
         try self.streams.put(id, stream);
         errdefer _ = self.streams.remove(id); // Remove from map before deinit to avoid dangling pointer
+
+        // Add user's reference before returning (Mux has one, user gets one)
+        stream.retain();
 
         // Send SYN (unlocked - output_fn may need to acquire other locks)
         self.mutex.unlock();
@@ -567,11 +629,17 @@ pub const Mux = struct {
         }
     }
 
-    /// Remove a stream from the Mux.
+    /// Remove a stream from the Mux and release Mux's reference.
+    /// If stream is not in map, this is a no-op.
     pub fn removeStream(self: *Mux, id: u32) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
-        _ = self.streams.remove(id);
+        const maybe_stream = self.streams.fetchRemove(id);
+        self.mutex.unlock();
+
+        // Release Mux's reference if stream was in map
+        if (maybe_stream) |kv| {
+            _ = kv.value.release();
+        }
     }
 
     /// Update all streams.
@@ -660,6 +728,8 @@ test "Mux open stream" {
     defer mux.deinit();
 
     const stream = try mux.openStream();
+    defer stream.close(); // Release user's reference before mux.deinit()
+
     try std.testing.expectEqual(@as(u32, 1), stream.getId());
     try std.testing.expectEqual(@as(usize, 1), mux.numStreams());
 }
@@ -681,5 +751,7 @@ test "Stream state" {
     defer mux.deinit();
 
     const stream = try mux.openStream();
+    defer stream.close(); // Release user's reference before mux.deinit()
+
     try std.testing.expectEqual(StreamState.open, stream.getState());
 }
