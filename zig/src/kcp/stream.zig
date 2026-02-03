@@ -180,10 +180,16 @@ pub const Stream = struct {
                 if (n > 0) {
                     const copy_len = @min(buffer.len, @as(usize, @intCast(n)));
                     @memcpy(buffer[0..copy_len], tmp[0..copy_len]);
-                    // Buffer remaining data (need recv_mutex)
+                    // Buffer remaining data (need recv_mutex) with size limit check
                     if (@as(usize, @intCast(n)) > copy_len) {
                         self.recv_mutex.lock();
-                        self.recv_buf.write(tmp[copy_len..@intCast(n)]) catch {};
+                        const current_size = self.recv_buf.readableLength();
+                        const max_size = self.mux.config.max_receive_buffer;
+                        const remaining = tmp[copy_len..@intCast(n)];
+                        if (current_size + remaining.len <= max_size) {
+                            self.recv_buf.write(remaining) catch {};
+                        }
+                        // If buffer full, drop remaining data (backpressure)
                         self.recv_mutex.unlock();
                     }
                     return copy_len;
@@ -282,8 +288,15 @@ pub const Stream = struct {
                 data_slice = heap_buf.?[0..@intCast(n)];
             }
 
-            // Phase 2: Write to recv_buf (recv_mutex)
+            // Phase 2: Write to recv_buf (recv_mutex) with size limit check
             self.recv_mutex.lock();
+            const current_size = self.recv_buf.readableLength();
+            const max_size = self.mux.config.max_receive_buffer;
+            if (current_size + data_slice.len > max_size) {
+                // Buffer full - apply backpressure by not receiving more
+                self.recv_mutex.unlock();
+                break;
+            }
             self.recv_buf.write(data_slice) catch {
                 self.recv_mutex.unlock();
                 break;

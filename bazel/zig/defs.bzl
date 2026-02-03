@@ -23,6 +23,8 @@ Run:
     bazel build //path/to/project:my_binary
 """
 
+load("@bazel_skylib//lib:shell.bzl", "shell")
+
 def _zig_run_impl(ctx):
     """Run a standalone Zig project.
     
@@ -149,20 +151,28 @@ def _zig_binary_impl(ctx):
     zig_bin = ctx.file._zig
     zig_files = ctx.attr._zig_toolchain.files.to_list()
 
-    # Generate copy commands for source files
+    # Generate copy commands for source files (with proper shell quoting)
     src_copy_commands = []
     for f in src_files:
         rel_path = f.short_path
-        src_copy_commands.append('mkdir -p "$WORK/$(dirname {})" && cp "{}" "$WORK/{}"'.format(
-            rel_path,
-            f.path,
-            rel_path,
+        # Use shell.quote to prevent command injection from file paths
+        quoted_rel = shell.quote(rel_path)
+        quoted_src = shell.quote(f.path)
+        src_copy_commands.append('mkdir -p "$WORK/$(dirname {})" && cp {} "$WORK/{}"'.format(
+            quoted_rel,
+            quoted_src,
+            quoted_rel,
         ))
 
-    # Determine zig_root and target
+    # Determine zig_root and target (with shell quoting for safety)
     zig_root = ctx.attr.zig_root if ctx.attr.zig_root else "zig"
-    target = ctx.attr.target if ctx.attr.target else ctx.attr.binary_name
     optimize = ctx.attr.optimize
+
+    # Validate attribute values to prevent injection
+    # These are from BUILD files, not user input, but we quote them for defense-in-depth
+    quoted_zig_root = shell.quote(zig_root)
+    quoted_optimize = shell.quote(optimize)
+    quoted_binary_name = shell.quote(ctx.attr.binary_name)
 
     # Build command - use absolute path to zig binary
     # After cd to work directory, relative paths don't work anymore
@@ -191,17 +201,17 @@ mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 {src_copy_commands}
 
 # Build all artifacts (don't use step name which may run the binary)
-cd "$WORK/{zig_root}"
+cd "$WORK"/{zig_root}
 "$ZIG" build -Doptimize={optimize}
 
 # Copy output to Bazel's output directory
-cp "$WORK/{zig_root}/zig-out/bin/{binary_name}" "$OUTPUT"
+cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
 """.format(
         zig_path = zig_bin.path,
-        zig_root = zig_root,
+        zig_root = quoted_zig_root,
         src_copy_commands = "\n".join(src_copy_commands),
-        optimize = optimize,
-        binary_name = ctx.attr.binary_name,
+        optimize = quoted_optimize,
+        binary_name = quoted_binary_name,
         output = out.path,
     )
 
