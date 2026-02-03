@@ -111,13 +111,12 @@ pub fn main() !void {
 
     std.debug.print("[{s}] Listening on port {}\n", .{ my_name, udp.port() });
 
-    // Find peer (the one that's not us, preferring go/rust over zig for initial tests)
+    // Find peer (the one that's not us)
     var peer_host: ?HostInfo = null;
     for (config.hosts) |h| {
         if (!std.mem.eql(u8, h.name, my_name)) {
-            if (peer_host == null or !std.mem.eql(u8, h.name, "zig")) {
-                peer_host = h;
-            }
+            peer_host = h;
+            break;
         }
     }
 
@@ -215,7 +214,8 @@ fn runOpenerTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key, p
     std.debug.print("[opener] Sent {} bytes: {s}\n", .{ test_cfg.echo_message.len, test_cfg.echo_message });
 
     // Read echo response with timeout
-    const response = try readWithTimeout(stream, 5 * std.time.ns_per_s);
+    var response_buf: [1024]u8 = undefined;
+    const response = try readWithTimeout(stream, 5 * std.time.ns_per_s, &response_buf);
     std.debug.print("[opener] Received echo response: {s}\n", .{response});
 
     // Bidirectional throughput test
@@ -268,12 +268,13 @@ fn runAccepterTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key,
     std.debug.print("[accepter] Accepted stream {}\n", .{s.getId()});
 
     // Echo test - receive and echo back
-    const received = try readWithTimeout(s, 5 * std.time.ns_per_s);
+    var recv_buf: [1024]u8 = undefined;
+    const received = try readWithTimeout(s, 5 * std.time.ns_per_s, &recv_buf);
     std.debug.print("[accepter] Received echo: {s}\n", .{received});
 
     // Echo back with prefix
     var response_buf: [256]u8 = undefined;
-    const response = std.fmt.bufPrint(&response_buf, "Echo from accepter: {s}", .{received}) catch received;
+    const response = std.fmt.bufPrint(&response_buf, "Echo from accepter: {s}", .{received}) catch received[0..@min(received.len, 256)];
     _ = s.write(response) catch |e| {
         std.debug.print("[accepter] Failed to write echo response: {}\n", .{e});
         return e;
@@ -391,18 +392,20 @@ fn runBidirectionalTest(allocator: std.mem.Allocator, stream: *Stream, role: []c
 }
 
 /// Read data from stream with timeout.
-fn readWithTimeout(stream: *Stream, timeout_ns: i128) ![]const u8 {
+/// Caller provides buffer to avoid use-after-free.
+fn readWithTimeout(stream: *Stream, timeout_ns: i128, buf: []u8) ![]u8 {
     const deadline = std.time.nanoTimestamp() + timeout_ns;
-    var buf: [4096]u8 = undefined;
-    var result: [4096]u8 = undefined;
-    var total: usize = 0;
 
     while (std.time.nanoTimestamp() < deadline) {
-        const n = stream.read(&buf) catch return result[0..total];
+        const n = stream.read(buf) catch |e| {
+            if (e == error.WouldBlock) {
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+                continue;
+            }
+            return error.ReadFailed;
+        };
         if (n > 0) {
-            @memcpy(result[total..][0..n], buf[0..n]);
-            total += n;
-            return result[0..total];
+            return buf[0..n];
         }
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }

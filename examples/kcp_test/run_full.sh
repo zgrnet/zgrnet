@@ -66,14 +66,14 @@ echo "=== Building all implementations ==="
 
 echo "Building Go kcp_test..."
 cd "$GO_DIR"
-go build -o "$SCRIPT_DIR/kcp_go" ./examples/kcp_test 2>/dev/null || {
+go build -o "$SCRIPT_DIR/kcp_go" ./examples/kcp_test || {
     echo "Note: Go kcp_test not found, skipping Go"
     touch "$SCRIPT_DIR/kcp_go_skip"
 }
 
 echo "Building Rust kcp_interop..."
 cd "$RUST_DIR"
-cargo build --example kcp_interop --release 2>/dev/null || cargo build --example kcp_interop 2>/dev/null
+cargo build --example kcp_interop --release || cargo build --example kcp_interop
 if [ -f target/release/examples/kcp_interop ]; then
     cp target/release/examples/kcp_interop "$SCRIPT_DIR/kcp_rust"
 elif [ -f target/debug/examples/kcp_interop ]; then
@@ -85,7 +85,7 @@ fi
 
 echo "Building Zig kcp_interop..."
 cd "$ZIG_DIR"
-zig build -Doptimize=ReleaseFast 2>/dev/null || zig build 2>/dev/null
+zig build -Doptimize=ReleaseFast || zig build
 if [ -f zig-out/bin/kcp_interop ]; then
     cp zig-out/bin/kcp_interop "$SCRIPT_DIR/kcp_zig"
 else

@@ -927,24 +927,35 @@ pub const UDP = struct {
             return;
         };
 
-        // Lock peer to update mux (protects against concurrent initMux calls)
-        peer.mutex.lock();
-        defer peer.mutex.unlock();
+        // Lock peer to swap mux pointer (protects against concurrent initMux calls)
+        // We extract old_mux under lock but deinit it after releasing to avoid deadlock
+        // with sendPsh which holds mux.mutex and calls sendToPeer which acquires peer.mutex.
+        var old_mux: ?*Mux = null;
+        var old_ctx: ?*MuxContext = null;
 
+        peer.mutex.lock();
         // Store UDP pointer for reference
         peer.udp_ptr = self;
 
-        // Close existing mux if any (and free its context)
-        if (peer.mux) |old_mux| {
-            if (old_mux.user_data) |old_ctx| {
-                const old_mux_ctx: *MuxContext = @ptrCast(@alignCast(old_ctx));
-                self.allocator.destroy(old_mux_ctx);
+        // Extract existing mux if any (will deinit after releasing lock)
+        if (peer.mux) |existing_mux| {
+            old_mux = existing_mux;
+            if (existing_mux.user_data) |existing_ctx| {
+                old_ctx = @ptrCast(@alignCast(existing_ctx));
             }
-            old_mux.deinit();
         }
 
         peer.mux = mux;
         peer.accept_queue = .{};
+        peer.mutex.unlock();
+
+        // Deinit old mux after releasing peer.mutex to avoid deadlock
+        if (old_mux) |m| {
+            m.deinit();
+        }
+        if (old_ctx) |c| {
+            self.allocator.destroy(c);
+        }
     }
 
     /// Mux output callback - encrypts and sends KCP data.

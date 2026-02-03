@@ -200,7 +200,6 @@ cp "$WORK/{zig_root}/zig-out/bin/{binary_name}" "$OUTPUT"
         zig_path = zig_bin.path,
         zig_root = zig_root,
         src_copy_commands = "\n".join(src_copy_commands),
-        target = target,
         optimize = optimize,
         binary_name = ctx.attr.binary_name,
         output = out.path,
