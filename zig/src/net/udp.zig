@@ -1,7 +1,8 @@
 //! Unified UDP networking layer for zgrnet.
 //!
 //! Provides a single `UDP` type that manages multiple peers, handles
-//! Noise Protocol handshakes, and supports roaming.
+//! Noise Protocol handshakes, and supports roaming. Includes KCP stream
+//! multiplexing for reliable, ordered delivery over UDP.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -10,6 +11,7 @@ const Atomic = std.atomic.Value;
 const posix = std.posix;
 
 const noise = @import("../noise/mod.zig");
+const kcp_stream = @import("../kcp/stream.zig");
 
 pub const Key = noise.Key;
 pub const KeyPair = noise.KeyPair;
@@ -20,6 +22,13 @@ pub const HandshakeState = noise.HandshakeState;
 pub const Config = noise.Config;
 pub const Pattern = noise.Pattern;
 const message = noise.message;
+
+// KCP stream exports
+pub const Mux = kcp_stream.Mux;
+pub const MuxConfig = kcp_stream.MuxConfig;
+pub const Stream = kcp_stream.Stream;
+pub const StreamState = kcp_stream.StreamState;
+pub const StreamError = kcp_stream.StreamError;
 
 /// Peer connection state.
 pub const PeerState = enum {
@@ -104,6 +113,12 @@ pub const UdpError = error{
     OutOfMemory,
     /// Message too short.
     MessageTooShort,
+    /// Mux is closed.
+    MuxClosed,
+    /// Stream error.
+    StreamError,
+    /// Accept queue is full.
+    AcceptQueueFull,
 };
 
 /// Result of reading from UDP.
@@ -141,6 +156,34 @@ pub const DecryptedPacket = struct {
     ok: bool,
 };
 
+/// Accept queue capacity for incoming streams.
+const accept_queue_capacity = 16;
+
+/// Simple bounded queue for streams (fixed-size ring buffer).
+const StreamQueue = struct {
+    items: [accept_queue_capacity]?*Stream = [_]?*Stream{null} ** accept_queue_capacity,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+
+    fn push(self: *StreamQueue, stream: *Stream) bool {
+        if (self.count >= accept_queue_capacity) return false;
+        self.items[self.tail] = stream;
+        self.tail = (self.tail + 1) % accept_queue_capacity;
+        self.count += 1;
+        return true;
+    }
+
+    fn pop(self: *StreamQueue) ?*Stream {
+        if (self.count == 0) return null;
+        const stream = self.items[self.head];
+        self.items[self.head] = null;
+        self.head = (self.head + 1) % accept_queue_capacity;
+        self.count -= 1;
+        return stream;
+    }
+};
+
 /// Internal peer state.
 const PeerStateInternal = struct {
     mutex: Mutex = .{},
@@ -154,6 +197,13 @@ const PeerStateInternal = struct {
     rx_bytes: u64,
     tx_bytes: u64,
     last_seen: ?i128,
+
+    // KCP stream multiplexing (initialized after handshake)
+    mux: ?*Mux = null,
+    accept_queue: StreamQueue = .{},
+
+    // Context for mux output callback
+    udp_ptr: ?*UDP = null,
 };
 
 /// Pending handshake tracking.
@@ -261,10 +311,20 @@ pub const UDP = struct {
         // Close socket
         posix.close(self.socket);
 
-        // Free peers
+        // Free peers (including their mux instances and contexts)
         var peer_iter = self.peers_map.valueIterator();
         while (peer_iter.next()) |peer_ptr| {
-            self.allocator.destroy(peer_ptr.*);
+            const peer = peer_ptr.*;
+            // Clean up mux if present
+            if (peer.mux) |mux| {
+                // Free the MuxContext
+                if (mux.user_data) |ctx| {
+                    const mux_ctx: *MuxContext = @ptrCast(@alignCast(ctx));
+                    self.allocator.destroy(mux_ctx);
+                }
+                mux.deinit();
+            }
+            self.allocator.destroy(peer);
         }
         self.peers_map.deinit();
         self.by_index.deinit();
@@ -792,6 +852,368 @@ pub const UDP = struct {
         return self.closed.load(.seq_cst);
     }
 
+    // ========== KCP Stream API ==========
+
+    /// Determines if we are the KCP client for a peer.
+    /// Uses deterministic rule: smaller public key is client (uses odd stream IDs).
+    fn isKcpClient(self: *UDP, remote_pk: Key) bool {
+        return std.mem.lessThan(u8, &self.local_key.public.data, &remote_pk.data);
+    }
+
+    /// Sends encrypted data to a peer with the given protocol byte.
+    fn sendToPeer(self: *UDP, peer: *PeerStateInternal, protocol: message.Protocol, data: []const u8) UdpError!void {
+        peer.mutex.lock();
+        defer peer.mutex.unlock();
+
+        const endpoint = peer.endpoint orelse return UdpError.NoEndpoint;
+        var session = peer.session orelse return UdpError.NoSession;
+
+        // Encode payload with protocol byte (use stack buffer for efficiency)
+        var payload_buf: [message.max_packet_size]u8 = undefined;
+        payload_buf[0] = @intFromEnum(protocol);
+        @memcpy(payload_buf[1..][0..data.len], data);
+        const payload = payload_buf[0 .. 1 + data.len];
+
+        // Encrypt
+        var ciphertext: [message.max_packet_size]u8 = undefined;
+        const nonce = session.encrypt(payload, ciphertext[0 .. payload.len + 16]) catch return UdpError.EncryptFailed;
+
+        // Build transport message
+        const header = message.buildTransportHeader(session.remoteIndex(), nonce);
+        var msg: [message.max_packet_size]u8 = undefined;
+        @memcpy(msg[0..message.transport_header_size], &header);
+        @memcpy(msg[message.transport_header_size..][0 .. payload.len + 16], ciphertext[0 .. payload.len + 16]);
+
+        const msg_len = message.transport_header_size + payload.len + 16;
+
+        // Send
+        const n = posix.sendto(self.socket, msg[0..msg_len], 0, &endpoint, peer.endpoint_len) catch return UdpError.SendFailed;
+
+        // Update stats
+        _ = self.total_tx.fetchAdd(@intCast(n), .seq_cst);
+        peer.tx_bytes += @intCast(n);
+        peer.session = session;
+    }
+
+    /// Context for Mux callbacks - passed as user_data.
+    const MuxContext = struct {
+        udp: *UDP,
+        peer: *PeerStateInternal,
+    };
+
+    /// Initializes the KCP Mux for a peer after handshake completes.
+    fn initMux(self: *UDP, peer: *PeerStateInternal) void {
+        const is_client = self.isKcpClient(peer.pk);
+
+        // Create context for callbacks
+        const ctx = self.allocator.create(MuxContext) catch return;
+        ctx.* = .{
+            .udp = self,
+            .peer = peer,
+        };
+
+        // Store UDP pointer for reference
+        peer.udp_ptr = self;
+
+        // Create Mux with callbacks that use the context
+        const mux = Mux.init(
+            self.allocator,
+            .{},
+            is_client,
+            &muxOutput,
+            &muxOnStreamData,
+            &muxOnNewStream,
+            ctx,
+        ) catch {
+            self.allocator.destroy(ctx);
+            return;
+        };
+
+        // Close existing mux if any (and free its context)
+        if (peer.mux) |old_mux| {
+            if (old_mux.user_data) |old_ctx| {
+                const old_mux_ctx: *MuxContext = @ptrCast(@alignCast(old_ctx));
+                self.allocator.destroy(old_mux_ctx);
+            }
+            old_mux.deinit();
+        }
+
+        peer.mux = mux;
+        peer.accept_queue = .{};
+    }
+
+    /// Mux output callback - encrypts and sends KCP data.
+    fn muxOutput(data: []const u8, user_data: ?*anyopaque) anyerror!void {
+        const ctx: *MuxContext = @ptrCast(@alignCast(user_data orelse return error.NoContext));
+        ctx.udp.sendToPeer(ctx.peer, .kcp, data) catch |e| {
+            // Log error but don't propagate - KCP will retry
+            std.log.err("muxOutput failed: {}", .{e});
+            return e;
+        };
+    }
+
+    /// Mux stream data callback - called when stream has data available.
+    fn muxOnStreamData(_: u32, _: ?*anyopaque) void {
+        // Data availability is handled internally by Stream.read
+        // User polls streams directly
+    }
+
+    /// Mux new stream callback - adds stream to accept queue.
+    fn muxOnNewStream(stream: *Stream, user_data: ?*anyopaque) void {
+        const ctx: *MuxContext = @ptrCast(@alignCast(user_data orelse return));
+        ctx.peer.mutex.lock();
+        defer ctx.peer.mutex.unlock();
+
+        // Add to accept queue
+        if (!ctx.peer.accept_queue.push(stream)) {
+            // Queue full, close the stream
+            stream.shutdown();
+        }
+    }
+
+    /// Poll for I/O events and update all KCP states.
+    /// This is the main event loop driver for passive/poll-based operation.
+    /// Call this periodically (e.g., every 1-10ms) from your main loop.
+    pub fn poll(self: *UDP, current_ms: u32) UdpError!void {
+        if (self.closed.load(.seq_cst)) {
+            return UdpError.Closed;
+        }
+
+        // 1. Process incoming packets (non-blocking)
+        var buf: [message.max_packet_size]u8 = undefined;
+        var out_buf: [message.max_packet_size]u8 = undefined;
+
+        // Process multiple packets per poll call
+        var packets_processed: usize = 0;
+        const max_packets_per_poll: usize = 100;
+
+        while (packets_processed < max_packets_per_poll) {
+            const raw = self.processIO(&buf) catch |e| {
+                if (e == UdpError.ReceiveFailed) break; // WouldBlock - no more packets
+                if (e == UdpError.Closed) return e;
+                break;
+            };
+
+            // Process the packet (handles handshakes internally, routes KCP to mux)
+            _ = self.processDecryptWithKcp(&raw, &out_buf);
+            packets_processed += 1;
+        }
+
+        // 2. Update all peer Muxes for KCP retransmissions
+        self.peers_mutex.lock();
+        defer self.peers_mutex.unlock();
+
+        var iter = self.peers_map.valueIterator();
+        while (iter.next()) |peer_ptr| {
+            const peer = peer_ptr.*;
+            if (peer.mux) |mux| {
+                mux.update(current_ms);
+            }
+        }
+    }
+
+    /// Process a decrypted packet and route KCP data to mux.
+    fn processDecryptWithKcp(self: *UDP, raw: *const RawPacket, out_buf: []u8) DecryptedPacket {
+        var result = DecryptedPacket{
+            .pk = undefined,
+            .protocol = 0,
+            .payload = &[_]u8{},
+            .len = 0,
+            .is_handshake = false,
+            .ok = false,
+        };
+
+        if (raw.len < 1) {
+            return result;
+        }
+
+        // Parse message type
+        const msg_type: message.MessageType = @enumFromInt(raw.data[0]);
+
+        // Cast sockaddr to sockaddr.in for IPv4
+        const from_addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&raw.from));
+
+        switch (msg_type) {
+            .handshake_init => {
+                self.handleHandshakeInit(raw.data[0..raw.len], from_addr, raw.from_len);
+                result.is_handshake = true;
+                result.ok = true;
+                return result;
+            },
+            .handshake_resp => {
+                self.handleHandshakeResp(raw.data[0..raw.len], from_addr, raw.from_len);
+                result.is_handshake = true;
+                result.ok = true;
+                return result;
+            },
+            .transport => {
+                // Process transport message with KCP routing
+                if (self.handleTransportWithKcp(raw.data[0..raw.len], from_addr, raw.from_len, out_buf)) |transport_result| {
+                    result.pk = transport_result.pk;
+                    result.protocol = transport_result.protocol;
+                    result.payload = out_buf[0..transport_result.len];
+                    result.len = transport_result.len;
+                    result.ok = true;
+                }
+                return result;
+            },
+            else => return result,
+        }
+    }
+
+    /// Transport result with protocol byte.
+    const TransportResult = struct {
+        pk: Key,
+        protocol: u8,
+        len: usize,
+    };
+
+    /// Handle transport message with KCP protocol routing.
+    fn handleTransportWithKcp(self: *UDP, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t, out_buf: []u8) ?TransportResult {
+        const msg = message.parseTransportMessage(data) catch return null;
+
+        // Find peer by receiver index
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            const peer_pk = self.by_index.get(msg.receiver_index) orelse return null;
+            break :blk self.peers_map.get(peer_pk) orelse return null;
+        };
+
+        // Decrypt and update state, get mux reference (release lock before mux.input)
+        const decrypt_result = blk: {
+            peer.mutex.lock();
+            defer peer.mutex.unlock();
+
+            var session = peer.session orelse return null;
+
+            // Decrypt
+            const n = session.decrypt(msg.ciphertext, msg.counter, out_buf) catch return null;
+
+            // Update peer state (roaming + stats)
+            peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
+            peer.endpoint_len = from_len;
+            peer.endpoint_port = std.mem.bigToNative(u16, from.port);
+            peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
+            peer.rx_bytes += @intCast(data.len);
+            peer.last_seen = std.time.nanoTimestamp();
+            peer.session = session;
+
+            break :blk .{
+                .n = n,
+                .pk = peer.pk,
+                .mux = peer.mux,
+            };
+        };
+
+        if (decrypt_result.n == 0) {
+            // Empty keepalive
+            return null;
+        }
+
+        // Decode protocol and payload
+        const decode_result = message.decodePayload(out_buf[0..decrypt_result.n]) catch return null;
+        const protocol = decode_result.protocol;
+        const payload = decode_result.payload;
+
+        // Route based on protocol (peer lock NOT held here to avoid deadlock)
+        if (protocol == .kcp) {
+            // Route to KCP Mux
+            if (decrypt_result.mux) |mux| {
+                mux.input(payload) catch {};
+            }
+            // KCP data handled internally, return null to not expose to user
+            return null;
+        }
+
+        // Non-KCP protocol, copy payload to output
+        const payload_len = payload.len;
+        if (payload_len > 0 and payload_len <= out_buf.len) {
+            // Move payload to start of buffer
+            std.mem.copyForwards(u8, out_buf[0..payload_len], payload);
+        }
+
+        return TransportResult{
+            .pk = decrypt_result.pk,
+            .protocol = @intFromEnum(protocol),
+            .len = payload_len,
+        };
+    }
+
+    /// Opens a new KCP stream to the specified peer.
+    /// The peer must be in established state with mux initialized.
+    pub fn openStream(self: *UDP, pk: *const Key) UdpError!*Stream {
+        if (self.closed.load(.seq_cst)) {
+            return UdpError.Closed;
+        }
+
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(pk.*) orelse return UdpError.PeerNotFound;
+        };
+
+        // Get mux without holding peer lock (avoid deadlock with muxOutput)
+        const mux = blk: {
+            peer.mutex.lock();
+            defer peer.mutex.unlock();
+
+            if (peer.state != .established) {
+                return UdpError.NoSession;
+            }
+
+            break :blk peer.mux orelse return UdpError.NoSession;
+        };
+
+        // openStream() will call output callback which needs peer.mutex
+        return mux.openStream() catch return UdpError.MuxClosed;
+    }
+
+    /// Accepts an incoming KCP stream from the specified peer.
+    /// Returns null if no stream is available (non-blocking).
+    /// The peer must be in established state with mux initialized.
+    pub fn acceptStream(self: *UDP, pk: *const Key) ?*Stream {
+        if (self.closed.load(.seq_cst)) {
+            return null;
+        }
+
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(pk.*) orelse return null;
+        };
+
+        peer.mutex.lock();
+        defer peer.mutex.unlock();
+
+        if (peer.state != .established) {
+            return null;
+        }
+
+        // Pop from accept queue
+        return peer.accept_queue.pop();
+    }
+
+    /// Returns the Mux for a peer, if available.
+    pub fn getMux(self: *UDP, pk: *const Key) ?*Mux {
+        if (self.closed.load(.seq_cst)) {
+            return null;
+        }
+
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers_map.get(pk.*) orelse return null;
+        };
+
+        peer.mutex.lock();
+        defer peer.mutex.unlock();
+
+        return peer.mux;
+    }
+
+    // ========== End KCP Stream API ==========
+
     // Internal: handle incoming handshake initiation
     fn handleHandshakeInit(self: *UDP, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t) void {
         const msg = message.parseHandshakeInit(data) catch return;
@@ -899,6 +1321,11 @@ pub const UDP = struct {
             defer self.peers_mutex.unlock();
             self.by_index.put(local_idx, remote_pk) catch {};
         }
+
+        // Initialize KCP Mux for this peer
+        if (peer_opt) |peer| {
+            self.initMux(peer);
+        }
     }
 
     // Internal: handle incoming handshake response
@@ -978,6 +1405,11 @@ pub const UDP = struct {
             self.peers_mutex.lock();
             defer self.peers_mutex.unlock();
             self.by_index.put(pending.local_idx, pending.peer_pk) catch {};
+        }
+
+        // Initialize KCP Mux for this peer
+        if (peer_opt) |peer| {
+            self.initMux(peer);
         }
 
         // Signal completion

@@ -108,10 +108,10 @@ func main() {
 	log.Printf("[%s] Public key: %x", *name, keyPair.Public[:8])
 	log.Printf("[%s] Role: %s", *name, myInfo.Role)
 
-	// Find peer info
+	// Find peer info (first host that is not us)
 	var peerInfo *HostInfo
 	for i := range config.Hosts {
-		if config.Hosts[i].Name != *name && config.Hosts[i].Name != "zig" {
+		if config.Hosts[i].Name != *name {
 			peerInfo = &config.Hosts[i]
 			break
 		}

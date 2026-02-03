@@ -53,10 +53,18 @@ pub const PeerState = udp.PeerState;
 pub const HostInfo = udp.HostInfo;
 pub const PeerInfo = udp.PeerInfo;
 pub const ReadResult = udp.ReadResult;
+pub const UdpError = udp.UdpError;
 
 // Pipeline API types for high-throughput scenarios
 pub const RawPacket = udp.RawPacket;
 pub const DecryptedPacket = udp.DecryptedPacket;
+
+// KCP stream types (re-exported from UDP)
+pub const Mux = udp.Mux;
+pub const MuxConfig = udp.MuxConfig;
+pub const Stream = udp.Stream;
+pub const StreamState = udp.StreamState;
+pub const StreamError = udp.StreamError;
 
 // Re-export constants
 pub const rekey_after_time_ns = consts.rekey_after_time_ns;

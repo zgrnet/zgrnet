@@ -318,7 +318,7 @@ func runStreamBenchmark(clientStream, serverStream *znet.Stream, dataSizeMB, chu
 	totalBytes := int64(dataSizeMB) * 1024 * 1024
 	chunkBytes := chunkSizeKB * 1024
 
-	log.Printf("[bench] Starting KCP throughput test: %d MB, chunk size %d KB", dataSizeMB, chunkSizeKB)
+	log.Printf("[bench] Starting KCP BIDIRECTIONAL throughput test: %d MB each direction, chunk size %d KB", dataSizeMB, chunkSizeKB)
 
 	// Generate random data
 	chunk := make([]byte, chunkBytes)
@@ -326,48 +326,84 @@ func runStreamBenchmark(clientStream, serverStream *znet.Stream, dataSizeMB, chu
 		log.Fatalf("[bench] Failed to generate random data: %v", err)
 	}
 
-	// Server reads all data
 	var wg sync.WaitGroup
-	var serverErr error
-	var serverBytes int64
+	var clientTxBytes, clientRxBytes, serverTxBytes, serverRxBytes int64
 
+	start := time.Now()
+
+	// Client writer (client -> server)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var sent int64
+		iterations := int(totalBytes) / chunkBytes
+		for i := 0; i < iterations; i++ {
+			n, err := clientStream.Write(chunk)
+			if err != nil {
+				log.Printf("[client-tx] Write failed: %v", err)
+				return
+			}
+			sent += int64(n)
+		}
+		atomic.StoreInt64(&clientTxBytes, sent)
+	}()
+
+	// Client reader (server -> client)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, chunkBytes)
-		for serverBytes < totalBytes {
+		var recv int64
+		for recv < totalBytes {
+			n, err := clientStream.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return
+			}
+			recv += int64(n)
+		}
+		atomic.StoreInt64(&clientRxBytes, recv)
+	}()
+
+	// Server writer (server -> client)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var sent int64
+		iterations := int(totalBytes) / chunkBytes
+		for i := 0; i < iterations; i++ {
+			n, err := serverStream.Write(chunk)
+			if err != nil {
+				log.Printf("[server-tx] Write failed: %v", err)
+				return
+			}
+			sent += int64(n)
+		}
+		atomic.StoreInt64(&serverTxBytes, sent)
+	}()
+
+	// Server reader (client -> server)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, chunkBytes)
+		var recv int64
+		for recv < totalBytes {
 			n, err := serverStream.Read(buf)
 			if err != nil {
 				if err == io.EOF {
 					break
 				}
-				serverErr = err
 				return
 			}
-			serverBytes += int64(n)
+			recv += int64(n)
 		}
+		atomic.StoreInt64(&serverRxBytes, recv)
 	}()
 
-	// Client sends all data
-	start := time.Now()
-	var sentBytes int64
-	iterations := int(totalBytes) / chunkBytes
-
-	for i := 0; i < iterations; i++ {
-		n, err := clientStream.Write(chunk)
-		if err != nil {
-			log.Fatalf("[bench] Write failed at iteration %d: %v", i, err)
-		}
-		sentBytes += int64(n)
-
-		// Progress update every 10%
-		if (i+1)%(iterations/10+1) == 0 {
-			progress := float64(i+1) / float64(iterations) * 100
-			log.Printf("[bench] Progress: %.0f%% (%d/%d MB)", progress, (i+1)*chunkSizeKB/1024, dataSizeMB)
-		}
-	}
-
-	// Wait for server to receive all data (with timeout)
+	// Wait for all goroutines with timeout
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -376,23 +412,24 @@ func runStreamBenchmark(clientStream, serverStream *znet.Stream, dataSizeMB, chu
 
 	select {
 	case <-done:
-	case <-time.After(30 * time.Second):
-		log.Printf("[bench] Warning: Timeout waiting for server to receive all data")
+	case <-time.After(120 * time.Second):
+		log.Printf("[bench] Warning: Timeout waiting for completion")
 	}
 
 	elapsed := time.Since(start)
 
-	if serverErr != nil {
-		log.Fatalf("[bench] Server read error: %v", serverErr)
-	}
-
 	// Calculate throughput
-	throughputMBps := float64(sentBytes) / elapsed.Seconds() / 1024 / 1024
+	totalTransfer := atomic.LoadInt64(&clientTxBytes) + atomic.LoadInt64(&clientRxBytes) +
+		atomic.LoadInt64(&serverTxBytes) + atomic.LoadInt64(&serverRxBytes)
+	throughputMBps := float64(totalTransfer) / elapsed.Seconds() / 1024 / 1024
 
-	log.Printf("[bench] ========== KCP Results ==========")
-	log.Printf("[bench] Sent:       %d bytes (%.2f MB)", sentBytes, float64(sentBytes)/1024/1024)
-	log.Printf("[bench] Received:   %d bytes (%.2f MB)", serverBytes, float64(serverBytes)/1024/1024)
+	log.Printf("[bench] ========== KCP Bidirectional Results ==========")
+	log.Printf("[bench] Client TX:  %d bytes (%.2f MB)", atomic.LoadInt64(&clientTxBytes), float64(atomic.LoadInt64(&clientTxBytes))/1024/1024)
+	log.Printf("[bench] Client RX:  %d bytes (%.2f MB)", atomic.LoadInt64(&clientRxBytes), float64(atomic.LoadInt64(&clientRxBytes))/1024/1024)
+	log.Printf("[bench] Server TX:  %d bytes (%.2f MB)", atomic.LoadInt64(&serverTxBytes), float64(atomic.LoadInt64(&serverTxBytes))/1024/1024)
+	log.Printf("[bench] Server RX:  %d bytes (%.2f MB)", atomic.LoadInt64(&serverRxBytes), float64(atomic.LoadInt64(&serverRxBytes))/1024/1024)
+	log.Printf("[bench] Total:      %d bytes (%.2f GB)", totalTransfer, float64(totalTransfer)/1024/1024/1024)
 	log.Printf("[bench] Time:       %v", elapsed)
-	log.Printf("[bench] Throughput: %.2f MB/s", throughputMBps)
-	log.Printf("[bench] ==================================")
+	log.Printf("[bench] Throughput: %.2f MB/s (bidirectional)", throughputMBps)
+	log.Printf("[bench] ================================================")
 }

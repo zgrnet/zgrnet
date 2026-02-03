@@ -82,11 +82,11 @@ fn main() {
     let info = udp.host_info();
     println!("[{}] Listening on {}", name, info.addr);
 
-    // Find peer (skip zig for now)
+    // Find peer (first host that is not us)
     let peer_host = config
         .hosts
         .iter()
-        .find(|h| h.name != name && h.name != "zig")
+        .find(|h| h.name != name)
         .unwrap_or_else(|| panic!("No peer found in config"));
 
     let peer_priv_bytes = hex::decode(&peer_host.private_key).unwrap();
