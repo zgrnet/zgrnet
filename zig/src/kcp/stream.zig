@@ -565,25 +565,25 @@ pub const Mux = struct {
     /// Lock order: We release mux.mutex before calling stream methods to avoid
     /// deadlock with Stream.write() which holds kcp_mutex and calls sendPsh().
     pub fn update(self: *Mux, current: u32) void {
-        // Collect stream pointers under lock
-        var stream_list: [256]*Stream = undefined;
-        var id_list: [256]u32 = undefined;
-        var count: usize = 0;
+        // Use arena allocator for temporary dynamic lists to handle any number of streams
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
 
+        var stream_list = std.array_list.AlignedManaged(*Stream, null).init(alloc);
+        var id_list = std.array_list.AlignedManaged(u32, null).init(alloc);
+
+        // Collect stream pointers under lock
         self.mutex.lock();
         var iter = self.streams.iterator();
         while (iter.next()) |entry| {
-            if (count >= 256) break;
-            stream_list[count] = entry.value_ptr.*;
-            id_list[count] = entry.key_ptr.*;
-            count += 1;
+            stream_list.append(entry.value_ptr.*) catch break;
+            id_list.append(entry.key_ptr.*) catch break;
         }
         self.mutex.unlock();
 
         // Update streams without holding mux.mutex (avoids deadlock with write->sendPsh)
-        for (0..count) |i| {
-            const stream = stream_list[i];
-            const id = id_list[i];
+        for (stream_list.items, id_list.items) |stream, id| {
             stream.kcpUpdate(current);
             if (stream.kcpRecv()) {
                 self.on_stream_data(id, self.user_data);

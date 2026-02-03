@@ -152,10 +152,10 @@ pub fn main() !void {
 
     const poll_thread = try std.Thread.spawn(.{}, struct {
         fn poll(ctx: PollCtx) void {
-            var current_ms: u32 = 0;
+            const start = std.time.milliTimestamp();
             while (ctx.running.load(.seq_cst)) {
+                const current_ms: u32 = @truncate(@as(u64, @intCast(std.time.milliTimestamp() - start)));
                 ctx.udp.poll(current_ms) catch {};
-                current_ms +%= 1;
                 std.Thread.sleep(1 * std.time.ns_per_ms);
             }
         }
