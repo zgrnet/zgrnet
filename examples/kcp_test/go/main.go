@@ -1,8 +1,8 @@
-// Package main demonstrates KCP stream interoperability between Go and Rust.
+// Package main demonstrates KCP stream interoperability between Go, Rust, and Zig.
 //
 // Usage:
 //
-//	go run ./examples/kcp_test -name go -config ../examples/kcp_test/config.json
+//	go run . -name go -config ../config.json
 package main
 
 import (

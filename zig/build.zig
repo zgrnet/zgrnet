@@ -116,6 +116,15 @@ pub fn build(b: *std.Build) void {
     addKcpFiles(lib, kcp_path);
     b.installArtifact(lib);
 
+    // Export module for dependents (e.g., examples/kcp_test/zig)
+    // This allows other packages to do: dep.module("noise")
+    _ = b.addModule("noise", .{
+        .root_source_file = b.path("src/noise.zig"),
+        .imports = &.{
+            .{ .name = "build_options", .module = options.createModule() },
+        },
+    });
+
     // Test module
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/noise.zig"),
@@ -205,9 +214,9 @@ pub fn build(b: *std.Build) void {
     const throughput_test_step = b.step("throughput", "Run throughput test");
     throughput_test_step.dependOn(&run_throughput_test.step);
 
-    // KCP Stream test example
+    // KCP Stream test (source in examples/stream_test/zig/)
     const kcp_stream_test_module = b.createModule(.{
-        .root_source_file = b.path("examples/kcp_stream_test.zig"),
+        .root_source_file = b.path("../examples/stream_test/zig/src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -215,7 +224,7 @@ pub fn build(b: *std.Build) void {
     kcp_stream_test_module.addImport("noise", lib_module);
 
     const kcp_stream_test_exe = b.addExecutable(.{
-        .name = "kcp_stream_test",
+        .name = "stream_test",
         .root_module = kcp_stream_test_module,
     });
     kcp_stream_test_exe.linkLibrary(lib);
@@ -225,12 +234,12 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_kcp_stream_test.addArgs(args);
     }
-    const kcp_stream_test_step = b.step("kcp_stream_test", "Run KCP stream throughput test");
+    const kcp_stream_test_step = b.step("stream_test", "Run KCP stream throughput test");
     kcp_stream_test_step.dependOn(&run_kcp_stream_test.step);
 
-    // KCP Interop test example (for cross-language testing)
+    // KCP Interop test (source in examples/kcp_test/zig/)
     const kcp_interop_module = b.createModule(.{
-        .root_source_file = b.path("examples/kcp_interop.zig"),
+        .root_source_file = b.path("../examples/kcp_test/zig/src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -238,7 +247,7 @@ pub fn build(b: *std.Build) void {
     kcp_interop_module.addImport("noise", lib_module);
 
     const kcp_interop_exe = b.addExecutable(.{
-        .name = "kcp_interop",
+        .name = "kcp_test",
         .root_module = kcp_interop_module,
     });
     kcp_interop_exe.linkLibrary(lib);
@@ -248,6 +257,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_kcp_interop.addArgs(args);
     }
-    const kcp_interop_step = b.step("kcp_interop", "Run KCP interop test");
+    const kcp_interop_step = b.step("kcp_test", "Run KCP interop test");
     kcp_interop_step.dependOn(&run_kcp_interop.step);
 }

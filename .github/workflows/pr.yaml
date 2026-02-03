@@ -51,10 +51,11 @@ jobs:
           echo "has_targets=$([[ -n "$TARGETS" ]] && echo true || echo false)" >> $GITHUB_OUTPUT
           
           # Detect language changes for native tests
+          # Include both main SDK dirs and examples
           changed=$(git diff --name-only "$BASE" HEAD)
-          echo "has_go=$(echo "$changed" | grep -q '^go/' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_rust=$(echo "$changed" | grep -q '^rust/' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_zig=$(echo "$changed" | grep -q '^zig/' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_go=$(echo "$changed" | grep -qE '^(go/|examples/.*/go/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|examples/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|examples/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build affected targets
   build:

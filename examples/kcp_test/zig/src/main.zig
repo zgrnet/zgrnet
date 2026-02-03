@@ -1,7 +1,7 @@
 //! KCP stream interoperability test between Zig, Go, and Rust.
 //!
 //! Usage:
-//!   zig build kcp_interop && ./zig-out/bin/kcp_interop --name zig --config ../examples/kcp_test/config.json
+//!   zig build run -- --name zig --config ../config.json
 
 const std = @import("std");
 const posix = std.posix;

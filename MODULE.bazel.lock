@@ -268,7 +268,7 @@
         "usagesDigest": "G5eTdyVnytctdzA+HKAuFYG2Ar2EZYSTIlsg8LYavkY=",
         "recordedFileInputs": {
           "@@//rust/Cargo.lock": "78ebc2e1ee8e251977cb338852d746220983e4935def232279e83cf0940aed97",
-          "@@//rust/Cargo.toml": "69179d90e05886a26ecd0c655bbb85657af39ce3d737255ede6ff8e935289947"
+          "@@//rust/Cargo.toml": "0210a5a118a973d8333e622c06102eb0083e74a98db499fd6a338c6e47a0cfc7"
         },
         "recordedDirentsInputs": {},
         "envVariables": {
