@@ -1,0 +1,98 @@
+//! Async Runtime Primitives
+//!
+//! This module provides platform-agnostic async runtime primitives that allow
+//! Zig code to be driven by external executors and timers.
+//!
+//! ## Design Philosophy
+//!
+//! Zig is often used in embedded or library scenarios where:
+//! - The host application has its own event loop (Go, Rust, C with libuv, etc.)
+//! - Zig should not create threads or run its own scheduler
+//! - All timing and scheduling should be delegated to the platform
+//!
+//! This module defines the **interfaces** (traits), and the platform provides
+//! the **implementations**.
+//!
+//! ## Core Primitives
+//!
+//! - `Task` - A type-erased callable unit of work
+//! - `Executor` - An execution context that can run tasks
+//! - `TimerService` - A service for scheduling delayed tasks
+//! - `Actor` - A state machine with a message queue (single-threaded execution)
+//!
+//! ## Implementations
+//!
+//! Two implementation backends are provided:
+//!
+//! - `thread` - std.Thread based implementations (ThreadExecutor, EventLoop)
+//! - `minicoro` - C coroutine based implementation (CoroScheduler)
+//!
+//! ## Usage Example
+//!
+//! ```zig
+//! const async_mod = @import("async");
+//!
+//! // Using thread-based executor
+//! var loop = async_mod.thread.EventLoop.init(allocator);
+//! defer loop.deinit();
+//! loop.executor().dispatch(my_task);
+//!
+//! // Using minicoro-based coroutines (requires C linkage)
+//! var scheduler = async_mod.minicoro.CoroScheduler.init(allocator);
+//! defer scheduler.deinit();
+//! ```
+//!
+//! ## Testing Utilities
+//!
+//! The module also provides simple implementations for testing:
+//! - `InlineExecutor` - Executes tasks immediately
+//! - `QueuedExecutor` - Queues tasks for manual execution
+//! - `SimpleTimerService` - Manual time advancement for testing
+
+const std = @import("std");
+
+// Core primitives (platform-independent interfaces)
+pub const task = @import("task.zig");
+pub const executor = @import("executor.zig");
+pub const timer = @import("timer.zig");
+pub const mpsc = @import("mpsc.zig");
+pub const actor = @import("actor.zig");
+
+// Implementation backends
+pub const thread = @import("thread/mod.zig");
+pub const minicoro = @import("minicoro/mod.zig");
+
+// Re-export main types for convenience
+pub const Task = task.Task;
+pub const Executor = executor.Executor;
+pub const TimerService = timer.TimerService;
+pub const TimerHandle = timer.TimerHandle;
+
+// Re-export testing utilities
+pub const InlineExecutor = executor.InlineExecutor;
+pub const QueuedExecutor = executor.QueuedExecutor;
+pub const SimpleTimerService = timer.SimpleTimerService;
+
+// Re-export actor types
+pub const Actor = actor.Actor;
+pub const ActorHandle = actor.ActorHandle;
+
+// Re-export MPSC queue
+pub const MpscQueue = mpsc.MpscQueue;
+
+// Convenience re-exports from thread backend (most common usage)
+pub const ThreadExecutor = thread.ThreadExecutor;
+pub const ThreadExecutorWithTimers = thread.ThreadExecutorWithTimers;
+pub const EventLoop = thread.EventLoop;
+pub const Coroutine = thread.Coroutine;
+
+// Tests
+test {
+    _ = task;
+    _ = executor;
+    _ = timer;
+    _ = mpsc;
+    _ = actor;
+    _ = thread;
+    // Note: minicoro tests require C linkage, tested separately
+}

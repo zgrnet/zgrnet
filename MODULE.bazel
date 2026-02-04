@@ -49,3 +49,19 @@ bazel_dep(name = "bazel_skylib", version = "1.7.1")
 
 # BoringSSL
 bazel_dep(name = "boringssl", version = "0.20250212.0")
+
+# Minicoro - single-header coroutine library
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(
+    name = "minicoro",
+    urls = ["https://github.com/edubart/minicoro/archive/refs/heads/main.tar.gz"],
+    strip_prefix = "minicoro-main",
+    integrity = "sha256-VC+XUbdzpL0FzEZu8PGxXAuc0jIv+RRQrBckiQe8G1k=",
+    build_file_content = """
+cc_library(
+    name = "minicoro",
+    hdrs = ["minicoro.h"],
+    visibility = ["//visibility:public"],
+)
+""",
+)

@@ -12,6 +12,7 @@ pub const net = @import("net/mod.zig");
 pub const kcp_mod = @import("kcp/mod.zig");
 pub const sync = @import("sync/mod.zig");
 pub const os = @import("os/mod.zig");
+pub const async_mod = @import("async/mod.zig");
 
 // KCP multiplexing (re-export submodules)
 pub const kcp = kcp_mod.kcp;
@@ -86,6 +87,18 @@ pub const MuxConfig = stream.MuxConfig;
 pub const Channel = sync.Channel;
 pub const ReadySignal = sync.ReadySignal;
 
+// Async runtime types
+pub const Task = async_mod.Task;
+pub const Executor = async_mod.Executor;
+pub const TimerService = async_mod.TimerService;
+pub const TimerHandle = async_mod.TimerHandle;
+pub const Actor = async_mod.Actor;
+pub const ActorHandle = async_mod.ActorHandle;
+pub const MpscQueue = async_mod.MpscQueue;
+pub const InlineExecutor = async_mod.InlineExecutor;
+pub const QueuedExecutor = async_mod.QueuedExecutor;
+pub const SimpleTimerService = async_mod.SimpleTimerService;
+
 /// Returns the name of the active cipher backend.
 pub fn backendName() []const u8 {
     return noise.backendName();
@@ -98,4 +111,5 @@ test {
     _ = kcp_mod;
     _ = sync;
     _ = os;
+    _ = async_mod;
 }
