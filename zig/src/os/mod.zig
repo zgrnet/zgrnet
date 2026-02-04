@@ -23,9 +23,14 @@ const build_options = @import("build_options");
 
 /// Platform implementations
 pub const Darwin = @import("darwin.zig");
-pub const None = @import("none.zig").None;
+pub const none = @import("none.zig");
+pub const None = none.None;
 // pub const Linux = @import("linux.zig");       // TODO
 // pub const FreeRtos = @import("freertos.zig"); // TODO
+
+/// IOService implementations
+pub const KqueueIO = Darwin.KqueueIO;
+pub const BusyPollIO = none.BusyPollIO;
 
 /// Build-time selected OS backend
 pub const OsBackend = build_options.os_backend;

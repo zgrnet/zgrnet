@@ -1,1782 +1,1361 @@
-//! Unified UDP networking layer for zgrnet.
+//! UDP Network Layer with Noise Protocol
 //!
-//! Provides a single `UDP` type that manages multiple peers, handles
-//! Noise Protocol handshakes, and supports roaming. Includes KCP stream
-//! multiplexing for reliable, ordered delivery over UDP.
+//! This module implements a UDP-based network using the Noise Protocol,
+//! with a double-queue architecture matching Go/Rust implementations:
+//!
+//! ## Architecture
+//!
+//! ```
+//! socket -> ioLoop -> [decryptChan] -> workers -> signal ready
+//!                  -> [outputChan] -> readFrom waits -> returns
+//! ```
+//!
+//! - **ioLoop**: Single thread reading from socket, dispatches to both queues
+//! - **decryptWorkers**: N threads processing packets in parallel
+//! - **readFrom**: Waits for ready signal, returns decrypted data
+//!
+//! ## Design
+//!
+//! Uses comptime generics for IOService injection, allowing platform-specific
+//! optimizations (kqueue on macOS, epoll on Linux, select fallback).
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
-const Mutex = std.Thread.Mutex;
-const Atomic = std.atomic.Value;
 const posix = std.posix;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const Thread = std.Thread;
+const Mutex = Thread.Mutex;
+const Atomic = std.atomic.Value;
 
 const noise = @import("../noise/mod.zig");
-const kcp_stream = @import("../kcp/stream.zig");
+const async_mod = @import("../async/mod.zig");
+const os_mod = @import("../os/mod.zig");
+const kcp_mod = @import("../kcp/mod.zig");
+const Channel = async_mod.channel.Channel;
+const Signal = async_mod.channel.Signal;
+const Reactor = os_mod.Darwin.Reactor;
+pub const SimpleTimerService = async_mod.SimpleTimerService;
+pub const KcpMux = kcp_mod.Mux(SimpleTimerService);
+pub const KcpStream = kcp_mod.Stream;
 
-pub const Key = noise.Key;
-pub const KeyPair = noise.KeyPair;
-pub const key_size = noise.key_size;
-pub const Session = noise.Session;
-pub const SessionConfig = noise.SessionConfig;
-pub const HandshakeState = noise.HandshakeState;
-pub const Config = noise.Config;
-pub const Pattern = noise.Pattern;
+const Key = noise.Key;
+const KeyPair = noise.KeyPair;
+const Session = noise.Session;
+const SessionConfig = noise.SessionConfig;
+const SessionState = noise.SessionState;
+const HandshakeState = noise.HandshakeState;
 const message = noise.message;
 
-// KCP stream exports
-pub const Mux = kcp_stream.Mux;
-pub const MuxConfig = kcp_stream.MuxConfig;
-pub const Stream = kcp_stream.Stream;
-pub const StreamState = kcp_stream.StreamState;
-pub const StreamError = kcp_stream.StreamError;
+// ============================================================================
+// Constants
+// ============================================================================
 
-/// Peer connection state.
-pub const PeerState = enum {
-    /// Newly registered peer.
-    new,
-    /// Performing handshake.
-    connecting,
-    /// Session established.
-    established,
-    /// Connection failed.
-    failed,
+/// Default decrypt channel size (raw packets waiting for decryption).
+pub const DecryptChanSize: usize = 4096;
 
-    pub fn format(
-        self: PeerState,
-        comptime _: []const u8,
-        _: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        try writer.writeAll(switch (self) {
-            .new => "new",
-            .connecting => "connecting",
-            .established => "established",
-            .failed => "failed",
-        });
-    }
-};
+/// Default output channel size (packets waiting for readFrom).
+pub const OutputChanSize: usize = 256;
 
-
-/// Information about a peer.
-pub const PeerInfo = struct {
-    public_key: Key,
-    endpoint_port: u16,
-    endpoint_addr: u32, // IPv4 address in network byte order
-    has_endpoint: bool,
-    state: PeerState,
-    rx_bytes: u64,
-    tx_bytes: u64,
-    last_seen_ns: i64,
-};
-
-/// Information about the local host.
-pub const HostInfo = struct {
-    public_key: Key,
-    addr_port: u16,
-    addr_ip: u32, // IPv4 address in network byte order
-    peer_count: usize,
-    rx_bytes: u64,
-    tx_bytes: u64,
-    last_seen_ns: i64,
-};
-
-/// A peer with its info.
-pub const Peer = struct {
-    info: PeerInfo,
-};
-
-/// Errors from UDP operations.
-pub const UdpError = error{
-    /// UDP socket is closed.
-    Closed,
-    /// Peer not found.
-    PeerNotFound,
-    /// Peer has no endpoint.
-    NoEndpoint,
-    /// Peer has no established session.
-    NoSession,
-    /// Handshake failed.
-    HandshakeFailed,
-    /// Handshake timeout.
-    HandshakeTimeout,
-    /// Socket bind failed.
-    BindFailed,
-    /// Socket receive failed.
-    ReceiveFailed,
-    /// Socket send failed.
-    SendFailed,
-    /// Encryption failed.
-    EncryptFailed,
-    /// Decryption failed.
-    DecryptFailed,
-    /// Out of memory.
-    OutOfMemory,
-    /// Message too short.
-    MessageTooShort,
-    /// Mux is closed.
-    MuxClosed,
-    /// Stream error.
-    StreamError,
-    /// Accept queue is full.
-    AcceptQueueFull,
-};
-
-/// Result of reading from UDP.
-pub const ReadResult = struct {
-    pk: Key,
-    n: usize,
-};
-
-/// Raw packet from socket (for pipeline processing).
-/// The caller owns the data buffer and is responsible for freeing it.
-pub const RawPacket = struct {
-    /// Raw data buffer (caller-owned).
-    data: []u8,
-    /// Actual data length.
-    len: usize,
-    /// Sender's socket address.
-    from: posix.sockaddr,
-    /// Address length.
-    from_len: posix.socklen_t,
-};
-
-/// Decrypted packet ready for consumption (for pipeline processing).
-pub const DecryptedPacket = struct {
-    /// Sender's public key.
-    pk: Key,
-    /// Protocol byte.
-    protocol: u8,
-    /// Decrypted payload (slice into caller's buffer).
-    payload: []const u8,
-    /// Payload length.
-    len: usize,
-    /// True if this is a handshake packet (handled internally).
-    is_handshake: bool,
-    /// True if decryption was successful.
-    ok: bool,
-};
+/// Default number of decrypt workers (0 = use CPU count).
+pub const DefaultWorkers: usize = 0;
 
 /// Accept queue capacity for incoming streams.
-const accept_queue_capacity = 16;
+pub const AcceptQueueCapacity: usize = 16;
 
-/// Simple bounded queue for streams (fixed-size ring buffer).
-const StreamQueue = struct {
-    items: [accept_queue_capacity]?*Stream = [_]?*Stream{null} ** accept_queue_capacity,
-    head: usize = 0,
-    tail: usize = 0,
-    count: usize = 0,
+/// Maximum packet size.
+pub const MaxPacketSize: usize = message.max_packet_size;
 
-    fn push(self: *StreamQueue, stream: *Stream) bool {
-        if (self.count >= accept_queue_capacity) return false;
-        self.items[self.tail] = stream;
-        self.tail = (self.tail + 1) % accept_queue_capacity;
-        self.count += 1;
-        return true;
+// ============================================================================
+// Errors
+// ============================================================================
+
+pub const UdpError = error{
+    /// Failed to bind the socket.
+    BindFailed,
+    /// Failed to send data.
+    SendFailed,
+    /// Failed to receive data.
+    ReceiveFailed,
+    /// No peer found for the given public key.
+    PeerNotFound,
+    /// Handshake failed.
+    HandshakeFailed,
+    /// Handshake timed out.
+    HandshakeTimeout,
+    /// Message too short to be valid.
+    MessageTooShort,
+    /// Decryption failed.
+    DecryptFailed,
+    /// UDP socket is closed.
+    Closed,
+    /// No data available (non-blocking).
+    NoData,
+    /// Accept queue is full.
+    AcceptQueueFull,
+    /// Out of memory.
+    OutOfMemory,
+    /// Channel closed.
+    ChannelClosed,
+};
+
+// ============================================================================
+// Packet
+// ============================================================================
+
+/// A packet in the processing pipeline.
+/// Carries raw data and gets decrypted in parallel by workers.
+/// Consumers wait on the ready signal before accessing decrypted data.
+pub const Packet = struct {
+    // Input (set by ioLoop)
+    data: []u8, // Buffer (from pool)
+    len: usize, // Actual data length
+    from_addr: posix.sockaddr.in, // Sender address
+    from_len: posix.socklen_t, // Address length
+
+    // Output (set by decryptWorker)
+    pk: Key, // Sender's public key
+    protocol: u8, // Protocol byte
+    payload: []u8, // Decrypted payload (slice into data or out_buf)
+    payload_len: usize, // Payload length
+    err: ?UdpError, // Decrypt error (if any)
+
+    // Decryption output buffer
+    out_buf: [MaxPacketSize]u8,
+
+    // Synchronization
+    ready: Signal, // Signaled when decryption is complete
+
+    pub fn init() Packet {
+        return Packet{
+            .data = &[_]u8{},
+            .len = 0,
+            .from_addr = undefined,
+            .from_len = 0,
+            .pk = Key.zero,
+            .protocol = 0,
+            .payload = &[_]u8{},
+            .payload_len = 0,
+            .err = null,
+            .out_buf = undefined,
+            .ready = Signal.init(),
+        };
     }
 
-    fn pop(self: *StreamQueue) ?*Stream {
-        if (self.count == 0) return null;
-        const stream = self.items[self.head];
-        self.items[self.head] = null;
-        self.head = (self.head + 1) % accept_queue_capacity;
-        self.count -= 1;
-        return stream;
+    pub fn reset(self: *Packet) void {
+        self.len = 0;
+        self.pk = Key.zero;
+        self.protocol = 0;
+        self.payload = &[_]u8{};
+        self.payload_len = 0;
+        self.err = null;
+        self.ready.reset();
     }
 };
 
-/// Internal peer state.
-const PeerStateInternal = struct {
-    mutex: Mutex = .{},
+// ============================================================================
+// PacketPool
+// ============================================================================
+
+/// Pool of reusable packets to avoid allocation per-packet.
+pub const PacketPool = struct {
+    const Self = @This();
+
+    packets: []Packet,
+    buffers: []u8, // Contiguous buffer for all packet data
+    free_stack: []usize, // Stack of free packet indices
+    stack_top: Atomic(usize),
+    mutex: Mutex,
+    allocator: Allocator,
+    capacity: usize,
+
+    pub fn init(allocator: Allocator, capacity: usize) !Self {
+        const packets = try allocator.alloc(Packet, capacity);
+        const buffers = try allocator.alloc(u8, capacity * MaxPacketSize);
+
+        // Initialize packets and assign buffer slices
+        for (packets, 0..) |*pkt, i| {
+            pkt.* = Packet.init();
+            pkt.data = buffers[i * MaxPacketSize .. (i + 1) * MaxPacketSize];
+        }
+
+        // Initialize free stack
+        const free_stack = try allocator.alloc(usize, capacity);
+        for (free_stack, 0..) |*slot, i| {
+            slot.* = i;
+        }
+
+        return Self{
+            .packets = packets,
+            .buffers = buffers,
+            .free_stack = free_stack,
+            .stack_top = Atomic(usize).init(capacity),
+            .mutex = .{},
+            .allocator = allocator,
+            .capacity = capacity,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.free_stack);
+        self.allocator.free(self.buffers);
+        self.allocator.free(self.packets);
+    }
+
+    /// Acquire a packet from the pool. Returns null if pool is empty.
+    pub fn acquire(self: *Self) ?*Packet {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const top = self.stack_top.load(.acquire);
+        if (top == 0) return null;
+
+        const new_top = top - 1;
+        const idx = self.free_stack[new_top];
+        self.stack_top.store(new_top, .release);
+
+        const pkt = &self.packets[idx];
+        pkt.reset();
+        return pkt;
+    }
+
+    /// Release a packet back to the pool.
+    pub fn release(self: *Self, pkt: *Packet) void {
+        // Calculate index from pointer
+        const pkt_addr = @intFromPtr(pkt);
+        const base_addr = @intFromPtr(self.packets.ptr);
+        const idx = (pkt_addr - base_addr) / @sizeOf(Packet);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const top = self.stack_top.load(.acquire);
+        self.free_stack[top] = idx;
+        self.stack_top.store(top + 1, .release);
+    }
+};
+
+// ============================================================================
+// Peer State
+// ============================================================================
+
+/// State for a single peer.
+const PeerState = struct {
     pk: Key,
-    endpoint: ?posix.sockaddr,
+    endpoint: posix.sockaddr,
     endpoint_len: posix.socklen_t,
-    endpoint_port: u16, // Cached port (network byte order converted)
-    endpoint_addr: u32, // Cached IPv4 addr (network byte order)
-    session: ?Session,
-    state: PeerState,
-    rx_bytes: u64,
-    tx_bytes: u64,
-    last_seen: ?i128,
+    session: ?*Session,
+    handshake: ?*HandshakeState,
 
-    // KCP stream multiplexing (initialized after handshake)
-    mux: ?*Mux = null,
-    accept_queue: StreamQueue = .{},
+    // Statistics
+    tx_bytes: Atomic(u64),
+    rx_bytes: Atomic(u64),
 
-    // Context for mux output callback
-    udp_ptr: ?*UDP = null,
+    // Stream multiplexing (KCP)
+    mux: ?*KcpMux,
+    mux_ctx: ?*anyopaque, // For cleanup
+
+    pub fn init(pk: Key) PeerState {
+        return PeerState{
+            .pk = pk,
+            .endpoint = undefined,
+            .endpoint_len = 0,
+            .session = null,
+            .handshake = null,
+            .tx_bytes = Atomic(u64).init(0),
+            .rx_bytes = Atomic(u64).init(0),
+            .mux = null,
+            .mux_ctx = null,
+        };
+    }
 };
 
-/// Pending handshake tracking.
+
+/// Pending handshake state.
 const PendingHandshake = struct {
-    peer_pk: Key,
-    hs_state: HandshakeState,
-    local_idx: u32,
-    done: bool,
-    result: ?UdpError,
+    hs: *HandshakeState,
+    pk: Key,
+    done: Signal,
+    success: bool,
     created_at: i128,
 };
 
-/// Options for creating a UDP instance.
+// ============================================================================
+// UDP Options
+// ============================================================================
+
 pub const UdpOptions = struct {
-    /// Address to bind to. Default is "0.0.0.0:0".
-    bind_addr: ?[]const u8 = null,
-    /// Port to bind to (overrides bind_addr port).
-    port: u16 = 0,
+    /// Address to bind to (default: "0.0.0.0:0").
+    bind_addr: []const u8 = "0.0.0.0:0",
     /// Allow connections from unknown peers.
     allow_unknown: bool = false,
+    /// Number of decrypt workers (0 = CPU count).
+    decrypt_workers: usize = DefaultWorkers,
+    /// Decrypt channel size.
+    decrypt_chan_size: usize = DecryptChanSize,
+    /// Output channel size.
+    output_chan_size: usize = OutputChanSize,
 };
 
-/// UDP-based network using the Noise Protocol.
-///
-/// Manages multiple peers, handles handshakes, and supports roaming.
+// ============================================================================
+// UDP
+// ============================================================================
+
+/// UDP network layer with Noise Protocol encryption.
 pub const UDP = struct {
+    const Self = @This();
+
+    // Core state
     allocator: Allocator,
+    local_key: *const KeyPair,
     socket: posix.socket_t,
-    local_key: KeyPair,
+    local_port: u16,
+
+    // Options
     allow_unknown: bool,
 
     // Peer management
-    peers_mutex: Mutex = .{},
-    peers_map: std.AutoHashMap(Key, *PeerStateInternal),
+    peers_mutex: Mutex,
+    peers: std.AutoHashMap([32]u8, *PeerState),
     by_index: std.AutoHashMap(u32, Key),
 
-    // Pending handshakes (as initiator)
-    pending_mutex: Mutex = .{},
+    // Pending handshakes
+    pending_mutex: Mutex,
     pending: std.AutoHashMap(u32, *PendingHandshake),
 
+    // Pipeline channels (Go-style double queue)
+    packet_pool: PacketPool,
+    decrypt_chan: Channel(*Packet),
+    output_chan: Channel(*Packet),
+
+    // Worker threads
+    io_thread: ?Thread,
+    timer_thread: ?Thread, // For KCP update ticks
+    workers: []Thread,
+    num_workers: usize,
+
+    // IO reactor (kqueue on macOS)
+    reactor: Reactor,
+
+    // Timer service for KCP updates
+    timer_service: SimpleTimerService,
+
+    // Close signaling
+    closed: Atomic(bool),
+    close_signal: Signal,
+
     // Statistics
-    total_rx: Atomic(u64) = Atomic(u64).init(0),
-    total_tx: Atomic(u64) = Atomic(u64).init(0),
-    last_seen: Atomic(i128) = Atomic(i128).init(0),
+    total_tx: Atomic(u64),
+    total_rx: Atomic(u64),
+    last_seen: Atomic(i128),
 
-    // State
-    closed: Atomic(bool) = Atomic(bool).init(false),
+    // Index generator
+    next_index: Atomic(u32),
 
-    // Local address
-    local_addr: posix.sockaddr,
-    local_addr_len: posix.socklen_t,
-    local_port: u16,
-
-    /// Creates a new UDP network.
-    pub fn init(allocator: Allocator, key: KeyPair, opts: UdpOptions) UdpError!*UDP {
-        const self = allocator.create(UDP) catch return UdpError.OutOfMemory;
-        errdefer allocator.destroy(self);
-
+    /// Initialize a new UDP instance.
+    pub fn init(
+        allocator: Allocator,
+        key: *const KeyPair,
+        options: UdpOptions,
+    ) UdpError!*Self {
         // Create socket
         const socket = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return UdpError.BindFailed;
         errdefer posix.close(socket);
 
-        // Set socket to non-blocking mode
+        // Set socket to non-blocking mode for clean shutdown
         const current_flags = posix.fcntl(socket, posix.F.GETFL, 0) catch 0;
-        var o_flags: posix.O = @bitCast(@as(u32, @truncate(current_flags)));
+        var o_flags: posix.O = @bitCast(@as(u32, @intCast(current_flags)));
         o_flags.NONBLOCK = true;
         _ = posix.fcntl(socket, posix.F.SETFL, @as(usize, @as(u32, @bitCast(o_flags)))) catch {};
 
-        // Bind address
+        // Parse bind address
         var addr: posix.sockaddr.in = .{
             .family = posix.AF.INET,
-            .port = std.mem.nativeToBig(u16, opts.port),
-            .addr = 0, // INADDR_ANY
+            .port = 0,
+            .addr = 0,
         };
 
+        if (parseBindAddr(options.bind_addr)) |parsed| {
+            addr = parsed;
+        }
+
+        // Bind socket
         posix.bind(socket, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) catch return UdpError.BindFailed;
 
-        // Get actual bound address (reuse addr which is properly aligned)
+        // Get bound address
         var bound_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
         posix.getsockname(socket, @ptrCast(&addr), &bound_addr_len) catch return UdpError.BindFailed;
+        const local_port = mem.bigToNative(u16, addr.port);
 
-        // Extract the actual port after binding
-        const local_port = std.mem.bigToNative(u16, addr.port);
+        // Determine worker count
+        var num_workers = options.decrypt_workers;
+        if (num_workers == 0) {
+            num_workers = @max(1, Thread.getCpuCount() catch 4);
+        }
 
-        self.* = .{
+        // Allocate self
+        const self = allocator.create(Self) catch return UdpError.OutOfMemory;
+        errdefer allocator.destroy(self);
+
+        // Initialize packet pool
+        const pool_size = options.decrypt_chan_size + options.output_chan_size;
+        const packet_pool = PacketPool.init(allocator, pool_size) catch return UdpError.OutOfMemory;
+
+        // Initialize channels
+        const decrypt_chan = Channel(*Packet).init(allocator, options.decrypt_chan_size) catch return UdpError.OutOfMemory;
+        const output_chan = Channel(*Packet).init(allocator, options.output_chan_size) catch return UdpError.OutOfMemory;
+
+        // Allocate worker array
+        const workers = allocator.alloc(Thread, num_workers) catch return UdpError.OutOfMemory;
+
+        // Initialize kqueue reactor for efficient I/O
+        var reactor = Reactor.init() catch return UdpError.BindFailed;
+        errdefer reactor.deinit();
+
+        // Register socket for read events
+        reactor.register(@intCast(socket), .read, os_mod.Darwin.Flags.ADD | os_mod.Darwin.Flags.ENABLE) catch return UdpError.BindFailed;
+
+        // Register user event for shutdown signaling (ident = 1)
+        reactor.registerUser(1) catch return UdpError.BindFailed;
+
+        self.* = Self{
             .allocator = allocator,
-            .socket = socket,
             .local_key = key,
-            .allow_unknown = opts.allow_unknown,
-            .peers_map = std.AutoHashMap(Key, *PeerStateInternal).init(allocator),
-            .by_index = std.AutoHashMap(u32, Key).init(allocator),
-            .pending = std.AutoHashMap(u32, *PendingHandshake).init(allocator),
-            .local_addr = @as(*posix.sockaddr, @ptrCast(&addr)).*,
-            .local_addr_len = bound_addr_len,
+            .socket = socket,
             .local_port = local_port,
+            .allow_unknown = options.allow_unknown,
+            .peers_mutex = .{},
+            .peers = std.AutoHashMap([32]u8, *PeerState).init(allocator),
+            .by_index = std.AutoHashMap(u32, Key).init(allocator),
+            .pending_mutex = .{},
+            .pending = std.AutoHashMap(u32, *PendingHandshake).init(allocator),
+            .packet_pool = packet_pool,
+            .decrypt_chan = decrypt_chan,
+            .output_chan = output_chan,
+            .io_thread = null,
+            .timer_thread = null,
+            .workers = workers,
+            .num_workers = num_workers,
+            .reactor = reactor,
+            .timer_service = SimpleTimerService.init(allocator),
+            .closed = Atomic(bool).init(false),
+            .close_signal = Signal.init(),
+            .total_tx = Atomic(u64).init(0),
+            .total_rx = Atomic(u64).init(0),
+            .last_seen = Atomic(i128).init(0),
+            .next_index = Atomic(u32).init(1),
         };
+
+        // Start IO thread
+        self.io_thread = Thread.spawn(.{}, ioLoop, .{self}) catch return UdpError.OutOfMemory;
+
+        // Start timer thread for KCP updates
+        self.timer_thread = Thread.spawn(.{}, timerLoop, .{self}) catch return UdpError.OutOfMemory;
+
+        // Start decrypt workers
+        for (self.workers) |*w| {
+            w.* = Thread.spawn(.{}, decryptWorker, .{self}) catch return UdpError.OutOfMemory;
+        }
 
         return self;
     }
 
-    /// Cleanup and release all resources.
-    pub fn deinit(self: *UDP) void {
-        self.closed.store(true, .seq_cst);
+    /// Close the UDP instance.
+    pub fn deinit(self: *Self) void {
+        // Signal close
+        self.closed.store(true, .release);
+        self.close_signal.signal();
+
+        // Trigger user event to wake ioLoop
+        self.reactor.triggerUser(1) catch {};
+
+        // Close channels to wake blocked threads
+        self.decrypt_chan.close();
+        self.output_chan.close();
 
         // Close socket
         posix.close(self.socket);
 
-        // Free peers (including their mux instances and contexts)
-        var peer_iter = self.peers_map.valueIterator();
+        // Join threads
+        if (self.io_thread) |t| {
+            t.join();
+        }
+        if (self.timer_thread) |t| {
+            t.join();
+        }
+        for (self.workers) |w| {
+            w.join();
+        }
+
+        // Free peers first (before timer_service, as mux.deinit() needs to cancel timers)
+        var peer_iter = self.peers.valueIterator();
         while (peer_iter.next()) |peer_ptr| {
             const peer = peer_ptr.*;
-            // Clean up mux if present
             if (peer.mux) |mux| {
-                // Free the MuxContext
-                if (mux.user_data) |ctx| {
-                    const mux_ctx: *MuxContext = @ptrCast(@alignCast(ctx));
-                    self.allocator.destroy(mux_ctx);
-                }
                 mux.deinit();
+            }
+            if (peer.mux_ctx) |ctx| {
+                const ctx_ptr: *MuxOutputCtx = @ptrCast(@alignCast(ctx));
+                self.allocator.destroy(ctx_ptr);
+            }
+            if (peer.session) |s| {
+                self.allocator.destroy(s);
+            }
+            if (peer.handshake) |hs| {
+                self.allocator.destroy(hs);
             }
             self.allocator.destroy(peer);
         }
-        self.peers_map.deinit();
+        self.peers.deinit();
         self.by_index.deinit();
 
-        // Free pending
+        // Free pending handshakes
         var pending_iter = self.pending.valueIterator();
-        while (pending_iter.next()) |p_ptr| {
-            self.allocator.destroy(p_ptr.*);
+        while (pending_iter.next()) |ph_ptr| {
+            const ph = ph_ptr.*;
+            self.allocator.destroy(ph.hs);
+            self.allocator.destroy(ph);
         }
         self.pending.deinit();
+
+        // Now cleanup internal resources
+        self.reactor.deinit();
+        self.timer_service.deinit();
+        self.decrypt_chan.deinit();
+        self.output_chan.deinit();
+        self.packet_pool.deinit();
+        self.allocator.free(self.workers);
 
         self.allocator.destroy(self);
     }
 
-    /// Sets or updates a peer's endpoint address.
-    pub fn setPeerEndpoint(self: *UDP, pk: Key, addr: posix.sockaddr, addr_len: posix.socklen_t) void {
-        if (self.closed.load(.seq_cst)) {
-            return;
-        }
-
-        // Extract port and address from sockaddr (avoid alignment issues)
-        // Note: sockaddr.in stores port and addr in network byte order (big endian)
-        var ep_port: u16 = 0;
-        var ep_addr: u32 = 0;
-        if (addr_len >= @sizeOf(posix.sockaddr.in)) {
-            // Use byte-level access to avoid alignment issues
-            const bytes: [*]const u8 = @ptrCast(&addr);
-            // readInt with .big interprets bytes as big-endian and returns native order
-            ep_port = std.mem.readInt(u16, bytes[2..4], .big);
-            ep_addr = std.mem.readInt(u32, bytes[4..8], .big);
-        }
-
-        self.peers_mutex.lock();
-        defer self.peers_mutex.unlock();
-
-        if (self.peers_map.get(pk)) |peer| {
-            peer.mutex.lock();
-            defer peer.mutex.unlock();
-            peer.endpoint = addr;
-            peer.endpoint_len = addr_len;
-            peer.endpoint_port = ep_port;
-            peer.endpoint_addr = ep_addr;
-        } else {
-            const peer = self.allocator.create(PeerStateInternal) catch return;
-            peer.* = .{
-                .pk = pk,
-                .endpoint = addr,
-                .endpoint_len = addr_len,
-                .endpoint_port = ep_port,
-                .endpoint_addr = ep_addr,
-                .session = null,
-                .state = .new,
-                .rx_bytes = 0,
-                .tx_bytes = 0,
-                .last_seen = null,
-            };
-            self.peers_map.put(pk, peer) catch {
-                self.allocator.destroy(peer);
-            };
-        }
+    /// Alias for deinit.
+    pub fn close(self: *Self) void {
+        self.deinit();
     }
 
-    /// Removes a peer.
-    pub fn removePeer(self: *UDP, pk: *const Key) void {
-        self.peers_mutex.lock();
-        defer self.peers_mutex.unlock();
+    // ========================================================================
+    // Public API
+    // ========================================================================
 
-        if (self.peers_map.fetchRemove(pk.*)) |kv| {
-            const peer = kv.value;
-            {
-                peer.mutex.lock();
-                defer peer.mutex.unlock();
-                if (peer.session) |*session| {
-                    _ = self.by_index.remove(session.localIndex());
-                }
-            }
-            self.allocator.destroy(peer);
-        }
-    }
-
-    /// Returns the local public key.
-    pub fn publicKey(self: *UDP) Key {
-        return self.local_key.public;
-    }
-
-    /// Returns the local port.
-    pub fn port(self: *UDP) u16 {
+    /// Get local port.
+    pub fn getLocalPort(self: *Self) u16 {
         return self.local_port;
     }
 
-    /// Returns the peer count.
-    pub fn peerCount(self: *UDP) usize {
-        self.peers_mutex.lock();
-        defer self.peers_mutex.unlock();
-        return self.peers_map.count();
-    }
-
-    /// Returns the total received bytes.
-    pub fn rxBytes(self: *UDP) u64 {
-        return self.total_rx.load(.seq_cst);
-    }
-
-    /// Returns the total transmitted bytes.
-    pub fn txBytes(self: *UDP) u64 {
-        return self.total_tx.load(.seq_cst);
-    }
-
-    /// Returns information about a specific peer.
-    pub fn peerInfo(self: *UDP, pk: *const Key) ?PeerInfo {
-        const peer = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            break :blk self.peers_map.get(pk.*) orelse return null;
-        };
-
-        peer.mutex.lock();
-        defer peer.mutex.unlock();
-
-        const has_endpoint = peer.endpoint != null;
-        const last_seen_ns: i64 = if (peer.last_seen) |ls| @as(i64, @truncate(@mod(ls, std.math.maxInt(i64)))) else 0;
-
-        return .{
-            .public_key = peer.pk,
-            .endpoint_port = peer.endpoint_port,
-            .endpoint_addr = peer.endpoint_addr,
-            .has_endpoint = has_endpoint,
-            .state = peer.state,
-            .rx_bytes = peer.rx_bytes,
-            .tx_bytes = peer.tx_bytes,
-            .last_seen_ns = last_seen_ns,
-        };
-    }
-
-    /// Returns all peers.
-    pub fn peers(self: *UDP, allocator: Allocator) ![]Peer {
+    /// Set peer endpoint.
+    pub fn setPeerEndpoint(self: *Self, pk: Key, endpoint: posix.sockaddr, endpoint_len: posix.socklen_t) void {
         self.peers_mutex.lock();
         defer self.peers_mutex.unlock();
 
-        var result = std.ArrayList(Peer).init(allocator);
-        errdefer result.deinit();
-
-        var iter = self.peers_map.valueIterator();
-        while (iter.next()) |peer_ptr| {
-            const peer = peer_ptr.*;
-            peer.mutex.lock();
-            defer peer.mutex.unlock();
-
-            const has_endpoint = peer.endpoint != null;
-            const last_seen_ns: i64 = if (peer.last_seen) |ls| @as(i64, @truncate(@mod(ls, std.math.maxInt(i64)))) else 0;
-
-            try result.append(.{
-                .info = .{
-                    .public_key = peer.pk,
-                    .endpoint_port = peer.endpoint_port,
-                    .endpoint_addr = peer.endpoint_addr,
-                    .has_endpoint = has_endpoint,
-                    .state = peer.state,
-                    .rx_bytes = peer.rx_bytes,
-                    .tx_bytes = peer.tx_bytes,
-                    .last_seen_ns = last_seen_ns,
-                },
-            });
-        }
-
-        return result.toOwnedSlice();
+        const peer = self.getOrCreatePeerLocked(pk);
+        peer.endpoint = endpoint;
+        peer.endpoint_len = endpoint_len;
     }
 
-    /// Sends encrypted data to a peer.
-    pub fn writeTo(self: *UDP, pk: *const Key, data: []const u8) UdpError!void {
-        if (self.closed.load(.seq_cst)) {
-            return UdpError.Closed;
-        }
-
-        const peer = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            break :blk self.peers_map.get(pk.*) orelse return UdpError.PeerNotFound;
-        };
-
-        peer.mutex.lock();
-        defer peer.mutex.unlock();
-
-        const endpoint = peer.endpoint orelse return UdpError.NoEndpoint;
-        var session = peer.session orelse return UdpError.NoSession;
-
-        // Encrypt the data
-        var ciphertext: [message.max_packet_size]u8 = undefined;
-        const nonce = session.encrypt(data, ciphertext[0 .. data.len + 16]) catch return UdpError.EncryptFailed;
-
-        // Build transport message
-        const header = message.buildTransportHeader(session.remoteIndex(), nonce);
-        var msg: [message.max_packet_size]u8 = undefined;
-        @memcpy(msg[0..message.transport_header_size], &header);
-        @memcpy(msg[message.transport_header_size..][0 .. data.len + 16], ciphertext[0 .. data.len + 16]);
-
-        const msg_len = message.transport_header_size + data.len + 16;
-
-        // Send
-        const n = posix.sendto(self.socket, msg[0..msg_len], 0, &endpoint, peer.endpoint_len) catch return UdpError.SendFailed;
-
-        // Update stats
-        _ = self.total_tx.fetchAdd(@intCast(n), .seq_cst);
-        peer.tx_bytes += @intCast(n);
-        peer.session = session;
-    }
-
-    // ========== Pipeline API for high-throughput scenarios ==========
-    // These methods allow the caller to manage threads and queues externally.
-    // Usage pattern:
-    // 1. Call processIO() in an I/O thread to read raw packets
-    // 2. Call processDecrypt() in worker threads to decrypt packets
-    // 3. Consume DecryptedPacket results
-
-    /// Reads a raw packet from the socket (for pipeline processing).
-    /// The caller must provide a buffer and owns the returned data.
-    /// This is a blocking call that returns when a packet is received.
-    /// Returns RawPacket with data slice into the provided buffer.
-    pub fn processIO(self: *UDP, buf: []u8) UdpError!RawPacket {
-        if (self.closed.load(.seq_cst)) {
-            return UdpError.Closed;
-        }
-
-        var from_addr: posix.sockaddr.in = undefined;
-        var from_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-
-        const nr = posix.recvfrom(self.socket, buf, 0, @ptrCast(&from_addr), &from_addr_len) catch |err| {
-            if (err == error.WouldBlock) {
-                return UdpError.ReceiveFailed;
-            }
-            if (self.closed.load(.seq_cst)) {
-                return UdpError.Closed;
-            }
-            return UdpError.ReceiveFailed;
-        };
-
-        if (nr < 1) {
-            return UdpError.MessageTooShort;
-        }
-
-        // Update stats
-        _ = self.total_rx.fetchAdd(@intCast(nr), .seq_cst);
-        self.last_seen.store(std.time.nanoTimestamp(), .seq_cst);
-
-        return RawPacket{
-            .data = buf[0..nr],
-            .len = nr,
-            .from = @as(*posix.sockaddr, @ptrCast(&from_addr)).*,
-            .from_len = from_addr_len,
-        };
-    }
-
-    /// Decrypts a raw packet and returns the result (for pipeline processing).
-    /// The caller provides an output buffer for the decrypted payload.
-    /// Handshakes are handled internally.
-    pub fn processDecrypt(self: *UDP, raw: *const RawPacket, out_buf: []u8) DecryptedPacket {
-        var result = DecryptedPacket{
-            .pk = undefined,
-            .protocol = 0,
-            .payload = &[_]u8{},
-            .len = 0,
-            .is_handshake = false,
-            .ok = false,
-        };
-
-        if (raw.len < 1) {
-            return result;
-        }
-
-        // Parse message type
-        const msg_type: message.MessageType = @enumFromInt(raw.data[0]);
-
-        // Cast sockaddr to sockaddr.in for IPv4
-        const from_addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&raw.from));
-
-        switch (msg_type) {
-            .handshake_init => {
-                self.handleHandshakeInit(raw.data[0..raw.len], from_addr, raw.from_len);
-                result.is_handshake = true;
-                result.ok = true;
-                return result;
-            },
-            .handshake_resp => {
-                self.handleHandshakeResp(raw.data[0..raw.len], from_addr, raw.from_len);
-                result.is_handshake = true;
-                result.ok = true;
-                return result;
-            },
-            .transport => {
-                // Process transport message
-                if (self.processTransportPacket(raw.data[0..raw.len], from_addr, raw.from_len, out_buf)) |transport_result| {
-                    result.pk = transport_result.pk;
-                    result.payload = out_buf[0..transport_result.n];
-                    result.len = transport_result.n;
-                    result.ok = true;
-                }
-                return result;
-            },
-            else => return result,
-        }
-    }
-
-    /// Internal: process a transport packet for pipeline use.
-    fn processTransportPacket(self: *UDP, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t, out_buf: []u8) ?ReadResult {
-        _ = from_len;
-        // This is similar to handleTransport but returns the result instead of modifying buf
-        const msg = message.parseTransportMessage(data) catch return null;
-
-        // Find peer by receiver index
-        const peer = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            const pk = self.by_index.get(msg.receiver_index) orelse return null;
-            break :blk self.peers_map.get(pk) orelse return null;
-        };
-
-        peer.mutex.lock();
-        defer peer.mutex.unlock();
-
-        var session = peer.session orelse return null;
-
-        // Decrypt directly into out_buf
-        const n = session.decrypt(msg.ciphertext, msg.counter, out_buf) catch return null;
-
-        // Update peer state
-        peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
-        peer.endpoint_len = @sizeOf(posix.sockaddr.in);
-        peer.endpoint_port = std.mem.bigToNative(u16, from.port);
-        peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
-        peer.rx_bytes += @intCast(data.len);
-        peer.last_seen = std.time.nanoTimestamp();
-        peer.session = session;
-
-        return ReadResult{
-            .pk = peer.pk,
-            .n = n,
-        };
-    }
-
-    // ========== End Pipeline API ==========
-
-    /// Reads the next decrypted message from any peer.
-    /// Handles handshakes internally and only returns transport data.
-    /// Returns (sender_pk, bytes_read).
-    pub fn readFrom(self: *UDP, buf: []u8) UdpError!ReadResult {
-        if (self.closed.load(.seq_cst)) {
-            return UdpError.Closed;
-        }
-
-        var recv_buf: [message.max_packet_size]u8 = undefined;
-
-        while (true) {
-            if (self.closed.load(.seq_cst)) {
-                return UdpError.Closed;
-            }
-
-            // Read from socket (non-blocking)
-            // Use sockaddr.in directly for IPv4 - this ensures proper alignment and size
-            var from_addr: posix.sockaddr.in = undefined;
-            var from_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-
-            const nr = posix.recvfrom(self.socket, &recv_buf, 0, @ptrCast(&from_addr), &from_addr_len) catch |err| {
-                if (err == error.WouldBlock) {
-                    // Non-blocking, sleep a bit
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
-                    continue;
-                }
-                if (self.closed.load(.seq_cst)) {
-                    return UdpError.Closed;
-                }
-                return UdpError.ReceiveFailed;
-            };
-
-            if (nr < 1) {
-                continue;
-            }
-
-            // Update stats
-            _ = self.total_rx.fetchAdd(@intCast(nr), .seq_cst);
-            self.last_seen.store(std.time.nanoTimestamp(), .seq_cst);
-
-            // Parse message type
-            const msg_type: message.MessageType = @enumFromInt(recv_buf[0]);
-
-            switch (msg_type) {
-                .handshake_init => {
-                    self.handleHandshakeInit(recv_buf[0..nr], &from_addr, from_addr_len);
-                    continue;
-                },
-                .handshake_resp => {
-                    self.handleHandshakeResp(recv_buf[0..nr], &from_addr, from_addr_len);
-                    continue;
-                },
-                .transport => {
-                    if (self.handleTransport(recv_buf[0..nr], &from_addr, from_addr_len, buf)) |result| {
-                        return result;
-                    }
-                    continue;
-                },
-                else => continue,
-            }
-        }
-    }
-
-    /// Initiates a handshake with a peer.
-    pub fn connect(self: *UDP, pk: *const Key) UdpError!void {
+    /// Connect to a peer (initiate handshake).
+    pub fn connect(self: *Self, pk: *const Key) UdpError!void {
         return self.connectTimeout(pk, 5 * std.time.ns_per_s);
     }
 
-    /// Initiates a handshake with a peer with timeout.
-    pub fn connectTimeout(self: *UDP, pk: *const Key, timeout_ns: i128) UdpError!void {
-        if (self.closed.load(.seq_cst)) {
+    /// Connect with timeout.
+    pub fn connectTimeout(self: *Self, pk: *const Key, timeout_ns: i128) UdpError!void {
+        if (self.closed.load(.acquire)) {
             return UdpError.Closed;
         }
 
+        // Get or create peer
         const peer = blk: {
             self.peers_mutex.lock();
             defer self.peers_mutex.unlock();
-            break :blk self.peers_map.get(pk.*) orelse return UdpError.PeerNotFound;
+            break :blk self.getOrCreatePeerLocked(pk.*);
         };
 
-        const endpoint, const endpoint_len = blk: {
-            peer.mutex.lock();
-            defer peer.mutex.unlock();
-            const ep = peer.endpoint orelse return UdpError.NoEndpoint;
-            const ep_len = peer.endpoint_len;
-            peer.state = .connecting;
-            break :blk .{ ep, ep_len };
-        };
-
-        // Generate local index
-        const local_idx = noise.session.generateIndex();
+        // Check if already connected
+        if (peer.session) |s| {
+            if (s.getState() == .established) {
+                return; // Already connected
+            }
+        }
 
         // Create handshake state
-        var hs = HandshakeState.init(.{
+        const hs = self.allocator.create(HandshakeState) catch return UdpError.OutOfMemory;
+        hs.* = HandshakeState.init(.{
             .pattern = .IK,
             .initiator = true,
-            .local_static = self.local_key,
+            .local_static = self.local_key.*,
             .remote_static = pk.*,
-        }) catch return UdpError.HandshakeFailed;
+        }) catch {
+            self.allocator.destroy(hs);
+            return UdpError.HandshakeFailed;
+        };
 
-        // Write handshake initiation
-        var msg_buf: [256]u8 = undefined;
-        const msg_len = hs.writeMessage(&.{}, &msg_buf) catch return UdpError.HandshakeFailed;
-
-        // Build wire message
-        const ephemeral = hs.local_ephemeral orelse return UdpError.HandshakeFailed;
-        const wire_msg = message.buildHandshakeInit(local_idx, &ephemeral.public, msg_buf[key_size..msg_len]);
+        // Generate sender index
+        const sender_index = self.next_index.fetchAdd(1, .monotonic);
 
         // Register pending handshake
-        const pending = self.allocator.create(PendingHandshake) catch return UdpError.OutOfMemory;
-        pending.* = .{
-            .peer_pk = pk.*,
-            .hs_state = hs,
-            .local_idx = local_idx,
-            .done = false,
-            .result = null,
+        const pending = self.allocator.create(PendingHandshake) catch {
+            self.allocator.destroy(hs);
+            return UdpError.OutOfMemory;
+        };
+        pending.* = PendingHandshake{
+            .hs = hs,
+            .pk = pk.*,
+            .done = Signal.init(),
+            .success = false,
             .created_at = std.time.nanoTimestamp(),
         };
 
         {
             self.pending_mutex.lock();
             defer self.pending_mutex.unlock();
-            self.pending.put(local_idx, pending) catch {
+            self.pending.put(sender_index, pending) catch {
                 self.allocator.destroy(pending);
+                self.allocator.destroy(hs);
                 return UdpError.OutOfMemory;
             };
         }
 
-        // Send handshake initiation
-        _ = posix.sendto(self.socket, &wire_msg, 0, &endpoint, endpoint_len) catch {
-            self.pending_mutex.lock();
-            defer self.pending_mutex.unlock();
-            _ = self.pending.remove(local_idx);
-            self.allocator.destroy(pending);
+        // Build handshake init message
+        var msg_buf: [message.handshake_init_size]u8 = undefined;
+        var noise_msg: [80]u8 = undefined; // e(32) + es(48)
+
+        _ = hs.writeMessage(&[_]u8{}, &noise_msg) catch {
+            self.cleanupPending(sender_index);
+            return UdpError.HandshakeFailed;
+        };
+
+        // Wire format: type(1) + sender_idx(4) + noise_msg(80) = 85
+        msg_buf[0] = @intFromEnum(message.MessageType.handshake_init);
+        mem.writeInt(u32, msg_buf[1..5], sender_index, .little);
+        @memcpy(msg_buf[5..85], &noise_msg);
+
+        // Send
+        const endpoint = peer.endpoint;
+        const endpoint_len = peer.endpoint_len;
+        _ = posix.sendto(self.socket, &msg_buf, 0, &endpoint, endpoint_len) catch {
+            self.cleanupPending(sender_index);
             return UdpError.SendFailed;
         };
 
-        // Wait for response with timeout
-        const start = std.time.nanoTimestamp();
-        while (true) {
-            self.pending_mutex.lock();
-            const p = self.pending.get(local_idx);
-            if (p) |pend| {
-                if (pend.done) {
-                    const result = pend.result;
-                    _ = self.pending.remove(local_idx);
-                    self.pending_mutex.unlock();
-                    self.allocator.destroy(pend);
-                    if (result) |err| {
-                        return err;
-                    }
-                    return;
-                }
-            } else {
-                // Already removed (completed)
-                self.pending_mutex.unlock();
-                return;
-            }
-            self.pending_mutex.unlock();
-
-            const elapsed = std.time.nanoTimestamp() - start;
-            if (elapsed > timeout_ns) {
-                self.pending_mutex.lock();
-                _ = self.pending.remove(local_idx);
-                self.pending_mutex.unlock();
-                self.allocator.destroy(pending);
-
-                peer.mutex.lock();
-                peer.state = .failed;
-                peer.mutex.unlock();
-                return UdpError.HandshakeTimeout;
-            }
-
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-        }
-    }
-
-    /// Closes the UDP network.
-    pub fn close(self: *UDP) void {
-        self.closed.store(true, .seq_cst);
-    }
-
-    /// Returns true if the UDP network is closed.
-    pub fn isClosed(self: *UDP) bool {
-        return self.closed.load(.seq_cst);
-    }
-
-    // ========== KCP Stream API ==========
-
-    /// Determines if we are the KCP client for a peer.
-    /// Uses deterministic rule: smaller public key is client (uses odd stream IDs).
-    fn isKcpClient(self: *UDP, remote_pk: Key) bool {
-        return std.mem.lessThan(u8, &self.local_key.public.data, &remote_pk.data);
-    }
-
-    /// Sends encrypted data to a peer with the given protocol byte.
-    fn sendToPeer(self: *UDP, peer: *PeerStateInternal, protocol: message.Protocol, data: []const u8) UdpError!void {
-        peer.mutex.lock();
-        defer peer.mutex.unlock();
-
-        const endpoint = peer.endpoint orelse return UdpError.NoEndpoint;
-        var session = peer.session orelse return UdpError.NoSession;
-
-        // Encode payload with protocol byte (use stack buffer for efficiency)
-        var payload_buf: [message.max_packet_size]u8 = undefined;
-        payload_buf[0] = @intFromEnum(protocol);
-        @memcpy(payload_buf[1..][0..data.len], data);
-        const payload = payload_buf[0 .. 1 + data.len];
-
-        // Encrypt
-        var ciphertext: [message.max_packet_size]u8 = undefined;
-        const nonce = session.encrypt(payload, ciphertext[0 .. payload.len + 16]) catch return UdpError.EncryptFailed;
-
-        // Build transport message
-        const header = message.buildTransportHeader(session.remoteIndex(), nonce);
-        var msg: [message.max_packet_size]u8 = undefined;
-        @memcpy(msg[0..message.transport_header_size], &header);
-        @memcpy(msg[message.transport_header_size..][0 .. payload.len + 16], ciphertext[0 .. payload.len + 16]);
-
-        const msg_len = message.transport_header_size + payload.len + 16;
-
-        // Send
-        const n = posix.sendto(self.socket, msg[0..msg_len], 0, &endpoint, peer.endpoint_len) catch return UdpError.SendFailed;
-
-        // Update stats
-        _ = self.total_tx.fetchAdd(@intCast(n), .seq_cst);
-        peer.tx_bytes += @intCast(n);
-        peer.session = session;
-    }
-
-    /// Context for Mux callbacks - passed as user_data.
-    const MuxContext = struct {
-        udp: *UDP,
-        peer: *PeerStateInternal,
-    };
-
-    /// Initializes the KCP Mux for a peer after handshake completes.
-    /// Thread-safe: acquires peer.mutex internally.
-    fn initMux(self: *UDP, peer: *PeerStateInternal) void {
-        const is_client = self.isKcpClient(peer.pk);
-
-        // Create context for callbacks
-        const ctx = self.allocator.create(MuxContext) catch return;
-        ctx.* = .{
-            .udp = self,
-            .peer = peer,
-        };
-
-        // Create Mux with callbacks that use the context
-        const mux = Mux.init(
-            self.allocator,
-            .{},
-            is_client,
-            &muxOutput,
-            &muxOnStreamData,
-            &muxOnNewStream,
-            ctx,
-        ) catch {
-            self.allocator.destroy(ctx);
-            return;
-        };
-
-        // Lock peer to swap mux pointer (protects against concurrent initMux calls)
-        // We extract old_mux under lock but deinit it after releasing to avoid deadlock
-        // with sendPsh which holds mux.mutex and calls sendToPeer which acquires peer.mutex.
-        var old_mux: ?*Mux = null;
-        var old_ctx: ?*MuxContext = null;
-
-        peer.mutex.lock();
-        // Store UDP pointer for reference
-        peer.udp_ptr = self;
-
-        // Extract existing mux if any (will deinit after releasing lock)
-        if (peer.mux) |existing_mux| {
-            old_mux = existing_mux;
-            if (existing_mux.user_data) |existing_ctx| {
-                old_ctx = @ptrCast(@alignCast(existing_ctx));
-            }
+        // Wait for response
+        const timeout_u64: u64 = @intCast(@max(0, timeout_ns));
+        if (!pending.done.waitTimeout(timeout_u64)) {
+            self.cleanupPending(sender_index);
+            return UdpError.HandshakeTimeout;
         }
 
-        peer.mux = mux;
-        peer.accept_queue = .{};
-        peer.mutex.unlock();
-
-        // Deinit old mux after releasing peer.mutex to avoid deadlock
-        if (old_mux) |m| {
-            m.deinit();
+        if (!pending.success) {
+            self.cleanupPending(sender_index);
+            return UdpError.HandshakeFailed;
         }
-        if (old_ctx) |c| {
-            self.allocator.destroy(c);
-        }
+
+        // Success - cleanup pending (session already established)
+        self.cleanupPending(sender_index);
     }
 
-    /// Mux output callback - encrypts and sends KCP data.
-    fn muxOutput(data: []const u8, user_data: ?*anyopaque) anyerror!void {
-        const ctx: *MuxContext = @ptrCast(@alignCast(user_data orelse return error.NoContext));
-        ctx.udp.sendToPeer(ctx.peer, .kcp, data) catch |e| {
-            // Log error but don't propagate - KCP will retry
-            std.log.err("muxOutput failed: {}", .{e});
-            return e;
-        };
+    /// Write data to a peer.
+    pub fn writeTo(self: *Self, pk: *const Key, data: []const u8) UdpError!void {
+        return self.writeToProtocol(pk, @intFromEnum(message.Protocol.chat), data);
     }
 
-    /// Mux stream data callback - called when stream has data available.
-    fn muxOnStreamData(_: u32, _: ?*anyopaque) void {
-        // Data availability is handled internally by Stream.read
-        // User polls streams directly
-    }
-
-    /// Mux new stream callback - adds stream to accept queue.
-    /// Called when a new incoming stream is created via SYN.
-    /// Stream arrives with ref=1 (Mux's ref). We must:
-    /// - If accepted: retain() to add user's ref, then push to queue
-    /// - If rejected: removeStream() to release Mux's ref and free the stream
-    fn muxOnNewStream(stream: *Stream, user_data: ?*anyopaque) void {
-        const ctx: *MuxContext = @ptrCast(@alignCast(user_data orelse return));
-        ctx.peer.mutex.lock();
-        defer ctx.peer.mutex.unlock();
-
-        // Try to add to accept queue
-        if (ctx.peer.accept_queue.push(stream)) {
-            // Successfully queued - add user's reference (user will call close() when done)
-            stream.retain();
-        } else {
-            // Queue full - reject stream and clean up properly
-            stream.shutdown();
-            // Remove from Mux and release Mux's reference (will free since ref=1)
-            stream.mux.removeStream(stream.id);
-        }
-    }
-
-    /// Poll for I/O events and update all KCP states.
-    /// This is the main event loop driver for passive/poll-based operation.
-    /// Call this periodically (e.g., every 1-10ms) from your main loop.
-    pub fn poll(self: *UDP, current_ms: u32) UdpError!void {
-        if (self.closed.load(.seq_cst)) {
+    /// Write data with protocol byte.
+    pub fn writeToProtocol(self: *Self, pk: *const Key, protocol: u8, data: []const u8) UdpError!void {
+        if (self.closed.load(.acquire)) {
             return UdpError.Closed;
         }
 
-        // 1. Process incoming packets (non-blocking)
-        var buf: [message.max_packet_size]u8 = undefined;
-        var out_buf: [message.max_packet_size]u8 = undefined;
+        // Get peer and session
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers.get(pk.data) orelse return UdpError.PeerNotFound;
+        };
 
-        // Process multiple packets per poll call
-        var packets_processed: usize = 0;
-        const max_packets_per_poll: usize = 100;
-
-        while (packets_processed < max_packets_per_poll) {
-            const raw = self.processIO(&buf) catch |e| {
-                if (e == UdpError.ReceiveFailed) break; // WouldBlock - no more packets
-                if (e == UdpError.Closed) return e;
-                break;
-            };
-
-            // Process the packet (handles handshakes internally, routes KCP to mux)
-            _ = self.processDecryptWithKcp(&raw, &out_buf);
-            packets_processed += 1;
+        const session = peer.session orelse return UdpError.PeerNotFound;
+        if (session.getState() != .established) {
+            return UdpError.PeerNotFound;
         }
 
-        // 2. Update all peer Muxes for KCP retransmissions
-        self.peers_mutex.lock();
-        defer self.peers_mutex.unlock();
+        // Build transport message
+        var msg_buf: [MaxPacketSize]u8 = undefined;
 
-        var iter = self.peers_map.valueIterator();
-        while (iter.next()) |peer_ptr| {
-            const peer = peer_ptr.*;
-            if (peer.mux) |mux| {
-                mux.update(current_ms);
+        // Encrypt: protocol(1) + data
+        var plaintext: [MaxPacketSize]u8 = undefined;
+        plaintext[0] = protocol;
+        @memcpy(plaintext[1 .. data.len + 1], data);
+
+        const plaintext_len = data.len + 1;
+        const ciphertext_len = plaintext_len + noise.tag_size;
+
+        // encrypt returns nonce, writes ciphertext to msg_buf[13..]
+        const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..]) catch {
+            return UdpError.SendFailed;
+        };
+
+        // Header: type(1) + receiver_idx(4) + counter(8) = 13
+        msg_buf[0] = @intFromEnum(message.MessageType.transport);
+        mem.writeInt(u32, msg_buf[1..5], session.remote_index, .little);
+        mem.writeInt(u64, msg_buf[5..13], nonce, .little);
+
+        const msg_len = 13 + ciphertext_len;
+
+        // Send
+        const endpoint = peer.endpoint;
+        const endpoint_len = peer.endpoint_len;
+        const n = posix.sendto(self.socket, msg_buf[0..msg_len], 0, &endpoint, endpoint_len) catch {
+            return UdpError.SendFailed;
+        };
+
+        _ = self.total_tx.fetchAdd(@intCast(n), .release);
+        _ = peer.tx_bytes.fetchAdd(@intCast(n), .release);
+    }
+
+    /// Read result.
+    pub const ReadResult = struct {
+        pk: Key,
+        n: usize,
+    };
+
+    /// Read decrypted data from any peer.
+    /// Blocks until data is available or closed.
+    pub fn readFrom(self: *Self, buf: []u8) UdpError!ReadResult {
+        while (true) {
+            if (self.closed.load(.acquire)) {
+                return UdpError.Closed;
+            }
+
+            // Get packet from output channel
+            const pkt = self.output_chan.recv() orelse {
+                return UdpError.Closed;
+            };
+
+            // Wait for decryption to complete
+            pkt.ready.wait();
+
+            // Check for errors
+            if (pkt.err != null) {
+                self.packet_pool.release(pkt);
+                continue; // Try next packet
+            }
+
+            // Copy data
+            const n = @min(buf.len, pkt.payload_len);
+            @memcpy(buf[0..n], pkt.payload[0..n]);
+            const pk = pkt.pk;
+
+            self.packet_pool.release(pkt);
+            return ReadResult{ .pk = pk, .n = n };
+        }
+    }
+
+    // ========================================================================
+    // KCP Stream API
+    // ========================================================================
+
+    /// Determine if we are the KCP client for a peer.
+    /// Uses deterministic rule: smaller public key is client (uses odd stream IDs).
+    pub fn isKcpClient(self: *Self, remote_pk: Key) bool {
+        return mem.lessThan(u8, &self.local_key.public.data, &remote_pk.data);
+    }
+
+    /// Initialize Mux for a peer. Called when session is established.
+    fn initMux(self: *Self, peer: *PeerState) void {
+        // Close existing mux if any
+        if (peer.mux) |old_mux| {
+            old_mux.deinit();
+        }
+        // Free old context if any
+        if (peer.mux_ctx) |old_ctx| {
+            const ctx_ptr: *MuxOutputCtx = @ptrCast(@alignCast(old_ctx));
+            self.allocator.destroy(ctx_ptr);
+            peer.mux_ctx = null;
+        }
+
+        const is_client = self.isKcpClient(peer.pk);
+
+        // Allocate output context
+        const output_ctx = self.allocator.create(MuxOutputCtx) catch return;
+        output_ctx.* = .{ .udp = self, .peer = peer };
+        peer.mux_ctx = output_ctx;
+
+        // Create Mux
+        peer.mux = KcpMux.init(
+            self.allocator,
+            &self.timer_service,
+            .{},
+            is_client,
+            MuxOutputCtx.output,
+            onNewStream,
+            output_ctx,
+        ) catch {
+            self.allocator.destroy(output_ctx);
+            peer.mux_ctx = null;
+            return;
+        };
+    }
+
+    /// Output context for Mux - stored at file scope so we can reference it in cleanup.
+    const MuxOutputCtx = struct {
+        udp: *Self,
+        peer: *PeerState,
+
+        fn output(data: []const u8, user_data: ?*anyopaque) anyerror!void {
+            const ctx: *MuxOutputCtx = @ptrCast(@alignCast(user_data.?));
+            try ctx.udp.sendToPeer(ctx.peer, @intFromEnum(message.Protocol.kcp), data);
+        }
+    };
+
+    /// Callback when a new stream is accepted.
+    fn onNewStream(_: *KcpStream, _: ?*anyopaque) void {
+        // Stream is pushed to accept_chan in Mux, nothing extra to do here
+    }
+
+    /// Send data to a peer with protocol byte.
+    fn sendToPeer(self: *Self, peer: *PeerState, protocol: u8, data: []const u8) UdpError!void {
+        const session = peer.session orelse return UdpError.PeerNotFound;
+        if (session.getState() != .established) {
+            return UdpError.PeerNotFound;
+        }
+
+        var msg_buf: [MaxPacketSize]u8 = undefined;
+        var plaintext: [MaxPacketSize]u8 = undefined;
+        plaintext[0] = protocol;
+        @memcpy(plaintext[1 .. data.len + 1], data);
+
+        const plaintext_len = data.len + 1;
+        const ciphertext_len = plaintext_len + noise.tag_size;
+
+        const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..]) catch {
+            return UdpError.SendFailed;
+        };
+
+        msg_buf[0] = @intFromEnum(message.MessageType.transport);
+        mem.writeInt(u32, msg_buf[1..5], session.remote_index, .little);
+        mem.writeInt(u64, msg_buf[5..13], nonce, .little);
+
+        const msg_len = 13 + ciphertext_len;
+        const endpoint = peer.endpoint;
+        const endpoint_len = peer.endpoint_len;
+
+        _ = posix.sendto(self.socket, msg_buf[0..msg_len], 0, &endpoint, endpoint_len) catch {
+            return UdpError.SendFailed;
+        };
+    }
+
+    /// Open a new stream to a peer.
+    pub fn openStream(self: *Self, pk: *const Key) UdpError!*KcpStream {
+        if (self.closed.load(.acquire)) return UdpError.Closed;
+
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers.get(pk.data) orelse return UdpError.PeerNotFound;
+        };
+
+        // Initialize mux if not yet done
+        if (peer.mux == null) {
+            self.initMux(peer);
+        }
+
+        const mux = peer.mux orelse return UdpError.PeerNotFound;
+        return mux.openStream() catch return UdpError.OutOfMemory;
+    }
+
+    /// Accept an incoming stream from a peer.
+    /// Blocks until a stream is available or the peer is closed.
+    pub fn acceptStream(self: *Self, pk: *const Key) ?*KcpStream {
+        if (self.closed.load(.acquire)) return null;
+
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers.get(pk.data) orelse return null;
+        };
+
+        const mux = peer.mux orelse return null;
+        return mux.acceptStream();
+    }
+
+    /// Try to accept a stream without blocking.
+    pub fn tryAcceptStream(self: *Self, pk: *const Key) ?*KcpStream {
+        if (self.closed.load(.acquire)) return null;
+
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers.get(pk.data) orelse return null;
+        };
+
+        const mux = peer.mux orelse return null;
+        return mux.tryAcceptStream();
+    }
+
+    // ========================================================================
+    // Internal: IO Loop
+    // ========================================================================
+
+    fn ioLoop(self: *Self) void {
+        while (!self.closed.load(.acquire)) {
+            // Wait for socket readability using kqueue (efficient, no busy poll)
+            // null timeout = block indefinitely until event
+            const events = self.reactor.wait(null) catch {
+                if (self.closed.load(.acquire)) return;
+                continue;
+            };
+
+            if (self.closed.load(.acquire)) return;
+
+            // Check for shutdown signal (user event ident=1)
+            var should_exit = false;
+            for (events) |ev| {
+                if (ev.filter == posix.system.EVFILT.USER) {
+                    should_exit = true;
+                    break;
+                }
+            }
+            if (should_exit) return;
+
+            // Process all available packets (drain the socket)
+            while (!self.closed.load(.acquire)) {
+                // Acquire packet from pool
+                const pkt = self.packet_pool.acquire() orelse {
+                    // Pool exhausted, yield and retry
+                    std.Thread.yield() catch {};
+                    continue;
+                };
+
+                // Read from socket (non-blocking)
+                var from_addr: posix.sockaddr.in = undefined;
+                var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+
+                const nr = posix.recvfrom(
+                    self.socket,
+                    pkt.data,
+                    0,
+                    @ptrCast(&from_addr),
+                    &from_len,
+                ) catch |err| {
+                    self.packet_pool.release(pkt);
+                    if (err == error.WouldBlock) {
+                        break; // No more data, wait for next event
+                    }
+                    if (self.closed.load(.acquire)) return;
+                    return; // Other errors: exit
+                };
+
+                if (nr < 1) {
+                    self.packet_pool.release(pkt);
+                    continue;
+                }
+
+                pkt.len = nr;
+                pkt.from_addr = from_addr;
+                pkt.from_len = from_len;
+
+                // Update stats
+                _ = self.total_rx.fetchAdd(@intCast(nr), .release);
+                self.last_seen.store(std.time.nanoTimestamp(), .release);
+
+                // Send to decrypt channel (non-blocking)
+                if (!self.decrypt_chan.trySend(pkt)) {
+                    // Queue full, drop packet
+                    self.packet_pool.release(pkt);
+                    continue;
+                }
+
+                // Send to output channel (non-blocking)
+                // If full, packet is still in decrypt queue, just won't be delivered to readFrom
+                _ = self.output_chan.trySend(pkt);
             }
         }
     }
 
-    /// Process a decrypted packet and route KCP data to mux.
-    fn processDecryptWithKcp(self: *UDP, raw: *const RawPacket, out_buf: []u8) DecryptedPacket {
-        var result = DecryptedPacket{
-            .pk = undefined,
-            .protocol = 0,
-            .payload = &[_]u8{},
-            .len = 0,
-            .is_handshake = false,
-            .ok = false,
-        };
+    // ========================================================================
+    // Internal: Timer Loop (for KCP updates)
+    // ========================================================================
 
-        if (raw.len < 1) {
-            return result;
+    fn timerLoop(self: *Self) void {
+        while (!self.closed.load(.acquire)) {
+            // Sleep 1ms
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+
+            if (self.closed.load(.acquire)) return;
+
+            // Advance timer and fire due tasks
+            _ = self.timer_service.advance(1);
+        }
+    }
+
+    // ========================================================================
+    // Internal: Decrypt Worker
+    // ========================================================================
+
+    fn decryptWorker(self: *Self) void {
+        while (true) {
+            // Get packet from decrypt channel
+            const pkt = self.decrypt_chan.recv() orelse {
+                return; // Channel closed
+            };
+
+            // Process packet
+            self.processPacket(pkt);
+
+            // Signal ready
+            pkt.ready.signal();
+        }
+    }
+
+    fn processPacket(self: *Self, pkt: *Packet) void {
+        const data = pkt.data[0..pkt.len];
+
+        if (data.len < 1) {
+            pkt.err = UdpError.MessageTooShort;
+            return;
         }
 
-        // Parse message type
-        const msg_type: message.MessageType = @enumFromInt(raw.data[0]);
-
-        // Cast sockaddr to sockaddr.in for IPv4
-        const from_addr: *const posix.sockaddr.in = @ptrCast(@alignCast(&raw.from));
+        const msg_type: message.MessageType = @enumFromInt(data[0]);
 
         switch (msg_type) {
             .handshake_init => {
-                self.handleHandshakeInit(raw.data[0..raw.len], from_addr, raw.from_len);
-                result.is_handshake = true;
-                result.ok = true;
-                return result;
+                self.handleHandshakeInit(data, &pkt.from_addr, pkt.from_len);
+                pkt.err = UdpError.NoData; // Not a data packet
             },
             .handshake_resp => {
-                self.handleHandshakeResp(raw.data[0..raw.len], from_addr, raw.from_len);
-                result.is_handshake = true;
-                result.ok = true;
-                return result;
+                self.handleHandshakeResp(data, &pkt.from_addr, pkt.from_len);
+                pkt.err = UdpError.NoData; // Not a data packet
             },
             .transport => {
-                // Process transport message with KCP routing
-                if (self.handleTransportWithKcp(raw.data[0..raw.len], from_addr, raw.from_len, out_buf)) |transport_result| {
-                    result.pk = transport_result.pk;
-                    result.protocol = transport_result.protocol;
-                    result.payload = out_buf[0..transport_result.len];
-                    result.len = transport_result.len;
-                    result.ok = true;
-                }
-                return result;
+                self.decryptTransport(pkt, data);
             },
-            else => return result,
+            else => {
+                pkt.err = UdpError.NoData;
+            },
         }
     }
 
-    /// Transport result with protocol byte.
-    const TransportResult = struct {
-        pk: Key,
-        protocol: u8,
-        len: usize,
-    };
-
-    /// Handle transport message with KCP protocol routing.
-    fn handleTransportWithKcp(self: *UDP, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t, out_buf: []u8) ?TransportResult {
-        const msg = message.parseTransportMessage(data) catch return null;
-
-        // Find peer by receiver index
-        const peer = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            const peer_pk = self.by_index.get(msg.receiver_index) orelse return null;
-            break :blk self.peers_map.get(peer_pk) orelse return null;
+    fn decryptTransport(self: *Self, pkt: *Packet, data: []const u8) void {
+        // Parse transport header
+        const msg = message.parseTransportMessage(data) catch {
+            pkt.err = UdpError.MessageTooShort;
+            return;
         };
 
-        // Decrypt and update state, get mux reference (release lock before mux.input)
-        const decrypt_result = blk: {
-            peer.mutex.lock();
-            defer peer.mutex.unlock();
-
-            var session = peer.session orelse return null;
-
-            // Decrypt
-            const n = session.decrypt(msg.ciphertext, msg.counter, out_buf) catch return null;
-
-            // Update peer state (roaming + stats)
-            peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
-            peer.endpoint_len = from_len;
-            peer.endpoint_port = std.mem.bigToNative(u16, from.port);
-            peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
-            peer.rx_bytes += @intCast(data.len);
-            peer.last_seen = std.time.nanoTimestamp();
-            peer.session = session;
-
-            break :blk .{
-                .n = n,
-                .pk = peer.pk,
-                .mux = peer.mux,
+        // Find peer by receiver index
+        const pk = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.by_index.get(msg.receiver_index) orelse {
+                pkt.err = UdpError.PeerNotFound;
+                return;
             };
         };
 
-        if (decrypt_result.n == 0) {
-            // Empty keepalive
-            return null;
+        const peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers.get(pk.data) orelse {
+                pkt.err = UdpError.PeerNotFound;
+                return;
+            };
+        };
+
+        const session = peer.session orelse {
+            pkt.err = UdpError.PeerNotFound;
+            return;
+        };
+
+        // Decrypt - returns plaintext length
+        const plaintext_len = session.decrypt(msg.ciphertext, msg.counter, &pkt.out_buf) catch {
+            pkt.err = UdpError.DecryptFailed;
+            return;
+        };
+
+        if (plaintext_len < 1) {
+            pkt.err = UdpError.MessageTooShort;
+            return;
         }
 
-        // Decode protocol and payload
-        const decode_result = message.decodePayload(out_buf[0..decrypt_result.n]) catch return null;
-        const protocol = decode_result.protocol;
-        const payload = decode_result.payload;
+        const protocol = pkt.out_buf[0];
+        const payload = pkt.out_buf[1..plaintext_len];
 
-        // Route based on protocol (peer lock NOT held here to avoid deadlock)
-        if (protocol == .kcp) {
-            // Route to KCP Mux
-            if (decrypt_result.mux) |mux| {
+        // Route KCP protocol to Mux
+        if (protocol == @intFromEnum(message.Protocol.kcp)) {
+            if (peer.mux) |mux| {
                 mux.input(payload) catch {};
             }
-            // KCP data handled internally, return null to not expose to user
-            return null;
+            pkt.err = UdpError.NoData; // Handled internally
+            return;
         }
 
-        // Non-KCP protocol, copy payload to output
-        const payload_len = payload.len;
-        if (payload_len > 0 and payload_len <= out_buf.len) {
-            // Move payload to start of buffer
-            std.mem.copyForwards(u8, out_buf[0..payload_len], payload);
-        }
+        // Extract protocol and payload for other protocols
+        pkt.pk = pk;
+        pkt.protocol = protocol;
+        pkt.payload = payload;
+        pkt.payload_len = plaintext_len - 1;
+        pkt.err = null;
 
-        return TransportResult{
-            .pk = decrypt_result.pk,
-            .protocol = @intFromEnum(protocol),
-            .len = payload_len,
-        };
+        // Update stats
+        _ = peer.rx_bytes.fetchAdd(@intCast(pkt.len), .release);
     }
 
-    /// Opens a new KCP stream to the specified peer.
-    /// The peer must be in established state with mux initialized.
-    pub fn openStream(self: *UDP, pk: *const Key) UdpError!*Stream {
-        if (self.closed.load(.seq_cst)) {
-            return UdpError.Closed;
-        }
+    // ========================================================================
+    // Internal: Handshake Handling
+    // ========================================================================
 
-        const peer = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            break :blk self.peers_map.get(pk.*) orelse return UdpError.PeerNotFound;
-        };
-
-        // Get mux without holding peer lock (avoid deadlock with muxOutput)
-        const mux = blk: {
-            peer.mutex.lock();
-            defer peer.mutex.unlock();
-
-            if (peer.state != .established) {
-                return UdpError.NoSession;
-            }
-
-            break :blk peer.mux orelse return UdpError.NoSession;
-        };
-
-        // openStream() will call output callback which needs peer.mutex
-        return mux.openStream() catch return UdpError.MuxClosed;
-    }
-
-    /// Accepts an incoming KCP stream from the specified peer.
-    /// Returns null if no stream is available (non-blocking).
-    /// The peer must be in established state with mux initialized.
-    pub fn acceptStream(self: *UDP, pk: *const Key) ?*Stream {
-        if (self.closed.load(.seq_cst)) {
-            return null;
-        }
-
-        const peer = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            break :blk self.peers_map.get(pk.*) orelse return null;
-        };
-
-        peer.mutex.lock();
-        defer peer.mutex.unlock();
-
-        if (peer.state != .established) {
-            return null;
-        }
-
-        // Pop from accept queue
-        return peer.accept_queue.pop();
-    }
-
-    /// Returns the Mux for a peer, if available.
-    pub fn getMux(self: *UDP, pk: *const Key) ?*Mux {
-        if (self.closed.load(.seq_cst)) {
-            return null;
-        }
-
-        const peer = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            break :blk self.peers_map.get(pk.*) orelse return null;
-        };
-
-        peer.mutex.lock();
-        defer peer.mutex.unlock();
-
-        return peer.mux;
-    }
-
-    // ========== End KCP Stream API ==========
-
-    // Internal: handle incoming handshake initiation
-    fn handleHandshakeInit(self: *UDP, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t) void {
+    fn handleHandshakeInit(self: *Self, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t) void {
         const msg = message.parseHandshakeInit(data) catch return;
 
-        // Create handshake state to process the init
+        // Create responder handshake state
         var hs = HandshakeState.init(.{
             .pattern = .IK,
             .initiator = false,
-            .local_static = self.local_key,
+            .local_static = self.local_key.*,
         }) catch return;
 
-        // Build Noise message from wire format
-        var noise_msg: [key_size + 48]u8 = undefined;
-        @memcpy(noise_msg[0..key_size], msg.ephemeral.asBytes());
-        @memcpy(noise_msg[key_size..][0..48], &msg.static_encrypted);
+        // Build noise message from wire format
+        var noise_msg: [80]u8 = undefined;
+        @memcpy(noise_msg[0..32], &msg.ephemeral.data);
+        @memcpy(noise_msg[32..80], &msg.static_encrypted);
 
-        // Read the handshake message
-        var payload_buf: [64]u8 = undefined;
-        _ = hs.readMessage(&noise_msg, &payload_buf) catch return;
+        // Read message 1
+        _ = hs.readMessage(&noise_msg, &[_]u8{}) catch return;
 
-        // Get the remote's public key
+        // Get remote public key
         const remote_pk = hs.getRemoteStatic();
 
-        // Check if peer is known or if we allow unknown peers
-        self.peers_mutex.lock();
-        if (self.peers_map.get(remote_pk) == null) {
-            if (!self.allow_unknown) {
-                self.peers_mutex.unlock();
-                return;
-            }
-            const peer = self.allocator.create(PeerStateInternal) catch {
-                self.peers_mutex.unlock();
-                return;
-            };
-            peer.* = .{
-                .pk = remote_pk,
-                .endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*,
-                .endpoint_len = from_len,
-                .endpoint_port = std.mem.bigToNative(u16, from.port),
-                .endpoint_addr = std.mem.bigToNative(u32, from.addr),
-                .session = null,
-                .state = .new,
-                .rx_bytes = 0,
-                .tx_bytes = 0,
-                .last_seen = null,
-            };
-            self.peers_map.put(remote_pk, peer) catch {
-                self.peers_mutex.unlock();
-                self.allocator.destroy(peer);
-                return;
-            };
+        // Check if we allow this peer
+        if (!self.allow_unknown) {
+            self.peers_mutex.lock();
+            const exists = self.peers.contains(remote_pk.data);
+            self.peers_mutex.unlock();
+            if (!exists) return;
         }
-        self.peers_mutex.unlock();
 
-        // Generate local index for response
-        const local_idx = noise.session.generateIndex();
+        // Generate our sender index
+        const sender_index = self.next_index.fetchAdd(1, .monotonic);
 
-        // Write response message
-        var resp_buf: [256]u8 = undefined;
-        const resp_len = hs.writeMessage(&.{}, &resp_buf) catch return;
+        // Write response
+        var resp_noise: [48]u8 = undefined; // e(32) + ee(16)
+        _ = hs.writeMessage(&[_]u8{}, &resp_noise) catch return;
 
         // Build wire message
-        const ephemeral = hs.local_ephemeral orelse return;
-        const wire_msg = message.buildHandshakeResp(local_idx, msg.sender_index, &ephemeral.public, resp_buf[key_size..resp_len]);
+        var resp_buf: [message.handshake_resp_size]u8 = undefined;
+        resp_buf[0] = @intFromEnum(message.MessageType.handshake_resp);
+        mem.writeInt(u32, resp_buf[1..5], sender_index, .little);
+        mem.writeInt(u32, resp_buf[5..9], msg.sender_index, .little);
+        @memcpy(resp_buf[9..41], resp_noise[0..32]); // ephemeral
+        @memcpy(resp_buf[41..57], resp_noise[32..48]); // encrypted empty
 
-        // Send response - cast sockaddr.in to sockaddr for sendto
-        _ = posix.sendto(self.socket, &wire_msg, 0, @ptrCast(from), from_len) catch return;
+        // Send response
+        _ = posix.sendto(self.socket, &resp_buf, 0, @ptrCast(from), from_len) catch return;
 
-        // Complete handshake and create session
-        const cipher_pair = hs.split() catch return;
-        const send_cs = cipher_pair[0];
-        const recv_cs = cipher_pair[1];
-
-        const session = Session.init(.{
-            .local_index = local_idx,
+        // Create session from split cipher states
+        const send_cipher, const recv_cipher = hs.split() catch return;
+        const session = self.allocator.create(Session) catch return;
+        session.* = Session.init(.{
+            .local_index = sender_index,
             .remote_index = msg.sender_index,
-            .send_key = send_cs.key,
-            .recv_key = recv_cs.key,
+            .send_key = send_cipher.key,
+            .recv_key = recv_cipher.key,
             .remote_pk = remote_pk,
         });
 
-        // Find peer (release peers_mutex before acquiring peer.mutex)
-        const peer_opt: ?*PeerStateInternal = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            break :blk self.peers_map.get(remote_pk);
-        };
+        // Store session
+        self.peers_mutex.lock();
 
-        // Update peer state
-        if (peer_opt) |peer| {
-            peer.mutex.lock();
-            defer peer.mutex.unlock();
-            peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
-            peer.endpoint_len = from_len;
-            peer.endpoint_port = std.mem.bigToNative(u16, from.port);
-            peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
-            peer.session = session;
-            peer.state = .established;
-            peer.last_seen = std.time.nanoTimestamp();
+        const peer = self.getOrCreatePeerLocked(remote_pk);
+        if (peer.session) |old| {
+            self.allocator.destroy(old);
         }
+        peer.session = session;
+        peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
+        peer.endpoint_len = from_len;
 
-        // Register in index map
-        {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            self.by_index.put(local_idx, remote_pk) catch {};
-        }
+        self.by_index.put(sender_index, remote_pk) catch {};
+        self.peers_mutex.unlock();
 
-        // Initialize KCP Mux for this peer
-        if (peer_opt) |peer| {
-            self.initMux(peer);
-        }
+        // Initialize KCP mux for this peer
+        self.initMux(peer);
     }
 
-    // Internal: handle incoming handshake response
-    fn handleHandshakeResp(self: *UDP, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t) void {
+    fn handleHandshakeResp(self: *Self, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t) void {
         const msg = message.parseHandshakeResp(data) catch return;
 
-        // Find the pending handshake
+        // Find pending handshake
         const pending = blk: {
             self.pending_mutex.lock();
             defer self.pending_mutex.unlock();
             break :blk self.pending.get(msg.receiver_index) orelse return;
         };
 
-        // Build Noise message from wire format
-        var noise_msg: [key_size + 16]u8 = undefined;
-        @memcpy(noise_msg[0..key_size], msg.ephemeral.asBytes());
-        @memcpy(noise_msg[key_size..][0..16], &msg.empty_encrypted);
+        // Build noise message
+        var noise_msg: [48]u8 = undefined;
+        @memcpy(noise_msg[0..32], &msg.ephemeral.data);
+        @memcpy(noise_msg[32..48], &msg.empty_encrypted);
 
-        // Read the handshake response
-        var payload_buf: [64]u8 = undefined;
-        _ = pending.hs_state.readMessage(&noise_msg, &payload_buf) catch {
-            // Find peer (release peers_mutex before acquiring peer.mutex)
-            const peer_opt: ?*PeerStateInternal = blk: {
-                self.peers_mutex.lock();
-                defer self.peers_mutex.unlock();
-                break :blk self.peers_map.get(pending.peer_pk);
-            };
-            if (peer_opt) |peer| {
-                peer.mutex.lock();
-                defer peer.mutex.unlock();
-                peer.state = .failed;
-            }
-            pending.done = true;
-            pending.result = UdpError.HandshakeFailed;
+        // Read response
+        _ = pending.hs.readMessage(&noise_msg, &[_]u8{}) catch {
+            pending.success = false;
+            pending.done.signal();
             return;
         };
 
-        // Complete handshake and create session
-        const cipher_pair = pending.hs_state.split() catch {
-            pending.done = true;
-            pending.result = UdpError.HandshakeFailed;
+        // Create session from split cipher states
+        const send_cipher, const recv_cipher = pending.hs.split() catch {
+            pending.success = false;
+            pending.done.signal();
             return;
         };
-        const send_cs = cipher_pair[0];
-        const recv_cs = cipher_pair[1];
 
-        const session = Session.init(.{
-            .local_index = pending.local_idx,
+        const session = self.allocator.create(Session) catch {
+            pending.success = false;
+            pending.done.signal();
+            return;
+        };
+
+        session.* = Session.init(.{
+            .local_index = msg.receiver_index,
             .remote_index = msg.sender_index,
-            .send_key = send_cs.key,
-            .recv_key = recv_cs.key,
-            .remote_pk = pending.peer_pk,
+            .send_key = send_cipher.key,
+            .recv_key = recv_cipher.key,
+            .remote_pk = pending.pk,
         });
 
-        // Find peer (release peers_mutex before acquiring peer.mutex)
-        const peer_opt: ?*PeerStateInternal = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            break :blk self.peers_map.get(pending.peer_pk);
-        };
+        // Store session
+        self.peers_mutex.lock();
 
-        // Update peer state
-        if (peer_opt) |peer| {
-            peer.mutex.lock();
-            defer peer.mutex.unlock();
-            peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
-            peer.endpoint_len = from_len;
-            peer.endpoint_port = std.mem.bigToNative(u16, from.port);
-            peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
-            peer.session = session;
-            peer.state = .established;
-            peer.last_seen = std.time.nanoTimestamp();
+        const peer = self.getOrCreatePeerLocked(pending.pk);
+        if (peer.session) |old| {
+            self.allocator.destroy(old);
         }
-
-        // Register in index map
-        {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            self.by_index.put(pending.local_idx, pending.peer_pk) catch {};
-        }
-
-        // Initialize KCP Mux for this peer
-        if (peer_opt) |peer| {
-            self.initMux(peer);
-        }
-
-        // Signal completion
-        pending.done = true;
-        pending.result = null;
-    }
-
-    // Internal: handle incoming transport message
-    fn handleTransport(self: *UDP, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t, out_buf: []u8) ?ReadResult {
-        const msg = message.parseTransportMessage(data) catch return null;
-
-        // Find peer by receiver index
-        const peer = blk: {
-            self.peers_mutex.lock();
-            defer self.peers_mutex.unlock();
-            const peer_pk = self.by_index.get(msg.receiver_index) orelse return null;
-            break :blk self.peers_map.get(peer_pk) orelse return null;
-        };
-
-        peer.mutex.lock();
-        defer peer.mutex.unlock();
-
-        var session = peer.session orelse return null;
-
-        // Decrypt
-        const n = session.decrypt(msg.ciphertext, msg.counter, out_buf) catch return null;
-
-        // Update peer state (roaming + stats)
+        peer.session = session;
         peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
         peer.endpoint_len = from_len;
-        peer.endpoint_port = std.mem.bigToNative(u16, from.port);
-        peer.endpoint_addr = std.mem.bigToNative(u32, from.addr);
-        peer.rx_bytes += @intCast(data.len);
-        peer.last_seen = std.time.nanoTimestamp();
-        peer.session = session;
 
-        return .{ .pk = peer.pk, .n = n };
+        self.by_index.put(msg.receiver_index, pending.pk) catch {};
+        self.peers_mutex.unlock();
+
+        // Initialize KCP mux for this peer
+        self.initMux(peer);
+
+        pending.success = true;
+        pending.done.signal();
+    }
+
+    // ========================================================================
+    // Internal: Helpers
+    // ========================================================================
+
+    fn getOrCreatePeerLocked(self: *Self, pk: Key) *PeerState {
+        if (self.peers.get(pk.data)) |peer| {
+            return peer;
+        }
+
+        const peer = self.allocator.create(PeerState) catch unreachable;
+        peer.* = PeerState.init(pk);
+        self.peers.put(pk.data, peer) catch unreachable;
+        return peer;
+    }
+
+    fn cleanupPending(self: *Self, index: u32) void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+
+        if (self.pending.fetchRemove(index)) |kv| {
+            self.allocator.destroy(kv.value.hs);
+            self.allocator.destroy(kv.value);
+        }
+    }
+
+    fn parseBindAddr(addr: []const u8) ?posix.sockaddr.in {
+        // Simple parser for "host:port"
+        var it = std.mem.splitScalar(u8, addr, ':');
+        const host = it.next() orelse return null;
+        const port_str = it.next() orelse return null;
+
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+
+        var result: posix.sockaddr.in = .{
+            .family = posix.AF.INET,
+            .port = mem.nativeToBig(u16, port),
+            .addr = 0,
+        };
+
+        if (std.mem.eql(u8, host, "0.0.0.0")) {
+            result.addr = 0;
+        } else if (std.mem.eql(u8, host, "127.0.0.1")) {
+            result.addr = mem.nativeToBig(u32, 0x7F000001);
+        } else {
+            // Parse IP address
+            var octets: [4]u8 = undefined;
+            var octet_it = std.mem.splitScalar(u8, host, '.');
+            for (&octets) |*octet| {
+                const s = octet_it.next() orelse return null;
+                octet.* = std.fmt.parseInt(u8, s, 10) catch return null;
+            }
+            result.addr = mem.bytesToValue(u32, &octets);
+        }
+
+        return result;
     }
 };
 
-// =============================================================================
+// ============================================================================
 // Tests
-// =============================================================================
+// ============================================================================
 
-test "new udp" {
+test "PacketPool basic" {
     const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-    try std.testing.expect(!udp.isClosed());
-    udp.close();
-    try std.testing.expect(udp.isClosed());
+
+    var pool = try PacketPool.init(allocator, 4);
+    defer pool.deinit();
+
+    // Acquire all packets
+    const p1 = pool.acquire().?;
+    const p2 = pool.acquire().?;
+    const p3 = pool.acquire().?;
+    const p4 = pool.acquire().?;
+
+    // Pool should be empty
+    try std.testing.expect(pool.acquire() == null);
+
+    // Release one
+    pool.release(p1);
+
+    // Can acquire again
+    const p5 = pool.acquire().?;
+    try std.testing.expect(p5 == p1);
+
+    // Cleanup
+    pool.release(p2);
+    pool.release(p3);
+    pool.release(p4);
+    pool.release(p5);
 }
 
-test "set peer endpoint" {
+test "Channel with Packet pointers" {
     const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
 
-    const peer_key = KeyPair.generate();
-    var endpoint: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, 12345),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1 in network byte order
-    };
+    var pool = try PacketPool.init(allocator, 4);
+    defer pool.deinit();
 
-    udp.setPeerEndpoint(peer_key.public, @as(*posix.sockaddr, @ptrCast(&endpoint)).*, @sizeOf(posix.sockaddr.in));
+    var ch = try Channel(*Packet).init(allocator, 4);
+    defer ch.deinit();
 
-    const info = udp.peerInfo(&peer_key.public);
-    try std.testing.expect(info != null);
-    try std.testing.expectEqual(PeerState.new, info.?.state);
-}
+    // Send packets through channel
+    const p1 = pool.acquire().?;
+    const p2 = pool.acquire().?;
 
-test "remove peer" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
+    try ch.send(p1);
+    try ch.send(p2);
 
-    const peer_key = KeyPair.generate();
-    var endpoint: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, 12345),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1 in network byte order
-    };
+    // Receive
+    const r1 = ch.recv().?;
+    const r2 = ch.recv().?;
 
-    udp.setPeerEndpoint(peer_key.public, @as(*posix.sockaddr, @ptrCast(&endpoint)).*, @sizeOf(posix.sockaddr.in));
-    try std.testing.expect(udp.peerInfo(&peer_key.public) != null);
+    try std.testing.expect(r1 == p1);
+    try std.testing.expect(r2 == p2);
 
-    udp.removePeer(&peer_key.public);
-    try std.testing.expect(udp.peerInfo(&peer_key.public) == null);
-}
-
-test "host info methods" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    try std.testing.expect(std.mem.eql(u8, &udp.publicKey().data, &key.public.data));
-    try std.testing.expectEqual(@as(usize, 0), udp.peerCount());
-}
-
-test "connect peer not found" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    const peer_key = KeyPair.generate();
-
-    // Try to connect to unknown peer
-    const result = udp.connect(&peer_key.public);
-    try std.testing.expectError(UdpError.PeerNotFound, result);
-}
-
-test "connect no endpoint" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    const peer_key = KeyPair.generate();
-
-    // Add peer without endpoint (directly to map without setPeerEndpoint)
-    const peer = try allocator.create(PeerStateInternal);
-    peer.* = .{
-        .pk = peer_key.public,
-        .endpoint = null,
-        .endpoint_len = 0,
-        .endpoint_port = 0,
-        .endpoint_addr = 0,
-        .session = null,
-        .state = .new,
-        .rx_bytes = 0,
-        .tx_bytes = 0,
-        .last_seen = null,
-    };
-    udp.peers_mutex.lock();
-    try udp.peers_map.put(peer_key.public, peer);
-    udp.peers_mutex.unlock();
-
-    // Try to connect - should fail with no endpoint
-    const result = udp.connect(&peer_key.public);
-    try std.testing.expectError(UdpError.NoEndpoint, result);
-}
-
-test "connect after close" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-
-    const peer_key = KeyPair.generate();
-    var endpoint: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, 12345),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-    };
-    udp.setPeerEndpoint(peer_key.public, @as(*posix.sockaddr, @ptrCast(&endpoint)).*, @sizeOf(posix.sockaddr.in));
-
-    // Close and try to connect
-    udp.close();
-    udp.deinit();
-
-    // Note: After deinit, we can't test connect as the struct is invalid
-    // This test mainly ensures close/deinit work correctly
-}
-
-test "writeTo peer not found" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    const peer_key = KeyPair.generate();
-
-    // Try to write to unknown peer
-    const result = udp.writeTo(&peer_key.public, "test");
-    try std.testing.expectError(UdpError.PeerNotFound, result);
-}
-
-test "writeTo no session" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    const peer_key = KeyPair.generate();
-    var endpoint: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, 12345),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-    };
-    udp.setPeerEndpoint(peer_key.public, @as(*posix.sockaddr, @ptrCast(&endpoint)).*, @sizeOf(posix.sockaddr.in));
-
-    // Try to write without session
-    const result = udp.writeTo(&peer_key.public, "test");
-    try std.testing.expectError(UdpError.NoSession, result);
-}
-
-test "writeTo after close" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    const peer_key = KeyPair.generate();
-
-    // Close UDP
-    udp.close();
-
-    // Try to write after close
-    const result = udp.writeTo(&peer_key.public, "test");
-    try std.testing.expectError(UdpError.Closed, result);
-}
-
-test "readFrom after close" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    // Close UDP
-    udp.close();
-
-    // Try to read after close
-    var buf: [1024]u8 = undefined;
-    const result = udp.readFrom(&buf);
-    try std.testing.expectError(UdpError.Closed, result);
-}
-
-test "peer state transitions" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    const peer_key = KeyPair.generate();
-    var endpoint: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, 12345),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001),
-    };
-    udp.setPeerEndpoint(peer_key.public, @as(*posix.sockaddr, @ptrCast(&endpoint)).*, @sizeOf(posix.sockaddr.in));
-
-    // Initial state should be new
-    const info = udp.peerInfo(&peer_key.public);
-    try std.testing.expect(info != null);
-    try std.testing.expectEqual(PeerState.new, info.?.state);
-}
-
-test "multiple peers" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    // Add multiple peers
-    const num_peers = 5;
-    var peers: [num_peers]KeyPair = undefined;
-
-    for (0..num_peers) |i| {
-        peers[i] = KeyPair.generate();
-        var endpoint: posix.sockaddr.in = .{
-            .family = posix.AF.INET,
-            .port = std.mem.nativeToBig(u16, @intCast(12345 + i)),
-            .addr = std.mem.nativeToBig(u32, 0x7F000001),
-        };
-        udp.setPeerEndpoint(peers[i].public, @as(*posix.sockaddr, @ptrCast(&endpoint)).*, @sizeOf(posix.sockaddr.in));
-    }
-
-    // Verify peer count
-    try std.testing.expectEqual(@as(usize, num_peers), udp.peerCount());
-
-    // Verify each peer exists
-    for (peers) |peer| {
-        try std.testing.expect(udp.peerInfo(&peer.public) != null);
-    }
-
-    // Remove one peer
-    udp.removePeer(&peers[0].public);
-    try std.testing.expectEqual(@as(usize, num_peers - 1), udp.peerCount());
-    try std.testing.expect(udp.peerInfo(&peers[0].public) == null);
-}
-
-test "RawPacket and DecryptedPacket types" {
-    // Test that the pipeline types are correctly defined
-    var raw_buf: [1024]u8 = undefined;
-    const raw_pkt = RawPacket{
-        .data = &raw_buf,
-        .len = 100,
-        .from = undefined,
-        .from_len = @sizeOf(posix.sockaddr.in),
-    };
-    try std.testing.expectEqual(@as(usize, 100), raw_pkt.len);
-
-    const dec_pkt = DecryptedPacket{
-        .pk = undefined,
-        .protocol = 128,
-        .payload = &[_]u8{},
-        .len = 0,
-        .is_handshake = false,
-        .ok = true,
-    };
-    try std.testing.expectEqual(@as(u8, 128), dec_pkt.protocol);
-    try std.testing.expect(dec_pkt.ok);
-    try std.testing.expect(!dec_pkt.is_handshake);
-}
-
-test "processIO returns error when closed" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-
-    // Close the UDP
-    udp.close();
-    defer udp.deinit();
-
-    // processIO should return Closed error
-    var buf: [1024]u8 = undefined;
-    const result = udp.processIO(&buf);
-    try std.testing.expectError(UdpError.Closed, result);
-}
-
-test "processDecrypt handles empty packet" {
-    const allocator = std.testing.allocator;
-    const key = KeyPair.generate();
-    const udp = try UDP.init(allocator, key, .{});
-    defer udp.deinit();
-
-    // Create an empty raw packet
-    var raw_buf: [1024]u8 = undefined;
-    const raw_pkt = RawPacket{
-        .data = raw_buf[0..0], // empty
-        .len = 0,
-        .from = undefined,
-        .from_len = @sizeOf(posix.sockaddr.in),
-    };
-
-    // processDecrypt should return not ok for empty packet
-    var out_buf: [1024]u8 = undefined;
-    const result = udp.processDecrypt(&raw_pkt, &out_buf);
-    try std.testing.expect(!result.ok);
+    pool.release(r1);
+    pool.release(r2);
 }

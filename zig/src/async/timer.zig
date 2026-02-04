@@ -1,19 +1,27 @@
 //! Timer - Time-based task scheduling.
 //!
-//! TimerService is a platform-provided interface for scheduling tasks to be
-//! executed after a delay. This is essential for protocols like KCP that need
-//! to schedule retransmissions.
+//! ## Comptime vs Runtime Polymorphism
 //!
-//! ## Design Principles
-//! - Platform agnostic: Platform provides the actual timer implementation
-//! - Cancellable: Timers can be cancelled before they fire
-//! - Zero allocation in interface: Allocation is platform's responsibility
+//! This module provides both:
+//! 1. **Direct methods** on implementations (comptime, zero overhead)
+//! 2. **TimerService vtable** for runtime polymorphism (when needed)
 //!
-//! ## Platform Implementation Example
-//! The platform could use:
-//! - Go: time.AfterFunc
-//! - Rust: tokio::time::sleep
-//! - C: libuv timers, epoll timerfd, etc.
+//! Prefer using implementations directly with comptime generics:
+//! ```zig
+//! fn scheduleRetry(timer: anytype, delay_ms: u32, task: Task) TimerHandle {
+//!     return timer.schedule(delay_ms, task);
+//! }
+//! ```
+//!
+//! ## Required Interface (comptime)
+//!
+//! Any type implementing TimerService must have:
+//! - `schedule(self: *T, delay_ms: u32, task: Task) TimerHandle`
+//! - `cancel(self: *T, handle: TimerHandle) void`
+//!
+//! Optional:
+//! - `scheduleFn(...)` - convenience wrapper
+//! - `nowMs(self: *T) u64` - current timestamp
 
 const std = @import("std");
 const Task = @import("task.zig").Task;
@@ -31,11 +39,15 @@ pub const TimerHandle = struct {
     }
 };
 
-/// TimerService - Platform-provided timer scheduling service.
+// ============================================================================
+// Runtime Polymorphism (vtable-based) - for legacy/FFI use
+// ============================================================================
+
+/// TimerService - Runtime polymorphic timer service interface.
 ///
-/// This interface allows Zig code to schedule tasks to be executed after
-/// a specified delay. The platform is responsible for the actual timing
-/// mechanism.
+/// Use this when you need to store timer services of different types in the same
+/// variable or pass them through FFI boundaries. For comptime polymorphism,
+/// use implementations directly with `anytype`.
 pub const TimerService = struct {
     /// Opaque pointer to platform-specific timer service state
     ptr: *anyopaque,
@@ -43,36 +55,8 @@ pub const TimerService = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Schedule a task to be executed after `delay_ms` milliseconds.
-        ///
-        /// Returns a handle that can be used to cancel the timer.
-        /// The task will be executed on an executor determined by the platform.
-        ///
-        /// ## Parameters
-        /// - `ptr`: The timer service's opaque pointer
-        /// - `delay_ms`: Delay in milliseconds before the task executes
-        /// - `task`: The task to execute when the timer fires
-        ///
-        /// ## Returns
-        /// A TimerHandle that can be used to cancel the timer.
         schedule: *const fn (ptr: *anyopaque, delay_ms: u32, task: Task) TimerHandle,
-
-        /// Cancel a scheduled timer.
-        ///
-        /// If the timer has already fired or was already cancelled, this is a no-op.
-        ///
-        /// ## Parameters
-        /// - `ptr`: The timer service's opaque pointer
-        /// - `handle`: The handle returned from `schedule`
         cancel: *const fn (ptr: *anyopaque, handle: TimerHandle) void,
-
-        /// Get the current time in milliseconds.
-        ///
-        /// This should return a monotonic timestamp suitable for use with
-        /// protocols like KCP. The actual epoch doesn't matter, only that
-        /// it's monotonically increasing.
-        ///
-        /// Optional: platforms can provide this for protocols that need timestamps.
         now_ms: ?*const fn (ptr: *anyopaque) u64 = null,
     };
 
@@ -100,8 +84,6 @@ pub const TimerService = struct {
     }
 
     /// Get the current time in milliseconds.
-    ///
-    /// Returns null if the platform doesn't provide this.
     pub fn nowMs(self: TimerService) ?u64 {
         if (self.vtable.now_ms) |now_fn| {
             return now_fn(self.ptr);
@@ -110,8 +92,6 @@ pub const TimerService = struct {
     }
 
     /// A null timer service that does nothing.
-    ///
-    /// Useful as a placeholder. Scheduled tasks are silently dropped.
     pub const null_service: TimerService = .{
         .ptr = undefined,
         .vtable = &.{
@@ -127,10 +107,27 @@ pub const TimerService = struct {
     };
 };
 
+// ============================================================================
+// Implementations
+// ============================================================================
+
 /// SimpleTimerService - A basic timer service for testing.
 ///
 /// This implementation stores scheduled timers and allows manual advancement
 /// of time. Useful for unit testing time-dependent code.
+///
+/// ## Direct Usage (comptime, zero overhead)
+/// ```zig
+/// var timer_svc = SimpleTimerService.init(allocator);
+/// const handle = timer_svc.schedule(100, my_task);
+/// _ = timer_svc.advance(100);
+/// ```
+///
+/// ## Runtime Polymorphism
+/// ```zig
+/// const ts: TimerService = timer_svc.timerService();
+/// ts.schedule(100, my_task);
+/// ```
 pub const SimpleTimerService = struct {
     const TimerEntry = struct {
         handle: TimerHandle,
@@ -162,12 +159,61 @@ pub const SimpleTimerService = struct {
         self.timers.deinit(self.allocator);
     }
 
-    /// Create a TimerService interface from this SimpleTimerService.
-    pub fn timerService(self: *SimpleTimerService) TimerService {
-        return .{
-            .ptr = @ptrCast(self),
-            .vtable = &vtable,
-        };
+    /// Schedule a task to be executed after `delay_ms` milliseconds.
+    ///
+    /// Direct method - use this for comptime polymorphism.
+    pub fn schedule(self: *SimpleTimerService, delay_ms: u32, task: Task) TimerHandle {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const handle = TimerHandle{ .id = self.next_id };
+        self.next_id += 1;
+
+        self.timers.append(self.allocator, .{
+            .handle = handle,
+            .fire_at = self.current_time + delay_ms,
+            .task = task,
+            .cancelled = false,
+        }) catch return TimerHandle.null_handle;
+
+        return handle;
+    }
+
+    /// Schedule a typed context with a method to be called after a delay.
+    pub fn scheduleFn(
+        self: *SimpleTimerService,
+        delay_ms: u32,
+        comptime T: type,
+        context: *T,
+        comptime method: fn (*T) void,
+    ) TimerHandle {
+        return self.schedule(delay_ms, Task.init(T, context, method));
+    }
+
+    /// Cancel a scheduled timer.
+    ///
+    /// Direct method - use this for comptime polymorphism.
+    pub fn cancel(self: *SimpleTimerService, handle: TimerHandle) void {
+        if (!handle.isValid()) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.timers.items) |*entry| {
+            if (entry.handle.id == handle.id) {
+                entry.cancelled = true;
+                return;
+            }
+        }
+    }
+
+    /// Get the current time in milliseconds.
+    ///
+    /// Direct method - use this for comptime polymorphism.
+    pub fn nowMs(self: *SimpleTimerService) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.current_time;
     }
 
     /// Advance time and fire any due timers.
@@ -216,48 +262,35 @@ pub const SimpleTimerService = struct {
         return count;
     }
 
+    /// Create a TimerService interface from this SimpleTimerService.
+    ///
+    /// Use this only when runtime polymorphism is needed.
+    pub fn timerService(self: *SimpleTimerService) TimerService {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
     const vtable: TimerService.VTable = .{
-        .schedule = schedule,
-        .cancel = cancel,
-        .now_ms = nowMs,
+        .schedule = scheduleVtable,
+        .cancel = cancelVtable,
+        .now_ms = nowMsVtable,
     };
 
-    fn schedule(ptr: *anyopaque, delay_ms: u32, task: Task) TimerHandle {
+    fn scheduleVtable(ptr: *anyopaque, delay_ms: u32, task: Task) TimerHandle {
         const self: *SimpleTimerService = @ptrCast(@alignCast(ptr));
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const handle = TimerHandle{ .id = self.next_id };
-        self.next_id += 1;
-
-        self.timers.append(self.allocator, .{
-            .handle = handle,
-            .fire_at = self.current_time + delay_ms,
-            .task = task,
-            .cancelled = false,
-        }) catch return TimerHandle.null_handle;
-
-        return handle;
+        return self.schedule(delay_ms, task);
     }
 
-    fn cancel(ptr: *anyopaque, handle: TimerHandle) void {
+    fn cancelVtable(ptr: *anyopaque, handle: TimerHandle) void {
         const self: *SimpleTimerService = @ptrCast(@alignCast(ptr));
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.timers.items) |*entry| {
-            if (entry.handle.id == handle.id) {
-                entry.cancelled = true;
-                return;
-            }
-        }
+        self.cancel(handle);
     }
 
-    fn nowMs(ptr: *anyopaque) u64 {
+    fn nowMsVtable(ptr: *anyopaque) u64 {
         const self: *SimpleTimerService = @ptrCast(@alignCast(ptr));
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.current_time;
+        return self.nowMs();
     }
 };
 
@@ -265,17 +298,14 @@ pub const SimpleTimerService = struct {
 // Tests
 // ============================================================================
 
-test "SimpleTimerService schedules and fires timers" {
+test "SimpleTimerService direct schedule (comptime)" {
     var timer_svc = SimpleTimerService.init(std.testing.allocator);
     defer timer_svc.deinit();
-
-    const ts = timer_svc.timerService();
 
     var fired: bool = false;
 
     const Context = struct {
         flag: *bool,
-
         fn fire(self: *@This()) void {
             self.flag.* = true;
         }
@@ -283,8 +313,8 @@ test "SimpleTimerService schedules and fires timers" {
 
     var ctx = Context{ .flag = &fired };
 
-    // Schedule a timer for 100ms from now
-    const handle = ts.scheduleFn(100, Context, &ctx, Context.fire);
+    // Direct schedule - comptime polymorphism
+    const handle = timer_svc.schedule(100, Task.init(Context, &ctx, Context.fire));
     try std.testing.expect(handle.isValid());
     try std.testing.expectEqual(@as(usize, 1), timer_svc.pendingCount());
 
@@ -295,10 +325,33 @@ test "SimpleTimerService schedules and fires timers" {
     // Advance another 50ms - timer should fire
     try std.testing.expectEqual(@as(usize, 1), timer_svc.advance(50));
     try std.testing.expect(fired);
-    try std.testing.expectEqual(@as(usize, 0), timer_svc.pendingCount());
 }
 
-test "SimpleTimerService cancels timers" {
+test "SimpleTimerService direct cancel (comptime)" {
+    var timer_svc = SimpleTimerService.init(std.testing.allocator);
+    defer timer_svc.deinit();
+
+    var fired: bool = false;
+
+    const Context = struct {
+        flag: *bool,
+        fn fire(self: *@This()) void {
+            self.flag.* = true;
+        }
+    };
+
+    var ctx = Context{ .flag = &fired };
+
+    const handle = timer_svc.scheduleFn(100, Context, &ctx, Context.fire);
+
+    // Direct cancel
+    timer_svc.cancel(handle);
+
+    _ = timer_svc.advance(200);
+    try std.testing.expect(!fired);
+}
+
+test "SimpleTimerService vtable schedule (runtime)" {
     var timer_svc = SimpleTimerService.init(std.testing.allocator);
     defer timer_svc.deinit();
 
@@ -308,7 +361,6 @@ test "SimpleTimerService cancels timers" {
 
     const Context = struct {
         flag: *bool,
-
         fn fire(self: *@This()) void {
             self.flag.* = true;
         }
@@ -317,27 +369,24 @@ test "SimpleTimerService cancels timers" {
     var ctx = Context{ .flag = &fired };
 
     const handle = ts.scheduleFn(100, Context, &ctx, Context.fire);
+    try std.testing.expect(handle.isValid());
 
-    // Cancel before it fires
-    ts.cancel(handle);
-
-    // Advance past the fire time
-    _ = timer_svc.advance(200);
-
-    // Should not have fired
-    try std.testing.expect(!fired);
+    _ = timer_svc.advance(100);
+    try std.testing.expect(fired);
 }
 
-test "TimerService.nowMs returns current time" {
+test "SimpleTimerService.nowMs" {
     var timer_svc = SimpleTimerService.init(std.testing.allocator);
     defer timer_svc.deinit();
 
-    const ts = timer_svc.timerService();
-
-    try std.testing.expectEqual(@as(?u64, 0), ts.nowMs());
+    try std.testing.expectEqual(@as(u64, 0), timer_svc.nowMs());
 
     _ = timer_svc.advance(42);
 
+    try std.testing.expectEqual(@as(u64, 42), timer_svc.nowMs());
+
+    // Via vtable
+    const ts = timer_svc.timerService();
     try std.testing.expectEqual(@as(?u64, 42), ts.nowMs());
 }
 

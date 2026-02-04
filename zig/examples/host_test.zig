@@ -9,7 +9,7 @@ const noise = @import("noise");
 
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
-const UDP = noise.UDP;
+const UDP = noise.LegacyUDP; // Using non-async UDP for simple examples
 
 const HostInfo = struct {
     name: []const u8,

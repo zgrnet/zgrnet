@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-zgrnet = { path = "../../../rust" }
+zgrnet = { package = "zgrnet-noise", path = "../../../rust" }
 hex = "0.4"

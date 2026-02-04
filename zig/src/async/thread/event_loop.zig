@@ -98,7 +98,78 @@ pub const EventLoop = struct {
         self.timers.entries.deinit(self.allocator);
     }
 
+    // ========================================================================
+    // Direct dispatch methods (for comptime polymorphism)
+    // ========================================================================
+
+    /// Dispatch a task to be executed.
+    ///
+    /// Direct method - use this for comptime polymorphism (zero overhead).
+    pub fn dispatch(self: *Self, task: Task) void {
+        _ = self.tasks.push(task);
+    }
+
+    /// Dispatch a typed context with a method to be called.
+    pub fn dispatchFn(
+        self: *Self,
+        comptime T: type,
+        context: *T,
+        comptime method: fn (*T) void,
+    ) void {
+        self.dispatch(Task.init(T, context, method));
+    }
+
+    /// Schedule a task to be executed after a delay.
+    ///
+    /// Direct method - use this for comptime polymorphism (zero overhead).
+    pub fn schedule(self: *Self, delay_ms: u32, task: Task) TimerHandle {
+        const id = self.timers.next_id;
+        self.timers.next_id += 1;
+
+        const fire_at = self.current_time_ms + delay_ms;
+
+        self.timers.entries.append(self.allocator, .{
+            .id = id,
+            .fire_at = fire_at,
+            .task = task,
+            .cancelled = false,
+        }) catch return TimerHandle.null_handle;
+
+        return .{ .id = id };
+    }
+
+    /// Schedule a typed context with a method to be called after a delay.
+    pub fn scheduleFn(
+        self: *Self,
+        delay_ms: u32,
+        comptime T: type,
+        context: *T,
+        comptime method: fn (*T) void,
+    ) TimerHandle {
+        return self.schedule(delay_ms, Task.init(T, context, method));
+    }
+
+    /// Cancel a scheduled timer.
+    ///
+    /// Direct method - use this for comptime polymorphism (zero overhead).
+    pub fn cancel(self: *Self, handle: TimerHandle) void {
+        if (!handle.isValid()) return;
+
+        for (self.timers.entries.items) |*entry| {
+            if (entry.id == handle.id) {
+                entry.cancelled = true;
+                return;
+            }
+        }
+    }
+
+    // ========================================================================
+    // vtable-based interfaces (for runtime polymorphism)
+    // ========================================================================
+
     /// Create an Executor interface.
+    ///
+    /// Use this only when runtime polymorphism is needed.
     pub fn executor(self: *Self) Executor {
         return .{
             .ptr = @ptrCast(self),
@@ -107,6 +178,8 @@ pub const EventLoop = struct {
     }
 
     /// Create a TimerService interface.
+    ///
+    /// Use this only when runtime polymorphism is needed.
     pub fn timerService(self: *Self) TimerService {
         return .{
             .ptr = @ptrCast(self),

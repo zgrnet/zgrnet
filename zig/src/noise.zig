@@ -64,12 +64,12 @@ pub const ListenerError = net.ListenerError;
 pub const UdpTransport = net.UdpTransport;
 pub const UdpAddr = net.UdpAddr;
 
-// High-level UDP API types
+// High-level UDP API types (double-queue architecture)
 pub const UDP = net.UDP;
-pub const PeerInfo = net.PeerInfo;
-pub const PeerState = net.PeerState;
-pub const HostInfo = net.HostInfo;
-pub const ReadResult = net.ReadResult;
+pub const UdpError = net.UdpError;
+pub const UdpOptions = net.UdpOptions;
+pub const Packet = net.Packet;
+pub const PacketPool = net.PacketPool;
 
 // KCP types
 pub const Kcp = kcp.Kcp;
@@ -95,6 +95,8 @@ pub const TimerHandle = async_mod.TimerHandle;
 pub const Actor = async_mod.Actor;
 pub const ActorHandle = async_mod.ActorHandle;
 pub const MpscQueue = async_mod.MpscQueue;
+pub const AsyncChannel = async_mod.Channel;
+pub const Signal = async_mod.Signal;
 pub const InlineExecutor = async_mod.InlineExecutor;
 pub const QueuedExecutor = async_mod.QueuedExecutor;
 pub const SimpleTimerService = async_mod.SimpleTimerService;

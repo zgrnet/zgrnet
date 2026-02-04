@@ -55,8 +55,11 @@ const std = @import("std");
 pub const task = @import("task.zig");
 pub const executor = @import("executor.zig");
 pub const timer = @import("timer.zig");
+pub const io = @import("io.zig");
 pub const mpsc = @import("mpsc.zig");
+pub const channel = @import("channel.zig");
 pub const actor = @import("actor.zig");
+pub const concepts = @import("concepts.zig");
 
 // Implementation backends
 pub const thread = @import("thread/mod.zig");
@@ -80,6 +83,24 @@ pub const ActorHandle = actor.ActorHandle;
 // Re-export MPSC queue
 pub const MpscQueue = mpsc.MpscQueue;
 
+// Re-export Channel types
+pub const Channel = channel.Channel;
+pub const Signal = channel.Signal;
+
+// Re-export comptime concepts
+pub const isExecutor = concepts.isExecutor;
+pub const isTimerService = concepts.isTimerService;
+pub const isIOService = concepts.isIOService;
+pub const assertExecutor = concepts.assertExecutor;
+pub const assertTimerService = concepts.assertTimerService;
+pub const assertIOService = concepts.assertIOService;
+
+// Re-export IO types
+pub const ReadyCallback = io.ReadyCallback;
+pub const Interest = io.Interest;
+pub const Registration = io.Registration;
+pub const IOService = io.IOService;
+
 // Convenience re-exports from thread backend (most common usage)
 pub const ThreadExecutor = thread.ThreadExecutor;
 pub const ThreadExecutorWithTimers = thread.ThreadExecutorWithTimers;
@@ -91,8 +112,11 @@ test {
     _ = task;
     _ = executor;
     _ = timer;
+    _ = io;
     _ = mpsc;
+    _ = channel;
     _ = actor;
     _ = thread;
+    _ = concepts;
     // Note: minicoro tests require C linkage, tested separately
 }

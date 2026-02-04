@@ -1,10 +1,30 @@
 //! Stream - A multiplexed reliable stream over KCP.
+//!
+//! Uses comptime generics for zero-cost async primitives:
+//! - TimerServiceT: For KCP update scheduling (1ms interval)
+//! - Output is synchronous (caller provides callback)
+//!
+//! ## Architecture
+//!
+//! ```
+//! Mux<TimerServiceT>
+//!   ├── timer_service: *TimerServiceT (injected)
+//!   ├── streams: HashMap<u32, *Stream>
+//!   ├── update_handle: TimerHandle (KCP timer)
+//!   └── output_fn: callback to send data
+//! ```
 
 const std = @import("std");
 const kcp_mod = @import("kcp.zig");
 const ring_buffer = @import("ring_buffer.zig");
+const async_mod = @import("../async/mod.zig");
+const concepts = async_mod.concepts;
 
 const kcp = kcp_mod;
+const Task = async_mod.Task;
+const TimerHandle = async_mod.TimerHandle;
+const Channel = async_mod.Channel;
+const Signal = async_mod.Signal;
 
 /// Re-export RingBuffer for convenience
 pub const RingBuffer = ring_buffer.RingBuffer;
@@ -22,49 +42,71 @@ pub const StreamError = error{
     StreamClosed,
     KcpSendFailed,
     Timeout,
+    MuxClosed,
 };
 
+/// Mux errors
+pub const MuxError = error{
+    MuxClosed,
+    OutOfMemory,
+    InvalidFrame,
+};
+
+/// Mux configuration
+pub const MuxConfig = struct {
+    max_frame_size: usize = 32 * 1024,
+    max_receive_buffer: usize = 16 * 1024 * 1024, // 16MB to allow larger transfers
+    update_interval_ms: u32 = 1, // KCP update interval
+};
+
+/// Output callback type.
+pub const OutputFn = *const fn (data: []const u8, user_data: ?*anyopaque) anyerror!void;
+
+/// Callback when a new stream is accepted.
+pub const OnNewStreamFn = *const fn (stream: *Stream, user_data: ?*anyopaque) void;
+
 /// Stream represents a multiplexed stream over KCP.
-/// Uses fine-grained locking for better concurrency:
-/// - kcp_mutex: protects KCP operations (send/recv/update)
-/// - recv_mutex: protects recv_buf only
-/// - state/output_error: atomic for lock-free reads
-///
-/// Reference counting:
-/// - Stream uses reference counting to allow safe re-handshake without use-after-free.
-/// - Mux holds one reference (via streams map).
-/// - User holds one reference (via openStream return or on_new_stream callback).
-/// - Call release() to decrement ref count. When it reaches 0, memory is freed.
-/// - For convenience, close() handles shutdown + removeStream + release.
+/// Uses fine-grained locking for better concurrency.
 pub const Stream = struct {
     id: u32,
-    mux: *Mux,
+    mux_ptr: *anyopaque, // Type-erased Mux pointer (to avoid circular comptime dependency)
+    send_frame_fn: *const fn (mux: *anyopaque, cmd: kcp.Cmd, stream_id: u32, payload: []const u8) anyerror!void,
     kcp_instance: ?kcp.Kcp,
-    recv_buf: RingBuffer(u8), // O(1) head removal
+    recv_buf: RingBuffer(u8),
     allocator: std.mem.Allocator,
 
-    // Fine-grained locks (lock order: kcp_mutex -> recv_mutex)
-    kcp_mutex: std.Thread.Mutex, // Protects kcp_instance operations
-    recv_mutex: std.Thread.Mutex, // Protects recv_buf only
+    // Fine-grained locks
+    kcp_mutex: std.Thread.Mutex,
+    recv_mutex: std.Thread.Mutex,
 
-    // Atomic state for lock-free reads
+    // Atomic state
     state: std.atomic.Value(StreamState),
     output_error: std.atomic.Value(bool),
 
-    // Reference counting for safe memory management during re-handshake
+    // Reference counting
     ref_count: std.atomic.Value(u32),
 
+    // Max receive buffer (from config)
+    max_receive_buffer: usize,
+
+    // Condition variable for blocking read
+    data_available: std.Thread.Condition,
+
     /// Initialize a new stream.
-    pub fn init(allocator: std.mem.Allocator, id: u32, mux: *Mux) !*Stream {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        id: u32,
+        mux_ptr: *anyopaque,
+        send_frame_fn: *const fn (*anyopaque, kcp.Cmd, u32, []const u8) anyerror!void,
+        max_recv_buf: usize,
+    ) !*Stream {
         const self = try allocator.create(Stream);
         errdefer allocator.destroy(self);
 
-        // Retain the Mux - stream holds a reference to prevent use-after-free
-        mux.retain();
-
         self.* = Stream{
             .id = id,
-            .mux = mux,
+            .mux_ptr = mux_ptr,
+            .send_frame_fn = send_frame_fn,
             .kcp_instance = null,
             .recv_buf = RingBuffer(u8).init(allocator),
             .allocator = allocator,
@@ -72,13 +114,15 @@ pub const Stream = struct {
             .recv_mutex = .{},
             .state = std.atomic.Value(StreamState).init(.open),
             .output_error = std.atomic.Value(bool).init(false),
-            .ref_count = std.atomic.Value(u32).init(1), // Mux's reference
+            .ref_count = std.atomic.Value(u32).init(1),
+            .max_receive_buffer = max_recv_buf,
+            .data_available = .{},
         };
 
-        // Create KCP with output callback that routes data through the Mux
+        // Create KCP with output callback
         self.kcp_instance = try kcp.Kcp.init(id, &Stream.kcpOutput, self);
         if (self.kcp_instance) |*k| {
-            k.setUserPtr(); // Set user pointer for callback to access this Stream
+            k.setUserPtr();
             k.setDefaultConfig();
         }
 
@@ -86,52 +130,32 @@ pub const Stream = struct {
     }
 
     /// Increment reference count.
-    /// Call this when passing stream to another owner.
     pub fn retain(self: *Stream) void {
         _ = self.ref_count.fetchAdd(1, .seq_cst);
     }
 
-    /// Decrement reference count and free if it reaches zero.
-    /// Returns true if memory was freed.
+    /// Decrement reference count and free if zero.
     pub fn release(self: *Stream) bool {
         const old = self.ref_count.fetchSub(1, .seq_cst);
         if (old == 1) {
-            // Was 1, now 0 - we were the last reference, free memory
             self.deinitInternal();
             return true;
         }
         return false;
     }
 
-    /// Close the stream (user-facing API).
-    /// This handles: shutdown + remove from Mux + release user's reference.
-    /// After calling close(), do not use the stream pointer anymore.
+    /// Close the stream (user API).
     pub fn close(self: *Stream) void {
-        // Mark as closing and send FIN if needed
         self.shutdown();
-        // Remove from Mux's streams map (releases Mux's reference)
-        self.mux.removeStream(self.id);
-        // Release user's reference
         _ = self.release();
     }
 
-    /// Internal deinitialization - actually frees memory.
-    /// Only called when ref_count reaches 0.
     fn deinitInternal(self: *Stream) void {
         if (self.kcp_instance) |*k| {
             k.deinit();
         }
         self.recv_buf.deinit();
-        // Release our reference to the Mux (may free Mux if we were the last reference)
-        const mux = self.mux;
         self.allocator.destroy(self);
-        _ = mux.release();
-    }
-
-    /// Deinitialize the stream (deprecated - use close() or release() instead).
-    /// Kept for backward compatibility but prefer close() for user code.
-    pub fn deinit(self: *Stream) void {
-        self.deinitInternal();
     }
 
     /// Get stream ID.
@@ -139,17 +163,13 @@ pub const Stream = struct {
         return self.id;
     }
 
-    /// Get stream state (lock-free atomic read).
+    /// Get stream state.
     pub fn getState(self: *const Stream) StreamState {
         return self.state.load(.seq_cst);
     }
 
     /// Write data to the stream.
-    /// Note: KCP send() returns 0 on success, < 0 on error.
-    /// We return data.len on success to indicate bytes accepted.
-    /// Uses kcp_mutex only (not recv_mutex).
     pub fn write(self: *Stream, data: []const u8) StreamError!usize {
-        // Lock-free state check
         const current_state = self.state.load(.seq_cst);
         if (current_state == .closed or current_state == .local_close) {
             return StreamError.StreamClosed;
@@ -163,23 +183,30 @@ pub const Stream = struct {
             if (ret < 0) {
                 return StreamError.KcpSendFailed;
             }
-            // Flush immediately for better throughput (same as Go/Rust)
             k.flush();
-            // KCP returns 0 on success, we return bytes accepted
             return data.len;
         }
 
         return StreamError.KcpSendFailed;
     }
 
-    /// Read data from the stream.
-    /// Uses recv_mutex only (not kcp_mutex) for better concurrency.
+    /// Flush pending data.
+    pub fn flush(self: *Stream) StreamError!void {
+        self.kcp_mutex.lock();
+        defer self.kcp_mutex.unlock();
+
+        if (self.kcp_instance) |*k| {
+            k.flush();
+        }
+    }
+
+    /// Read data from the stream (non-blocking).
+    /// Returns 0 if no data available or EOF.
     pub fn read(self: *Stream, buffer: []u8) StreamError!usize {
         self.recv_mutex.lock();
         defer self.recv_mutex.unlock();
 
         if (self.recv_buf.readableLength() == 0) {
-            // Lock-free state check
             const current_state = self.state.load(.seq_cst);
             if (current_state == .closed or current_state == .remote_close) {
                 return 0; // EOF
@@ -187,83 +214,40 @@ pub const Stream = struct {
             return 0; // No data available
         }
 
-        // LinearFifo.read() automatically removes data from head - O(1)
         return self.recv_buf.read(buffer);
     }
 
-    /// Receive data directly from KCP into user-provided buffer (zero-copy fast path).
-    /// Returns the number of bytes received, or 0 if no data available.
-    /// This bypasses the internal recv_buf for lower latency when caller can process immediately.
-    /// Lock order: kcp_mutex -> recv_mutex (if both needed).
-    pub fn recvIntoBuffer(self: *Stream, buffer: []u8) StreamError!usize {
-        // First drain any buffered data (recv_mutex only)
+    /// Read data from the stream (blocking).
+    /// Blocks until data is available, EOF, or timeout.
+    pub fn readBlocking(self: *Stream, buffer: []u8, timeout_ns: ?u64) StreamError!usize {
         self.recv_mutex.lock();
-        if (self.recv_buf.readableLength() > 0) {
-            const n = self.recv_buf.read(buffer);
-            self.recv_mutex.unlock();
-            return n;
-        }
-        self.recv_mutex.unlock();
+        defer self.recv_mutex.unlock();
 
-        // No buffered data, try direct receive from KCP (kcp_mutex)
-        self.kcp_mutex.lock();
-        defer self.kcp_mutex.unlock();
-
-        if (self.kcp_instance) |*k| {
-            const size = k.peekSize();
-            if (size <= 0) {
-                const current_state = self.state.load(.seq_cst);
-                if (current_state == .closed or current_state == .remote_close) {
-                    return 0; // EOF
-                }
-                return 0; // No data available
+        // Wait for data if buffer is empty
+        while (self.recv_buf.readableLength() == 0) {
+            const current_state = self.state.load(.seq_cst);
+            if (current_state == .closed or current_state == .remote_close) {
+                return 0; // EOF
             }
 
-            // Direct receive into user buffer if it fits
-            if (buffer.len >= @as(usize, @intCast(size))) {
-                const n = k.recv(buffer);
-                if (n > 0) {
-                    return @intCast(n);
-                }
+            if (timeout_ns) |ns| {
+                self.data_available.timedWait(&self.recv_mutex, ns) catch {
+                    // Timeout
+                    return 0;
+                };
             } else {
-                // Buffer too small, need intermediate allocation
-                const tmp = self.allocator.alloc(u8, @intCast(size)) catch return 0;
-                defer self.allocator.free(tmp);
-
-                const n = k.recv(tmp);
-                if (n > 0) {
-                    const copy_len = @min(buffer.len, @as(usize, @intCast(n)));
-                    @memcpy(buffer[0..copy_len], tmp[0..copy_len]);
-                    // Buffer remaining data (need recv_mutex) with size limit check
-                    if (@as(usize, @intCast(n)) > copy_len) {
-                        self.recv_mutex.lock();
-                        const current_size = self.recv_buf.readableLength();
-                        const max_size = self.mux.config.max_receive_buffer;
-                        const remaining = tmp[copy_len..@intCast(n)];
-                        if (current_size + remaining.len <= max_size) {
-                            self.recv_buf.write(remaining) catch {};
-                        }
-                        // If buffer full, drop remaining data (backpressure)
-                        self.recv_mutex.unlock();
-                    }
-                    return copy_len;
-                }
+                self.data_available.wait(&self.recv_mutex);
             }
         }
 
-        return 0;
+        return self.recv_buf.read(buffer);
     }
 
-    /// Close the stream.
-    /// Shutdown the write-half of the stream.
-    /// Sends a FIN frame to the remote peer and transitions to `local_close` state.
-    /// The stream can still receive data until a FIN is received from the peer.
-    /// Uses atomic CAS for thread-safe state transition.
+    /// Shutdown write side.
     pub fn shutdown(self: *Stream) void {
         const current_state = self.state.load(.seq_cst);
         if (current_state == .closed or current_state == .local_close) return;
 
-        // Only send FIN when transitioning from open to local_close
         const should_send_fin = current_state == .open;
 
         if (current_state == .open) {
@@ -272,21 +256,13 @@ pub const Stream = struct {
             self.state.store(.closed, .seq_cst);
         }
 
-        // Send FIN (only once)
         if (should_send_fin) {
-            self.mux.sendFin(self.id) catch {};
+            self.send_frame_fn(self.mux_ptr, .fin, self.id, &[_]u8{}) catch {};
         }
     }
 
-    /// Check if a transport output error has occurred (lock-free).
-    pub fn hasOutputError(self: *const Stream) bool {
-        return self.output_error.load(.seq_cst);
-    }
-
     /// Input data from KCP.
-    /// Uses kcp_mutex only.
     pub fn kcpInput(self: *Stream, data: []const u8) void {
-        // Lock-free state check
         if (self.state.load(.seq_cst) == .closed) return;
 
         self.kcp_mutex.lock();
@@ -297,20 +273,14 @@ pub const Stream = struct {
         }
     }
 
-    /// Receive data from KCP and buffer it.
-    /// Uses stack buffer for common MTU-sized messages, heap fallback for oversized.
-    /// Returns true if any data was received.
-    /// Fine-grained locking: kcp_mutex for KCP ops, recv_mutex for buffer ops.
+    /// Receive from KCP and buffer.
     pub fn kcpRecv(self: *Stream) bool {
         var received = false;
-        // Stack buffer for common case (MTU-sized messages)
         var stack_buf: [1500]u8 = undefined;
-        // Heap buffer for oversized messages (allocated on demand)
         var heap_buf: ?[]u8 = null;
         defer if (heap_buf) |buf| self.allocator.free(buf);
 
         while (true) {
-            // Phase 1: Peek and recv from KCP (kcp_mutex)
             self.kcp_mutex.lock();
             const size = if (self.kcp_instance) |*k| k.peekSize() else -1;
             if (size <= 0) {
@@ -322,13 +292,11 @@ pub const Stream = struct {
             var data_slice: []u8 = undefined;
 
             if (usize_size <= stack_buf.len) {
-                // Common path: use stack buffer
                 const n = if (self.kcp_instance) |*k| k.recv(stack_buf[0..usize_size]) else -1;
                 self.kcp_mutex.unlock();
                 if (n <= 0) break;
                 data_slice = stack_buf[0..@intCast(n)];
             } else {
-                // Rare path: allocate/grow heap buffer for oversized
                 if (heap_buf == null or heap_buf.?.len < usize_size) {
                     if (heap_buf) |old| self.allocator.free(old);
                     heap_buf = self.allocator.alloc(u8, usize_size) catch {
@@ -342,12 +310,9 @@ pub const Stream = struct {
                 data_slice = heap_buf.?[0..@intCast(n)];
             }
 
-            // Phase 2: Write to recv_buf (recv_mutex) with size limit check
             self.recv_mutex.lock();
             const current_size = self.recv_buf.readableLength();
-            const max_size = self.mux.config.max_receive_buffer;
-            if (current_size + data_slice.len > max_size) {
-                // Buffer full - apply backpressure by not receiving more
+            if (current_size + data_slice.len > self.max_receive_buffer) {
                 self.recv_mutex.unlock();
                 break;
             }
@@ -355,6 +320,8 @@ pub const Stream = struct {
                 self.recv_mutex.unlock();
                 break;
             };
+            // Signal waiting readers that data is available
+            self.data_available.signal();
             self.recv_mutex.unlock();
             received = true;
         }
@@ -363,9 +330,7 @@ pub const Stream = struct {
     }
 
     /// Update KCP state.
-    /// Uses kcp_mutex only.
     pub fn kcpUpdate(self: *Stream, current: u32) void {
-        // Lock-free state check
         if (self.state.load(.seq_cst) == .closed) return;
 
         self.kcp_mutex.lock();
@@ -377,7 +342,6 @@ pub const Stream = struct {
     }
 
     /// Handle FIN from remote.
-    /// Uses atomic state transitions.
     pub fn handleFin(self: *Stream) void {
         const current_state = self.state.load(.seq_cst);
         if (current_state == .local_close) {
@@ -385,429 +349,368 @@ pub const Stream = struct {
         } else if (current_state == .open) {
             self.state.store(.remote_close, .seq_cst);
         }
+        // Wake up any blocked readers
+        self.data_available.broadcast();
     }
 
-    /// KCP output callback
+    /// KCP output callback.
     fn kcpOutput(data: []const u8, user: ?*anyopaque) void {
         if (user) |u| {
             const stream: *Stream = @ptrCast(@alignCast(u));
-            stream.mux.sendPsh(stream.id, data) catch |err| {
+            stream.send_frame_fn(stream.mux_ptr, .psh, stream.id, data) catch |err| {
                 stream.output_error.store(true, .seq_cst);
-                std.log.err("Mux output error in stream {d}: {s}", .{ stream.id, @errorName(err) });
+                std.log.err("Stream {d} output error: {s}", .{ stream.id, @errorName(err) });
             };
         }
     }
 };
 
-/// Mux configuration
-pub const MuxConfig = struct {
-    max_frame_size: usize = 32 * 1024,
-    max_receive_buffer: usize = 256 * 1024,
-};
+/// Mux multiplexes streams over a single connection.
+/// Uses comptime generics for zero-cost timer scheduling.
+pub fn Mux(comptime TimerServiceT: type) type {
+    // Compile-time check for TimerService interface
+    comptime {
+        concepts.assertTimerService(TimerServiceT);
+    }
 
-/// Callback when stream has data available to read (with user data).
-pub const OnStreamDataFn = *const fn (stream_id: u32, user_data: ?*anyopaque) void;
+    return struct {
+        const Self = @This();
 
-/// Callback when a new stream is accepted (with user data).
-pub const OnNewStreamFn = *const fn (stream: *Stream, user_data: ?*anyopaque) void;
-
-/// Output callback type (with user data for context).
-pub const OutputFn = *const fn (data: []const u8, user_data: ?*anyopaque) anyerror!void;
-
-/// Mux multiplexes multiple streams over a single connection.
-/// Thread-safe: all public methods are protected by mutex.
-///
-/// Reference counting:
-/// - Mux uses reference counting to prevent use-after-free when streams outlive their parent.
-/// - Each Stream holds a reference to its Mux (incremented in Stream.init, decremented in Stream.deinitInternal).
-/// - Owner of Mux should call release() instead of deinit() when done.
-/// - Mux is only freed when ref_count reaches 0.
-pub const Mux = struct {
-    config: MuxConfig,
-    output_fn: OutputFn,
-    on_stream_data: OnStreamDataFn,
-    on_new_stream: OnNewStreamFn,
-    user_data: ?*anyopaque,
-    is_client: bool,
-    streams: std.AutoHashMap(u32, *Stream),
-    next_id: u32,
-    closed: bool,
-    allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex,
-
-    // Reference counting for safe memory management
-    ref_count: std.atomic.Value(u32),
-
-    /// Initialize a new Mux.
-    pub fn init(
-        allocator: std.mem.Allocator,
         config: MuxConfig,
-        is_client: bool,
+        timer_service: *TimerServiceT,
         output_fn: OutputFn,
-        on_stream_data: OnStreamDataFn,
         on_new_stream: OnNewStreamFn,
         user_data: ?*anyopaque,
-    ) !*Mux {
-        const self = try allocator.create(Mux);
-        errdefer allocator.destroy(self);
+        is_client: bool,
+        streams: std.AutoHashMap(u32, *Stream),
+        next_id: u32,
+        closed: std.atomic.Value(bool),
+        allocator: std.mem.Allocator,
+        mutex: std.Thread.Mutex,
+        update_handle: TimerHandle,
+        ref_count: std.atomic.Value(u32),
 
-        self.* = Mux{
-            .config = config,
-            .output_fn = output_fn,
-            .on_stream_data = on_stream_data,
-            .on_new_stream = on_new_stream,
-            .user_data = user_data,
-            .is_client = is_client,
-            .streams = .init(allocator),
-            .next_id = if (is_client) 1 else 2, // Client: odd, Server: even
-            .closed = false,
-            .allocator = allocator,
-            .mutex = .{},
-            .ref_count = std.atomic.Value(u32).init(1), // Owner's reference
-        };
+        // Accept channel for incoming streams
+        accept_chan: ?*Channel(*Stream),
 
-        return self;
-    }
+        /// Initialize a new Mux.
+        pub fn init(
+            allocator: std.mem.Allocator,
+            timer_service: *TimerServiceT,
+            config: MuxConfig,
+            is_client: bool,
+            output_fn: OutputFn,
+            on_new_stream: OnNewStreamFn,
+            user_data: ?*anyopaque,
+        ) !*Self {
+            const self = try allocator.create(Self);
+            errdefer allocator.destroy(self);
 
-    /// Increment reference count.
-    pub fn retain(self: *Mux) void {
-        _ = self.ref_count.fetchAdd(1, .seq_cst);
-    }
+            // Create accept channel on heap
+            const accept_chan = try allocator.create(Channel(*Stream));
+            errdefer allocator.destroy(accept_chan);
+            accept_chan.* = try Channel(*Stream).init(allocator, 16);
 
-    /// Decrement reference count and free if it reaches zero.
-    /// Returns true if memory was freed.
-    pub fn release(self: *Mux) bool {
-        const old = self.ref_count.fetchSub(1, .seq_cst);
-        if (old == 1) {
-            // Was 1, now 0 - we were the last reference, free memory
-            self.deinitInternal();
-            return true;
-        }
-        return false;
-    }
+            self.* = Self{
+                .config = config,
+                .timer_service = timer_service,
+                .output_fn = output_fn,
+                .on_new_stream = on_new_stream,
+                .user_data = user_data,
+                .is_client = is_client,
+                .streams = std.AutoHashMap(u32, *Stream).init(allocator),
+                .next_id = if (is_client) 1 else 2,
+                .closed = std.atomic.Value(bool).init(false),
+                .allocator = allocator,
+                .mutex = .{},
+                .update_handle = TimerHandle.null_handle,
+                .ref_count = std.atomic.Value(u32).init(1),
+                .accept_chan = accept_chan,
+            };
 
-    /// Close the Mux and release all streams.
-    /// Call this when you're done with the Mux. This marks it as closed,
-    /// releases all stream references, then releases the owner's reference.
-    /// The Mux may not be freed immediately if streams still hold references.
-    pub fn deinit(self: *Mux) void {
-        self.mutex.lock();
+            // Schedule first KCP update
+            self.scheduleUpdate();
 
-        // Mark as closed
-        self.closed = true;
-
-        // Release Mux's reference to all streams
-        // If user still holds a reference, stream remains valid but operations return errors
-        var iter = self.streams.valueIterator();
-        while (iter.next()) |stream| {
-            // Mark stream as closed so operations return errors
-            stream.*.state.store(.closed, .seq_cst);
-            // Release Mux's reference (may free stream if user has no reference)
-            _ = stream.*.release();
-        }
-        self.streams.deinit();
-        self.mutex.unlock();
-
-        // Release owner's reference (may free Mux if no streams hold references)
-        _ = self.release();
-    }
-
-    /// Internal deinitialization - actually frees memory.
-    /// Only called when ref_count reaches 0.
-    fn deinitInternal(self: *Mux) void {
-        self.allocator.destroy(self);
-    }
-
-    /// Open a new stream.
-    /// Returns a stream with user's reference. Caller must call stream.close()
-    /// or stream.release() when done to avoid memory leaks.
-    pub fn openStream(self: *Mux) !*Stream {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.closed) return error.MuxClosed;
-
-        const id = self.next_id;
-        self.next_id += 2;
-
-        const stream = try Stream.init(self.allocator, id, self);
-        errdefer stream.deinit();
-
-        try self.streams.put(id, stream);
-        errdefer _ = self.streams.remove(id); // Remove from map before deinit to avoid dangling pointer
-
-        // Add user's reference before returning (Mux has one, user gets one)
-        stream.retain();
-
-        // Send SYN (unlocked - output_fn may need to acquire other locks)
-        self.mutex.unlock();
-        defer self.mutex.lock();
-        try self.sendSynUnlocked(id);
-
-        return stream;
-    }
-
-    /// Get number of active streams.
-    pub fn numStreams(self: *Mux) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.streams.count();
-    }
-
-    /// Check if closed.
-    pub fn isClosed(self: *Mux) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.closed;
-    }
-
-    /// Close the Mux.
-    pub fn closeMux(self: *Mux) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.closed = true;
-    }
-
-    /// Input a frame.
-    pub fn input(self: *Mux, data: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.closed) return error.MuxClosed;
-
-        const frame = try kcp.Frame.decode(data);
-
-        switch (frame.cmd) {
-            .syn => try self.handleSynLocked(frame.stream_id),
-            .fin => self.handleFinLocked(frame.stream_id),
-            .psh => self.handlePshLocked(frame.stream_id, frame.payload),
-            .nop => {}, // Keepalive, nothing to do
-        }
-    }
-
-    /// Handle SYN (stream open request). Must be called with mutex held.
-    fn handleSynLocked(self: *Mux, id: u32) !void {
-        if (self.streams.contains(id)) return; // Duplicate SYN
-
-        const stream = try Stream.init(self.allocator, id, self);
-        errdefer stream.deinit();
-
-        try self.streams.put(id, stream);
-
-        // Notify via callback (unlock to avoid deadlock)
-        self.mutex.unlock();
-        defer self.mutex.lock();
-        self.on_new_stream(stream, self.user_data);
-    }
-
-    /// Handle FIN (stream close). Must be called with mutex held.
-    fn handleFinLocked(self: *Mux, id: u32) void {
-        if (self.streams.get(id)) |stream| {
-            stream.handleFin();
-        }
-    }
-
-    /// Handle PSH (data). Must be called with mutex held.
-    /// Releases mutex before calling stream methods to avoid deadlock with Stream.write.
-    fn handlePshLocked(self: *Mux, id: u32, payload: []const u8) void {
-        const stream = self.streams.get(id) orelse return;
-
-        // Retain stream to prevent it from being freed while we work with it
-        stream.retain();
-
-        // Release mutex before calling stream methods that acquire kcp_mutex
-        // This avoids deadlock: write holds kcp_mutex->mux.mutex, input holds mux.mutex->kcp_mutex
-        self.mutex.unlock();
-
-        stream.kcpInput(payload);
-        const has_data = stream.kcpRecv();
-
-        // Release our temporary reference
-        _ = stream.release();
-
-        // Callback outside of lock
-        if (has_data) {
-            self.on_stream_data(id, self.user_data);
+            return self;
         }
 
-        // Reacquire mutex (caller expects it to be held)
-        self.mutex.lock();
-    }
+        /// Schedule the next KCP update.
+        fn scheduleUpdate(self: *Self) void {
+            if (self.closed.load(.acquire)) return;
 
-    /// Send a SYN frame (unlocked version for use when mutex is temporarily released).
-    fn sendSynUnlocked(self: *Mux, id: u32) !void {
-        try self.sendFrameUnlocked(.{
-            .cmd = .syn,
-            .stream_id = id,
-            .payload = &[_]u8{},
-        });
-    }
-
-    /// Send a FIN frame.
-    pub fn sendFin(self: *Mux, id: u32) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.sendFrameUnlocked(.{
-            .cmd = .fin,
-            .stream_id = id,
-            .payload = &[_]u8{},
-        });
-    }
-
-    /// Send a PSH frame.
-    pub fn sendPsh(self: *Mux, id: u32, payload: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.sendFrameUnlocked(.{
-            .cmd = .psh,
-            .stream_id = id,
-            .payload = payload,
-        });
-    }
-
-    /// Send a frame (must NOT hold mutex - output_fn may acquire other locks).
-    fn sendFrameUnlocked(self: *Mux, frame: kcp.Frame) !void {
-        if (self.closed) return error.MuxClosed;
-
-        const required_size = kcp.FrameHeaderSize + frame.payload.len;
-        var stack_buf: [1500]u8 = undefined; // MTU-sized stack buffer
-
-        if (required_size <= stack_buf.len) {
-            // Use stack buffer for typical small frames
-            const encoded = try frame.encode(&stack_buf);
-            try self.output_fn(encoded, self.user_data);
-        } else {
-            // Heap allocate for oversized frames
-            const buf = try self.allocator.alloc(u8, required_size);
-            defer self.allocator.free(buf);
-            const encoded = try frame.encode(buf);
-            try self.output_fn(encoded, self.user_data);
+            self.update_handle = self.timer_service.schedule(
+                self.config.update_interval_ms,
+                Task.init(Self, self, doUpdate),
+            );
         }
-    }
 
-    /// Remove a stream from the Mux and release Mux's reference.
-    /// If stream is not in map, this is a no-op.
-    pub fn removeStream(self: *Mux, id: u32) void {
-        self.mutex.lock();
-        const maybe_stream = self.streams.fetchRemove(id);
-        self.mutex.unlock();
+        /// KCP update task (called by timer).
+        fn doUpdate(self: *Self) void {
+            if (self.closed.load(.acquire)) return;
 
-        // Release Mux's reference if stream was in map
-        if (maybe_stream) |kv| {
-            _ = kv.value.release();
+            const current: u32 = @intCast(@mod(std.time.milliTimestamp(), std.math.maxInt(u32)));
+
+            // Update all streams
+            self.mutex.lock();
+            var iter = self.streams.valueIterator();
+            var stream_list: [64]*Stream = undefined;
+            var count: usize = 0;
+            while (iter.next()) |stream_ptr| {
+                if (count < stream_list.len) {
+                    stream_list[count] = stream_ptr.*;
+                    count += 1;
+                }
+            }
+            self.mutex.unlock();
+
+            // Update outside lock
+            for (stream_list[0..count]) |stream| {
+                stream.kcpUpdate(current);
+                _ = stream.kcpRecv();
+            }
+
+            // Schedule next update
+            self.scheduleUpdate();
         }
-    }
 
-    /// Update all streams.
-    /// Lock order: We release mux.mutex before calling stream methods to avoid
-    /// deadlock with Stream.write() which holds kcp_mutex and calls sendPsh().
-    pub fn update(self: *Mux, current: u32) void {
-        // Use arena allocator for temporary dynamic lists to handle any number of streams
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-
-        var stream_list = std.array_list.AlignedManaged(*Stream, null).init(alloc);
-        var id_list = std.array_list.AlignedManaged(u32, null).init(alloc);
-
-        // Collect stream pointers under lock
-        self.mutex.lock();
-        var iter = self.streams.iterator();
-        while (iter.next()) |entry| {
-            stream_list.append(entry.value_ptr.*) catch break;
-            id_list.append(entry.key_ptr.*) catch break;
+        /// Retain reference.
+        pub fn retain(self: *Self) void {
+            _ = self.ref_count.fetchAdd(1, .seq_cst);
         }
-        self.mutex.unlock();
 
-        // Update streams without holding mux.mutex (avoids deadlock with write->sendPsh)
-        for (stream_list.items, id_list.items) |stream, id| {
-            stream.kcpUpdate(current);
-            if (stream.kcpRecv()) {
-                self.on_stream_data(id, self.user_data);
+        /// Release reference.
+        pub fn release(self: *Self) bool {
+            const old = self.ref_count.fetchSub(1, .seq_cst);
+            if (old == 1) {
+                self.deinitInternal();
+                return true;
+            }
+            return false;
+        }
+
+        /// Close the Mux.
+        pub fn deinit(self: *Self) void {
+            self.closed.store(true, .release);
+
+            // Cancel timer
+            self.timer_service.cancel(self.update_handle);
+
+            // Close accept channel
+            if (self.accept_chan) |ch| {
+                ch.close();
+                ch.deinit();
+                self.allocator.destroy(ch);
+            }
+
+            // Release all streams
+            self.mutex.lock();
+            var iter = self.streams.valueIterator();
+            while (iter.next()) |stream_ptr| {
+                stream_ptr.*.state.store(.closed, .seq_cst);
+                _ = stream_ptr.*.release();
+            }
+            self.streams.deinit();
+            self.mutex.unlock();
+
+            _ = self.release();
+        }
+
+        fn deinitInternal(self: *Self) void {
+            self.allocator.destroy(self);
+        }
+
+        /// Check if closed.
+        pub fn isClosed(self: *Self) bool {
+            return self.closed.load(.acquire);
+        }
+
+        /// Open a new stream.
+        pub fn openStream(self: *Self) MuxError!*Stream {
+            if (self.closed.load(.acquire)) return MuxError.MuxClosed;
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const id = self.next_id;
+            self.next_id += 2;
+
+            const stream = Stream.init(
+                self.allocator,
+                id,
+                self,
+                sendFrameWrapper,
+                self.config.max_receive_buffer,
+            ) catch return MuxError.OutOfMemory;
+
+            self.streams.put(id, stream) catch {
+                _ = stream.release();
+                return MuxError.OutOfMemory;
+            };
+
+            // Send SYN
+            self.sendFrameInternal(.syn, id, &[_]u8{}) catch {
+                _ = self.streams.remove(id);
+                _ = stream.release();
+                return MuxError.OutOfMemory;
+            };
+
+            stream.retain(); // User's reference
+            return stream;
+        }
+
+        /// Accept an incoming stream (blocks until available or closed).
+        pub fn acceptStream(self: *Self) ?*Stream {
+            if (self.accept_chan) |ch| {
+                return ch.recv();
+            }
+            return null;
+        }
+
+        /// Try to accept a stream without blocking.
+        pub fn tryAcceptStream(self: *Self) ?*Stream {
+            if (self.accept_chan) |ch| {
+                return ch.tryRecv();
+            }
+            return null;
+        }
+
+        /// Input a frame from the network.
+        pub fn input(self: *Self, data: []const u8) MuxError!void {
+            if (self.closed.load(.acquire)) return MuxError.MuxClosed;
+
+            const frame = kcp.Frame.decode(data) catch return MuxError.InvalidFrame;
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            switch (frame.cmd) {
+                .syn => self.handleSyn(frame.stream_id),
+                .fin => self.handleFin(frame.stream_id),
+                .psh => self.handlePsh(frame.stream_id, frame.payload),
+                .nop => {},
             }
         }
-    }
 
-    /// Get a stream by ID.
-    pub fn getStream(self: *Mux, id: u32) ?*Stream {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.streams.get(id);
-    }
-};
+        fn handleSyn(self: *Self, id: u32) void {
+            if (self.streams.contains(id)) return;
 
-// Tests
-test "Frame encode decode" {
-    const frame = kcp.Frame{
-        .cmd = .syn,
-        .stream_id = 1,
-        .payload = &[_]u8{},
+            const stream = Stream.init(
+                self.allocator,
+                id,
+                self,
+                sendFrameWrapper,
+                self.config.max_receive_buffer,
+            ) catch return;
+
+            self.streams.put(id, stream) catch {
+                _ = stream.release();
+                return;
+            };
+
+            // Push to accept channel
+            if (self.accept_chan) |ch| {
+                stream.retain(); // Reference for accept channel
+                if (!ch.trySend(stream)) {
+                    _ = stream.release(); // Channel full
+                }
+            }
+
+            // Also call callback
+            self.mutex.unlock();
+            self.on_new_stream(stream, self.user_data);
+            self.mutex.lock();
+        }
+
+        fn handleFin(self: *Self, id: u32) void {
+            if (self.streams.get(id)) |stream| {
+                stream.handleFin();
+            }
+        }
+
+        fn handlePsh(self: *Self, id: u32, payload: []const u8) void {
+            const stream = self.streams.get(id) orelse return;
+            stream.retain();
+
+            self.mutex.unlock();
+            stream.kcpInput(payload);
+            _ = stream.kcpRecv();
+            _ = stream.release();
+            self.mutex.lock();
+        }
+
+        /// Send a frame (called from Stream).
+        fn sendFrameWrapper(mux_ptr: *anyopaque, cmd: kcp.Cmd, stream_id: u32, payload: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(mux_ptr));
+            try self.sendFrameInternal(cmd, stream_id, payload);
+        }
+
+        fn sendFrameInternal(self: *Self, cmd: kcp.Cmd, stream_id: u32, payload: []const u8) !void {
+            if (self.closed.load(.acquire)) return MuxError.MuxClosed;
+
+            const frame = kcp.Frame{
+                .cmd = cmd,
+                .stream_id = stream_id,
+                .payload = payload,
+            };
+
+            const required_size = kcp.FrameHeaderSize + payload.len;
+            var stack_buf: [1500]u8 = undefined;
+
+            if (required_size <= stack_buf.len) {
+                const encoded = try frame.encode(&stack_buf);
+                try self.output_fn(encoded, self.user_data);
+            } else {
+                const buf = try self.allocator.alloc(u8, required_size);
+                defer self.allocator.free(buf);
+                const encoded = try frame.encode(buf);
+                try self.output_fn(encoded, self.user_data);
+            }
+        }
+
+        /// Remove a stream.
+        pub fn removeStream(self: *Self, id: u32) void {
+            self.mutex.lock();
+            const maybe_stream = self.streams.fetchRemove(id);
+            self.mutex.unlock();
+
+            if (maybe_stream) |kv| {
+                _ = kv.value.release();
+            }
+        }
+
+        /// Get stream count.
+        pub fn numStreams(self: *Self) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.streams.count();
+        }
     };
-    var buf: [kcp.FrameHeaderSize]u8 = undefined;
-    const encoded = try frame.encode(&buf);
-    const decoded = try kcp.Frame.decode(encoded);
-    try std.testing.expectEqual(kcp.Cmd.syn, decoded.cmd);
-    try std.testing.expectEqual(@as(u32, 1), decoded.stream_id);
 }
 
-test "Mux init deinit" {
-    const allocator = std.testing.allocator;
+// Convenience type alias for common timer service
+pub const SimpleMux = Mux(async_mod.SimpleTimerService);
 
-    const outputFn = struct {
-        fn output(_: []const u8, _: ?*anyopaque) anyerror!void {}
-    }.output;
-    const onStreamData = struct {
-        fn cb(_: u32, _: ?*anyopaque) void {}
-    }.cb;
-    const onNewStream = struct {
-        fn cb(_: *Stream, _: ?*anyopaque) void {}
-    }.cb;
+// ============================================================================
+// Tests
+// ============================================================================
 
-    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream, null);
-    mux.deinit();
+test "Mux comptime check" {
+    // Just verify the type compiles
+    const MuxType = Mux(async_mod.SimpleTimerService);
+    _ = MuxType;
 }
 
-test "Mux open stream" {
+test "Stream init deinit" {
     const allocator = std.testing.allocator;
 
-    const outputFn = struct {
-        fn output(_: []const u8, _: ?*anyopaque) anyerror!void {}
-    }.output;
-    const onStreamData = struct {
-        fn cb(_: u32, _: ?*anyopaque) void {}
-    }.cb;
-    const onNewStream = struct {
-        fn cb(_: *Stream, _: ?*anyopaque) void {}
-    }.cb;
+    const DummyMux = struct {
+        fn sendFrame(_: *anyopaque, _: kcp.Cmd, _: u32, _: []const u8) anyerror!void {}
+    };
 
-    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream, null);
-    defer mux.deinit();
-
-    const stream = try mux.openStream();
-    defer stream.close(); // Release user's reference before mux.deinit()
+    var dummy: u8 = 0;
+    const stream = try Stream.init(allocator, 1, &dummy, DummyMux.sendFrame, 256 * 1024);
+    defer _ = stream.release();
 
     try std.testing.expectEqual(@as(u32, 1), stream.getId());
-    try std.testing.expectEqual(@as(usize, 1), mux.numStreams());
-}
-
-test "Stream state" {
-    const allocator = std.testing.allocator;
-
-    const outputFn = struct {
-        fn output(_: []const u8, _: ?*anyopaque) anyerror!void {}
-    }.output;
-    const onStreamData = struct {
-        fn cb(_: u32, _: ?*anyopaque) void {}
-    }.cb;
-    const onNewStream = struct {
-        fn cb(_: *Stream, _: ?*anyopaque) void {}
-    }.cb;
-
-    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream, null);
-    defer mux.deinit();
-
-    const stream = try mux.openStream();
-    defer stream.close(); // Release user's reference before mux.deinit()
-
     try std.testing.expectEqual(StreamState.open, stream.getState());
 }

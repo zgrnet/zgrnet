@@ -10,8 +10,7 @@ const noise = @import("noise");
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
 const UDP = noise.UDP;
-const PeerState = noise.PeerState;
-const Stream = noise.Stream;
+const KcpStream = noise.net.KcpStream;
 
 /// JSON config structures
 const Config = struct {
@@ -102,14 +101,18 @@ pub fn main() !void {
     std.debug.print("[{s}] Public key: {x}...\n", .{ my_name, key_pair.public.data[0..8].* });
     std.debug.print("[{s}] Role: {s}\n", .{ my_name, host.role });
 
-    // Create UDP
-    const udp = try UDP.init(allocator, key_pair, .{
-        .port = host.port,
+    // Create bind address string
+    var bind_buf: [32]u8 = undefined;
+    const bind_addr = std.fmt.bufPrint(&bind_buf, "0.0.0.0:{}", .{host.port}) catch "0.0.0.0:0";
+
+    // Create UDP (new API - no poll() needed, internal threads handle everything)
+    const udp = try UDP.init(allocator, &key_pair, .{
+        .bind_addr = bind_addr,
         .allow_unknown = true,
     });
     defer udp.deinit();
 
-    std.debug.print("[{s}] Listening on port {}\n", .{ my_name, udp.port() });
+    std.debug.print("[{s}] Listening on port {}\n", .{ my_name, udp.getLocalPort() });
 
     // Find peer (the one that's not us)
     var peer_host: ?HostInfo = null;
@@ -142,25 +145,6 @@ pub fn main() !void {
     udp.setPeerEndpoint(peer_kp.public, @as(*posix.sockaddr, @ptrCast(&peer_addr)).*, @sizeOf(posix.sockaddr.in));
     std.debug.print("[{s}] Added peer {s} at port {}\n", .{ my_name, peer.name, peer.port });
 
-    // Start poll thread
-    var poll_running = std.atomic.Value(bool).init(true);
-    const PollCtx = struct {
-        udp: *UDP,
-        running: *std.atomic.Value(bool),
-    };
-    const poll_ctx = PollCtx{ .udp = udp, .running = &poll_running };
-
-    const poll_thread = try std.Thread.spawn(.{}, struct {
-        fn poll(ctx: PollCtx) void {
-            const start = std.time.milliTimestamp();
-            while (ctx.running.load(.seq_cst)) {
-                const current_ms: u32 = @truncate(@as(u64, @intCast(std.time.milliTimestamp() - start)));
-                ctx.udp.poll(current_ms) catch {};
-                std.Thread.sleep(1 * std.time.ns_per_ms);
-            }
-        }
-    }.poll, .{poll_ctx});
-
     // Run test based on role
     if (std.mem.eql(u8, host.role, "opener")) {
         // Wait for peer to start
@@ -171,8 +155,6 @@ pub fn main() !void {
         std.debug.print("[{s}] Connecting to {s}...\n", .{ my_name, peer.name });
         udp.connectTimeout(&peer_kp.public, 10 * std.time.ns_per_s) catch |e| {
             std.debug.print("[{s}] Failed to connect: {}\n", .{ my_name, e });
-            poll_running.store(false, .seq_cst);
-            poll_thread.join();
             return e;
         };
         std.debug.print("[{s}] Connected to {s}!\n", .{ my_name, peer.name });
@@ -188,10 +170,6 @@ pub fn main() !void {
     }
 
     std.debug.print("[{s}] Test completed successfully!\n", .{my_name});
-
-    // Cleanup
-    poll_running.store(false, .seq_cst);
-    poll_thread.join();
     udp.close();
 }
 
@@ -213,10 +191,17 @@ fn runOpenerTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key, p
     };
     std.debug.print("[opener] Sent {} bytes: {s}\n", .{ test_cfg.echo_message.len, test_cfg.echo_message });
 
-    // Read echo response with timeout
+    // Read echo response with timeout (use blocking read)
     var response_buf: [1024]u8 = undefined;
-    const response = try readWithTimeout(stream, 5 * std.time.ns_per_s, &response_buf);
-    std.debug.print("[opener] Received echo response: {s}\n", .{response});
+    const n = stream.readBlocking(&response_buf, 5 * std.time.ns_per_s) catch |e| {
+        std.debug.print("[opener] Failed to read echo response: {}\n", .{e});
+        return e;
+    };
+    if (n == 0) {
+        std.debug.print("[opener] Read timeout or EOF\n", .{});
+        return error.ReadTimeout;
+    }
+    std.debug.print("[opener] Received echo response: {s}\n", .{response_buf[0..n]});
 
     // Bidirectional throughput test
     try runBidirectionalTest(allocator, stream, "opener", test_cfg, my_name);
@@ -225,33 +210,12 @@ fn runOpenerTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key, p
 }
 
 fn runAccepterTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key, peer_name: []const u8, test_cfg: *const TestConfig, my_name: []const u8) !void {
-    // Wait for peer to connect and establish session
-    std.debug.print("[accepter] Waiting for {s} to connect...\n", .{peer_name});
-
-    const deadline = std.time.nanoTimestamp() + 30 * std.time.ns_per_s;
-    while (true) {
-        if (std.time.nanoTimestamp() > deadline) {
-            std.debug.print("[accepter] Timeout waiting for peer connection\n", .{});
-            return error.ConnectionTimeout;
-        }
-
-        if (udp.peerInfo(peer_pk)) |info| {
-            if (info.state == .established) {
-                std.debug.print("[accepter] Session established with {s}\n", .{peer_name});
-                break;
-            }
-        }
-
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-
-    // Wait for mux initialization
-    std.Thread.sleep(100 * std.time.ns_per_ms);
-
-    std.debug.print("[accepter] Waiting to accept stream from {s}...\n", .{peer_name});
+    // The opener will connect to us. We just wait for streams.
+    // The Noise handshake happens automatically when we receive the init message.
+    std.debug.print("[accepter] Waiting for stream from {s}...\n", .{peer_name});
 
     // Wait for stream with timeout
-    var stream: ?*Stream = null;
+    var stream: ?*KcpStream = null;
     const stream_deadline = std.time.nanoTimestamp() + 10 * std.time.ns_per_s;
     while (stream == null) {
         if (std.time.nanoTimestamp() > stream_deadline) {
@@ -267,9 +231,17 @@ fn runAccepterTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key,
     const s = stream.?;
     std.debug.print("[accepter] Accepted stream {}\n", .{s.getId()});
 
-    // Echo test - receive and echo back
+    // Echo test - receive and echo back (use blocking read)
     var recv_buf: [1024]u8 = undefined;
-    const received = try readWithTimeout(s, 5 * std.time.ns_per_s, &recv_buf);
+    const n = s.readBlocking(&recv_buf, 5 * std.time.ns_per_s) catch |e| {
+        std.debug.print("[accepter] Failed to read echo: {}\n", .{e});
+        return e;
+    };
+    if (n == 0) {
+        std.debug.print("[accepter] Read timeout or EOF\n", .{});
+        return error.ReadTimeout;
+    }
+    const received = recv_buf[0..n];
     std.debug.print("[accepter] Received echo: {s}\n", .{received});
 
     // Echo back with prefix
@@ -281,6 +253,10 @@ fn runAccepterTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key,
     };
     std.debug.print("[accepter] Sent echo response: {s}\n", .{response});
 
+    // Small delay to let opener read echo response before starting throughput test
+    // (KCP is stream-based, no message boundaries)
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
     // Bidirectional throughput test
     try runBidirectionalTest(allocator, s, "accepter", test_cfg, my_name);
 
@@ -289,7 +265,7 @@ fn runAccepterTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key,
     s.shutdown();
 }
 
-fn runBidirectionalTest(allocator: std.mem.Allocator, stream: *Stream, role: []const u8, test_cfg: *const TestConfig, my_name: []const u8) !void {
+fn runBidirectionalTest(allocator: std.mem.Allocator, stream: *KcpStream, role: []const u8, test_cfg: *const TestConfig, my_name: []const u8) !void {
     _ = my_name;
 
     const total_bytes: u64 = @intCast(test_cfg.throughput_mb * 1024 * 1024);
@@ -304,7 +280,7 @@ fn runBidirectionalTest(allocator: std.mem.Allocator, stream: *Stream, role: []c
 
     // Writer context
     const WriteCtx = struct {
-        stream: *Stream,
+        stream: *KcpStream,
         total_bytes: u64,
         chunk_size: usize,
         sent: *std.atomic.Value(u64),
@@ -313,7 +289,7 @@ fn runBidirectionalTest(allocator: std.mem.Allocator, stream: *Stream, role: []c
 
     // Reader context
     const ReadCtx = struct {
-        stream: *Stream,
+        stream: *KcpStream,
         total_bytes: u64,
         recv: *std.atomic.Value(u64),
     };
@@ -348,20 +324,22 @@ fn runBidirectionalTest(allocator: std.mem.Allocator, stream: *Stream, role: []c
         }
     }.writeFn, .{write_ctx});
 
-    // Start reader thread
+    // Start reader thread (use blocking read)
     const read_thread = try std.Thread.spawn(.{}, struct {
         fn readFn(ctx: ReadCtx) void {
             var buf: [65536]u8 = undefined;
             var recv: u64 = 0;
 
             while (recv < ctx.total_bytes) {
-                const n = ctx.stream.read(&buf) catch break;
+                // Use blocking read with 100ms timeout
+                const n = ctx.stream.readBlocking(&buf, 100 * std.time.ns_per_ms) catch break;
                 if (n > 0) {
                     recv += n;
                     ctx.recv.store(recv, .seq_cst);
                 } else {
-                    // Yield to avoid busy-waiting
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    // Check if stream is closed
+                    const state = ctx.stream.getState();
+                    if (state == .closed or state == .remote_close) break;
                 }
             }
         }
@@ -381,34 +359,12 @@ fn runBidirectionalTest(allocator: std.mem.Allocator, stream: *Stream, role: []c
     const throughput = @as(f64, @floatFromInt(total_transfer)) / elapsed_s / 1024 / 1024;
 
     std.debug.print("[{s}] ========== Bidirectional Results ==========\n", .{role});
-    std.debug.print("[{s}] Sent:       {} bytes ({d:.2} GB)\n", .{ role, sent, @as(f64, @floatFromInt(sent)) / 1024 / 1024 / 1024 });
-    std.debug.print("[{s}] Received:   {} bytes ({d:.2} GB)\n", .{ role, recv, @as(f64, @floatFromInt(recv)) / 1024 / 1024 / 1024 });
-    std.debug.print("[{s}] Total:      {} bytes ({d:.2} GB)\n", .{ role, total_transfer, @as(f64, @floatFromInt(total_transfer)) / 1024 / 1024 / 1024 });
+    std.debug.print("[{s}] Sent:       {} bytes ({d:.2} MB)\n", .{ role, sent, @as(f64, @floatFromInt(sent)) / 1024 / 1024 });
+    std.debug.print("[{s}] Received:   {} bytes ({d:.2} MB)\n", .{ role, recv, @as(f64, @floatFromInt(recv)) / 1024 / 1024 });
+    std.debug.print("[{s}] Total:      {} bytes ({d:.2} MB)\n", .{ role, total_transfer, @as(f64, @floatFromInt(total_transfer)) / 1024 / 1024 });
     std.debug.print("[{s}] Time:       {d:.2} seconds\n", .{ role, elapsed_s });
     std.debug.print("[{s}] Throughput: {d:.2} MB/s (bidirectional)\n", .{ role, throughput });
     std.debug.print("[{s}] ============================================\n", .{role});
 
     _ = allocator;
-}
-
-/// Read data from stream with timeout.
-/// Caller provides buffer to avoid use-after-free.
-fn readWithTimeout(stream: *Stream, timeout_ns: i128, buf: []u8) ![]u8 {
-    const deadline = std.time.nanoTimestamp() + timeout_ns;
-
-    while (std.time.nanoTimestamp() < deadline) {
-        const n = stream.read(buf) catch |e| {
-            if (e == error.WouldBlock) {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
-                continue;
-            }
-            return error.ReadFailed;
-        };
-        if (n > 0) {
-            return buf[0..n];
-        }
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-    }
-
-    return error.ReadTimeout;
 }

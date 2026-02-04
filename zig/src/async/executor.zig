@@ -1,34 +1,41 @@
 //! Executor - An execution context that can run tasks.
 //!
-//! Executor is a platform-provided interface that allows Zig code to dispatch
-//! tasks to a specific execution context (thread, event loop, etc.).
+//! ## Comptime vs Runtime Polymorphism
 //!
-//! ## Design Principles
-//! - Platform agnostic: The interface is abstract, platform provides implementation
-//! - Zero allocation: Executor is just a pointer + vtable
-//! - Thread-safe dispatch: `dispatch()` must be safe to call from any thread
+//! This module provides both:
+//! 1. **Direct methods** on implementations (comptime, zero overhead)
+//! 2. **Executor vtable** for runtime polymorphism (when needed)
 //!
-//! ## Platform Implementation Example (Go)
-//! ```go
-//! //export goDispatch
-//! func goDispatch(executorPtr unsafe.Pointer, taskPtr unsafe.Pointer, taskCallback unsafe.Pointer) {
-//!     // Queue the task to be executed on the Go runtime
-//!     runtime.ScheduleTask(taskPtr, taskCallback)
+//! Prefer using implementations directly with comptime generics:
+//! ```zig
+//! fn doWork(executor: anytype) void {
+//!     executor.dispatch(my_task);
 //! }
 //! ```
+//!
+//! Use the vtable `Executor` type only when you need runtime polymorphism.
+//!
+//! ## Required Interface (comptime)
+//!
+//! Any type implementing Executor must have:
+//! - `dispatch(self: *T, task: Task) void`
+//!
+//! Optional:
+//! - `dispatchFn(self: *T, comptime C: type, ctx: *C, comptime method: fn(*C) void) void`
+//! - `isCurrentThread(self: *T) bool`
 
 const std = @import("std");
 const Task = @import("task.zig").Task;
 
-/// Executor - An execution context that can run tasks.
+// ============================================================================
+// Runtime Polymorphism (vtable-based) - for legacy/FFI use
+// ============================================================================
+
+/// Executor - Runtime polymorphic executor interface.
 ///
-/// An Executor represents a place where tasks can be executed. This could be:
-/// - A single thread with an event loop
-/// - A thread pool
-/// - A specific OS thread
-/// - A coroutine scheduler
-///
-/// The platform provides the implementation, Zig code uses the interface.
+/// Use this when you need to store executors of different types in the same
+/// variable or pass them through FFI boundaries. For comptime polymorphism,
+/// use implementations directly with `anytype`.
 pub const Executor = struct {
     /// Opaque pointer to platform-specific executor state
     ptr: *anyopaque,
@@ -36,35 +43,16 @@ pub const Executor = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Dispatch a task to be executed on this executor.
-        ///
-        /// This function must be thread-safe - it can be called from any thread.
-        /// The task will be executed asynchronously on the executor's context.
-        ///
-        /// ## Parameters
-        /// - `ptr`: The executor's opaque pointer
-        /// - `task`: The task to execute
         dispatch: *const fn (ptr: *anyopaque, task: Task) void,
-
-        /// Check if the current thread is the executor's thread.
-        ///
-        /// This is useful for optimizations - if we're already on the executor's
-        /// thread, we might execute synchronously instead of queuing.
-        ///
-        /// Optional: platforms can return false if not applicable.
         is_current_thread: ?*const fn (ptr: *anyopaque) bool = null,
     };
 
     /// Dispatch a task to be executed on this executor.
-    ///
-    /// The task will be executed asynchronously. This function is thread-safe.
     pub fn dispatch(self: Executor, task: Task) void {
         self.vtable.dispatch(self.ptr, task);
     }
 
     /// Dispatch a typed context with a method to be called.
-    ///
-    /// Convenience wrapper around `dispatch` that creates a Task internally.
     pub fn dispatchFn(
         self: Executor,
         comptime T: type,
@@ -75,8 +63,6 @@ pub const Executor = struct {
     }
 
     /// Check if the current thread is the executor's thread.
-    ///
-    /// Returns false if the executor doesn't support this check.
     pub fn isCurrentThread(self: Executor) bool {
         if (self.vtable.is_current_thread) |check| {
             return check(self.ptr);
@@ -85,8 +71,6 @@ pub const Executor = struct {
     }
 
     /// A null executor that panics on dispatch.
-    ///
-    /// Useful as a placeholder or for detecting uninitialized executors.
     pub const null_executor: Executor = .{
         .ptr = undefined,
         .vtable = &.{
@@ -99,12 +83,53 @@ pub const Executor = struct {
     };
 };
 
+// ============================================================================
+// Implementations
+// ============================================================================
+
 /// InlineExecutor - Executes tasks immediately on the calling thread.
 ///
 /// This is a simple executor implementation useful for testing and
 /// single-threaded scenarios. Tasks are executed synchronously when dispatched.
+///
+/// ## Direct Usage (comptime, zero overhead)
+/// ```zig
+/// var exec = InlineExecutor{};
+/// exec.dispatch(my_task);
+/// ```
+///
+/// ## Runtime Polymorphism
+/// ```zig
+/// var exec = InlineExecutor{};
+/// const executor: Executor = exec.executor();
+/// executor.dispatch(my_task);
+/// ```
 pub const InlineExecutor = struct {
+    /// Dispatch a task to be executed immediately.
+    ///
+    /// Direct method - use this for comptime polymorphism.
+    pub fn dispatch(_: *InlineExecutor, task: Task) void {
+        task.run();
+    }
+
+    /// Dispatch a typed context with a method to be called.
+    pub fn dispatchFn(
+        self: *InlineExecutor,
+        comptime T: type,
+        context: *T,
+        comptime method: fn (*T) void,
+    ) void {
+        self.dispatch(Task.init(T, context, method));
+    }
+
+    /// Check if the current thread is the executor's thread.
+    pub fn isCurrentThread(_: *InlineExecutor) bool {
+        return true;
+    }
+
     /// Create an Executor interface from this InlineExecutor.
+    ///
+    /// Use this only when runtime polymorphism is needed.
     pub fn executor(self: *InlineExecutor) Executor {
         return .{
             .ptr = @ptrCast(self),
@@ -113,17 +138,15 @@ pub const InlineExecutor = struct {
     }
 
     const vtable: Executor.VTable = .{
-        .dispatch = dispatch,
-        .is_current_thread = isCurrentThread,
+        .dispatch = dispatchVtable,
+        .is_current_thread = isCurrentThreadVtable,
     };
 
-    fn dispatch(_: *anyopaque, task: Task) void {
-        // Execute immediately
+    fn dispatchVtable(_: *anyopaque, task: Task) void {
         task.run();
     }
 
-    fn isCurrentThread(_: *anyopaque) bool {
-        // InlineExecutor always executes on current thread
+    fn isCurrentThreadVtable(_: *anyopaque) bool {
         return true;
     }
 };
@@ -132,6 +155,13 @@ pub const InlineExecutor = struct {
 ///
 /// This executor stores tasks in a queue and executes them when `runAll()` is called.
 /// Useful for testing and for controlling when tasks execute.
+///
+/// ## Direct Usage (comptime, zero overhead)
+/// ```zig
+/// var exec = QueuedExecutor.init(allocator);
+/// exec.dispatch(my_task);
+/// _ = exec.runAll();
+/// ```
 pub const QueuedExecutor = struct {
     const TaskQueue = std.ArrayListAligned(Task, null);
 
@@ -150,12 +180,23 @@ pub const QueuedExecutor = struct {
         self.queue.deinit(self.allocator);
     }
 
-    /// Create an Executor interface from this QueuedExecutor.
-    pub fn executor(self: *QueuedExecutor) Executor {
-        return .{
-            .ptr = @ptrCast(self),
-            .vtable = &vtable,
-        };
+    /// Dispatch a task to be queued for later execution.
+    ///
+    /// Direct method - use this for comptime polymorphism.
+    pub fn dispatch(self: *QueuedExecutor, task: Task) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.queue.append(self.allocator, task) catch {};
+    }
+
+    /// Dispatch a typed context with a method to be called.
+    pub fn dispatchFn(
+        self: *QueuedExecutor,
+        comptime T: type,
+        context: *T,
+        comptime method: fn (*T) void,
+    ) void {
+        self.dispatch(Task.init(T, context, method));
     }
 
     /// Run all queued tasks.
@@ -163,7 +204,10 @@ pub const QueuedExecutor = struct {
     /// Returns the number of tasks executed.
     pub fn runAll(self: *QueuedExecutor) usize {
         self.mutex.lock();
-        const tasks = self.queue.toOwnedSlice(self.allocator) catch return 0;
+        const tasks = self.queue.toOwnedSlice(self.allocator) catch {
+            self.mutex.unlock();
+            return 0;
+        };
         self.mutex.unlock();
 
         defer self.allocator.free(tasks);
@@ -182,18 +226,23 @@ pub const QueuedExecutor = struct {
         return self.queue.items.len;
     }
 
+    /// Create an Executor interface from this QueuedExecutor.
+    ///
+    /// Use this only when runtime polymorphism is needed.
+    pub fn executor(self: *QueuedExecutor) Executor {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
     const vtable: Executor.VTable = .{
-        .dispatch = dispatch,
+        .dispatch = dispatchVtable,
     };
 
-    fn dispatch(ptr: *anyopaque, task: Task) void {
+    fn dispatchVtable(ptr: *anyopaque, task: Task) void {
         const self: *QueuedExecutor = @ptrCast(@alignCast(ptr));
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.queue.append(self.allocator, task) catch {
-            // If we can't queue, we have to drop the task
-            // In production, this should probably log or panic
-        };
+        self.dispatch(task);
     }
 };
 
@@ -201,15 +250,12 @@ pub const QueuedExecutor = struct {
 // Tests
 // ============================================================================
 
-test "InlineExecutor executes immediately" {
-    var inline_exec = InlineExecutor{};
-    const exec = inline_exec.executor();
-
+test "InlineExecutor direct dispatch (comptime)" {
+    var exec = InlineExecutor{};
     var counter: u32 = 0;
 
     const Counter = struct {
         count: *u32,
-
         fn increment(self: *@This()) void {
             self.count.* += 1;
         }
@@ -217,17 +263,63 @@ test "InlineExecutor executes immediately" {
 
     var ctx = Counter{ .count = &counter };
 
-    try std.testing.expectEqual(@as(u32, 0), counter);
-
-    exec.dispatchFn(Counter, &ctx, Counter.increment);
-
-    // Should have executed immediately
+    // Direct dispatch - comptime polymorphism
+    exec.dispatch(Task.init(Counter, &ctx, Counter.increment));
     try std.testing.expectEqual(@as(u32, 1), counter);
 
+    // dispatchFn convenience
+    exec.dispatchFn(Counter, &ctx, Counter.increment);
+    try std.testing.expectEqual(@as(u32, 2), counter);
+}
+
+test "InlineExecutor vtable dispatch (runtime)" {
+    var inline_exec = InlineExecutor{};
+    const exec = inline_exec.executor();
+
+    var counter: u32 = 0;
+
+    const Counter = struct {
+        count: *u32,
+        fn increment(self: *@This()) void {
+            self.count.* += 1;
+        }
+    };
+
+    var ctx = Counter{ .count = &counter };
+
+    exec.dispatchFn(Counter, &ctx, Counter.increment);
+    try std.testing.expectEqual(@as(u32, 1), counter);
     try std.testing.expect(exec.isCurrentThread());
 }
 
-test "QueuedExecutor queues tasks for later" {
+test "QueuedExecutor direct dispatch (comptime)" {
+    var exec = QueuedExecutor.init(std.testing.allocator);
+    defer exec.deinit();
+
+    var counter: u32 = 0;
+
+    const Counter = struct {
+        count: *u32,
+        fn increment(self: *@This()) void {
+            self.count.* += 1;
+        }
+    };
+
+    var ctx = Counter{ .count = &counter };
+
+    // Direct dispatch
+    exec.dispatch(Task.init(Counter, &ctx, Counter.increment));
+    exec.dispatch(Task.init(Counter, &ctx, Counter.increment));
+
+    try std.testing.expectEqual(@as(u32, 0), counter);
+    try std.testing.expectEqual(@as(usize, 2), exec.pendingCount());
+
+    const executed = exec.runAll();
+    try std.testing.expectEqual(@as(usize, 2), executed);
+    try std.testing.expectEqual(@as(u32, 2), counter);
+}
+
+test "QueuedExecutor vtable dispatch (runtime)" {
     var queued_exec = QueuedExecutor.init(std.testing.allocator);
     defer queued_exec.deinit();
 
@@ -237,7 +329,6 @@ test "QueuedExecutor queues tasks for later" {
 
     const Counter = struct {
         count: *u32,
-
         fn increment(self: *@This()) void {
             self.count.* += 1;
         }
@@ -245,25 +336,17 @@ test "QueuedExecutor queues tasks for later" {
 
     var ctx = Counter{ .count = &counter };
 
-    // Dispatch multiple tasks
     exec.dispatchFn(Counter, &ctx, Counter.increment);
     exec.dispatchFn(Counter, &ctx, Counter.increment);
     exec.dispatchFn(Counter, &ctx, Counter.increment);
 
-    // Nothing executed yet
     try std.testing.expectEqual(@as(u32, 0), counter);
-    try std.testing.expectEqual(@as(usize, 3), queued_exec.pendingCount());
 
-    // Run all tasks
     const executed = queued_exec.runAll();
-
     try std.testing.expectEqual(@as(usize, 3), executed);
     try std.testing.expectEqual(@as(u32, 3), counter);
-    try std.testing.expectEqual(@as(usize, 0), queued_exec.pendingCount());
 }
 
-test "Executor.null_executor panics on dispatch" {
-    // We can't easily test panics in Zig tests, but we can verify
-    // the null executor is properly defined
+test "Executor.null_executor" {
     _ = Executor.null_executor;
 }

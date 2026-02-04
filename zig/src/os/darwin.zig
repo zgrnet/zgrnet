@@ -328,6 +328,235 @@ pub const Mutex = struct {
     }
 };
 
+// ============================================================================
+// KqueueIO - IOService implementation using kqueue
+// ============================================================================
+
+const async_io = @import("../async/io.zig");
+const ReadyCallback = async_io.ReadyCallback;
+
+/// kqueue-based I/O service implementing the IOService interface.
+///
+/// ## Direct Usage (comptime, zero overhead)
+/// ```zig
+/// var io = try KqueueIO.init(allocator);
+/// defer io.deinit();
+///
+/// io.registerRead(socket_fd, .{ .ptr = ctx, .callback = onReady });
+///
+/// while (running) {
+///     _ = io.poll(100);
+/// }
+/// ```
+pub const KqueueIO = struct {
+    const Self = @This();
+    const max_events = 64;
+
+    /// Internal registration entry
+    const Entry = struct {
+        fd: posix.fd_t,
+        read_cb: ReadyCallback,
+        write_cb: ReadyCallback,
+        read_registered: bool,
+        write_registered: bool,
+    };
+
+    kq: posix.fd_t,
+    allocator: Allocator,
+    registrations: std.AutoHashMap(posix.fd_t, Entry),
+    events: [max_events]posix.system.Kevent,
+
+    pub fn init(allocator: Allocator) !Self {
+        const kq = try posix.kqueue();
+        return .{
+            .kq = kq,
+            .allocator = allocator,
+            .registrations = std.AutoHashMap(posix.fd_t, Entry).init(allocator),
+            .events = undefined,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        posix.close(self.kq);
+        self.registrations.deinit();
+    }
+
+    /// Register a file descriptor for read readiness.
+    ///
+    /// Direct method - use this for comptime polymorphism.
+    pub fn registerRead(self: *Self, fd: posix.fd_t, callback: ReadyCallback) void {
+        // Get or create entry
+        const result = self.registrations.getOrPut(fd) catch return;
+        if (!result.found_existing) {
+            result.value_ptr.* = .{
+                .fd = fd,
+                .read_cb = ReadyCallback.noop,
+                .write_cb = ReadyCallback.noop,
+                .read_registered = false,
+                .write_registered = false,
+            };
+        }
+
+        result.value_ptr.read_cb = callback;
+
+        // Register with kqueue if not already
+        if (!result.value_ptr.read_registered) {
+            const changelist = [_]posix.system.Kevent{.{
+                .ident = @intCast(fd),
+                .filter = posix.system.EVFILT.READ,
+                .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }};
+            _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch return;
+            result.value_ptr.read_registered = true;
+        }
+    }
+
+    /// Register a file descriptor for write readiness.
+    ///
+    /// Direct method - use this for comptime polymorphism.
+    pub fn registerWrite(self: *Self, fd: posix.fd_t, callback: ReadyCallback) void {
+        // Get or create entry
+        const result = self.registrations.getOrPut(fd) catch return;
+        if (!result.found_existing) {
+            result.value_ptr.* = .{
+                .fd = fd,
+                .read_cb = ReadyCallback.noop,
+                .write_cb = ReadyCallback.noop,
+                .read_registered = false,
+                .write_registered = false,
+            };
+        }
+
+        result.value_ptr.write_cb = callback;
+
+        // Register with kqueue if not already
+        if (!result.value_ptr.write_registered) {
+            const changelist = [_]posix.system.Kevent{.{
+                .ident = @intCast(fd),
+                .filter = posix.system.EVFILT.WRITE,
+                .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }};
+            _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch return;
+            result.value_ptr.write_registered = true;
+        }
+    }
+
+    /// Unregister a file descriptor from all events.
+    ///
+    /// Direct method - use this for comptime polymorphism.
+    pub fn unregister(self: *Self, fd: posix.fd_t) void {
+        if (self.registrations.fetchRemove(fd)) |entry| {
+            // Remove from kqueue
+            var changelist: [2]posix.system.Kevent = undefined;
+            var count: usize = 0;
+
+            if (entry.value.read_registered) {
+                changelist[count] = .{
+                    .ident = @intCast(fd),
+                    .filter = posix.system.EVFILT.READ,
+                    .flags = posix.system.EV.DELETE,
+                    .fflags = 0,
+                    .data = 0,
+                    .udata = 0,
+                };
+                count += 1;
+            }
+
+            if (entry.value.write_registered) {
+                changelist[count] = .{
+                    .ident = @intCast(fd),
+                    .filter = posix.system.EVFILT.WRITE,
+                    .flags = posix.system.EV.DELETE,
+                    .fflags = 0,
+                    .data = 0,
+                    .udata = 0,
+                };
+                count += 1;
+            }
+
+            if (count > 0) {
+                _ = posix.kevent(self.kq, changelist[0..count], &[_]posix.system.Kevent{}, null) catch {};
+            }
+        }
+    }
+
+    /// Poll for I/O events and invoke callbacks.
+    ///
+    /// Returns the number of events processed.
+    /// Direct method - use this for comptime polymorphism.
+    pub fn poll(self: *Self, timeout_ms: i32) usize {
+        const ts: ?posix.timespec = if (timeout_ms >= 0) .{
+            .sec = @intCast(@divFloor(timeout_ms, 1000)),
+            .nsec = @intCast(@mod(timeout_ms, 1000) * 1_000_000),
+        } else null;
+
+        const n = posix.kevent(
+            self.kq,
+            &[_]posix.system.Kevent{},
+            &self.events,
+            if (ts) |*t| t else null,
+        ) catch return 0;
+
+        // Process events and invoke callbacks
+        for (self.events[0..n]) |event| {
+            const fd: posix.fd_t = @intCast(event.ident);
+
+            if (self.registrations.get(fd)) |entry| {
+                if (event.filter == posix.system.EVFILT.READ) {
+                    entry.read_cb.call(fd);
+                } else if (event.filter == posix.system.EVFILT.WRITE) {
+                    entry.write_cb.call(fd);
+                }
+            }
+        }
+
+        return n;
+    }
+
+    /// Create an IOService interface from this KqueueIO.
+    ///
+    /// Use this only when runtime polymorphism is needed.
+    pub fn ioService(self: *Self) async_io.IOService {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    const vtable: async_io.IOService.VTable = .{
+        .register_read = registerReadVtable,
+        .register_write = registerWriteVtable,
+        .unregister = unregisterVtable,
+        .poll = pollVtable,
+    };
+
+    fn registerReadVtable(ptr: *anyopaque, fd: posix.fd_t, callback: ReadyCallback) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.registerRead(fd, callback);
+    }
+
+    fn registerWriteVtable(ptr: *anyopaque, fd: posix.fd_t, callback: ReadyCallback) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.registerWrite(fd, callback);
+    }
+
+    fn unregisterVtable(ptr: *anyopaque, fd: posix.fd_t) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.unregister(fd);
+    }
+
+    fn pollVtable(ptr: *anyopaque, timeout_ms: i32) usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.poll(timeout_ms);
+    }
+};
+
 /// Counting semaphore using futex.
 pub const Semaphore = struct {
     permits: std.atomic.Value(u32),
@@ -479,4 +708,79 @@ test "Reactor basic" {
     // Wait should return immediately
     const events = try reactor.wait(100);
     try std.testing.expect(events.len > 0);
+}
+
+test "KqueueIO basic" {
+    var io = try KqueueIO.init(std.testing.allocator);
+    defer io.deinit();
+
+    // Create a pipe for testing
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    var read_called = false;
+    var read_fd: posix.fd_t = -1;
+
+    const Ctx = struct {
+        called: *bool,
+        fd: *posix.fd_t,
+    };
+
+    var ctx = Ctx{
+        .called = &read_called,
+        .fd = &read_fd,
+    };
+
+    // Register for read on pipe read end
+    io.registerRead(pipe_fds[0], .{
+        .ptr = @ptrCast(&ctx),
+        .callback = struct {
+            fn cb(ptr: ?*anyopaque, fd: posix.fd_t) void {
+                const c: *Ctx = @ptrCast(@alignCast(ptr.?));
+                c.called.* = true;
+                c.fd.* = fd;
+            }
+        }.cb,
+    });
+
+    // Write to pipe write end to make read end readable
+    _ = try posix.write(pipe_fds[1], "hello");
+
+    // Poll should invoke callback
+    const count = io.poll(100);
+    try std.testing.expect(count > 0);
+    try std.testing.expect(read_called);
+    try std.testing.expectEqual(pipe_fds[0], read_fd);
+}
+
+test "KqueueIO unregister" {
+    var io = try KqueueIO.init(std.testing.allocator);
+    defer io.deinit();
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    var called = false;
+
+    io.registerRead(pipe_fds[0], .{
+        .ptr = @ptrCast(&called),
+        .callback = struct {
+            fn cb(ptr: ?*anyopaque, _: posix.fd_t) void {
+                const c: *bool = @ptrCast(@alignCast(ptr.?));
+                c.* = true;
+            }
+        }.cb,
+    });
+
+    // Unregister before triggering
+    io.unregister(pipe_fds[0]);
+
+    // Write to make it readable
+    _ = try posix.write(pipe_fds[1], "hello");
+
+    // Poll should not invoke callback
+    _ = io.poll(10);
+    try std.testing.expect(!called);
 }

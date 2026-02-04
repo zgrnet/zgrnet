@@ -6,8 +6,7 @@
 //! - `dial`: Client-side connection initiator
 //! - `SessionManager`: Multi-peer session management
 //! - `UdpTransport`: UDP-based transport implementation
-//! - `UDP`: High-level peer management layer
-//! - Timer constants based on WireGuard's timing parameters
+//! - `UDP`: High-level peer management layer with double-queue architecture
 
 const std = @import("std");
 
@@ -47,24 +46,22 @@ pub const ManagerError = manager.ManagerError;
 pub const UdpTransport = transport_udp.UdpTransport;
 pub const UdpAddr = transport_udp.UdpAddr;
 
-// Re-export high-level UDP API
+// Re-export high-level UDP API (double-queue architecture)
 pub const UDP = udp.UDP;
-pub const PeerState = udp.PeerState;
-pub const HostInfo = udp.HostInfo;
-pub const PeerInfo = udp.PeerInfo;
-pub const ReadResult = udp.ReadResult;
 pub const UdpError = udp.UdpError;
+pub const UdpOptions = udp.UdpOptions;
+pub const Packet = udp.Packet;
+pub const PacketPool = udp.PacketPool;
+pub const ReadResult = udp.UDP.ReadResult;
 
-// Pipeline API types for high-throughput scenarios
-pub const RawPacket = udp.RawPacket;
-pub const DecryptedPacket = udp.DecryptedPacket;
+// KCP types (accessed via UDP)
+pub const KcpMux = udp.KcpMux;
+pub const KcpStream = udp.KcpStream;
 
-// KCP stream types (re-exported from UDP)
-pub const Mux = udp.Mux;
-pub const MuxConfig = udp.MuxConfig;
-pub const Stream = udp.Stream;
-pub const StreamState = udp.StreamState;
-pub const StreamError = udp.StreamError;
+// Channel sizes
+pub const DecryptChanSize = udp.DecryptChanSize;
+pub const OutputChanSize = udp.OutputChanSize;
+pub const MaxPacketSize = udp.MaxPacketSize;
 
 // Re-export constants
 pub const rekey_after_time_ns = consts.rekey_after_time_ns;
