@@ -59,6 +59,9 @@ pub const Stream = struct {
         const self = try allocator.create(Stream);
         errdefer allocator.destroy(self);
 
+        // Retain the Mux - stream holds a reference to prevent use-after-free
+        mux.retain();
+
         self.* = Stream{
             .id = id,
             .mux = mux,
@@ -119,7 +122,10 @@ pub const Stream = struct {
             k.deinit();
         }
         self.recv_buf.deinit();
+        // Release our reference to the Mux (may free Mux if we were the last reference)
+        const mux = self.mux;
         self.allocator.destroy(self);
+        _ = mux.release();
     }
 
     /// Deinitialize the stream (deprecated - use close() or release() instead).
@@ -410,6 +416,12 @@ pub const OutputFn = *const fn (data: []const u8, user_data: ?*anyopaque) anyerr
 
 /// Mux multiplexes multiple streams over a single connection.
 /// Thread-safe: all public methods are protected by mutex.
+///
+/// Reference counting:
+/// - Mux uses reference counting to prevent use-after-free when streams outlive their parent.
+/// - Each Stream holds a reference to its Mux (incremented in Stream.init, decremented in Stream.deinitInternal).
+/// - Owner of Mux should call release() instead of deinit() when done.
+/// - Mux is only freed when ref_count reaches 0.
 pub const Mux = struct {
     config: MuxConfig,
     output_fn: OutputFn,
@@ -422,6 +434,9 @@ pub const Mux = struct {
     closed: bool,
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
+
+    // Reference counting for safe memory management
+    ref_count: std.atomic.Value(u32),
 
     /// Initialize a new Mux.
     pub fn init(
@@ -448,18 +463,37 @@ pub const Mux = struct {
             .closed = false,
             .allocator = allocator,
             .mutex = .{},
+            .ref_count = std.atomic.Value(u32).init(1), // Owner's reference
         };
 
         return self;
     }
 
-    /// Deinitialize the Mux.
-    /// Releases Mux's reference to all streams. Streams with user references
-    /// will remain valid (but non-functional) until user calls release().
+    /// Increment reference count.
+    pub fn retain(self: *Mux) void {
+        _ = self.ref_count.fetchAdd(1, .seq_cst);
+    }
+
+    /// Decrement reference count and free if it reaches zero.
+    /// Returns true if memory was freed.
+    pub fn release(self: *Mux) bool {
+        const old = self.ref_count.fetchSub(1, .seq_cst);
+        if (old == 1) {
+            // Was 1, now 0 - we were the last reference, free memory
+            self.deinitInternal();
+            return true;
+        }
+        return false;
+    }
+
+    /// Close the Mux and release all streams.
+    /// Call this when you're done with the Mux. This marks it as closed,
+    /// releases all stream references, then releases the owner's reference.
+    /// The Mux may not be freed immediately if streams still hold references.
     pub fn deinit(self: *Mux) void {
         self.mutex.lock();
 
-        // Mark as closed and collect streams to release
+        // Mark as closed
         self.closed = true;
 
         // Release Mux's reference to all streams
@@ -468,11 +502,19 @@ pub const Mux = struct {
         while (iter.next()) |stream| {
             // Mark stream as closed so operations return errors
             stream.*.state.store(.closed, .seq_cst);
-            // Release Mux's reference (may free if user has no reference)
+            // Release Mux's reference (may free stream if user has no reference)
             _ = stream.*.release();
         }
         self.streams.deinit();
         self.mutex.unlock();
+
+        // Release owner's reference (may free Mux if no streams hold references)
+        _ = self.release();
+    }
+
+    /// Internal deinitialization - actually frees memory.
+    /// Only called when ref_count reaches 0.
+    fn deinitInternal(self: *Mux) void {
         self.allocator.destroy(self);
     }
 
@@ -566,16 +608,30 @@ pub const Mux = struct {
     }
 
     /// Handle PSH (data). Must be called with mutex held.
+    /// Releases mutex before calling stream methods to avoid deadlock with Stream.write.
     fn handlePshLocked(self: *Mux, id: u32, payload: []const u8) void {
-        if (self.streams.get(id)) |stream| {
-            stream.kcpInput(payload);
-            if (stream.kcpRecv()) {
-                // Unlock before callback to avoid deadlock
-                self.mutex.unlock();
-                defer self.mutex.lock();
-                self.on_stream_data(id, self.user_data);
-            }
+        const stream = self.streams.get(id) orelse return;
+
+        // Retain stream to prevent it from being freed while we work with it
+        stream.retain();
+
+        // Release mutex before calling stream methods that acquire kcp_mutex
+        // This avoids deadlock: write holds kcp_mutex->mux.mutex, input holds mux.mutex->kcp_mutex
+        self.mutex.unlock();
+
+        stream.kcpInput(payload);
+        const has_data = stream.kcpRecv();
+
+        // Release our temporary reference
+        _ = stream.release();
+
+        // Callback outside of lock
+        if (has_data) {
+            self.on_stream_data(id, self.user_data);
         }
+
+        // Reacquire mutex (caller expects it to be held)
+        self.mutex.lock();
     }
 
     /// Send a SYN frame (unlocked version for use when mutex is temporarily released).

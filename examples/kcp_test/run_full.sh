@@ -36,9 +36,10 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-GO_DIR="$ROOT_DIR/go"
-RUST_DIR="$ROOT_DIR/rust"
-ZIG_DIR="$ROOT_DIR/zig"
+# Each language example is now in its own subdirectory under examples/kcp_test/
+GO_DIR="$SCRIPT_DIR/go"
+RUST_DIR="$SCRIPT_DIR/rust"
+ZIG_DIR="$SCRIPT_DIR/zig"
 
 echo "=== ZGRNet Full 3-Way KCP Interop Test ==="
 echo "Transfer size: ${SIZE_MB} MB per direction per pair"
@@ -66,30 +67,30 @@ echo "=== Building all implementations ==="
 
 echo "Building Go kcp_test..."
 cd "$GO_DIR"
-go build -o "$SCRIPT_DIR/kcp_go" ./examples/kcp_test || {
+go build -o "$SCRIPT_DIR/kcp_go" . || {
     echo "Note: Go kcp_test not found, skipping Go"
     touch "$SCRIPT_DIR/kcp_go_skip"
 }
 
-echo "Building Rust kcp_interop..."
+echo "Building Rust kcp_test..."
 cd "$RUST_DIR"
-cargo build --example kcp_interop --release || cargo build --example kcp_interop
-if [ -f target/release/examples/kcp_interop ]; then
-    cp target/release/examples/kcp_interop "$SCRIPT_DIR/kcp_rust"
-elif [ -f target/debug/examples/kcp_interop ]; then
-    cp target/debug/examples/kcp_interop "$SCRIPT_DIR/kcp_rust"
+cargo build --release || cargo build
+if [ -f target/release/kcp_test ]; then
+    cp target/release/kcp_test "$SCRIPT_DIR/kcp_rust"
+elif [ -f target/debug/kcp_test ]; then
+    cp target/debug/kcp_test "$SCRIPT_DIR/kcp_rust"
 else
-    echo "Note: Rust kcp_interop not found, skipping Rust"
+    echo "Note: Rust kcp_test not found, skipping Rust"
     touch "$SCRIPT_DIR/kcp_rust_skip"
 fi
 
-echo "Building Zig kcp_interop..."
+echo "Building Zig kcp_test..."
 cd "$ZIG_DIR"
 zig build -Doptimize=ReleaseFast || zig build
-if [ -f zig-out/bin/kcp_interop ]; then
-    cp zig-out/bin/kcp_interop "$SCRIPT_DIR/kcp_zig"
+if [ -f zig-out/bin/kcp_test ]; then
+    cp zig-out/bin/kcp_test "$SCRIPT_DIR/kcp_zig"
 else
-    echo "Note: Zig kcp_interop not found, skipping Zig"
+    echo "Note: Zig kcp_test not found, skipping Zig"
     touch "$SCRIPT_DIR/kcp_zig_skip"
 fi
 
