@@ -56,6 +56,18 @@ RESULTS=""
 PASS_COUNT=0
 FAIL_COUNT=0
 
+# Port counter for deterministic port allocation (avoids RANDOM flakiness)
+PORT_COUNTER=0
+
+get_next_ports() {
+    PORT_COUNTER=$((PORT_COUNTER + 1))
+    # Use deterministic ports: base + counter * 10 to avoid collisions
+    # Opener: 10010, 10020, 10030, ...
+    # Accepter: 11010, 11020, 11030, ...
+    OPENER_PORT=$((10000 + PORT_COUNTER * 10))
+    ACCEPTER_PORT=$((11000 + PORT_COUNTER * 10))
+}
+
 run_pair_test() {
     local opener=$1
     local accepter=$2
@@ -64,13 +76,16 @@ run_pair_test() {
 
     echo "Test: $opener <-> $accepter"
 
+    # Get deterministic ports for this test pair
+    get_next_ports
+
     # Create pair config
     local CONFIG="$TEMP_DIR/config_${opener}_${accepter}.json"
     cat > "$CONFIG" << EOF
 {
   "hosts": [
-    {"name": "${opener}", "private_key": "0000000000000000000000000000000000000000000000000000000000000001", "port": $((10000 + RANDOM % 1000)), "role": "opener"},
-    {"name": "${accepter}", "private_key": "0000000000000000000000000000000000000000000000000000000000000002", "port": $((11000 + RANDOM % 1000)), "role": "accepter"}
+    {"name": "${opener}", "private_key": "0000000000000000000000000000000000000000000000000000000000000001", "port": ${OPENER_PORT}, "role": "opener"},
+    {"name": "${accepter}", "private_key": "0000000000000000000000000000000000000000000000000000000000000002", "port": ${ACCEPTER_PORT}, "role": "accepter"}
   ],
   "test": {
     "echo_message": "Hello KCP Interop!",

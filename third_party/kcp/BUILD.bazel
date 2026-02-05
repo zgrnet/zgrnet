@@ -31,13 +31,15 @@ genrule(
     """,
 )
 
-# Compile patched KCP using zig cc
+# Compile patched KCP using zig cc from Bazel toolchain
 genrule(
     name = "kcp_static",
     srcs = [":kcp_patched"],
     outs = ["libkcp.a"],
     cmd = """
         set -e
+        ZIG=$(location @zig_toolchain//:zig)
+
         # Set up zig cache directories within sandbox
         export ZIG_LOCAL_CACHE_DIR=./.zig-cache
         export ZIG_GLOBAL_CACHE_DIR=./.zig-global-cache
@@ -45,11 +47,11 @@ genrule(
 
         OUTDIR=$$(mktemp -d)
 
-        # Find patched ikcp.c
+        # Compile patched ikcp.c with zig cc
         for src in $(SRCS); do
             case "$$src" in
                 */ikcp.c)
-                    zig cc -c "$$src" -o "$$OUTDIR/ikcp.o" \
+                    $$ZIG cc -c "$$src" -o "$$OUTDIR/ikcp.o" \
                         -O3 \
                         -DNDEBUG \
                         -fno-sanitize=undefined \
