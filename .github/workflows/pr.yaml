@@ -291,7 +291,9 @@ jobs:
         run: |
           # Build and test in sequence (library built above)
           bazel build //rust:tun_test
-          sudo bazel-bin/rust/tun_test
+          # Rust test binary is in a hash directory, find it
+          RUST_TEST=$(find bazel-bin/rust -name 'tun_test' -type f -executable | head -1)
+          sudo "$RUST_TEST"
 
   # Skip job when no targets affected
   skip:
