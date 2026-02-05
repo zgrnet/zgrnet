@@ -238,10 +238,9 @@ jobs:
         run: sudo modprobe tun
 
       - name: Test Zig TUN
+        if: runner.os != 'Windows'  # Zig toolchain doesn't support Windows yet
         shell: bash
         run: |
-          # Use MSYS_NO_PATHCONV to prevent path conversion on Windows
-          export MSYS_NO_PATHCONV=1
           if [ -n "${{ matrix.sudo }}" ]; then
             sudo env "PATH=$PATH" bazel run //zig:tun_test
           else

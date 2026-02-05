@@ -17,6 +17,7 @@ filegroup(
         "src/**/*.S",
         "src/**/*.c",
         "src/**/*.h",
+        "include/**/*.h",  # C headers for TUN library
         "examples/**/*.zig",  # host_test.zig remains
     ]) + [
         "build.zig",
