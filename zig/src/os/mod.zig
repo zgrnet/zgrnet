@@ -22,19 +22,22 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 
 /// Platform implementations (conditionally imported to avoid compile errors)
-pub const Darwin = if (builtin.os.tag == .macos or builtin.os.tag == .ios or
-    builtin.os.tag == .tvos or builtin.os.tag == .watchos)
-    @import("darwin.zig")
+/// Named by I/O mechanism, not OS: kqueue (BSD), epoll (Linux), io_uring (Linux 5.1+)
+pub const Kqueue = if (builtin.os.tag == .macos or builtin.os.tag == .ios or
+    builtin.os.tag == .tvos or builtin.os.tag == .watchos or
+    builtin.os.tag == .freebsd or builtin.os.tag == .netbsd or builtin.os.tag == .openbsd)
+    @import("kqueue.zig")
 else
-    struct {}; // Empty struct on non-Darwin platforms
+    struct {}; // Empty struct on non-kqueue platforms
 pub const none = @import("none.zig");
 pub const None = none.None;
-// pub const Linux = @import("linux.zig");       // TODO
-// pub const FreeRtos = @import("freertos.zig"); // TODO
+// pub const Epoll = @import("epoll.zig");       // TODO: Linux epoll
+// pub const IoUring = @import("io_uring.zig");  // TODO: Linux io_uring
+// pub const FreeRtos = @import("freertos.zig"); // TODO: FreeRTOS
 
 /// IOService implementations
-pub const KqueueIO = if (@hasDecl(Darwin, "KqueueIO")) Darwin.KqueueIO else struct {};
-pub const BusyPollIO = none.BusyPollIO;
+pub const KqueueIO = if (@hasDecl(Kqueue, "KqueueIO")) Kqueue.KqueueIO else struct {};
+pub const BusyPollIO = if (@hasDecl(Kqueue, "BusyPollIO")) Kqueue.BusyPollIO else struct {};
 
 /// Build-time selected OS backend
 pub const OsBackend = build_options.os_backend;
@@ -136,9 +139,10 @@ pub fn OsLayer(comptime Impl: type) type {
 }
 
 /// Default OS layer based on build option and target OS.
-/// Falls back to None on non-Darwin platforms.
+/// Falls back to None on platforms without kqueue/epoll support.
 pub const Os = switch (builtin.os.tag) {
-    .macos, .ios, .tvos, .watchos => OsLayer(Darwin),
+    .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd => OsLayer(Kqueue),
+    // TODO: .linux => OsLayer(Epoll),
     else => OsLayer(None(std.heap.page_allocator)),
 };
 

@@ -11,6 +11,37 @@ const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
+/// C interop for select() - Zig's std.posix doesn't expose fd_set on BSD
+const sys = @cImport({
+    @cInclude("sys/select.h");
+});
+
+/// Helper functions for fd_set operations (C macros don't translate properly)
+const FdSet = struct {
+    /// Clear all bits in fd_set
+    fn zero(fds: *sys.fd_set) void {
+        @memset(@as([*]u8, @ptrCast(fds))[0..@sizeOf(sys.fd_set)], 0);
+    }
+
+    /// Set a file descriptor bit
+    fn setBit(fd: c_int, fds: *sys.fd_set) void {
+        const ufd: usize = @intCast(fd);
+        const bits_per_word = @sizeOf(c_int) * 8;
+        const word_index = ufd / bits_per_word;
+        const bit_index: u5 = @intCast(ufd % bits_per_word);
+        fds.fds_bits[word_index] |= (@as(i32, 1) << bit_index);
+    }
+
+    /// Check if a file descriptor bit is set
+    fn isSet(fd: c_int, fds: *const sys.fd_set) bool {
+        const ufd: usize = @intCast(fd);
+        const bits_per_word = @sizeOf(c_int) * 8;
+        const word_index = ufd / bits_per_word;
+        const bit_index: u5 = @intCast(ufd % bits_per_word);
+        return (fds.fds_bits[word_index] & (@as(i32, 1) << bit_index)) != 0;
+    }
+};
+
 /// kqueue event filter and flags
 pub const Filter = enum(i16) {
     read = posix.system.EVFILT.READ,
@@ -557,6 +588,204 @@ pub const KqueueIO = struct {
     }
 };
 
+// ============================================================================
+// BusyPollIO - Fallback IOService using select (BSD/macOS)
+// ============================================================================
+
+/// Busy-poll based I/O service using select() - fallback when kqueue overhead
+/// is not justified (e.g., single fd, short-lived operations).
+///
+/// ## Direct Usage (comptime, zero overhead)
+/// ```zig
+/// var io = BusyPollIO.init(allocator);
+/// defer io.deinit();
+///
+/// io.registerRead(socket_fd, .{ .ptr = ctx, .callback = onReady });
+///
+/// while (running) {
+///     _ = io.poll(100);
+/// }
+/// ```
+pub const BusyPollIO = struct {
+    const Self = @This();
+    const max_fds = 64;
+
+    /// Internal registration entry
+    const Entry = struct {
+        fd: posix.fd_t,
+        read_cb: ReadyCallback,
+        write_cb: ReadyCallback,
+        want_read: bool,
+        want_write: bool,
+    };
+
+    allocator: Allocator,
+    registrations: std.AutoHashMap(posix.fd_t, Entry),
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .registrations = std.AutoHashMap(posix.fd_t, Entry).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.registrations.deinit();
+    }
+
+    /// Register a file descriptor for read readiness.
+    pub fn registerRead(self: *Self, fd: posix.fd_t, callback: ReadyCallback) void {
+        const result = self.registrations.getOrPut(fd) catch return;
+        if (!result.found_existing) {
+            result.value_ptr.* = .{
+                .fd = fd,
+                .read_cb = ReadyCallback.noop,
+                .write_cb = ReadyCallback.noop,
+                .want_read = false,
+                .want_write = false,
+            };
+        }
+        result.value_ptr.read_cb = callback;
+        result.value_ptr.want_read = true;
+    }
+
+    /// Register a file descriptor for write readiness.
+    pub fn registerWrite(self: *Self, fd: posix.fd_t, callback: ReadyCallback) void {
+        const result = self.registrations.getOrPut(fd) catch return;
+        if (!result.found_existing) {
+            result.value_ptr.* = .{
+                .fd = fd,
+                .read_cb = ReadyCallback.noop,
+                .write_cb = ReadyCallback.noop,
+                .want_read = false,
+                .want_write = false,
+            };
+        }
+        result.value_ptr.write_cb = callback;
+        result.value_ptr.want_write = true;
+    }
+
+    /// Unregister a file descriptor from all events.
+    pub fn unregister(self: *Self, fd: posix.fd_t) void {
+        _ = self.registrations.remove(fd);
+    }
+
+    /// Poll for I/O events using select and invoke callbacks.
+    ///
+    /// Returns the number of events processed.
+    pub fn poll(self: *Self, timeout_ms: i32) usize {
+        if (self.registrations.count() == 0) {
+            if (timeout_ms > 0) {
+                std.Thread.sleep(@as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms);
+            }
+            return 0;
+        }
+
+        // Build fd_sets for select using C interop
+        var read_fds: sys.fd_set = undefined;
+        var write_fds: sys.fd_set = undefined;
+        FdSet.zero(&read_fds);
+        FdSet.zero(&write_fds);
+        var max_fd: c_int = 0;
+
+        var iter = self.registrations.iterator();
+        while (iter.next()) |entry| {
+            const e = entry.value_ptr;
+            if (e.want_read) {
+                FdSet.setBit(e.fd, &read_fds);
+                if (e.fd > max_fd) max_fd = e.fd;
+            }
+            if (e.want_write) {
+                FdSet.setBit(e.fd, &write_fds);
+                if (e.fd > max_fd) max_fd = e.fd;
+            }
+        }
+
+        // Convert timeout
+        var tv: sys.struct_timeval = .{
+            .tv_sec = @intCast(@divFloor(timeout_ms, 1000)),
+            .tv_usec = @intCast(@mod(timeout_ms, 1000) * 1000),
+        };
+        const tv_ptr: ?*sys.struct_timeval = if (timeout_ms >= 0) &tv else null;
+
+        // Call select
+        const result = sys.select(
+            max_fd + 1,
+            &read_fds,
+            &write_fds,
+            null,
+            tv_ptr,
+        );
+
+        if (result <= 0) return 0;
+
+        // Process ready fds - collect callbacks first to avoid modification during iteration
+        var callbacks_to_call: [max_fds * 2]struct { cb: ReadyCallback, fd: posix.fd_t } = undefined;
+        var callback_count: usize = 0;
+
+        var iter2 = self.registrations.iterator();
+        while (iter2.next()) |entry| {
+            const e = entry.value_ptr;
+
+            if (e.want_read and FdSet.isSet(e.fd, &read_fds)) {
+                if (callback_count < callbacks_to_call.len) {
+                    callbacks_to_call[callback_count] = .{ .cb = e.read_cb, .fd = e.fd };
+                    callback_count += 1;
+                }
+            }
+
+            if (e.want_write and FdSet.isSet(e.fd, &write_fds)) {
+                if (callback_count < callbacks_to_call.len) {
+                    callbacks_to_call[callback_count] = .{ .cb = e.write_cb, .fd = e.fd };
+                    callback_count += 1;
+                }
+            }
+        }
+
+        // Now invoke callbacks
+        for (callbacks_to_call[0..callback_count]) |item| {
+            item.cb.call(item.fd);
+        }
+
+        return callback_count;
+    }
+
+    /// Create an IOService interface from this BusyPollIO.
+    pub fn ioService(self: *Self) async_io.IOService {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    const vtable: async_io.IOService.VTable = .{
+        .register_read = registerReadVtable,
+        .register_write = registerWriteVtable,
+        .unregister = unregisterVtable,
+        .poll = pollVtable,
+    };
+
+    fn registerReadVtable(ptr: *anyopaque, fd: posix.fd_t, callback: ReadyCallback) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.registerRead(fd, callback);
+    }
+
+    fn registerWriteVtable(ptr: *anyopaque, fd: posix.fd_t, callback: ReadyCallback) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.registerWrite(fd, callback);
+    }
+
+    fn unregisterVtable(ptr: *anyopaque, fd: posix.fd_t) void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.unregister(fd);
+    }
+
+    fn pollVtable(ptr: *anyopaque, timeout_ms: i32) usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.poll(timeout_ms);
+    }
+};
+
 /// Counting semaphore using futex.
 pub const Semaphore = struct {
     permits: std.atomic.Value(u32),
@@ -756,6 +985,68 @@ test "KqueueIO basic" {
 
 test "KqueueIO unregister" {
     var io = try KqueueIO.init(std.testing.allocator);
+    defer io.deinit();
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    var called = false;
+
+    io.registerRead(pipe_fds[0], .{
+        .ptr = @ptrCast(&called),
+        .callback = struct {
+            fn cb(ptr: ?*anyopaque, _: posix.fd_t) void {
+                const c: *bool = @ptrCast(@alignCast(ptr.?));
+                c.* = true;
+            }
+        }.cb,
+    });
+
+    // Unregister before triggering
+    io.unregister(pipe_fds[0]);
+
+    // Write to make it readable
+    _ = try posix.write(pipe_fds[1], "hello");
+
+    // Poll should not invoke callback
+    _ = io.poll(10);
+    try std.testing.expect(!called);
+}
+
+test "BusyPollIO basic" {
+    var io = BusyPollIO.init(std.testing.allocator);
+    defer io.deinit();
+
+    // Create a pipe for testing
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    var read_called = false;
+
+    // Register for read on pipe read end
+    io.registerRead(pipe_fds[0], .{
+        .ptr = @ptrCast(&read_called),
+        .callback = struct {
+            fn cb(ptr: ?*anyopaque, _: posix.fd_t) void {
+                const called: *bool = @ptrCast(@alignCast(ptr.?));
+                called.* = true;
+            }
+        }.cb,
+    });
+
+    // Write to pipe write end to make read end readable
+    _ = try posix.write(pipe_fds[1], "hello");
+
+    // Poll should invoke callback
+    const count = io.poll(100);
+    try std.testing.expect(count > 0);
+    try std.testing.expect(read_called);
+}
+
+test "BusyPollIO unregister" {
+    var io = BusyPollIO.init(std.testing.allocator);
     defer io.deinit();
 
     const pipe_fds = try posix.pipe();

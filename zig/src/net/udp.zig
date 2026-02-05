@@ -414,8 +414,8 @@ pub const UDP = struct {
         // Register socket for read events (platform-specific flags)
         const builtin = @import("builtin");
         const register_flags: u16 = switch (builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos => os_mod.Darwin.Flags.ADD | os_mod.Darwin.Flags.ENABLE,
-            else => 0, // Stub on non-Darwin platforms
+            .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd => os_mod.Kqueue.Flags.ADD | os_mod.Kqueue.Flags.ENABLE,
+            else => 0, // Stub on non-kqueue platforms
         };
         reactor.register(@intCast(socket), .read, register_flags) catch return UdpError.BindFailed;
 
@@ -911,11 +911,13 @@ pub const UDP = struct {
             if (self.closed.load(.acquire)) return;
 
             // Check for shutdown signal (user event ident=1)
-            // Only on Darwin platforms where kqueue USER events are supported
+            // Only on kqueue platforms where USER events are supported
             const builtin_os = @import("builtin");
             var should_exit = false;
             if (builtin_os.os.tag == .macos or builtin_os.os.tag == .ios or
-                builtin_os.os.tag == .tvos or builtin_os.os.tag == .watchos)
+                builtin_os.os.tag == .tvos or builtin_os.os.tag == .watchos or
+                builtin_os.os.tag == .freebsd or builtin_os.os.tag == .netbsd or
+                builtin_os.os.tag == .openbsd)
             {
                 for (events) |ev| {
                     if (ev.filter == posix.system.EVFILT.USER) {
