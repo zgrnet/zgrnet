@@ -263,13 +263,25 @@ jobs:
         shell: bash
         run: |
           export MSYS_NO_PATHCONV=1
-          ${{ matrix.sudo }} bazel test //go/pkg/tun:tun_test --test_output=errors
+          # Build first (as user), then run with sudo
+          bazel build //go/pkg/tun:tun_test
+          if [ -n "${{ matrix.sudo }}" ]; then
+            sudo $(bazel info bazel-bin)/go/pkg/tun/tun_test_/tun_test
+          else
+            $(bazel info bazel-bin)/go/pkg/tun/tun_test_/tun_test
+          fi
 
       - name: Test Rust TUN
         shell: bash
         run: |
           export MSYS_NO_PATHCONV=1
-          ${{ matrix.sudo }} bazel test //rust:tun_test --test_output=errors
+          # Build first (as user), then run with sudo
+          bazel build //rust:tun_test
+          if [ -n "${{ matrix.sudo }}" ]; then
+            sudo $(bazel info bazel-bin)/rust/tun_test
+          else
+            $(bazel info bazel-bin)/rust/tun_test
+          fi
 
   # Format check
   format:
