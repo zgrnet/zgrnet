@@ -313,4 +313,45 @@ pub fn build(b: *std.Build) void {
     }
     const kcp_interop_step = b.step("kcp_test", "Run KCP interop test");
     kcp_interop_step.dependOn(&run_kcp_interop.step);
+
+    // ========================================================================
+    // TUN Module
+    // ========================================================================
+
+    // TUN library module (cross-platform TUN device abstraction)
+    const tun_lib_module = b.createModule(.{
+        .root_source_file = b.path("src/tun/cabi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // TUN library (static library with C ABI)
+    const tun_lib = b.addLibrary(.{
+        .name = "tun",
+        .root_module = tun_lib_module,
+    });
+    b.installArtifact(tun_lib);
+
+    // Install C header
+    b.installFile("include/tun.h", "include/tun.h");
+
+    // TUN tests
+    const tun_test_module = b.createModule(.{
+        .root_source_file = b.path("src/tun/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const tun_tests = b.addTest(.{
+        .root_module = tun_test_module,
+    });
+
+    const run_tun_tests = b.addRunArtifact(tun_tests);
+    const tun_test_step = b.step("test-tun", "Run TUN tests (requires root/admin)");
+    tun_test_step.dependOn(&run_tun_tests.step);
+
+    // Export TUN module for dependents
+    _ = b.addModule("tun", .{
+        .root_source_file = b.path("src/tun/mod.zig"),
+    });
 }

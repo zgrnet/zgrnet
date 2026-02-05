@@ -1,0 +1,559 @@
+//! Cross-platform TUN device interface.
+//!
+//! This module provides safe Rust wrappers around the Zig TUN library,
+//! offering a native Rust API for creating and managing TUN devices.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use zgrnet::tun::{init, Device};
+//! use std::net::Ipv4Addr;
+//!
+//! // Initialize TUN subsystem
+//! init().expect("failed to initialize TUN");
+//!
+//! // Create TUN device
+//! let mut device = Device::create(None).expect("failed to create TUN");
+//! println!("Created TUN: {}", device.name());
+//!
+//! // Configure IP address
+//! device.set_ipv4(
+//!     Ipv4Addr::new(10, 0, 0, 1),
+//!     Ipv4Addr::new(255, 255, 255, 0),
+//! ).expect("failed to set IP");
+//!
+//! // Bring interface up
+//! device.up().expect("failed to bring up");
+//! ```
+
+mod ffi;
+
+use std::ffi::{CStr, CString};
+use std::io::{self, Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Once;
+
+pub use ffi::RawHandle;
+
+/// Error type for TUN operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    CreateFailed,
+    OpenFailed,
+    InvalidName,
+    PermissionDenied,
+    DeviceNotFound,
+    NotSupported,
+    DeviceBusy,
+    InvalidArgument,
+    SystemResources,
+    WouldBlock,
+    IoError,
+    SetMtuFailed,
+    SetAddressFailed,
+    SetStateFailed,
+    AlreadyClosed,
+    WintunNotFound,
+    WintunInitFailed,
+    NullPointer,
+    Unknown(i32),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::CreateFailed => write!(f, "failed to create TUN device"),
+            Error::OpenFailed => write!(f, "failed to open TUN device"),
+            Error::InvalidName => write!(f, "invalid device name"),
+            Error::PermissionDenied => write!(f, "permission denied"),
+            Error::DeviceNotFound => write!(f, "device not found"),
+            Error::NotSupported => write!(f, "operation not supported"),
+            Error::DeviceBusy => write!(f, "device is busy"),
+            Error::InvalidArgument => write!(f, "invalid argument"),
+            Error::SystemResources => write!(f, "system resources exhausted"),
+            Error::WouldBlock => write!(f, "operation would block"),
+            Error::IoError => write!(f, "I/O error"),
+            Error::SetMtuFailed => write!(f, "failed to set MTU"),
+            Error::SetAddressFailed => write!(f, "failed to set address"),
+            Error::SetStateFailed => write!(f, "failed to set interface state"),
+            Error::AlreadyClosed => write!(f, "device already closed"),
+            Error::WintunNotFound => write!(f, "Wintun driver not found"),
+            Error::WintunInitFailed => write!(f, "Wintun initialization failed"),
+            Error::NullPointer => write!(f, "null pointer"),
+            Error::Unknown(code) => write!(f, "unknown error code: {}", code),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<Error> for io::Error {
+    fn from(err: Error) -> io::Error {
+        let kind = match err {
+            Error::PermissionDenied => io::ErrorKind::PermissionDenied,
+            Error::DeviceNotFound => io::ErrorKind::NotFound,
+            Error::InvalidArgument => io::ErrorKind::InvalidInput,
+            Error::WouldBlock => io::ErrorKind::WouldBlock,
+            Error::AlreadyClosed => io::ErrorKind::NotConnected,
+            Error::NotSupported => io::ErrorKind::Unsupported,
+            _ => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, err)
+    }
+}
+
+fn code_to_error(code: i32) -> Error {
+    match code {
+        ffi::TUN_ERR_CREATE_FAILED => Error::CreateFailed,
+        ffi::TUN_ERR_OPEN_FAILED => Error::OpenFailed,
+        ffi::TUN_ERR_INVALID_NAME => Error::InvalidName,
+        ffi::TUN_ERR_PERMISSION_DENIED => Error::PermissionDenied,
+        ffi::TUN_ERR_DEVICE_NOT_FOUND => Error::DeviceNotFound,
+        ffi::TUN_ERR_NOT_SUPPORTED => Error::NotSupported,
+        ffi::TUN_ERR_DEVICE_BUSY => Error::DeviceBusy,
+        ffi::TUN_ERR_INVALID_ARGUMENT => Error::InvalidArgument,
+        ffi::TUN_ERR_SYSTEM_RESOURCES => Error::SystemResources,
+        ffi::TUN_ERR_WOULD_BLOCK => Error::WouldBlock,
+        ffi::TUN_ERR_IO_ERROR => Error::IoError,
+        ffi::TUN_ERR_SET_MTU_FAILED => Error::SetMtuFailed,
+        ffi::TUN_ERR_SET_ADDRESS_FAILED => Error::SetAddressFailed,
+        ffi::TUN_ERR_SET_STATE_FAILED => Error::SetStateFailed,
+        ffi::TUN_ERR_ALREADY_CLOSED => Error::AlreadyClosed,
+        ffi::TUN_ERR_WINTUN_NOT_FOUND => Error::WintunNotFound,
+        ffi::TUN_ERR_WINTUN_INIT_FAILED => Error::WintunInitFailed,
+        _ => Error::Unknown(code),
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+static INIT: Once = Once::new();
+static mut INIT_RESULT: i32 = 0;
+
+/// Initialize the TUN subsystem.
+///
+/// On Windows, this loads the Wintun driver.
+/// On Unix systems, this is a no-op but should be called for portability.
+///
+/// This function is safe to call multiple times; initialization happens once.
+pub fn init() -> Result<()> {
+    INIT.call_once(|| {
+        unsafe {
+            INIT_RESULT = ffi::tun_init();
+        }
+    });
+
+    let result = unsafe { INIT_RESULT };
+    if result == ffi::TUN_OK {
+        Ok(())
+    } else {
+        Err(code_to_error(result))
+    }
+}
+
+/// Cleanup the TUN subsystem.
+///
+/// On Windows, this unloads the Wintun driver.
+pub fn deinit() {
+    unsafe {
+        ffi::tun_deinit();
+    }
+}
+
+/// A TUN device.
+pub struct Device {
+    handle: *mut ffi::TunHandle,
+    name: String,
+}
+
+// SAFETY: The underlying TUN handle is thread-safe for basic operations.
+// However, concurrent read/write operations may produce undefined behavior.
+unsafe impl Send for Device {}
+
+impl Device {
+    /// Create a new TUN device.
+    ///
+    /// If `name` is `None`, the system will auto-assign a name.
+    pub fn create(name: Option<&str>) -> Result<Self> {
+        init()?;
+
+        let c_name = name.map(|s| CString::new(s).unwrap());
+        let name_ptr = c_name.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+
+        let handle = unsafe { ffi::tun_create(name_ptr) };
+        if handle.is_null() {
+            return Err(Error::CreateFailed);
+        }
+
+        // Get the assigned name
+        let dev_name = unsafe {
+            let name_ptr = ffi::tun_get_name(handle);
+            if name_ptr.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
+            }
+        };
+
+        Ok(Device {
+            handle,
+            name: dev_name,
+        })
+    }
+
+    /// Get the device name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Get the underlying file descriptor (Unix) or HANDLE (Windows).
+    pub fn raw_handle(&self) -> RawHandle {
+        unsafe { ffi::tun_get_handle(self.handle) }
+    }
+
+    /// Get the MTU (Maximum Transmission Unit).
+    pub fn mtu(&self) -> Result<i32> {
+        let mtu = unsafe { ffi::tun_get_mtu(self.handle) };
+        if mtu < 0 {
+            Err(code_to_error(mtu))
+        } else {
+            Ok(mtu)
+        }
+    }
+
+    /// Set the MTU (Maximum Transmission Unit).
+    ///
+    /// Requires root/admin privileges.
+    pub fn set_mtu(&mut self, mtu: i32) -> Result<()> {
+        let rc = unsafe { ffi::tun_set_mtu(self.handle, mtu) };
+        if rc == ffi::TUN_OK {
+            Ok(())
+        } else {
+            Err(code_to_error(rc))
+        }
+    }
+
+    /// Set non-blocking mode.
+    ///
+    /// In non-blocking mode, read returns `Error::WouldBlock` if no data is available.
+    pub fn set_nonblocking(&mut self, enabled: bool) -> Result<()> {
+        let flag = if enabled { 1 } else { 0 };
+        let rc = unsafe { ffi::tun_set_nonblocking(self.handle, flag) };
+        if rc == ffi::TUN_OK {
+            Ok(())
+        } else {
+            Err(code_to_error(rc))
+        }
+    }
+
+    /// Bring the interface up.
+    ///
+    /// Requires root/admin privileges.
+    pub fn up(&mut self) -> Result<()> {
+        let rc = unsafe { ffi::tun_set_up(self.handle) };
+        if rc == ffi::TUN_OK {
+            Ok(())
+        } else {
+            Err(code_to_error(rc))
+        }
+    }
+
+    /// Bring the interface down.
+    ///
+    /// Requires root/admin privileges.
+    pub fn down(&mut self) -> Result<()> {
+        let rc = unsafe { ffi::tun_set_down(self.handle) };
+        if rc == ffi::TUN_OK {
+            Ok(())
+        } else {
+            Err(code_to_error(rc))
+        }
+    }
+
+    /// Set IPv4 address and netmask.
+    ///
+    /// Requires root/admin privileges.
+    pub fn set_ipv4(&mut self, addr: Ipv4Addr, netmask: Ipv4Addr) -> Result<()> {
+        let addr_str = CString::new(addr.to_string()).map_err(|_| Error::InvalidArgument)?;
+        let mask_str = CString::new(netmask.to_string()).map_err(|_| Error::InvalidArgument)?;
+
+        let rc = unsafe { ffi::tun_set_ipv4(self.handle, addr_str.as_ptr(), mask_str.as_ptr()) };
+        if rc == ffi::TUN_OK {
+            Ok(())
+        } else {
+            Err(code_to_error(rc))
+        }
+    }
+
+    /// Set IPv6 address with prefix length.
+    ///
+    /// Requires root/admin privileges.
+    pub fn set_ipv6(&mut self, addr: Ipv6Addr, prefix_len: i32) -> Result<()> {
+        if prefix_len < 0 || prefix_len > 128 {
+            return Err(Error::InvalidArgument);
+        }
+
+        let addr_str = CString::new(addr.to_string()).map_err(|_| Error::InvalidArgument)?;
+
+        let rc = unsafe { ffi::tun_set_ipv6(self.handle, addr_str.as_ptr(), prefix_len) };
+        if rc == ffi::TUN_OK {
+            Ok(())
+        } else {
+            Err(code_to_error(rc))
+        }
+    }
+
+    /// Read a packet from the TUN device.
+    ///
+    /// Returns the number of bytes read.
+    pub fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let n = unsafe { ffi::tun_read(self.handle, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n < 0 {
+            Err(code_to_error(n as i32))
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    /// Write a packet to the TUN device.
+    ///
+    /// Returns the number of bytes written.
+    pub fn write_packet(&mut self, buf: &[u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let n = unsafe { ffi::tun_write(self.handle, buf.as_ptr() as *const _, buf.len()) };
+        if n < 0 {
+            Err(code_to_error(n as i32))
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                ffi::tun_close(self.handle);
+            }
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Read for Device {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read_packet(buf).map_err(Into::into)
+    }
+}
+
+impl Write for Device {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_packet(buf).map_err(Into::into)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn needs_root() -> bool {
+        #[cfg(unix)]
+        {
+            // Check if running as root using nix::unistd::getuid or raw syscall
+            // Use std::process::Command as a portable alternative
+            std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or(1)
+                        != 0
+                })
+                .unwrap_or(true)
+        }
+        #[cfg(windows)]
+        {
+            false
+        }
+    }
+
+    #[test]
+    fn test_create_close() {
+        if needs_root() {
+            eprintln!("Skipping test: requires root privileges");
+            return;
+        }
+
+        let device = Device::create(None).expect("failed to create TUN");
+        println!("Created TUN device: {}", device.name());
+        assert!(!device.name().is_empty());
+    }
+
+    #[test]
+    fn test_mtu() {
+        if needs_root() {
+            eprintln!("Skipping test: requires root privileges");
+            return;
+        }
+
+        let device = Device::create(None).expect("failed to create TUN");
+        let mtu = device.mtu().expect("failed to get MTU");
+        println!("Default MTU: {}", mtu);
+        assert!(mtu >= 576 && mtu <= 65535);
+    }
+
+    #[test]
+    fn test_set_ipv4() {
+        if needs_root() {
+            eprintln!("Skipping test: requires root privileges");
+            return;
+        }
+
+        let mut device = Device::create(None).expect("failed to create TUN");
+        device
+            .set_ipv4(
+                Ipv4Addr::new(10, 0, 100, 1),
+                Ipv4Addr::new(255, 255, 255, 0),
+            )
+            .expect("failed to set IPv4");
+        println!("TUN {} configured with IP 10.0.100.1/24", device.name());
+    }
+
+    #[test]
+    fn test_nonblocking() {
+        if needs_root() {
+            eprintln!("Skipping test: requires root privileges");
+            return;
+        }
+
+        let mut device = Device::create(None).expect("failed to create TUN");
+        device.set_nonblocking(true).expect("failed to enable nonblocking");
+        device.set_nonblocking(false).expect("failed to disable nonblocking");
+    }
+
+    #[test]
+    fn test_up_down() {
+        if needs_root() {
+            eprintln!("Skipping test: requires root privileges");
+            return;
+        }
+
+        let mut device = Device::create(None).expect("failed to create TUN");
+        // Set IP first (required on some systems)
+        let _ = device.set_ipv4(
+            Ipv4Addr::new(10, 0, 101, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+        );
+        device.up().expect("failed to bring up");
+        device.down().expect("failed to bring down");
+    }
+
+    #[test]
+    fn test_read_write_two_devices() {
+        if needs_root() {
+            eprintln!("Skipping test: requires root privileges");
+            return;
+        }
+
+        let mut dev1 = Device::create(None).expect("failed to create TUN 1");
+        let mut dev2 = Device::create(None).expect("failed to create TUN 2");
+
+        println!("Created TUN devices: {} and {}", dev1.name(), dev2.name());
+
+        // Configure
+        dev1.set_ipv4(Ipv4Addr::new(10, 0, 50, 1), Ipv4Addr::new(255, 255, 255, 0))
+            .expect("failed to set IPv4 on dev1");
+        dev2.set_ipv4(Ipv4Addr::new(10, 0, 51, 1), Ipv4Addr::new(255, 255, 255, 0))
+            .expect("failed to set IPv4 on dev2");
+
+        dev1.set_nonblocking(true).expect("failed to set nonblocking");
+        dev2.set_nonblocking(true).expect("failed to set nonblocking");
+
+        // Create ICMP packet
+        let packet = make_icmp_echo_request(
+            Ipv4Addr::new(10, 0, 50, 1),
+            Ipv4Addr::new(10, 0, 51, 1),
+        );
+
+        // Write to dev1
+        match dev1.write_packet(&packet) {
+            Ok(n) => println!("Wrote {} bytes to {}", n, dev1.name()),
+            Err(e) => println!("Write failed (expected without routing): {:?}", e),
+        }
+
+        // Try to read
+        let mut buf = [0u8; 1500];
+        match dev1.read_packet(&mut buf) {
+            Ok(n) => println!("Read {} bytes from {}", n, dev1.name()),
+            Err(Error::WouldBlock) => println!("No packet received (routing may not be configured)"),
+            Err(e) => println!("Read error: {:?}", e),
+        }
+    }
+
+    fn make_icmp_echo_request(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+
+        // IP header
+        packet[0] = 0x45; // Version 4, IHL 5
+        packet[1] = 0x00; // TOS
+        packet[2] = 0x00; // Total length high
+        packet[3] = 28;   // Total length low
+        packet[4] = 0x00; // ID high
+        packet[5] = 0x01; // ID low
+        packet[6] = 0x00; // Flags
+        packet[7] = 0x00; // Fragment offset
+        packet[8] = 64;   // TTL
+        packet[9] = 1;    // Protocol (ICMP)
+        packet[12..16].copy_from_slice(&src.octets());
+        packet[16..20].copy_from_slice(&dst.octets());
+
+        // IP checksum
+        let ip_checksum = calculate_checksum(&packet[..20]);
+        packet[10] = (ip_checksum >> 8) as u8;
+        packet[11] = ip_checksum as u8;
+
+        // ICMP header
+        packet[20] = 8;  // Type: Echo request
+        packet[21] = 0;  // Code
+        packet[24] = 0;  // ID high
+        packet[25] = 1;  // ID low
+        packet[26] = 0;  // Sequence high
+        packet[27] = 1;  // Sequence low
+
+        // ICMP checksum
+        let icmp_checksum = calculate_checksum(&packet[20..]);
+        packet[22] = (icmp_checksum >> 8) as u8;
+        packet[23] = icmp_checksum as u8;
+
+        packet
+    }
+
+    fn calculate_checksum(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        let mut i = 0;
+        while i < data.len() - 1 {
+            sum += ((data[i] as u32) << 8) | (data[i + 1] as u32);
+            i += 2;
+        }
+        if data.len() % 2 == 1 {
+            sum += (data[data.len() - 1] as u32) << 8;
+        }
+        while sum > 0xFFFF {
+            sum = (sum >> 16) + (sum & 0xFFFF);
+        }
+        !sum as u16
+    }
+}

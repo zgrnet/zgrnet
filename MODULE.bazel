@@ -69,3 +69,33 @@ cc_library(
 )
 """,
 )
+
+# Wintun - Windows TUN driver
+# https://www.wintun.net/
+http_archive(
+    name = "wintun",
+    urls = ["https://www.wintun.net/builds/wintun-0.14.1.zip"],
+    integrity = "sha256-J+swwQhZR5VvGgYjJYZ8J2F6V5Ej5x+CW+3Z7g6IxZw=",
+    build_file_content = """
+filegroup(
+    name = "dll_amd64",
+    srcs = ["wintun/bin/amd64/wintun.dll"],
+    visibility = ["//visibility:public"],
+)
+filegroup(
+    name = "dll_arm64",
+    srcs = ["wintun/bin/arm64/wintun.dll"],
+    visibility = ["//visibility:public"],
+)
+filegroup(
+    name = "dll_x86",
+    srcs = ["wintun/bin/x86/wintun.dll"],
+    visibility = ["//visibility:public"],
+)
+filegroup(
+    name = "header",
+    srcs = ["wintun/include/wintun.h"],
+    visibility = ["//visibility:public"],
+)
+""",
+)

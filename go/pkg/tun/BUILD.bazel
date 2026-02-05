@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "tun",
+    srcs = ["tun.go"],
+    cgo = True,
+    cdeps = ["//zig:tun_lib"],
+    copts = ["-I$(location //zig:tun_header)"],
+    importpath = "github.com/vibing/zgrnet/pkg/tun",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "tun_test",
+    srcs = ["tun_test.go"],
+    embed = [":tun"],
+    tags = ["requires-root"],
+)

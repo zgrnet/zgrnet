@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 load("//bazel/zig:defs.bzl", "zig_binary", "zig_run")
 
 # BoringSSL benchmark (C)
@@ -25,6 +25,39 @@ filegroup(
         "//examples/kcp_test/zig:srcs",
         "//examples/stream_test/zig:srcs",
     ],
+    visibility = ["//visibility:public"],
+)
+
+# TUN C header for Go/Rust bindings
+filegroup(
+    name = "tun_header",
+    srcs = ["include/tun.h"],
+    visibility = ["//visibility:public"],
+)
+
+# TUN static library (built via `zig build` outside Bazel)
+# To use in Bazel, first run: cd zig && zig build
+# This provides a prebuilt library target for Go CGo and Rust FFI
+cc_library(
+    name = "tun_lib",
+    hdrs = ["include/tun.h"],
+    srcs = select({
+        "@platforms//os:macos": ["zig-out/lib/libtun.a"],
+        "@platforms//os:linux": ["zig-out/lib/libtun.a"],
+        "@platforms//os:windows": ["zig-out/lib/tun.lib"],
+    }),
+    includes = ["include"],
+    linkopts = select({
+        "@platforms//os:macos": [
+            "-framework CoreFoundation",
+            "-framework SystemConfiguration",
+        ],
+        "@platforms//os:linux": [],
+        "@platforms//os:windows": [
+            "-lws2_32",
+            "-liphlpapi",
+        ],
+    }),
     visibility = ["//visibility:public"],
 )
 

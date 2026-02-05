@@ -1,0 +1,322 @@
+//! C ABI exports for the TUN module.
+//!
+//! This file provides C-compatible function exports that can be called
+//! from Rust, Go, or any other language that supports C FFI.
+
+const std = @import("std");
+const mod = @import("mod.zig");
+const Tun = mod.Tun;
+const TunError = mod.TunError;
+
+// Error code mapping
+const TUN_OK: c_int = 0;
+const TUN_ERR_CREATE_FAILED: c_int = -1;
+const TUN_ERR_OPEN_FAILED: c_int = -2;
+const TUN_ERR_INVALID_NAME: c_int = -3;
+const TUN_ERR_PERMISSION_DENIED: c_int = -4;
+const TUN_ERR_DEVICE_NOT_FOUND: c_int = -5;
+const TUN_ERR_NOT_SUPPORTED: c_int = -6;
+const TUN_ERR_DEVICE_BUSY: c_int = -7;
+const TUN_ERR_INVALID_ARGUMENT: c_int = -8;
+const TUN_ERR_SYSTEM_RESOURCES: c_int = -9;
+const TUN_ERR_WOULD_BLOCK: c_int = -10;
+const TUN_ERR_IO_ERROR: c_int = -11;
+const TUN_ERR_SET_MTU_FAILED: c_int = -12;
+const TUN_ERR_SET_ADDRESS_FAILED: c_int = -13;
+const TUN_ERR_SET_STATE_FAILED: c_int = -14;
+const TUN_ERR_ALREADY_CLOSED: c_int = -15;
+const TUN_ERR_WINTUN_NOT_FOUND: c_int = -16;
+const TUN_ERR_WINTUN_INIT_FAILED: c_int = -17;
+
+fn errorToCode(err: TunError) c_int {
+    return switch (err) {
+        TunError.CreateFailed => TUN_ERR_CREATE_FAILED,
+        TunError.OpenFailed => TUN_ERR_OPEN_FAILED,
+        TunError.InvalidName => TUN_ERR_INVALID_NAME,
+        TunError.PermissionDenied => TUN_ERR_PERMISSION_DENIED,
+        TunError.DeviceNotFound => TUN_ERR_DEVICE_NOT_FOUND,
+        TunError.NotSupported => TUN_ERR_NOT_SUPPORTED,
+        TunError.DeviceBusy => TUN_ERR_DEVICE_BUSY,
+        TunError.InvalidArgument => TUN_ERR_INVALID_ARGUMENT,
+        TunError.SystemResources => TUN_ERR_SYSTEM_RESOURCES,
+        TunError.WouldBlock => TUN_ERR_WOULD_BLOCK,
+        TunError.IoError => TUN_ERR_IO_ERROR,
+        TunError.SetMtuFailed => TUN_ERR_SET_MTU_FAILED,
+        TunError.SetAddressFailed => TUN_ERR_SET_ADDRESS_FAILED,
+        TunError.SetStateFailed => TUN_ERR_SET_STATE_FAILED,
+        TunError.AlreadyClosed => TUN_ERR_ALREADY_CLOSED,
+        TunError.WintunNotFound => TUN_ERR_WINTUN_NOT_FOUND,
+        TunError.WintunInitFailed => TUN_ERR_WINTUN_INIT_FAILED,
+    };
+}
+
+// Allocator for TUN objects
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const allocator = gpa.allocator();
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+/// Initialize TUN subsystem
+export fn tun_init() c_int {
+    mod.init() catch |err| {
+        return errorToCode(err);
+    };
+    return TUN_OK;
+}
+
+/// Cleanup TUN subsystem
+export fn tun_deinit() void {
+    mod.deinit();
+}
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+/// Create a new TUN device
+export fn tun_create(name: ?[*:0]const u8) ?*Tun {
+    const name_slice: ?[]const u8 = if (name) |n| blk: {
+        const len = std.mem.len(n);
+        break :blk n[0..len];
+    } else null;
+
+    const tun = allocator.create(Tun) catch {
+        return null;
+    };
+
+    tun.* = Tun.create(name_slice) catch {
+        allocator.destroy(tun);
+        return null;
+    };
+
+    return tun;
+}
+
+/// Close a TUN device
+export fn tun_close(tun: ?*Tun) void {
+    if (tun) |t| {
+        t.close();
+        allocator.destroy(t);
+    }
+}
+
+// ============================================================================
+// Read/Write
+// ============================================================================
+
+/// Read a packet from the TUN device
+export fn tun_read(tun: ?*Tun, buf: ?[*]u8, len: usize) isize {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+    const b = buf orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    const n = t.read(b[0..len]) catch |err| {
+        return errorToCode(err);
+    };
+
+    return @intCast(n);
+}
+
+/// Write a packet to the TUN device
+export fn tun_write(tun: ?*Tun, buf: ?[*]const u8, len: usize) isize {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+    const b = buf orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    const n = t.write(b[0..len]) catch |err| {
+        return errorToCode(err);
+    };
+
+    return @intCast(n);
+}
+
+// ============================================================================
+// Properties
+// ============================================================================
+
+/// Get the device name
+export fn tun_get_name(tun: ?*Tun) ?[*:0]const u8 {
+    const t = tun orelse return null;
+    _ = t.getName(); // Validate the tun is valid
+
+    // Return pointer to internal name buffer (null-terminated)
+    if (t.name_len < 16 and t.name_buf[t.name_len] == 0) {
+        return @ptrCast(&t.name_buf);
+    }
+    return null;
+}
+
+/// Get the underlying handle
+export fn tun_get_handle(tun: ?*Tun) c_int {
+    const t = tun orelse return -1;
+    return @intCast(t.getHandle());
+}
+
+// ============================================================================
+// MTU
+// ============================================================================
+
+/// Get the MTU
+export fn tun_get_mtu(tun: ?*Tun) c_int {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    const mtu = t.getMtu() catch |err| {
+        return errorToCode(err);
+    };
+
+    return @intCast(mtu);
+}
+
+/// Set the MTU
+export fn tun_set_mtu(tun: ?*Tun, mtu: c_int) c_int {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    if (mtu <= 0) return TUN_ERR_INVALID_ARGUMENT;
+
+    t.setMtu(@intCast(mtu)) catch |err| {
+        return errorToCode(err);
+    };
+
+    return TUN_OK;
+}
+
+// ============================================================================
+// Non-blocking Mode
+// ============================================================================
+
+/// Set non-blocking mode
+export fn tun_set_nonblocking(tun: ?*Tun, enabled: c_int) c_int {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    t.setNonBlocking(enabled != 0) catch |err| {
+        return errorToCode(err);
+    };
+
+    return TUN_OK;
+}
+
+// ============================================================================
+// Interface State
+// ============================================================================
+
+/// Bring the interface up
+export fn tun_set_up(tun: ?*Tun) c_int {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    t.setUp() catch |err| {
+        return errorToCode(err);
+    };
+
+    return TUN_OK;
+}
+
+/// Bring the interface down
+export fn tun_set_down(tun: ?*Tun) c_int {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    t.setDown() catch |err| {
+        return errorToCode(err);
+    };
+
+    return TUN_OK;
+}
+
+// ============================================================================
+// IP Configuration
+// ============================================================================
+
+/// Parse IPv4 address string to bytes
+fn parseIPv4(addr_str: []const u8) ?[4]u8 {
+    var addr: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, addr_str, '.');
+    var i: usize = 0;
+
+    while (it.next()) |part| {
+        if (i >= 4) return null;
+        addr[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+        i += 1;
+    }
+
+    if (i != 4) return null;
+    return addr;
+}
+
+/// Set IPv4 address and netmask
+export fn tun_set_ipv4(tun: ?*Tun, addr: ?[*:0]const u8, netmask: ?[*:0]const u8) c_int {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+    const a = addr orelse return TUN_ERR_INVALID_ARGUMENT;
+    const m = netmask orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    const addr_len = std.mem.len(a);
+    const mask_len = std.mem.len(m);
+
+    const addr_bytes = parseIPv4(a[0..addr_len]) orelse return TUN_ERR_INVALID_ARGUMENT;
+    const mask_bytes = parseIPv4(m[0..mask_len]) orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    t.setIPv4(addr_bytes, mask_bytes) catch |err| {
+        return errorToCode(err);
+    };
+
+    return TUN_OK;
+}
+
+/// Parse IPv6 address string to bytes
+fn parseIPv6(addr_str: []const u8) ?[16]u8 {
+    // Simplified IPv6 parsing - handles common formats
+    var addr: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var groups: [8]u16 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+    var group_idx: usize = 0;
+    var double_colon_idx: ?usize = null;
+
+    var it = std.mem.splitScalar(u8, addr_str, ':');
+    while (it.next()) |part| {
+        if (part.len == 0) {
+            if (double_colon_idx == null) {
+                double_colon_idx = group_idx;
+            }
+            continue;
+        }
+
+        if (group_idx >= 8) return null;
+        groups[group_idx] = std.fmt.parseInt(u16, part, 16) catch return null;
+        group_idx += 1;
+    }
+
+    // Expand :: if present
+    if (double_colon_idx) |dci| {
+        const zeros = 8 - group_idx;
+        var j: usize = 7;
+        while (j >= dci + zeros) : (j -= 1) {
+            groups[j] = groups[j - zeros];
+            if (j == 0) break;
+        }
+        for (dci..dci + zeros) |k| {
+            groups[k] = 0;
+        }
+    }
+
+    // Convert to bytes
+    for (groups, 0..) |g, i| {
+        addr[i * 2] = @truncate(g >> 8);
+        addr[i * 2 + 1] = @truncate(g);
+    }
+
+    return addr;
+}
+
+/// Set IPv6 address with prefix length
+export fn tun_set_ipv6(tun: ?*Tun, addr: ?[*:0]const u8, prefix_len: c_int) c_int {
+    const t = tun orelse return TUN_ERR_INVALID_ARGUMENT;
+    const a = addr orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    if (prefix_len < 0 or prefix_len > 128) return TUN_ERR_INVALID_ARGUMENT;
+
+    const addr_len = std.mem.len(a);
+    const addr_bytes = parseIPv6(a[0..addr_len]) orelse return TUN_ERR_INVALID_ARGUMENT;
+
+    t.setIPv6(addr_bytes, @intCast(prefix_len)) catch |err| {
+        return errorToCode(err);
+    };
+
+    return TUN_OK;
+}

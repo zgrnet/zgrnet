@@ -160,6 +160,112 @@ jobs:
         working-directory: zig
         run: zig build test
 
+  # TUN tests - Zig (multi-platform, requires elevated privileges)
+  tun-test-zig:
+    needs: affected
+    if: needs.affected.outputs.has_zig == 'true'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sudo: sudo
+          - os: macos-latest
+            sudo: sudo
+          - os: windows-latest
+            sudo: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Load TUN module (Linux)
+        if: runner.os == 'Linux'
+        run: sudo modprobe tun
+
+      - name: Test TUN
+        working-directory: zig
+        run: ${{ matrix.sudo }} zig build test-tun
+
+  # TUN tests - Go (multi-platform, requires elevated privileges)
+  tun-test-go:
+    needs: affected
+    if: needs.affected.outputs.has_go == 'true'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sudo: sudo
+          - os: macos-latest
+            sudo: sudo
+          - os: windows-latest
+            sudo: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go/go.sum
+
+      - name: Load TUN module (Linux)
+        if: runner.os == 'Linux'
+        run: sudo modprobe tun
+
+      - name: Build Zig TUN library
+        working-directory: zig
+        run: zig build
+
+      - name: Test Go TUN bindings
+        working-directory: go/pkg/tun
+        run: ${{ matrix.sudo }} go test -v -count=1 .
+
+  # TUN tests - Rust (multi-platform, requires elevated privileges)
+  tun-test-rust:
+    needs: affected
+    if: needs.affected.outputs.has_rust == 'true'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sudo: sudo
+          - os: macos-latest
+            sudo: sudo
+          - os: windows-latest
+            sudo: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+
+      - name: Load TUN module (Linux)
+        if: runner.os == 'Linux'
+        run: sudo modprobe tun
+
+      - name: Build Zig TUN library
+        working-directory: zig
+        run: zig build
+
+      - name: Test Rust TUN bindings
+        working-directory: rust
+        run: ${{ matrix.sudo }} cargo test tun:: --all-features -- --test-threads=1
+
   # Format check
   format:
     runs-on: ubuntu-latest
