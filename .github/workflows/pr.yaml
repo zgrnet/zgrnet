@@ -115,8 +115,20 @@ jobs:
       - name: Test affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Exit code 4 means "no test targets found", which is OK
-          bazel test $TARGETS --test_output=errors || [ $? -eq 4 ]
+          # Filter out TUN-related targets (require prebuilt libtun.a)
+          FILTERED=""
+          for t in $TARGETS; do
+            case "$t" in
+              *tun:*|*tun_test*|*tun_lib*) echo "Skipping TUN target: $t" ;;
+              *) FILTERED="$FILTERED $t" ;;
+            esac
+          done
+          if [ -n "$FILTERED" ]; then
+            # Exit code 4 means "no test targets found", which is OK
+            bazel test $FILTERED --test_output=errors || [ $? -eq 4 ]
+          else
+            echo "No non-TUN targets to test"
+          fi
 
   # Go native tests (faster than Bazel, includes race detector)
   # Excludes TUN tests which require elevated privileges
