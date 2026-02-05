@@ -224,7 +224,12 @@ jobs:
         run: sudo modprobe tun
 
       - name: Test Zig TUN
-        run: ${{ matrix.sudo }} bazel run //zig:tun_test
+        run: |
+          if [ -n "${{ matrix.sudo }}" ]; then
+            sudo env "PATH=$PATH" bazel run //zig:tun_test
+          else
+            bazel run //zig:tun_test
+          fi
 
       - name: Test Go TUN
         run: ${{ matrix.sudo }} bazel test //go/pkg/tun:tun_test --test_output=errors

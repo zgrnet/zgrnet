@@ -305,26 +305,26 @@ func makeICMPv6EchoRequest(src, dst net.IP) []byte {
 	packet := make([]byte, 48)
 
 	// IPv6 header
-	packet[0] = 0x60                           // Version 6
-	packet[1] = 0x00                           // Traffic class
-	packet[2] = 0x00                           // Flow label
-	packet[3] = 0x00                           // Flow label
-	packet[4] = 0x00                           // Payload length high byte
-	packet[5] = 8                              // Payload length low byte (ICMPv6 = 8 bytes)
-	packet[6] = 58                             // Next header: ICMPv6
-	packet[7] = 64                             // Hop limit
-	copy(packet[8:24], src16)                  // Source IPv6
-	copy(packet[24:40], dst16)                 // Dest IPv6
+	packet[0] = 0x60           // Version 6
+	packet[1] = 0x00           // Traffic class
+	packet[2] = 0x00           // Flow label
+	packet[3] = 0x00           // Flow label
+	packet[4] = 0x00           // Payload length high byte
+	packet[5] = 8              // Payload length low byte (ICMPv6 = 8 bytes)
+	packet[6] = 58             // Next header: ICMPv6
+	packet[7] = 64             // Hop limit
+	copy(packet[8:24], src16)  // Source IPv6
+	copy(packet[24:40], dst16) // Dest IPv6
 
 	// ICMPv6 Echo Request header
-	packet[40] = 128                           // Type: Echo Request
-	packet[41] = 0                             // Code
-	packet[42] = 0                             // Checksum (will calculate)
-	packet[43] = 0                             // Checksum
-	packet[44] = 0                             // Identifier high
-	packet[45] = 1                             // Identifier low
-	packet[46] = 0                             // Sequence high
-	packet[47] = 1                             // Sequence low
+	packet[40] = 128 // Type: Echo Request
+	packet[41] = 0   // Code
+	packet[42] = 0   // Checksum (will calculate)
+	packet[43] = 0   // Checksum
+	packet[44] = 0   // Identifier high
+	packet[45] = 1   // Identifier low
+	packet[46] = 0   // Sequence high
+	packet[47] = 1   // Sequence low
 
 	// Calculate ICMPv6 checksum (includes pseudo-header)
 	icmpv6Checksum := calculateICMPv6Checksum(src16, dst16, packet[40:])
@@ -377,20 +377,20 @@ func makeICMPEchoRequest(src, dst net.IP) []byte {
 	packet := make([]byte, 28)
 
 	// IP header
-	packet[0] = 0x45                           // Version 4, IHL 5
-	packet[1] = 0x00                           // TOS
-	packet[2] = 0x00                           // Total length high byte
-	packet[3] = 28                             // Total length low byte
-	packet[4] = 0x00                           // ID high
-	packet[5] = 0x01                           // ID low
-	packet[6] = 0x00                           // Flags and fragment offset
-	packet[7] = 0x00                           // Fragment offset
-	packet[8] = 64                             // TTL
-	packet[9] = 1                              // Protocol (ICMP)
-	packet[10] = 0x00                          // Checksum (will calculate)
-	packet[11] = 0x00                          // Checksum
-	copy(packet[12:16], src4)                  // Source IP
-	copy(packet[16:20], dst4)                  // Dest IP
+	packet[0] = 0x45          // Version 4, IHL 5
+	packet[1] = 0x00          // TOS
+	packet[2] = 0x00          // Total length high byte
+	packet[3] = 28            // Total length low byte
+	packet[4] = 0x00          // ID high
+	packet[5] = 0x01          // ID low
+	packet[6] = 0x00          // Flags and fragment offset
+	packet[7] = 0x00          // Fragment offset
+	packet[8] = 64            // TTL
+	packet[9] = 1             // Protocol (ICMP)
+	packet[10] = 0x00         // Checksum (will calculate)
+	packet[11] = 0x00         // Checksum
+	copy(packet[12:16], src4) // Source IP
+	copy(packet[16:20], dst4) // Dest IP
 
 	// Calculate IP header checksum
 	ipChecksum := calculateChecksum(packet[:20])
@@ -398,14 +398,14 @@ func makeICMPEchoRequest(src, dst net.IP) []byte {
 	packet[11] = byte(ipChecksum)
 
 	// ICMP header
-	packet[20] = 8    // Type: Echo request
-	packet[21] = 0    // Code
-	packet[22] = 0    // Checksum (will calculate)
-	packet[23] = 0    // Checksum
-	packet[24] = 0    // ID high
-	packet[25] = 1    // ID low
-	packet[26] = 0    // Sequence high
-	packet[27] = 1    // Sequence low
+	packet[20] = 8 // Type: Echo request
+	packet[21] = 0 // Code
+	packet[22] = 0 // Checksum (will calculate)
+	packet[23] = 0 // Checksum
+	packet[24] = 0 // ID high
+	packet[25] = 1 // ID low
+	packet[26] = 0 // Sequence high
+	packet[27] = 1 // Sequence low
 
 	// Calculate ICMP checksum
 	icmpChecksum := calculateChecksum(packet[20:])

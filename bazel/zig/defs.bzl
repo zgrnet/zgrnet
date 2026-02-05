@@ -71,20 +71,38 @@ def _zig_run_impl(ctx):
     script_content = """#!/bin/bash
 set -e
 
+# Find runfiles directory
+if [[ -d "$0.runfiles" ]]; then
+    RUNFILES_DIR="$0.runfiles"
+elif [[ -d "${{RUNFILES_DIR:-}}" ]]; then
+    RUNFILES_DIR="${{RUNFILES_DIR}}"
+else
+    # Fallback: derive from script location
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    RUNFILES_DIR="${{SCRIPT_DIR}}/{script_name}.runfiles"
+fi
+
 WORK=$(mktemp -d)
 trap "rm -rf $WORK" EXIT
 
 # Copy source files (preserving directory structure)
 {src_copy_commands}
 
-# Set up Zig path
-export PATH="{zig_dir}:$PATH"
+# Set up Zig path using runfiles
+ZIG_DIR="$RUNFILES_DIR/_main/{zig_dir}"
+if [[ -x "$ZIG_DIR/zig" ]]; then
+    export PATH="$ZIG_DIR:$PATH"
+else
+    # Fallback: try relative path (for local builds)
+    export PATH="{zig_dir}:$PATH"
+fi
 
 # Run zig build from zig_root
 cd "$WORK/{zig_root}"
 echo "[zig_run] Building with: zig build {build_args}"
 zig build {build_args}
 """.format(
+        script_name = ctx.label.name,
         zig_dir = zig_bin.dirname,
         zig_root = zig_root,
         src_copy_commands = "\n".join(src_copy_commands),
