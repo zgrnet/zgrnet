@@ -38,11 +38,10 @@ genrule(
     outs = ["libkcp.a"],
     cmd = """
         set -e
-        # Set up zig cache directories
-        export HOME=/tmp
-        export ZIG_LOCAL_CACHE_DIR=/tmp/zig-cache
-        export ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
-        mkdir -p /tmp/zig-cache
+        # Set up zig cache directories within sandbox
+        export ZIG_LOCAL_CACHE_DIR=./.zig-cache
+        export ZIG_GLOBAL_CACHE_DIR=./.zig-global-cache
+        mkdir -p ./.zig-cache ./.zig-global-cache
 
         OUTDIR=$$(mktemp -d)
 
