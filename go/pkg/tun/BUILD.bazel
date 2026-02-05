@@ -5,7 +5,6 @@ go_library(
     srcs = ["tun.go"],
     cgo = True,
     cdeps = ["//zig:tun_lib"],
-    copts = ["-I$(location //zig:tun_header)"],
     importpath = "github.com/vibing/zgrnet/pkg/tun",
     visibility = ["//visibility:public"],
 )
