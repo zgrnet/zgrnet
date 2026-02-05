@@ -640,7 +640,7 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Update peer state
+	// Update peer state (session must be set before initMux)
 	peer.mu.Lock()
 	peer.endpoint = from
 	peer.session = session
@@ -648,13 +648,14 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
 
-	// Register in index map
+	// Initialize mux BEFORE registering in byIndex
+	// This ensures mux is ready when packets start routing to this peer
+	u.initMux(peer)
+
+	// Now register in index map (makes peer visible for packet routing)
 	u.mu.Lock()
 	u.byIndex[localIdx] = peer
 	u.mu.Unlock()
-
-	// Initialize mux now that session is established
-	u.initMux(peer)
 }
 
 // handleHandshakeResp processes an incoming handshake response.
@@ -721,7 +722,7 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Update peer state
+	// Update peer state (session must be set before initMux)
 	peer := pending.peer
 	peer.mu.Lock()
 	peer.endpoint = from // Roaming: update endpoint
@@ -730,13 +731,14 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
 
-	// Register in index map
+	// Initialize mux BEFORE registering in byIndex
+	// This ensures mux is ready when packets start routing to this peer
+	u.initMux(peer)
+
+	// Now register in index map (makes peer visible for packet routing)
 	u.mu.Lock()
 	u.byIndex[pending.localIdx] = peer
 	u.mu.Unlock()
-
-	// Initialize mux now that session is established
-	u.initMux(peer)
 
 	// Signal completion
 	if pending.done != nil {
