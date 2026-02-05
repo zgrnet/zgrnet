@@ -331,6 +331,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tun/cabi.zig"),
         .target = target,
         .optimize = optimize,
+        .pic = true, // Required for linking with Go/Rust
     });
     tun_lib_module.addOptions("tun_build_options", tun_options);
 
