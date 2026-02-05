@@ -70,6 +70,16 @@ zig_run(
     zig_root = "zig",
 )
 
+# TUN test (requires root/admin privileges)
+# Usage: sudo bazel run //zig:tun_test
+zig_run(
+    name = "tun_test",
+    srcs = [":srcs"],
+    build_args = ["test-tun"],
+    zig_root = "zig",
+    tags = ["requires-root"],
+)
+
 # KCP test binary (source in examples/kcp_test/zig/)
 # Usage: bazel build //zig:kcp_test
 zig_binary(
