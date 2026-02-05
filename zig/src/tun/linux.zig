@@ -297,11 +297,27 @@ pub fn setIPv6(tun: *Tun, addr: [16]u8, prefix_len: u8) TunError!void {
         return TunError.InvalidArgument;
     };
 
+    // Use absolute path to prevent PATH hijacking
+    // Try /sbin/ip first (common on most distros), fallback to /usr/sbin/ip
     const result = std.process.Child.run(.{
         .allocator = std.heap.page_allocator,
-        .argv = &.{ "ip", "-6", "addr", "add", addr_str, "dev", name },
+        .argv = &.{ "/sbin/ip", "-6", "addr", "add", addr_str, "dev", name },
     }) catch {
-        return TunError.SetAddressFailed;
+        // Fallback to /usr/sbin/ip
+        const result2 = std.process.Child.run(.{
+            .allocator = std.heap.page_allocator,
+            .argv = &.{ "/usr/sbin/ip", "-6", "addr", "add", addr_str, "dev", name },
+        }) catch {
+            return TunError.SetAddressFailed;
+        };
+        defer {
+            std.heap.page_allocator.free(result2.stdout);
+            std.heap.page_allocator.free(result2.stderr);
+        }
+        if (result2.term.Exited != 0) {
+            return TunError.SetAddressFailed;
+        }
+        return;
     };
     defer {
         std.heap.page_allocator.free(result.stdout);

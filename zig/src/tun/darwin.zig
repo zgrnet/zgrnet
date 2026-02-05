@@ -182,8 +182,10 @@ pub fn create(name: ?[]const u8) TunError!Tun {
     };
 }
 
-/// Maximum MTU for TUN devices (standard Ethernet jumbo frame)
-const MAX_MTU = 9000;
+/// Maximum buffer size for TUN devices
+/// 2KB is sufficient for standard MTU (1500) + header (4), with room for slightly larger frames.
+/// For jumbo frames, consider using heap allocation or increasing this value.
+const MAX_BUFFER = 2048;
 
 /// Read a packet from the TUN device
 ///
@@ -191,11 +193,10 @@ const MAX_MTU = 9000;
 /// We strip this header and return only the IP packet.
 pub fn read(tun: *Tun, buf: []u8) TunError!usize {
     // Need extra 4 bytes for address family header
-    // Use stack buffer sized to user buffer + 4, capped at MAX_MTU + 4
-    // This avoids the 64KB stack allocation that could cause overflow
+    // Use 2KB stack buffer to avoid stack overflow in multi-threaded apps
     const header_size = 4;
-    const read_size = @min(buf.len + header_size, MAX_MTU + header_size);
-    var read_buf: [MAX_MTU + header_size]u8 = undefined;
+    const read_size = @min(buf.len + header_size, MAX_BUFFER);
+    var read_buf: [MAX_BUFFER]u8 = undefined;
 
     const n = posix.read(tun.handle, read_buf[0..read_size]) catch |err| {
         return switch (err) {
@@ -225,9 +226,9 @@ pub fn write(tun: *Tun, data: []const u8) TunError!usize {
     }
 
     // Prepend address family header
-    // Use stack buffer capped at MAX_MTU + 4 to avoid stack overflow
+    // Use 2KB stack buffer to avoid stack overflow in multi-threaded apps
     const header_size = 4;
-    var write_buf: [MAX_MTU + header_size]u8 = undefined;
+    var write_buf: [MAX_BUFFER]u8 = undefined;
     const total_len = data.len + header_size;
 
     if (total_len > write_buf.len) {

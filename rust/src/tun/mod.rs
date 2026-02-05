@@ -176,7 +176,11 @@ impl Device {
     pub fn create(name: Option<&str>) -> Result<Self> {
         init()?;
 
-        let c_name = name.map(|s| CString::new(s).unwrap());
+        // Handle CString creation gracefully - null bytes in name would cause panic
+        let c_name = match name {
+            Some(s) => Some(CString::new(s).map_err(|_| Error::InvalidName)?),
+            None => None,
+        };
         let name_ptr = c_name.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
 
         let handle = unsafe { ffi::tun_create(name_ptr) };
@@ -433,7 +437,7 @@ mod tests {
             return;
         }
 
-        let mut device = Device::create(None).expect("failed to create TUN");
+        let device = Device::create(None).expect("failed to create TUN");
         device
             .set_ipv4(
                 Ipv4Addr::new(10, 0, 100, 1),
@@ -450,7 +454,7 @@ mod tests {
             return;
         }
 
-        let mut device = Device::create(None).expect("failed to create TUN");
+        let device = Device::create(None).expect("failed to create TUN");
         device.set_nonblocking(true).expect("failed to enable nonblocking");
         device.set_nonblocking(false).expect("failed to disable nonblocking");
     }
@@ -462,7 +466,7 @@ mod tests {
             return;
         }
 
-        let mut device = Device::create(None).expect("failed to create TUN");
+        let device = Device::create(None).expect("failed to create TUN");
         // Set IP first (required on some systems)
         let _ = device.set_ipv4(
             Ipv4Addr::new(10, 0, 101, 1),
@@ -479,8 +483,8 @@ mod tests {
             return;
         }
 
-        let mut dev1 = Device::create(None).expect("failed to create TUN 1");
-        let mut dev2 = Device::create(None).expect("failed to create TUN 2");
+        let dev1 = Device::create(None).expect("failed to create TUN 1");
+        let dev2 = Device::create(None).expect("failed to create TUN 2");
 
         println!("Created TUN devices: {} and {}", dev1.name(), dev2.name());
 
@@ -512,6 +516,128 @@ mod tests {
             Err(Error::WouldBlock) => println!("No packet received (routing may not be configured)"),
             Err(e) => println!("Read error: {:?}", e),
         }
+    }
+
+    #[test]
+    fn test_set_ipv6() {
+        if is_unprivileged() {
+            eprintln!("Skipping test: requires root privileges");
+            return;
+        }
+
+        let device = Device::create(None).expect("failed to create TUN");
+        device
+            .set_ipv6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1), 64)
+            .expect("failed to set IPv6");
+        println!("TUN {} configured with IPv6 fd00::1/64", device.name());
+    }
+
+    #[test]
+    fn test_read_write_ipv6() {
+        if is_unprivileged() {
+            eprintln!("Skipping test: requires root privileges");
+            return;
+        }
+
+        let dev1 = Device::create(None).expect("failed to create TUN 1");
+        let dev2 = Device::create(None).expect("failed to create TUN 2");
+
+        println!("Created TUN devices: {} and {}", dev1.name(), dev2.name());
+
+        // Configure IPv6
+        dev1.set_ipv6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1), 64)
+            .expect("failed to set IPv6 on dev1");
+        dev2.set_ipv6(Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 1), 64)
+            .expect("failed to set IPv6 on dev2");
+
+        dev1.set_nonblocking(true).expect("failed to set nonblocking");
+        dev2.set_nonblocking(true).expect("failed to set nonblocking");
+
+        // Create ICMPv6 Echo Request packet
+        let packet = make_icmpv6_echo_request(
+            Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0xfd00, 0, 0, 1, 0, 0, 0, 1),
+        );
+
+        // Write to dev1
+        match dev1.write_packet(&packet) {
+            Ok(n) => println!("Wrote {} bytes (IPv6) to {}", n, dev1.name()),
+            Err(e) => println!("Write failed (expected without routing): {:?}", e),
+        }
+
+        // Try to read
+        let mut buf = [0u8; 1500];
+        match dev1.read_packet(&mut buf) {
+            Ok(n) => println!("Read {} bytes from {}", n, dev1.name()),
+            Err(Error::WouldBlock) => println!("No packet received (routing may not be configured)"),
+            Err(e) => println!("Read error: {:?}", e),
+        }
+    }
+
+    fn make_icmpv6_echo_request(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
+        let mut packet = vec![0u8; 48]; // IPv6 header (40) + ICMPv6 header (8)
+
+        // IPv6 header
+        packet[0] = 0x60; // Version 6
+        packet[1] = 0x00;
+        packet[2] = 0x00;
+        packet[3] = 0x00;
+        packet[4] = 0x00; // Payload length high
+        packet[5] = 8;    // Payload length low (ICMPv6 = 8 bytes)
+        packet[6] = 58;   // Next header: ICMPv6
+        packet[7] = 64;   // Hop limit
+
+        // Source address
+        packet[8..24].copy_from_slice(&src.octets());
+        // Destination address
+        packet[24..40].copy_from_slice(&dst.octets());
+
+        // ICMPv6 Echo Request
+        packet[40] = 128; // Type: Echo Request
+        packet[41] = 0;   // Code
+        // Checksum placeholder (bytes 42-43)
+        packet[44] = 0;   // Identifier high
+        packet[45] = 1;   // Identifier low
+        packet[46] = 0;   // Sequence high
+        packet[47] = 1;   // Sequence low
+
+        // Calculate ICMPv6 checksum (includes pseudo-header)
+        let checksum = calculate_icmpv6_checksum(&src.octets(), &dst.octets(), &packet[40..]);
+        packet[42..44].copy_from_slice(&checksum.to_be_bytes());
+
+        packet
+    }
+
+    fn calculate_icmpv6_checksum(src: &[u8; 16], dst: &[u8; 16], icmp_data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+
+        // Pseudo-header: src address
+        for i in (0..16).step_by(2) {
+            sum += ((src[i] as u32) << 8) | (src[i + 1] as u32);
+        }
+        // Pseudo-header: dst address
+        for i in (0..16).step_by(2) {
+            sum += ((dst[i] as u32) << 8) | (dst[i + 1] as u32);
+        }
+        // Pseudo-header: ICMPv6 length
+        sum += icmp_data.len() as u32;
+        // Pseudo-header: Next header (ICMPv6 = 58)
+        sum += 58;
+
+        // ICMPv6 data
+        let mut i = 0;
+        while i < icmp_data.len() - 1 {
+            sum += ((icmp_data[i] as u32) << 8) | (icmp_data[i + 1] as u32);
+            i += 2;
+        }
+        if icmp_data.len() % 2 == 1 {
+            sum += (icmp_data[icmp_data.len() - 1] as u32) << 8;
+        }
+
+        while sum > 0xFFFF {
+            sum = (sum >> 16) + (sum & 0xFFFF);
+        }
+        !sum as u16
     }
 
     fn make_icmp_echo_request(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {

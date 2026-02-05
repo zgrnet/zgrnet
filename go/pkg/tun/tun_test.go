@@ -231,6 +231,140 @@ func TestReadWriteWithTwoDevices(t *testing.T) {
 	}
 }
 
+func TestReadWriteIPv6(t *testing.T) {
+	needsRoot(t)
+
+	// Create two TUN devices
+	dev1, err := Create("")
+	if err != nil {
+		t.Fatalf("Create dev1 failed: %v", err)
+	}
+	defer dev1.Close()
+
+	dev2, err := Create("")
+	if err != nil {
+		t.Fatalf("Create dev2 failed: %v", err)
+	}
+	defer dev2.Close()
+
+	t.Logf("Created TUN devices: %s and %s", dev1.Name(), dev2.Name())
+
+	// Configure dev1: fd00::1/64
+	ip1 := net.ParseIP("fd00::1")
+	if err := dev1.SetIPv6(ip1, 64); err != nil {
+		t.Fatalf("SetIPv6 dev1 failed: %v", err)
+	}
+
+	// Configure dev2: fd00:0:0:1::1/64
+	ip2 := net.ParseIP("fd00:0:0:1::1")
+	if err := dev2.SetIPv6(ip2, 64); err != nil {
+		t.Fatalf("SetIPv6 dev2 failed: %v", err)
+	}
+
+	// Set both to non-blocking mode for the read test
+	if err := dev1.SetNonblocking(true); err != nil {
+		t.Fatalf("SetNonblocking dev1 failed: %v", err)
+	}
+	if err := dev2.SetNonblocking(true); err != nil {
+		t.Fatalf("SetNonblocking dev2 failed: %v", err)
+	}
+
+	// Create a simple ICMPv6 echo request packet
+	icmpv6Packet := makeICMPv6EchoRequest(ip1, ip2)
+	t.Logf("Created %d byte ICMPv6 packet", len(icmpv6Packet))
+
+	// Write to dev1
+	n, err := dev1.Write(icmpv6Packet)
+	if err != nil {
+		t.Logf("Write failed (expected without routing): %v", err)
+	} else {
+		t.Logf("Wrote %d bytes to %s", n, dev1.Name())
+	}
+
+	// Try to read from dev1 (non-blocking)
+	buf := make([]byte, 1500)
+	n, err = dev1.Read(buf)
+	if err == ErrWouldBlock {
+		t.Log("No packet received (routing may not be configured)")
+	} else if err != nil {
+		t.Logf("Read error: %v", err)
+	} else {
+		t.Logf("Read %d bytes from %s", n, dev1.Name())
+	}
+}
+
+// makeICMPv6EchoRequest creates a simple ICMPv6 echo request packet
+func makeICMPv6EchoRequest(src, dst net.IP) []byte {
+	src16 := src.To16()
+	dst16 := dst.To16()
+	if src16 == nil || dst16 == nil {
+		return nil
+	}
+
+	// IPv6 header (40 bytes) + ICMPv6 header (8 bytes) = 48 bytes
+	packet := make([]byte, 48)
+
+	// IPv6 header
+	packet[0] = 0x60                           // Version 6
+	packet[1] = 0x00                           // Traffic class
+	packet[2] = 0x00                           // Flow label
+	packet[3] = 0x00                           // Flow label
+	packet[4] = 0x00                           // Payload length high byte
+	packet[5] = 8                              // Payload length low byte (ICMPv6 = 8 bytes)
+	packet[6] = 58                             // Next header: ICMPv6
+	packet[7] = 64                             // Hop limit
+	copy(packet[8:24], src16)                  // Source IPv6
+	copy(packet[24:40], dst16)                 // Dest IPv6
+
+	// ICMPv6 Echo Request header
+	packet[40] = 128                           // Type: Echo Request
+	packet[41] = 0                             // Code
+	packet[42] = 0                             // Checksum (will calculate)
+	packet[43] = 0                             // Checksum
+	packet[44] = 0                             // Identifier high
+	packet[45] = 1                             // Identifier low
+	packet[46] = 0                             // Sequence high
+	packet[47] = 1                             // Sequence low
+
+	// Calculate ICMPv6 checksum (includes pseudo-header)
+	icmpv6Checksum := calculateICMPv6Checksum(src16, dst16, packet[40:])
+	packet[42] = byte(icmpv6Checksum >> 8)
+	packet[43] = byte(icmpv6Checksum)
+
+	return packet
+}
+
+// calculateICMPv6Checksum calculates ICMPv6 checksum including pseudo-header
+func calculateICMPv6Checksum(src, dst net.IP, icmpData []byte) uint16 {
+	var sum uint32
+
+	// Pseudo-header: source address
+	for i := 0; i < 16; i += 2 {
+		sum += uint32(src[i])<<8 | uint32(src[i+1])
+	}
+	// Pseudo-header: destination address
+	for i := 0; i < 16; i += 2 {
+		sum += uint32(dst[i])<<8 | uint32(dst[i+1])
+	}
+	// Pseudo-header: ICMPv6 length
+	sum += uint32(len(icmpData))
+	// Pseudo-header: Next header (ICMPv6 = 58)
+	sum += 58
+
+	// ICMPv6 data
+	for i := 0; i < len(icmpData)-1; i += 2 {
+		sum += uint32(icmpData[i])<<8 | uint32(icmpData[i+1])
+	}
+	if len(icmpData)%2 == 1 {
+		sum += uint32(icmpData[len(icmpData)-1]) << 8
+	}
+
+	for sum > 0xFFFF {
+		sum = (sum >> 16) + (sum & 0xFFFF)
+	}
+	return ^uint16(sum)
+}
+
 // makeICMPEchoRequest creates a simple ICMP echo request packet
 func makeICMPEchoRequest(src, dst net.IP) []byte {
 	src4 := src.To4()

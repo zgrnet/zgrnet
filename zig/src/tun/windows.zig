@@ -95,10 +95,30 @@ pub fn init() TunError!void {
 
     // Check if embedded DLL is available
     const dll_data = wintun_dll_data orelse {
-        // Try to load from current directory first, then system path
-        wintun_module = windows.kernel32.LoadLibraryA("wintun.dll");
+        // Try to load from System32 (secure location) or application directory
+        // Use absolute path to prevent DLL hijacking
+        var sys_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sys_dll_path = std.fmt.bufPrintZ(&sys_path_buf, "C:\\Windows\\System32\\wintun.dll", .{}) catch {
+            return TunError.WintunInitFailed;
+        };
+        wintun_module = windows.kernel32.LoadLibraryA(sys_dll_path.ptr);
         if (wintun_module == null) {
-            return TunError.WintunNotFound;
+            // Fallback: try application directory with absolute path
+            var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
+                return TunError.WintunNotFound;
+            };
+            const exe_dir = std.fs.path.dirname(exe_path) orelse {
+                return TunError.WintunNotFound;
+            };
+            var app_dll_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const app_dll_path = std.fmt.bufPrintZ(&app_dll_buf, "{s}\\wintun.dll", .{exe_dir}) catch {
+                return TunError.WintunNotFound;
+            };
+            wintun_module = windows.kernel32.LoadLibraryA(app_dll_path.ptr);
+            if (wintun_module == null) {
+                return TunError.WintunNotFound;
+            }
         }
         loadFunctions() catch return TunError.WintunInitFailed;
         init_done = true;
@@ -106,22 +126,28 @@ pub fn init() TunError!void {
     };
 
     // Get the executable's directory for secure DLL extraction
-    var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
+    var exe_path_buf2: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path2 = std.fs.selfExePath(&exe_path_buf2) catch {
         return TunError.WintunInitFailed;
     };
-    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+    const exe_dir2 = std.fs.path.dirname(exe_path2) orelse ".";
 
-    // Extract DLL to executable's directory (more secure than TEMP)
-    const dll_path = std.fs.path.join(std.heap.page_allocator, &.{
-        exe_dir,
-        "wintun.dll",
-    }) catch return TunError.WintunInitFailed;
+    // Build null-terminated path for LoadLibraryA
+    var dll_path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const dll_path_z = std.fmt.bufPrintZ(&dll_path_buf, "{s}\\wintun.dll", .{exe_dir2}) catch {
+        return TunError.WintunInitFailed;
+    };
 
-    wintun_dll_path = dll_path;
+    // Store path for cleanup (allocate with null terminator)
+    const dll_path_alloc = std.heap.page_allocator.alloc(u8, dll_path_z.len + 1) catch {
+        return TunError.WintunInitFailed;
+    };
+    @memcpy(dll_path_alloc[0..dll_path_z.len], dll_path_z);
+    dll_path_alloc[dll_path_z.len] = 0;
+    wintun_dll_path = dll_path_alloc;
 
     // Write DLL to file
-    const file = std.fs.createFileAbsolute(dll_path, .{}) catch {
+    const file = std.fs.createFileAbsolute(dll_path_z, .{}) catch {
         return TunError.WintunInitFailed;
     };
     defer file.close();
@@ -130,8 +156,8 @@ pub fn init() TunError!void {
         return TunError.WintunInitFailed;
     };
 
-    // Load the DLL from the extracted path
-    wintun_module = windows.kernel32.LoadLibraryA(dll_path.ptr);
+    // Load the DLL from the extracted path (null-terminated)
+    wintun_module = windows.kernel32.LoadLibraryA(dll_path_z.ptr);
     if (wintun_module == null) {
         return TunError.WintunNotFound;
     }
@@ -266,6 +292,10 @@ pub fn create(name: ?[]const u8) TunError!Tun {
 
     // Use state pointer as handle
     const handle: HANDLE = @ptrCast(state);
+
+    // Thread-safe access to tun_states
+    global_mutex.lock();
+    defer global_mutex.unlock();
     tun_states.put(@intFromPtr(state), state) catch {
         std.heap.page_allocator.destroy(state);
         return TunError.SystemResources;
@@ -281,6 +311,8 @@ pub fn create(name: ?[]const u8) TunError!Tun {
 
 fn getState(tun: *Tun) ?*WinTunState {
     const handle: *WinTunState = @ptrCast(@alignCast(tun.handle));
+    global_mutex.lock();
+    defer global_mutex.unlock();
     return tun_states.get(@intFromPtr(handle));
 }
 
@@ -339,6 +371,9 @@ pub fn close(tun: *Tun) void {
     endSession(state.session);
     closeAdapter(state.adapter);
 
+    // Thread-safe removal from tun_states
+    global_mutex.lock();
+    defer global_mutex.unlock();
     _ = tun_states.remove(@intFromPtr(state));
     std.heap.page_allocator.destroy(state);
 }
@@ -393,10 +428,11 @@ pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
     // Get interface index from LUID
     _ = state.luid;
 
+    // Use absolute path to prevent PATH hijacking
     const result = std.process.Child.run(.{
         .allocator = std.heap.page_allocator,
         .argv = &.{
-            "netsh",
+            "C:\\Windows\\System32\\netsh.exe",
             "interface",
             "ip",
             "set",
@@ -421,9 +457,50 @@ pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
 
 /// Set IPv6 address with prefix length
 pub fn setIPv6(tun: *Tun, addr: [16]u8, prefix_len: u8) TunError!void {
-    _ = tun;
-    _ = addr;
-    _ = prefix_len;
-    // Use netsh to set IPv6 address (similar to IPv4)
-    return TunError.NotSupported;
+    _ = getState(tun) orelse return TunError.AlreadyClosed;
+
+    // Format IPv6 as standard notation: xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx
+    var addr_str: [64]u8 = undefined;
+    const addr_len = std.fmt.bufPrint(&addr_str, "{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}", .{
+        @as(u16, addr[0]) << 8 | addr[1],
+        @as(u16, addr[2]) << 8 | addr[3],
+        @as(u16, addr[4]) << 8 | addr[5],
+        @as(u16, addr[6]) << 8 | addr[7],
+        @as(u16, addr[8]) << 8 | addr[9],
+        @as(u16, addr[10]) << 8 | addr[11],
+        @as(u16, addr[12]) << 8 | addr[13],
+        @as(u16, addr[14]) << 8 | addr[15],
+    }) catch {
+        return TunError.InvalidArgument;
+    };
+
+    var prefix_str: [4]u8 = undefined;
+    const prefix_len_str = std.fmt.bufPrint(&prefix_str, "{d}", .{prefix_len}) catch {
+        return TunError.InvalidArgument;
+    };
+
+    // Use absolute path to prevent PATH hijacking
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &.{
+            "C:\\Windows\\System32\\netsh.exe",
+            "interface",
+            "ipv6",
+            "add",
+            "address",
+            tun.name_buf[0..tun.name_len],
+            addr_str[0..addr_len],
+            prefix_len_str,
+        },
+    }) catch {
+        return TunError.SetAddressFailed;
+    };
+    defer {
+        std.heap.page_allocator.free(result.stdout);
+        std.heap.page_allocator.free(result.stderr);
+    }
+
+    if (result.term.Exited != 0) {
+        return TunError.SetAddressFailed;
+    }
 }
