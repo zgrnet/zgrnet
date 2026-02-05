@@ -177,15 +177,15 @@ def _zig_binary_impl(ctx):
         # KCP files go to $WORK/.deps/kcp/
         kcp_copy_commands.append('cp {} "$WORK/.deps/kcp/"'.format(shell.quote(f.path)))
 
-    # Determine zig_root and target (with shell quoting for safety)
+    # Determine zig_root and target
     zig_root = ctx.attr.zig_root if ctx.attr.zig_root else "zig"
     optimize = ctx.attr.optimize
+    binary_name = ctx.attr.binary_name
 
-    # Validate attribute values to prevent injection
-    # These are from BUILD files, not user input, but we quote them for defense-in-depth
+    # Only quote zig_root which is used in path context
+    # optimize and binary_name are simple identifiers from BUILD files
+    # and don't need quoting (shell.quote would add unwanted single quotes)
     quoted_zig_root = shell.quote(zig_root)
-    quoted_optimize = shell.quote(optimize)
-    quoted_binary_name = shell.quote(ctx.attr.binary_name)
 
     # Build command - use absolute path to zig binary
     # After cd to work directory, relative paths don't work anymore
@@ -228,8 +228,8 @@ cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
         zig_root = quoted_zig_root,
         src_copy_commands = "\n".join(src_copy_commands),
         kcp_copy_commands = "\n".join(kcp_copy_commands),
-        optimize = quoted_optimize,
-        binary_name = quoted_binary_name,
+        optimize = optimize,
+        binary_name = binary_name,
         output = out.path,
     )
 
