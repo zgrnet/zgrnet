@@ -89,9 +89,12 @@ trap "rm -rf $WORK" EXIT
 {src_copy_commands}
 
 # Set up Zig path using runfiles
-ZIG_DIR="$RUNFILES_DIR/_main/{zig_dir}"
-if [[ -x "$ZIG_DIR/zig" ]]; then
-    export PATH="$ZIG_DIR:$PATH"
+# In bzlmod, external repos are at root level of runfiles
+ZIG_REPO="+zig_toolchain+zig_toolchain"
+if [[ -x "$RUNFILES_DIR/$ZIG_REPO/zig" ]]; then
+    export PATH="$RUNFILES_DIR/$ZIG_REPO:$PATH"
+elif [[ -x "$RUNFILES_DIR/_main/{zig_dir}/zig" ]]; then
+    export PATH="$RUNFILES_DIR/_main/{zig_dir}:$PATH"
 else
     # Fallback: try relative path (for local builds)
     export PATH="{zig_dir}:$PATH"

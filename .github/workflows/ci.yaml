@@ -84,8 +84,21 @@ jobs:
       - name: Build affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          echo "Building: $TARGETS"
-          bazel build $TARGETS
+          # Filter out TUN-related targets (require prebuilt libtun.a)
+          # TUN tests are handled separately in tun-test job
+          FILTERED=""
+          for t in $TARGETS; do
+            case "$t" in
+              *tun:*|*tun_test*|*tun_lib*) echo "Skipping TUN target: $t" ;;
+              *) FILTERED="$FILTERED $t" ;;
+            esac
+          done
+          echo "Building: $FILTERED"
+          if [ -n "$FILTERED" ]; then
+            bazel build $FILTERED
+          else
+            echo "No non-TUN targets to build"
+          fi
 
       - name: Test affected targets
         run: |
