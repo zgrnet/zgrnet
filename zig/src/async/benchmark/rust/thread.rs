@@ -69,7 +69,7 @@ pub fn bench_task_creation() {
         let task: Box<dyn FnOnce()> = Box::new(|| {
             dummy += 1;
         });
-        std::hint::black_box(task);
+        let _ = std::hint::black_box(task);
     }
 
     let start = Instant::now();
@@ -78,7 +78,7 @@ pub fn bench_task_creation() {
         let task: Box<dyn FnOnce()> = Box::new(|| {
             dummy += 1;
         });
-        std::hint::black_box(task);
+        let _ = std::hint::black_box(task);
     }
 
     let elapsed = start.elapsed();

@@ -851,12 +851,14 @@ func (u *UDP) Close() error {
 	// Close socket (will unblock ioLoop's ReadFromUDP)
 	err := u.socket.Close()
 
-	// Close channels to unblock workers (ioLoop uses select with closeChan)
+	// Wait for all goroutines to finish BEFORE closing channels
+	// This prevents race condition where ioLoop is writing to channels
+	// while we're closing them
+	u.wg.Wait()
+
+	// Now safe to close channels (all writers have exited)
 	close(u.decryptChan)
 	close(u.outputChan)
-
-	// Wait for all goroutines to finish
-	u.wg.Wait()
 
 	return err
 }
@@ -941,10 +943,18 @@ func (u *UDP) ioLoop() {
 // Multiple workers run in parallel for higher throughput.
 // After processing, it signals ready so ReadFrom can consume.
 func (u *UDP) decryptWorker() {
-	for pkt := range u.decryptChan {
-		u.processPacket(pkt)
-		// Signal that decryption is complete
-		close(pkt.ready)
+	for {
+		select {
+		case pkt, ok := <-u.decryptChan:
+			if !ok {
+				return // channel closed
+			}
+			u.processPacket(pkt)
+			// Signal that decryption is complete
+			close(pkt.ready)
+		case <-u.closeChan:
+			return
+		}
 	}
 }
 
