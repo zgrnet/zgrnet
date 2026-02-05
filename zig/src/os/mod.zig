@@ -21,15 +21,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-/// Platform implementations
-pub const Darwin = @import("darwin.zig");
+/// Platform implementations (conditionally imported to avoid compile errors)
+pub const Darwin = if (builtin.os.tag == .macos or builtin.os.tag == .ios or
+    builtin.os.tag == .tvos or builtin.os.tag == .watchos)
+    @import("darwin.zig")
+else
+    struct {}; // Empty struct on non-Darwin platforms
 pub const none = @import("none.zig");
 pub const None = none.None;
 // pub const Linux = @import("linux.zig");       // TODO
 // pub const FreeRtos = @import("freertos.zig"); // TODO
 
 /// IOService implementations
-pub const KqueueIO = Darwin.KqueueIO;
+pub const KqueueIO = if (@hasDecl(Darwin, "KqueueIO")) Darwin.KqueueIO else struct {};
 pub const BusyPollIO = none.BusyPollIO;
 
 /// Build-time selected OS backend

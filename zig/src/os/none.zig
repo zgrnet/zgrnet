@@ -14,10 +14,14 @@
 
 const std = @import("std");
 const posix = std.posix;
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const async_io = @import("../async/io.zig");
 const ReadyCallback = async_io.ReadyCallback;
+
+// Check if fd_set is available (only on BSD/macOS)
+const has_fd_set = @hasDecl(posix, "fd_set");
 
 // ============================================================================
 // BusyPollIO - Fallback IOService using select/poll
@@ -106,7 +110,19 @@ pub const BusyPollIO = struct {
     /// Poll for I/O events using select and invoke callbacks.
     ///
     /// Returns the number of events processed.
-    pub fn poll(self: *Self, timeout_ms: i32) usize {
+    pub const poll = if (has_fd_set) pollWithSelect else pollStub;
+
+    // Stub poll for platforms without fd_set (Linux)
+    fn pollStub(self: *Self, timeout_ms: i32) usize {
+        _ = self.registrations.count(); // Touch self to avoid unused warning
+        if (timeout_ms > 0) {
+            std.Thread.sleep(@as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms);
+        }
+        return 0;
+    }
+
+    // Full poll implementation using select (macOS/BSD)
+    fn pollWithSelect(self: *Self, timeout_ms: i32) usize {
         if (self.registrations.count() == 0) {
             if (timeout_ms > 0) {
                 std.Thread.sleep(@as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms);
@@ -220,7 +236,18 @@ pub const BusyPollIO = struct {
 pub fn None(comptime allocator: Allocator) type {
     return struct {
         /// No-op Reactor.
+        /// Stub implementation for platforms without kqueue/epoll support.
         pub const Reactor = struct {
+            /// Placeholder event type for cross-platform compatibility
+            pub const KEvent = struct {
+                ident: usize = 0,
+                filter: i16 = 0,
+                flags: u16 = 0,
+                fflags: u32 = 0,
+                data: isize = 0,
+                udata: usize = 0,
+            };
+
             pub fn init() !Reactor {
                 return .{};
             }
@@ -228,6 +255,16 @@ pub fn None(comptime allocator: Allocator) type {
             pub fn deinit(_: *Reactor) void {}
 
             pub fn poll(_: *Reactor) void {}
+
+            // Stub methods for cross-platform compatibility with Darwin API
+            pub fn register(_: *Reactor, _: i32, _: anytype, _: anytype) !void {}
+            pub fn registerUser(_: *Reactor, _: u64) !void {}
+            pub fn triggerUser(_: *Reactor, _: u64) !void {}
+
+            /// Wait for events - returns empty slice on stub platforms
+            pub fn wait(_: *Reactor, _: ?i32) ![]const KEvent {
+                return &[_]KEvent{};
+            }
         };
 
         /// No-op Event (simple flag).
