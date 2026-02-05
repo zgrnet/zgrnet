@@ -17,7 +17,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-
+#define IKCP_FASTACK_CONSERVE
 
 //=====================================================================
 // KCP BASIC
@@ -470,6 +470,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 {
 	IKCPSEG *seg;
 	int count, i;
+	int sent = 0;
 
 	assert(kcp->mss > 0);
 	if (len < 0) return -1;
@@ -497,17 +498,22 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 				len -= extend;
 				iqueue_del_init(&old->node);
 				ikcp_segment_delete(kcp, old);
+				sent = extend;
 			}
 		}
 		if (len <= 0) {
-			return 0;
+			return sent;
 		}
 	}
 
 	if (len <= (int)kcp->mss) count = 1;
 	else count = (len + kcp->mss - 1) / kcp->mss;
 
-	if (count >= (int)IKCP_WND_RCV) return -2;
+	if (count >= (int)IKCP_WND_RCV) {
+		if (kcp->stream != 0 && sent > 0) 
+			return sent;
+		return -2;
+	}
 
 	if (count == 0) count = 1;
 
@@ -531,9 +537,10 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 			buffer += size;
 		}
 		len -= size;
+		sent += size;
 	}
 
-	return 0;
+	return sent;
 }
 
 
@@ -636,12 +643,12 @@ static void ikcp_parse_fastack(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 //---------------------------------------------------------------------
 static void ikcp_ack_push(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 {
-	size_t newsize = kcp->ackcount + 1;
+	IUINT32 newsize = kcp->ackcount + 1;
 	IUINT32 *ptr;
 
 	if (newsize > kcp->ackblock) {
 		IUINT32 *acklist;
-		size_t newblock;
+		IUINT32 newblock;
 
 		for (newblock = 8; newblock < newsize; newblock <<= 1);
 		acklist = (IUINT32*)ikcp_malloc(newblock * sizeof(IUINT32) * 2);
@@ -652,7 +659,7 @@ static void ikcp_ack_push(ikcpcb *kcp, IUINT32 sn, IUINT32 ts)
 		}
 
 		if (kcp->acklist != NULL) {
-			size_t x;
+			IUINT32 x;
 			for (x = 0; x < kcp->ackcount; x++) {
 				acklist[x * 2 + 0] = kcp->acklist[x * 2 + 0];
 				acklist[x * 2 + 1] = kcp->acklist[x * 2 + 1];

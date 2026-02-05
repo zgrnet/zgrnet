@@ -1,0 +1,21 @@
+# Stream throughput test binaries
+# These are single-language tests that measure KCP stream throughput.
+
+# Aliases for easy access
+alias(
+    name = "go",
+    actual = "//examples/stream_test/go:stream_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "rust",
+    actual = "//examples/stream_test/rust:stream_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "zig",
+    actual = "//examples/stream_test/zig:stream_test",
+    visibility = ["//visibility:public"],
+)

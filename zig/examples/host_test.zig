@@ -80,9 +80,15 @@ pub fn main() !void {
         peer_keypairs[i] = KeyPair.fromPrivate(Key.fromBytes(pk_bytes));
     }
 
-    // Create UDP
-    const udp = UDP.init(allocator, key_pair, .{
-        .port = info.port,
+    // Create UDP - format bind address
+    var bind_addr_buf: [32]u8 = undefined;
+    const bind_addr = std.fmt.bufPrint(&bind_addr_buf, "0.0.0.0:{d}", .{info.port}) catch {
+        std.debug.print("Failed to format bind address\n", .{});
+        return;
+    };
+
+    const udp = UDP.init(allocator, &key_pair, .{
+        .bind_addr = bind_addr,
         .allow_unknown = true,
     }) catch |err| {
         std.debug.print("Failed to create UDP: {}\n", .{err});
@@ -137,7 +143,7 @@ pub fn main() !void {
     const recv_thread = std.Thread.spawn(.{}, struct {
         fn run(ctx: RecvContext) void {
             var buf: [4096]u8 = undefined;
-            while (ctx.running.load(.seq_cst) and !ctx.udp.isClosed()) {
+            while (ctx.running.load(.seq_cst)) {
                 if (ctx.udp.readFrom(&buf)) |result| {
                     const from_name = findPeerNameCached(&result.pk, ctx.peer_keypairs);
                     std.debug.print("[{s}] Received from {s}: {s}\n", .{ ctx.host_name, from_name, buf[0..result.n] });
@@ -148,8 +154,9 @@ pub fn main() !void {
                         const reply = std.fmt.bufPrint(&reply_buf, "ACK from {s}: {s}", .{ ctx.host_name, buf[0..result.n] }) catch continue;
                         _ = ctx.udp.writeTo(&result.pk, reply) catch {};
                     }
-                } else |_| {
-                    // Error or timeout, continue
+                } else |err| {
+                    // Closed or other error
+                    if (err == error.Closed) break;
                 }
             }
         }

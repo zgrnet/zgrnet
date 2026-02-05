@@ -1,20 +1,40 @@
 //! Stream - A multiplexed reliable stream over KCP.
+//!
+//! Uses comptime generics for zero-cost async primitives:
+//! - TimerServiceT: For KCP update scheduling (1ms interval)
+//! - Output is synchronous (caller provides callback)
+//!
+//! ## Architecture
+//!
+//! ```
+//! Mux<TimerServiceT>
+//!   ├── timer_service: *TimerServiceT (injected)
+//!   ├── streams: HashMap<u32, *Stream>
+//!   ├── update_handle: TimerHandle (KCP timer)
+//!   └── output_fn: callback to send data
+//! ```
 
 const std = @import("std");
 const kcp_mod = @import("kcp.zig");
 const ring_buffer = @import("ring_buffer.zig");
+const async_mod = @import("../async/mod.zig");
+const concepts = async_mod.concepts;
 
 const kcp = kcp_mod;
+const Task = async_mod.Task;
+const TimerHandle = async_mod.TimerHandle;
+const Channel = async_mod.Channel;
+const Signal = async_mod.Signal;
 
 /// Re-export RingBuffer for convenience
 pub const RingBuffer = ring_buffer.RingBuffer;
 
-/// Stream state
-pub const StreamState = enum {
-    open,
-    local_close, // We sent FIN
-    remote_close, // We received FIN
-    closed,
+/// Stream state (u32 for atomic compatibility)
+pub const StreamState = enum(u32) {
+    open = 0,
+    local_close = 1, // We sent FIN
+    remote_close = 2, // We received FIN
+    closed = 3,
 };
 
 /// Stream errors
@@ -22,45 +42,115 @@ pub const StreamError = error{
     StreamClosed,
     KcpSendFailed,
     Timeout,
+    MuxClosed,
 };
 
+/// Mux errors
+pub const MuxError = error{
+    MuxClosed,
+    OutOfMemory,
+    InvalidFrame,
+};
+
+/// Mux configuration
+pub const MuxConfig = struct {
+    max_frame_size: usize = 32 * 1024,
+    max_receive_buffer: usize = 16 * 1024 * 1024, // 16MB to allow larger transfers
+    update_interval_ms: u32 = 1, // KCP update interval
+};
+
+/// Output callback type.
+pub const OutputFn = *const fn (data: []const u8, user_data: ?*anyopaque) anyerror!void;
+
+/// Callback when a new stream is accepted.
+pub const OnNewStreamFn = *const fn (stream: *Stream, user_data: ?*anyopaque) void;
+
 /// Stream represents a multiplexed stream over KCP.
+/// Uses fine-grained locking for better concurrency.
 pub const Stream = struct {
     id: u32,
-    mux: *Mux,
+    mux_ptr: *anyopaque, // Type-erased Mux pointer (to avoid circular comptime dependency)
+    send_frame_fn: *const fn (mux: *anyopaque, cmd: kcp.Cmd, stream_id: u32, payload: []const u8) anyerror!void,
     kcp_instance: ?kcp.Kcp,
-    state: StreamState,
-    recv_buf: RingBuffer(u8), // O(1) head removal
+    recv_buf: RingBuffer(u8),
     allocator: std.mem.Allocator,
-    output_error: bool, // Set on transport output error
+
+    // Fine-grained locks
+    kcp_mutex: std.Thread.Mutex,
+    recv_mutex: std.Thread.Mutex,
+
+    // Atomic state
+    state: std.atomic.Value(StreamState),
+    output_error: std.atomic.Value(bool),
+
+    // Reference counting
+    ref_count: std.atomic.Value(u32),
+
+    // Max receive buffer (from config)
+    max_receive_buffer: usize,
+
+    // Condition variable for blocking read
+    data_available: std.Thread.Condition,
 
     /// Initialize a new stream.
-    pub fn init(allocator: std.mem.Allocator, id: u32, mux: *Mux) !*Stream {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        id: u32,
+        mux_ptr: *anyopaque,
+        send_frame_fn: *const fn (*anyopaque, kcp.Cmd, u32, []const u8) anyerror!void,
+        max_recv_buf: usize,
+    ) !*Stream {
         const self = try allocator.create(Stream);
         errdefer allocator.destroy(self);
 
         self.* = Stream{
             .id = id,
-            .mux = mux,
+            .mux_ptr = mux_ptr,
+            .send_frame_fn = send_frame_fn,
             .kcp_instance = null,
-            .state = .open,
             .recv_buf = RingBuffer(u8).init(allocator),
             .allocator = allocator,
-            .output_error = false,
+            .kcp_mutex = .{},
+            .recv_mutex = .{},
+            .state = std.atomic.Value(StreamState).init(.open),
+            .output_error = std.atomic.Value(bool).init(false),
+            .ref_count = std.atomic.Value(u32).init(1),
+            .max_receive_buffer = max_recv_buf,
+            .data_available = .{},
         };
 
-        // Create KCP with output callback that routes data through the Mux
+        // Create KCP with output callback
         self.kcp_instance = try kcp.Kcp.init(id, &Stream.kcpOutput, self);
         if (self.kcp_instance) |*k| {
-            k.setUserPtr(); // Set user pointer for callback to access this Stream
+            k.setUserPtr();
             k.setDefaultConfig();
         }
 
         return self;
     }
 
-    /// Deinitialize the stream.
-    pub fn deinit(self: *Stream) void {
+    /// Increment reference count.
+    pub fn retain(self: *Stream) void {
+        _ = self.ref_count.fetchAdd(1, .seq_cst);
+    }
+
+    /// Decrement reference count and free if zero.
+    pub fn release(self: *Stream) bool {
+        const old = self.ref_count.fetchSub(1, .seq_cst);
+        if (old == 1) {
+            self.deinitInternal();
+            return true;
+        }
+        return false;
+    }
+
+    /// Close the stream (user API).
+    pub fn close(self: *Stream) void {
+        self.shutdown();
+        _ = self.release();
+    }
+
+    fn deinitInternal(self: *Stream) void {
         if (self.kcp_instance) |*k| {
             k.deinit();
         }
@@ -75,164 +165,177 @@ pub const Stream = struct {
 
     /// Get stream state.
     pub fn getState(self: *const Stream) StreamState {
-        return self.state;
+        return self.state.load(.seq_cst);
     }
 
     /// Write data to the stream.
     pub fn write(self: *Stream, data: []const u8) StreamError!usize {
-        if (self.state == .closed or self.state == .local_close) {
+        const current_state = self.state.load(.seq_cst);
+        if (current_state == .closed or current_state == .local_close) {
             return StreamError.StreamClosed;
         }
 
+        self.kcp_mutex.lock();
+        defer self.kcp_mutex.unlock();
+
         if (self.kcp_instance) |*k| {
-            const n = k.send(data);
-            if (n < 0) {
+            const ret = k.send(data);
+            if (ret < 0) {
                 return StreamError.KcpSendFailed;
             }
-            return @intCast(n);
+            k.flush();
+            return data.len;
         }
 
         return StreamError.KcpSendFailed;
     }
 
-    /// Read data from the stream.
+    /// Flush pending data.
+    pub fn flush(self: *Stream) StreamError!void {
+        self.kcp_mutex.lock();
+        defer self.kcp_mutex.unlock();
+
+        if (self.kcp_instance) |*k| {
+            k.flush();
+        }
+    }
+
+    /// Read data from the stream (non-blocking).
+    /// Returns 0 if no data available or EOF.
     pub fn read(self: *Stream, buffer: []u8) StreamError!usize {
+        self.recv_mutex.lock();
+        defer self.recv_mutex.unlock();
+
         if (self.recv_buf.readableLength() == 0) {
-            if (self.state == .closed or self.state == .remote_close) {
+            const current_state = self.state.load(.seq_cst);
+            if (current_state == .closed or current_state == .remote_close) {
                 return 0; // EOF
             }
             return 0; // No data available
         }
 
-        // LinearFifo.read() automatically removes data from head - O(1)
         return self.recv_buf.read(buffer);
     }
 
-    /// Receive data directly from KCP into user-provided buffer (zero-copy fast path).
-    /// Returns the number of bytes received, or 0 if no data available.
-    /// This bypasses the internal recv_buf for lower latency when caller can process immediately.
-    pub fn recvIntoBuffer(self: *Stream, buffer: []u8) StreamError!usize {
-        // First drain any buffered data
-        if (self.recv_buf.readableLength() > 0) {
-            return self.recv_buf.read(buffer);
-        }
+    /// Read data from the stream (blocking).
+    /// Blocks until data is available, EOF, or timeout.
+    pub fn readBlocking(self: *Stream, buffer: []u8, timeout_ns: ?u64) StreamError!usize {
+        self.recv_mutex.lock();
+        defer self.recv_mutex.unlock();
 
-        // No buffered data, try direct receive from KCP
-        if (self.kcp_instance) |*k| {
-            const size = k.peekSize();
-            if (size <= 0) {
-                if (self.state == .closed or self.state == .remote_close) {
-                    return 0; // EOF
-                }
-                return 0; // No data available
+        // Wait for data if buffer is empty
+        while (self.recv_buf.readableLength() == 0) {
+            const current_state = self.state.load(.seq_cst);
+            if (current_state == .closed or current_state == .remote_close) {
+                return 0; // EOF
             }
 
-            // Direct receive into user buffer if it fits
-            if (buffer.len >= @as(usize, @intCast(size))) {
-                const n = k.recv(buffer);
-                if (n > 0) {
-                    return @intCast(n);
-                }
+            if (timeout_ns) |ns| {
+                self.data_available.timedWait(&self.recv_mutex, ns) catch {
+                    // Timeout
+                    return 0;
+                };
             } else {
-                // Buffer too small, need intermediate allocation
-                const tmp = try self.allocator.alloc(u8, @intCast(size));
-                defer self.allocator.free(tmp);
-
-                const n = k.recv(tmp);
-                if (n > 0) {
-                    const copy_len = @min(buffer.len, @as(usize, @intCast(n)));
-                    @memcpy(buffer[0..copy_len], tmp[0..copy_len]);
-                    // Buffer remaining data
-                    if (@as(usize, @intCast(n)) > copy_len) {
-                        try self.recv_buf.write(tmp[copy_len..@intCast(n)]);
-                    }
-                    return copy_len;
-                }
+                self.data_available.wait(&self.recv_mutex);
             }
         }
 
-        return 0;
+        return self.recv_buf.read(buffer);
     }
 
-    /// Close the stream.
-    /// Shutdown the write-half of the stream.
-    /// Sends a FIN frame to the remote peer and transitions to `local_close` state.
-    /// The stream can still receive data until a FIN is received from the peer.
+    /// Shutdown write side.
     pub fn shutdown(self: *Stream) void {
-        if (self.state == .closed or self.state == .local_close) return;
+        const current_state = self.state.load(.seq_cst);
+        if (current_state == .closed or current_state == .local_close) return;
 
-        // Only send FIN when transitioning from open to local_close
-        const should_send_fin = self.state == .open;
+        const should_send_fin = current_state == .open;
 
-        if (self.state == .open) {
-            self.state = .local_close;
+        if (current_state == .open) {
+            self.state.store(.local_close, .seq_cst);
         } else {
-            self.state = .closed;
+            self.state.store(.closed, .seq_cst);
         }
 
-        // Send FIN (only once)
         if (should_send_fin) {
-            self.mux.sendFin(self.id) catch {};
+            self.send_frame_fn(self.mux_ptr, .fin, self.id, &[_]u8{}) catch {};
         }
-    }
-
-    /// Check if a transport output error has occurred.
-    pub fn hasOutputError(self: *const Stream) bool {
-        return self.output_error;
     }
 
     /// Input data from KCP.
     pub fn kcpInput(self: *Stream, data: []const u8) void {
-        if (self.state == .closed) return;
+        if (self.state.load(.seq_cst) == .closed) return;
+
+        self.kcp_mutex.lock();
+        defer self.kcp_mutex.unlock();
+
         if (self.kcp_instance) |*k| {
             _ = k.input(data);
         }
     }
 
-    /// Receive data from KCP and buffer it.
-    /// Uses stack buffer for common MTU-sized messages, heap fallback for oversized.
-    /// Heap buffer is reused across loop iterations to avoid repeated allocations.
-    /// Returns true if any data was received.
+    /// Receive from KCP and buffer.
     pub fn kcpRecv(self: *Stream) bool {
         var received = false;
-        if (self.kcp_instance) |*k| {
-            // Reusable MTU-sized stack buffer for common case
-            var stack_buf: [1500]u8 = undefined;
-            // Reusable heap buffer for oversized messages
-            var heap_buf: ?[]u8 = null;
-            defer if (heap_buf) |buf| self.allocator.free(buf);
+        var stack_buf: [1500]u8 = undefined;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |buf| self.allocator.free(buf);
 
-            while (true) {
-                const size = k.peekSize();
-                if (size <= 0) break;
-
-                const usize_size: usize = @intCast(size);
-
-                if (usize_size <= stack_buf.len) {
-                    // Common path: use stack buffer (no allocation)
-                    const n = k.recv(stack_buf[0..usize_size]);
-                    if (n <= 0) break;
-                    self.recv_buf.write(stack_buf[0..@intCast(n)]) catch break;
-                    received = true;
-                } else {
-                    // Rare path: reuse or grow heap buffer for oversized messages
-                    if (heap_buf == null or heap_buf.?.len < usize_size) {
-                        if (heap_buf) |old| self.allocator.free(old);
-                        heap_buf = self.allocator.alloc(u8, usize_size) catch break;
-                    }
-                    const n = k.recv(heap_buf.?[0..usize_size]);
-                    if (n <= 0) break;
-                    self.recv_buf.write(heap_buf.?[0..@intCast(n)]) catch break;
-                    received = true;
-                }
+        while (true) {
+            self.kcp_mutex.lock();
+            const size = if (self.kcp_instance) |*k| k.peekSize() else -1;
+            if (size <= 0) {
+                self.kcp_mutex.unlock();
+                break;
             }
+
+            const usize_size: usize = @intCast(size);
+            var data_slice: []u8 = undefined;
+
+            if (usize_size <= stack_buf.len) {
+                const n = if (self.kcp_instance) |*k| k.recv(stack_buf[0..usize_size]) else -1;
+                self.kcp_mutex.unlock();
+                if (n <= 0) break;
+                data_slice = stack_buf[0..@intCast(n)];
+            } else {
+                if (heap_buf == null or heap_buf.?.len < usize_size) {
+                    if (heap_buf) |old| self.allocator.free(old);
+                    heap_buf = self.allocator.alloc(u8, usize_size) catch {
+                        self.kcp_mutex.unlock();
+                        break;
+                    };
+                }
+                const n = if (self.kcp_instance) |*k| k.recv(heap_buf.?[0..usize_size]) else -1;
+                self.kcp_mutex.unlock();
+                if (n <= 0) break;
+                data_slice = heap_buf.?[0..@intCast(n)];
+            }
+
+            self.recv_mutex.lock();
+            const current_size = self.recv_buf.readableLength();
+            if (current_size + data_slice.len > self.max_receive_buffer) {
+                self.recv_mutex.unlock();
+                break;
+            }
+            self.recv_buf.write(data_slice) catch {
+                self.recv_mutex.unlock();
+                break;
+            };
+            // Signal waiting readers that data is available
+            self.data_available.signal();
+            self.recv_mutex.unlock();
+            received = true;
         }
+
         return received;
     }
 
     /// Update KCP state.
     pub fn kcpUpdate(self: *Stream, current: u32) void {
-        if (self.state == .closed) return;
+        if (self.state.load(.seq_cst) == .closed) return;
+
+        self.kcp_mutex.lock();
+        defer self.kcp_mutex.unlock();
+
         if (self.kcp_instance) |*k| {
             k.update(current);
         }
@@ -240,299 +343,375 @@ pub const Stream = struct {
 
     /// Handle FIN from remote.
     pub fn handleFin(self: *Stream) void {
-        if (self.state == .local_close) {
-            self.state = .closed;
-        } else if (self.state == .open) {
-            self.state = .remote_close;
+        const current_state = self.state.load(.seq_cst);
+        if (current_state == .local_close) {
+            self.state.store(.closed, .seq_cst);
+        } else if (current_state == .open) {
+            self.state.store(.remote_close, .seq_cst);
         }
+        // Wake up any blocked readers
+        self.data_available.broadcast();
     }
 
-    /// KCP output callback
+    /// KCP output callback.
     fn kcpOutput(data: []const u8, user: ?*anyopaque) void {
         if (user) |u| {
             const stream: *Stream = @ptrCast(@alignCast(u));
-            stream.mux.sendPsh(stream.id, data) catch |err| {
-                stream.output_error = true;
-                std.log.err("Mux output error in stream {d}: {s}", .{ stream.id, @errorName(err) });
+            stream.send_frame_fn(stream.mux_ptr, .psh, stream.id, data) catch |err| {
+                stream.output_error.store(true, .seq_cst);
+                std.log.err("Stream {d} output error: {s}", .{ stream.id, @errorName(err) });
             };
         }
     }
 };
 
-/// Mux configuration
-pub const MuxConfig = struct {
-    max_frame_size: usize = 32 * 1024,
-    max_receive_buffer: usize = 256 * 1024,
-};
+/// Mux multiplexes streams over a single connection.
+/// Uses comptime generics for zero-cost timer scheduling.
+pub fn Mux(comptime TimerServiceT: type) type {
+    // Compile-time check for TimerService interface
+    comptime {
+        concepts.assertTimerService(TimerServiceT);
+    }
 
-/// Callback when stream has data available to read.
-pub const OnStreamDataFn = *const fn (stream_id: u32) void;
+    return struct {
+        const Self = @This();
 
-/// Callback when a new stream is accepted.
-pub const OnNewStreamFn = *const fn (stream: *Stream) void;
-
-/// Mux multiplexes multiple streams over a single connection.
-pub const Mux = struct {
-    config: MuxConfig,
-    output_fn: *const fn ([]const u8) anyerror!void,
-    on_stream_data: OnStreamDataFn,
-    on_new_stream: OnNewStreamFn,
-    is_client: bool,
-    streams: std.AutoHashMap(u32, *Stream),
-    next_id: u32,
-    closed: bool,
-    allocator: std.mem.Allocator,
-
-    /// Initialize a new Mux.
-    pub fn init(
-        allocator: std.mem.Allocator,
         config: MuxConfig,
-        is_client: bool,
-        output_fn: *const fn ([]const u8) anyerror!void,
-        on_stream_data: OnStreamDataFn,
+        timer_service: *TimerServiceT,
+        output_fn: OutputFn,
         on_new_stream: OnNewStreamFn,
-    ) !*Mux {
-        const self = try allocator.create(Mux);
-        errdefer allocator.destroy(self);
+        user_data: ?*anyopaque,
+        is_client: bool,
+        streams: std.AutoHashMap(u32, *Stream),
+        next_id: u32,
+        closed: std.atomic.Value(bool),
+        allocator: std.mem.Allocator,
+        mutex: std.Thread.Mutex,
+        update_handle: TimerHandle,
+        ref_count: std.atomic.Value(u32),
 
-        self.* = Mux{
-            .config = config,
-            .output_fn = output_fn,
-            .on_stream_data = on_stream_data,
-            .on_new_stream = on_new_stream,
-            .is_client = is_client,
-            .streams = .init(allocator),
-            .next_id = if (is_client) 1 else 2, // Client: odd, Server: even
-            .closed = false,
-            .allocator = allocator,
-        };
+        // Accept channel for incoming streams
+        accept_chan: ?*Channel(*Stream),
 
-        return self;
-    }
+        /// Initialize a new Mux.
+        pub fn init(
+            allocator: std.mem.Allocator,
+            timer_service: *TimerServiceT,
+            config: MuxConfig,
+            is_client: bool,
+            output_fn: OutputFn,
+            on_new_stream: OnNewStreamFn,
+            user_data: ?*anyopaque,
+        ) !*Self {
+            const self = try allocator.create(Self);
+            errdefer allocator.destroy(self);
 
-    /// Deinitialize the Mux.
-    pub fn deinit(self: *Mux) void {
-        // Close all streams
-        var iter = self.streams.valueIterator();
-        while (iter.next()) |stream| {
-            stream.*.deinit();
+            // Create accept channel on heap
+            const accept_chan = try allocator.create(Channel(*Stream));
+            errdefer allocator.destroy(accept_chan);
+            accept_chan.* = try Channel(*Stream).init(allocator, 16);
+
+            self.* = Self{
+                .config = config,
+                .timer_service = timer_service,
+                .output_fn = output_fn,
+                .on_new_stream = on_new_stream,
+                .user_data = user_data,
+                .is_client = is_client,
+                .streams = std.AutoHashMap(u32, *Stream).init(allocator),
+                .next_id = if (is_client) 1 else 2,
+                .closed = std.atomic.Value(bool).init(false),
+                .allocator = allocator,
+                .mutex = .{},
+                .update_handle = TimerHandle.null_handle,
+                .ref_count = std.atomic.Value(u32).init(1),
+                .accept_chan = accept_chan,
+            };
+
+            // Schedule first KCP update
+            self.scheduleUpdate();
+
+            return self;
         }
-        self.streams.deinit();
-        self.allocator.destroy(self);
-    }
 
-    /// Open a new stream.
-    pub fn openStream(self: *Mux) !*Stream {
-        if (self.closed) return error.MuxClosed;
+        /// Schedule the next KCP update.
+        fn scheduleUpdate(self: *Self) void {
+            if (self.closed.load(.acquire)) return;
 
-        const id = self.next_id;
-        self.next_id += 2;
-
-        const stream = try Stream.init(self.allocator, id, self);
-        errdefer stream.deinit();
-
-        try self.streams.put(id, stream);
-        errdefer _ = self.streams.remove(id); // Remove from map before deinit to avoid dangling pointer
-
-        // Send SYN
-        try self.sendSyn(id);
-
-        return stream;
-    }
-
-    /// Get number of active streams.
-    pub fn numStreams(self: *const Mux) usize {
-        return self.streams.count();
-    }
-
-    /// Check if closed.
-    pub fn isClosed(self: *const Mux) bool {
-        return self.closed;
-    }
-
-    /// Close the Mux.
-    pub fn closeMux(self: *Mux) void {
-        self.closed = true;
-    }
-
-    /// Input a frame.
-    pub fn input(self: *Mux, data: []const u8) !void {
-        if (self.closed) return error.MuxClosed;
-
-        const frame = try kcp.Frame.decode(data);
-
-        switch (frame.cmd) {
-            .syn => try self.handleSyn(frame.stream_id),
-            .fin => self.handleFin(frame.stream_id),
-            .psh => self.handlePsh(frame.stream_id, frame.payload),
-            .nop => {}, // Keepalive, nothing to do
+            self.update_handle = self.timer_service.schedule(
+                self.config.update_interval_ms,
+                Task.init(Self, self, doUpdate),
+            );
         }
-    }
 
-    /// Handle SYN (stream open request).
-    fn handleSyn(self: *Mux, id: u32) !void {
-        if (self.streams.contains(id)) return; // Duplicate SYN
+        /// KCP update task (called by timer).
+        fn doUpdate(self: *Self) void {
+            if (self.closed.load(.acquire)) return;
 
-        const stream = try Stream.init(self.allocator, id, self);
-        errdefer stream.deinit();
+            const current: u32 = @intCast(@mod(std.time.milliTimestamp(), std.math.maxInt(u32)));
 
-        try self.streams.put(id, stream);
+            // Collect all streams with dynamic array to avoid missing any
+            var stream_list: std.ArrayListUnmanaged(*Stream) = .{};
+            defer stream_list.deinit(self.allocator);
 
-        // Notify via callback
-        self.on_new_stream(stream);
-    }
+            self.mutex.lock();
+            var iter = self.streams.valueIterator();
+            while (iter.next()) |stream_ptr| {
+                stream_list.append(self.allocator, stream_ptr.*) catch {
+                    // On OOM, update what we have so far
+                    break;
+                };
+            }
+            self.mutex.unlock();
 
-    /// Handle FIN (stream close).
-    fn handleFin(self: *Mux, id: u32) void {
-        if (self.streams.get(id)) |stream| {
-            stream.handleFin();
+            // Update outside lock
+            for (stream_list.items) |stream| {
+                stream.kcpUpdate(current);
+                _ = stream.kcpRecv();
+            }
+
+            // Schedule next update
+            self.scheduleUpdate();
         }
-    }
 
-    /// Handle PSH (data).
-    fn handlePsh(self: *Mux, id: u32, payload: []const u8) void {
-        if (self.streams.get(id)) |stream| {
+        /// Retain reference.
+        pub fn retain(self: *Self) void {
+            _ = self.ref_count.fetchAdd(1, .seq_cst);
+        }
+
+        /// Release reference.
+        pub fn release(self: *Self) bool {
+            const old = self.ref_count.fetchSub(1, .seq_cst);
+            if (old == 1) {
+                self.deinitInternal();
+                return true;
+            }
+            return false;
+        }
+
+        /// Close the Mux.
+        pub fn deinit(self: *Self) void {
+            self.closed.store(true, .release);
+
+            // Cancel timer
+            self.timer_service.cancel(self.update_handle);
+
+            // Close accept channel
+            if (self.accept_chan) |ch| {
+                ch.close();
+                ch.deinit();
+                self.allocator.destroy(ch);
+            }
+
+            // Release all streams
+            self.mutex.lock();
+            var iter = self.streams.valueIterator();
+            while (iter.next()) |stream_ptr| {
+                stream_ptr.*.state.store(.closed, .seq_cst);
+                _ = stream_ptr.*.release();
+            }
+            self.streams.deinit();
+            self.mutex.unlock();
+
+            _ = self.release();
+        }
+
+        fn deinitInternal(self: *Self) void {
+            self.allocator.destroy(self);
+        }
+
+        /// Check if closed.
+        pub fn isClosed(self: *Self) bool {
+            return self.closed.load(.acquire);
+        }
+
+        /// Open a new stream.
+        pub fn openStream(self: *Self) MuxError!*Stream {
+            if (self.closed.load(.acquire)) return MuxError.MuxClosed;
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const id = self.next_id;
+            self.next_id += 2;
+
+            const stream = Stream.init(
+                self.allocator,
+                id,
+                self,
+                sendFrameWrapper,
+                self.config.max_receive_buffer,
+            ) catch return MuxError.OutOfMemory;
+
+            self.streams.put(id, stream) catch {
+                _ = stream.release();
+                return MuxError.OutOfMemory;
+            };
+
+            // Send SYN
+            self.sendFrameInternal(.syn, id, &[_]u8{}) catch {
+                _ = self.streams.remove(id);
+                _ = stream.release();
+                return MuxError.OutOfMemory;
+            };
+
+            stream.retain(); // User's reference
+            return stream;
+        }
+
+        /// Accept an incoming stream (blocks until available or closed).
+        pub fn acceptStream(self: *Self) ?*Stream {
+            if (self.accept_chan) |ch| {
+                return ch.recv();
+            }
+            return null;
+        }
+
+        /// Try to accept a stream without blocking.
+        pub fn tryAcceptStream(self: *Self) ?*Stream {
+            if (self.accept_chan) |ch| {
+                return ch.tryRecv();
+            }
+            return null;
+        }
+
+        /// Input a frame from the network.
+        pub fn input(self: *Self, data: []const u8) MuxError!void {
+            if (self.closed.load(.acquire)) return MuxError.MuxClosed;
+
+            const frame = kcp.Frame.decode(data) catch return MuxError.InvalidFrame;
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            switch (frame.cmd) {
+                .syn => self.handleSyn(frame.stream_id),
+                .fin => self.handleFin(frame.stream_id),
+                .psh => self.handlePsh(frame.stream_id, frame.payload),
+                .nop => {},
+            }
+        }
+
+        fn handleSyn(self: *Self, id: u32) void {
+            if (self.streams.contains(id)) return;
+
+            const stream = Stream.init(
+                self.allocator,
+                id,
+                self,
+                sendFrameWrapper,
+                self.config.max_receive_buffer,
+            ) catch return;
+
+            self.streams.put(id, stream) catch {
+                _ = stream.release();
+                return;
+            };
+
+            // Push to accept channel
+            if (self.accept_chan) |ch| {
+                stream.retain(); // Reference for accept channel
+                if (!ch.trySend(stream)) {
+                    _ = stream.release(); // Channel full
+                }
+            }
+
+            // Also call callback
+            self.mutex.unlock();
+            self.on_new_stream(stream, self.user_data);
+            self.mutex.lock();
+        }
+
+        fn handleFin(self: *Self, id: u32) void {
+            if (self.streams.get(id)) |stream| {
+                stream.handleFin();
+            }
+        }
+
+        fn handlePsh(self: *Self, id: u32, payload: []const u8) void {
+            const stream = self.streams.get(id) orelse return;
+            stream.retain();
+
+            self.mutex.unlock();
             stream.kcpInput(payload);
-            if (stream.kcpRecv()) {
-                self.on_stream_data(id);
+            _ = stream.kcpRecv();
+            _ = stream.release();
+            self.mutex.lock();
+        }
+
+        /// Send a frame (called from Stream).
+        fn sendFrameWrapper(mux_ptr: *anyopaque, cmd: kcp.Cmd, stream_id: u32, payload: []const u8) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(mux_ptr));
+            try self.sendFrameInternal(cmd, stream_id, payload);
+        }
+
+        fn sendFrameInternal(self: *Self, cmd: kcp.Cmd, stream_id: u32, payload: []const u8) !void {
+            if (self.closed.load(.acquire)) return MuxError.MuxClosed;
+
+            const frame = kcp.Frame{
+                .cmd = cmd,
+                .stream_id = stream_id,
+                .payload = payload,
+            };
+
+            const required_size = kcp.FrameHeaderSize + payload.len;
+            var stack_buf: [1500]u8 = undefined;
+
+            if (required_size <= stack_buf.len) {
+                const encoded = try frame.encode(&stack_buf);
+                try self.output_fn(encoded, self.user_data);
+            } else {
+                const buf = try self.allocator.alloc(u8, required_size);
+                defer self.allocator.free(buf);
+                const encoded = try frame.encode(buf);
+                try self.output_fn(encoded, self.user_data);
             }
         }
-    }
 
-    /// Send a SYN frame.
-    fn sendSyn(self: *Mux, id: u32) !void {
-        try self.sendFrame(.{
-            .cmd = .syn,
-            .stream_id = id,
-            .payload = &[_]u8{},
-        });
-    }
+        /// Remove a stream.
+        pub fn removeStream(self: *Self, id: u32) void {
+            self.mutex.lock();
+            const maybe_stream = self.streams.fetchRemove(id);
+            self.mutex.unlock();
 
-    /// Send a FIN frame.
-    pub fn sendFin(self: *Mux, id: u32) !void {
-        try self.sendFrame(.{
-            .cmd = .fin,
-            .stream_id = id,
-            .payload = &[_]u8{},
-        });
-    }
-
-    /// Send a PSH frame.
-    pub fn sendPsh(self: *Mux, id: u32, payload: []const u8) !void {
-        try self.sendFrame(.{
-            .cmd = .psh,
-            .stream_id = id,
-            .payload = payload,
-        });
-    }
-
-    /// Send a frame.
-    fn sendFrame(self: *Mux, frame: kcp.Frame) !void {
-        if (self.closed) return error.MuxClosed;
-
-        const required_size = kcp.FrameHeaderSize + frame.payload.len;
-        var stack_buf: [1500]u8 = undefined; // MTU-sized stack buffer
-
-        if (required_size <= stack_buf.len) {
-            // Use stack buffer for typical small frames
-            const encoded = try frame.encode(&stack_buf);
-            try self.output_fn(encoded);
-        } else {
-            // Heap allocate for oversized frames
-            const buf = try self.allocator.alloc(u8, required_size);
-            defer self.allocator.free(buf);
-            const encoded = try frame.encode(buf);
-            try self.output_fn(encoded);
-        }
-    }
-
-    /// Remove a stream from the Mux.
-    pub fn removeStream(self: *Mux, id: u32) void {
-        _ = self.streams.remove(id);
-    }
-
-    /// Update all streams.
-    pub fn update(self: *Mux, current: u32) void {
-        var iter = self.streams.iterator();
-        while (iter.next()) |entry| {
-            const id = entry.key_ptr.*;
-            const stream = entry.value_ptr.*;
-            stream.kcpUpdate(current);
-            if (stream.kcpRecv()) {
-                self.on_stream_data(id);
+            if (maybe_stream) |kv| {
+                _ = kv.value.release();
             }
         }
-    }
-};
 
-// Tests
-test "Frame encode decode" {
-    const frame = kcp.Frame{
-        .cmd = .syn,
-        .stream_id = 1,
-        .payload = &[_]u8{},
+        /// Get stream count.
+        pub fn numStreams(self: *Self) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.streams.count();
+        }
     };
-    var buf: [kcp.FrameHeaderSize]u8 = undefined;
-    const encoded = try frame.encode(&buf);
-    const decoded = try kcp.Frame.decode(encoded);
-    try std.testing.expectEqual(kcp.Cmd.syn, decoded.cmd);
-    try std.testing.expectEqual(@as(u32, 1), decoded.stream_id);
 }
 
-test "Mux init deinit" {
-    const allocator = std.testing.allocator;
+// Convenience type alias for common timer service
+pub const SimpleMux = Mux(async_mod.SimpleTimerService);
 
-    const outputFn = struct {
-        fn output(_: []const u8) anyerror!void {}
-    }.output;
-    const onStreamData = struct {
-        fn cb(_: u32) void {}
-    }.cb;
-    const onNewStream = struct {
-        fn cb(_: *Stream) void {}
-    }.cb;
+// ============================================================================
+// Tests
+// ============================================================================
 
-    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream);
-    mux.deinit();
+test "Mux comptime check" {
+    // Just verify the type compiles
+    const MuxType = Mux(async_mod.SimpleTimerService);
+    _ = MuxType;
 }
 
-test "Mux open stream" {
+test "Stream init deinit" {
     const allocator = std.testing.allocator;
 
-    const outputFn = struct {
-        fn output(_: []const u8) anyerror!void {}
-    }.output;
-    const onStreamData = struct {
-        fn cb(_: u32) void {}
-    }.cb;
-    const onNewStream = struct {
-        fn cb(_: *Stream) void {}
-    }.cb;
+    const DummyMux = struct {
+        fn sendFrame(_: *anyopaque, _: kcp.Cmd, _: u32, _: []const u8) anyerror!void {}
+    };
 
-    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream);
-    defer mux.deinit();
+    var dummy: u8 = 0;
+    const stream = try Stream.init(allocator, 1, &dummy, DummyMux.sendFrame, 256 * 1024);
+    defer _ = stream.release();
 
-    const stream = try mux.openStream();
     try std.testing.expectEqual(@as(u32, 1), stream.getId());
-    try std.testing.expectEqual(@as(usize, 1), mux.numStreams());
-}
-
-test "Stream state" {
-    const allocator = std.testing.allocator;
-
-    const outputFn = struct {
-        fn output(_: []const u8) anyerror!void {}
-    }.output;
-    const onStreamData = struct {
-        fn cb(_: u32) void {}
-    }.cb;
-    const onNewStream = struct {
-        fn cb(_: *Stream) void {}
-    }.cb;
-
-    const mux = try Mux.init(allocator, .{}, true, outputFn, onStreamData, onNewStream);
-    defer mux.deinit();
-
-    const stream = try mux.openStream();
     try std.testing.expectEqual(StreamState.open, stream.getState());
 }

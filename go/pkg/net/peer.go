@@ -24,10 +24,17 @@ func (u *UDP) isKCPClient(remotePK noise.PublicKey) bool {
 	return bytes.Compare(u.localKey.Public[:], remotePK[:]) < 0
 }
 
-// initMux initializes the Mux for a peer.
-// Called when session is established (handshake complete).
-// If mux already exists, it will be closed and recreated.
-func (u *UDP) initMux(peer *peerState) {
+// muxResources holds the resources created by createMux.
+type muxResources struct {
+	mux         *mux
+	acceptChan  chan *stream
+	inboundChan chan protoPacket
+}
+
+// createMux creates a new Mux and associated channels for a peer.
+// The caller is responsible for assigning the returned resources to peer
+// and starting the mux update loop.
+func (u *UDP) createMux(peer *peerState) *muxResources {
 	// Determine client/server role based on public key comparison
 	isClient := u.isKCPClient(peer.pk)
 
@@ -56,17 +63,16 @@ func (u *UDP) initMux(peer *peerState) {
 		},
 	)
 
-	// Close existing mux and assign new fields under a single lock
-	peer.mu.Lock()
-	if peer.mux != nil {
-		peer.mux.Close()
+	return &muxResources{
+		mux:         m,
+		acceptChan:  acceptChan,
+		inboundChan: inboundChan,
 	}
-	peer.acceptChan = acceptChan
-	peer.inboundChan = inboundChan
-	peer.mux = m
-	peer.mu.Unlock()
+}
 
-	// Start the Mux update goroutine with reference to this specific mux
+// startMuxUpdateLoop starts the mux update goroutine.
+// Should be called after mux is assigned to peer.
+func (u *UDP) startMuxUpdateLoop(m *mux) {
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()

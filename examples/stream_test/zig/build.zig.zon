@@ -1,0 +1,16 @@
+.{
+    .name = .stream_test_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xc5a7f568cf5ccef0,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{
+        .noise = .{
+            .path = "../../../zig",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

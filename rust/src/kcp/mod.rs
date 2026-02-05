@@ -6,6 +6,7 @@
 //! - `Stream`: Multiplexed reliable stream
 //! - `Mux`: Stream multiplexer
 
+#[allow(clippy::module_inception)]
 mod kcp;
 mod stream;
 

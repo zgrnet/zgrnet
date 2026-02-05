@@ -104,6 +104,9 @@ impl Stream {
             return Err(StreamError::KcpSendFailed);
         }
 
+        // Flush immediately for better throughput (same as Go)
+        kcp.flush();
+
         // kcp.send returns 0 on success, so return data.len() as bytes written
         Ok(data.len())
     }

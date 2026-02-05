@@ -1,0 +1,29 @@
+{
+  "_WARNING": "TEST KEYS ONLY - DO NOT USE IN PRODUCTION. Full 3-way KCP interop testing.",
+  "_DESCRIPTION": "Each host connects to 2 peers. Total 6 connections for bidirectional transfer.",
+  "hosts": [
+    {
+      "name": "go",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "port": 10001,
+      "peers": ["rust", "zig"]
+    },
+    {
+      "name": "rust",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "port": 10002,
+      "peers": ["go", "zig"]
+    },
+    {
+      "name": "zig",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000003",
+      "port": 10003,
+      "peers": ["go", "rust"]
+    }
+  ],
+  "test": {
+    "echo_message": "Hello KCP Interop!",
+    "throughput_mb": 1024,
+    "chunk_kb": 64
+  }
+}

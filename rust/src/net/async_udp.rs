@@ -20,6 +20,9 @@ use crate::noise::{
     HandshakeState, Key, KeyPair, Pattern, Session, SessionConfig, MAX_PACKET_SIZE, KEY_SIZE,
 };
 
+/// Type alias for the peers map to reduce complexity.
+type PeersMap = Arc<RwLock<HashMap<Key, Arc<Mutex<PeerInternal>>>>>;
+
 /// Pipeline packet with ready signal (Go-style).
 struct PipelinePacket {
     // Raw data
@@ -132,6 +135,7 @@ pub struct AsyncUDP {
 
     // Peer management
     peers: Arc<RwLock<HashMap<Key, Arc<Mutex<PeerInternal>>>>>,
+    #[allow(dead_code)] // Used by worker tasks via Arc clone
     by_index: Arc<RwLock<HashMap<u32, Key>>>,
 
     // Pending handshakes
@@ -141,6 +145,7 @@ pub struct AsyncUDP {
     output_rx: Mutex<mpsc::Receiver<Arc<Mutex<PipelinePacket>>>>,
 
     // Stats
+    #[allow(dead_code)] // Reserved for future stats API
     total_rx: AtomicU64,
     total_tx: AtomicU64,
 
@@ -179,25 +184,20 @@ impl AsyncUDP {
         let io_output_tx = output_tx.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET_SIZE];
-            loop {
-                match io_socket.recv_from(&mut buf).await {
-                    Ok((n, from)) => {
-                        let pkt = Arc::new(Mutex::new(PipelinePacket::new(
-                            buf[..n].to_vec(),
-                            from,
-                        )));
-                        
-                        // Send to both channels (Go-style: same packet in both)
-                        // If decrypt_chan is full, drop
-                        if io_decrypt_tx.try_send(pkt.clone()).is_err() {
-                            continue;
-                        }
-                        
-                        // Send to output_chan
-                        let _ = io_output_tx.try_send(pkt);
-                    }
-                    Err(_) => break,
+            while let Ok((n, from)) = io_socket.recv_from(&mut buf).await {
+                let pkt = Arc::new(Mutex::new(PipelinePacket::new(
+                    buf[..n].to_vec(),
+                    from,
+                )));
+                
+                // Send to both channels (Go-style: same packet in both)
+                // If decrypt_chan is full, drop
+                if io_decrypt_tx.try_send(pkt.clone()).is_err() {
+                    continue;
                 }
+                
+                // Send to output_chan
+                let _ = io_output_tx.try_send(pkt);
             }
         });
 
@@ -469,7 +469,7 @@ impl AsyncUDP {
         from: SocketAddr,
         local_key: &KeyPair,
         allow_unknown: bool,
-        peers: &Arc<RwLock<HashMap<Key, Arc<Mutex<PeerInternal>>>>>,
+        peers: &PeersMap,
         by_index: &Arc<RwLock<HashMap<u32, Key>>>,
         socket: &Arc<TokioUdpSocket>,
     ) {
@@ -562,7 +562,7 @@ impl AsyncUDP {
     async fn handle_handshake_resp_static(
         data: &[u8],
         from: SocketAddr,
-        peers: &Arc<RwLock<HashMap<Key, Arc<Mutex<PeerInternal>>>>>,
+        peers: &PeersMap,
         by_index: &Arc<RwLock<HashMap<u32, Key>>>,
         pending: &Arc<Mutex<HashMap<u32, PendingHandshake>>>,
     ) {
@@ -628,7 +628,7 @@ impl AsyncUDP {
     async fn handle_transport_static(
         data: &[u8],
         from: SocketAddr,
-        peers: &Arc<RwLock<HashMap<Key, Arc<Mutex<PeerInternal>>>>>,
+        peers: &PeersMap,
         by_index: &Arc<RwLock<HashMap<u32, Key>>>,
     ) -> Option<(Key, Vec<u8>)> {
         let msg = parse_transport_message(data).ok()?;

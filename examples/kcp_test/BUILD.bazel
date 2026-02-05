@@ -1,0 +1,48 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+# Re-export language-specific binaries for easy access
+alias(
+    name = "go",
+    actual = "//examples/kcp_test/go:kcp_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "rust",
+    actual = "//examples/kcp_test/rust:kcp_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "zig",
+    actual = "//examples/kcp_test/zig:kcp_test",
+    visibility = ["//visibility:public"],
+)
+
+# Test data files
+filegroup(
+    name = "configs",
+    srcs = [
+        "config.json",
+        "config_full.json",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Shell test that runs 3-way interop
+sh_test(
+    name = "interop_test",
+    srcs = ["run_bazel.sh"],
+    data = [
+        ":configs",
+        "//examples/kcp_test/go:kcp_test",
+        "//examples/kcp_test/rust:kcp_test",
+        "//examples/kcp_test/zig:kcp_test",
+    ],
+    tags = [
+        "local",      # Needs network access
+        "exclusive",  # Don't run in parallel with other tests
+    ],
+    timeout = "long",
+    visibility = ["//visibility:public"],
+)

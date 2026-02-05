@@ -640,10 +640,17 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Update peer state
+	// Create mux resources before acquiring the lock
+	muxRes := u.createMux(peer)
+
+	// Update peer state and mux in the same lock
+	// This ensures mux is ready when packets start routing to this peer
 	peer.mu.Lock()
 	peer.endpoint = from
 	peer.session = session
+	peer.mux = muxRes.mux
+	peer.acceptChan = muxRes.acceptChan
+	peer.inboundChan = muxRes.inboundChan
 	peer.state = PeerStateEstablished
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
@@ -653,8 +660,8 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 	u.byIndex[localIdx] = peer
 	u.mu.Unlock()
 
-	// Initialize mux now that session is established
-	u.initMux(peer)
+	// Start the mux update loop
+	u.startMuxUpdateLoop(muxRes.mux)
 }
 
 // handleHandshakeResp processes an incoming handshake response.
@@ -721,11 +728,18 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Update peer state
+	// Create mux resources before acquiring the lock
 	peer := pending.peer
+	muxRes := u.createMux(peer)
+
+	// Update peer state and mux in the same lock
+	// This ensures mux is ready when packets start routing to this peer
 	peer.mu.Lock()
 	peer.endpoint = from // Roaming: update endpoint
 	peer.session = session
+	peer.mux = muxRes.mux
+	peer.acceptChan = muxRes.acceptChan
+	peer.inboundChan = muxRes.inboundChan
 	peer.state = PeerStateEstablished
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
@@ -735,8 +749,8 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 	u.byIndex[pending.localIdx] = peer
 	u.mu.Unlock()
 
-	// Initialize mux now that session is established
-	u.initMux(peer)
+	// Start the mux update loop
+	u.startMuxUpdateLoop(muxRes.mux)
 
 	// Signal completion
 	if pending.done != nil {
@@ -851,12 +865,14 @@ func (u *UDP) Close() error {
 	// Close socket (will unblock ioLoop's ReadFromUDP)
 	err := u.socket.Close()
 
-	// Close channels to unblock workers (ioLoop uses select with closeChan)
+	// Wait for all goroutines to finish BEFORE closing channels
+	// This prevents race condition where ioLoop is writing to channels
+	// while we're closing them
+	u.wg.Wait()
+
+	// Now safe to close channels (all writers have exited)
 	close(u.decryptChan)
 	close(u.outputChan)
-
-	// Wait for all goroutines to finish
-	u.wg.Wait()
 
 	return err
 }
@@ -941,10 +957,18 @@ func (u *UDP) ioLoop() {
 // Multiple workers run in parallel for higher throughput.
 // After processing, it signals ready so ReadFrom can consume.
 func (u *UDP) decryptWorker() {
-	for pkt := range u.decryptChan {
-		u.processPacket(pkt)
-		// Signal that decryption is complete
-		close(pkt.ready)
+	for {
+		select {
+		case pkt, ok := <-u.decryptChan:
+			if !ok {
+				return // channel closed
+			}
+			u.processPacket(pkt)
+			// Signal that decryption is complete
+			close(pkt.ready)
+		case <-u.closeChan:
+			return
+		}
 	}
 }
 

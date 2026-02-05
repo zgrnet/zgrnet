@@ -5,6 +5,7 @@
 //! - Embedded systems (FreeRTOS single-task)
 //! - WASM (no threads)
 //! - Cooperative multitasking
+//! - Platforms without kqueue/epoll (fallback)
 //!
 //! Usage:
 //! ```zig
@@ -19,7 +20,18 @@ const Allocator = std.mem.Allocator;
 pub fn None(comptime allocator: Allocator) type {
     return struct {
         /// No-op Reactor.
+        /// Stub implementation for platforms without kqueue/epoll support.
         pub const Reactor = struct {
+            /// Placeholder event type for cross-platform compatibility
+            pub const KEvent = struct {
+                ident: usize = 0,
+                filter: i16 = 0,
+                flags: u16 = 0,
+                fflags: u32 = 0,
+                data: isize = 0,
+                udata: usize = 0,
+            };
+
             pub fn init() !Reactor {
                 return .{};
             }
@@ -27,6 +39,16 @@ pub fn None(comptime allocator: Allocator) type {
             pub fn deinit(_: *Reactor) void {}
 
             pub fn poll(_: *Reactor) void {}
+
+            // Stub methods for cross-platform compatibility
+            pub fn register(_: *Reactor, _: i32, _: anytype, _: anytype) !void {}
+            pub fn registerUser(_: *Reactor, _: u64) !void {}
+            pub fn triggerUser(_: *Reactor, _: u64) !void {}
+
+            /// Wait for events - returns empty slice on stub platforms
+            pub fn wait(_: *Reactor, _: ?i32) ![]const KEvent {
+                return &[_]KEvent{};
+            }
         };
 
         /// No-op Event (simple flag).
