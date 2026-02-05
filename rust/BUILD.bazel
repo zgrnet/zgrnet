@@ -1,28 +1,19 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
-load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@crates//:defs.bzl", "all_crate_deps")
 
-# KCP C library
-cc_library(
-    name = "kcp_c",
-    srcs = ["kcp/ikcp.c"],
-    hdrs = ["kcp/ikcp.h"],
-    copts = ["-O3", "-DNDEBUG"],
-    visibility = ["//visibility:public"],
-)
-
 # Rust SDK - zgrnet library
+# KCP linked from //third_party/kcp (compiled with zig cc)
 rust_library(
     name = "zgrnet",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "zgrnet",
     edition = "2021",
     visibility = ["//visibility:public"],
-    deps = all_crate_deps() + [":kcp_c"],
+    deps = all_crate_deps() + ["//third_party/kcp"],
 )
 
 rust_test(
     name = "zgrnet_test",
     crate = ":zgrnet",
-    deps = all_crate_deps(normal_dev = True) + [":kcp_c"],
+    deps = all_crate_deps(normal_dev = True) + ["//third_party/kcp"],
 )

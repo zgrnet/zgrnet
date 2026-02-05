@@ -4,11 +4,11 @@ go_library(
     name = "kcp",
     srcs = [
         "frame.go",
-        "ikcp.c",
-        "ikcp.h",
         "kcp.go",
         "mux.go",
         "stream.go",
+        # Use centralized patched KCP source from //third_party/kcp
+        "//third_party/kcp:srcs",
     ],
     cgo = True,
     importpath = "github.com/vibing/zgrnet/pkg/kcp",

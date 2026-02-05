@@ -214,90 +214,118 @@ fn run_stream_benchmark(
     let total_bytes = (data_size_mb * 1024 * 1024) as u64;
     let chunk_bytes = chunk_size_kb * 1024;
 
-    println!("[bench] Starting KCP throughput test: {} MB, chunk size {} KB", data_size_mb, chunk_size_kb);
+    println!("[bench] Starting KCP BIDIRECTIONAL throughput test: {} MB each direction, chunk size {} KB", data_size_mb, chunk_size_kb);
 
     // Generate random data
     let chunk: Vec<u8> = (0..chunk_bytes).map(|i| (i % 256) as u8).collect();
 
-    // Server reads all data in background
-    let server_stream_clone = Arc::clone(server_stream);
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let total_bytes_for_reader = total_bytes;
-    
-    thread::spawn(move || {
-        let mut buf = vec![0u8; chunk_bytes * 4]; // Larger buffer for efficiency
-        let mut server_bytes: u64 = 0;
-        let start = Instant::now();
-        let mut spin_count = 0u32;
-        
-        while server_bytes < total_bytes_for_reader {
-            match server_stream_clone.read_data(&mut buf) {
-                Ok(n) if n > 0 => {
-                    server_bytes += n as u64;
-                    spin_count = 0;
-                }
-                Ok(_) => {
-                    // No data - adaptive backoff
-                    spin_count = spin_count.saturating_add(1);
-                    if spin_count > 10000 {
-                        thread::sleep(Duration::from_micros(50));
-                    } else {
-                        std::hint::spin_loop();
+    let client_tx = Arc::new(AtomicU64::new(0));
+    let client_rx = Arc::new(AtomicU64::new(0));
+    let server_tx = Arc::new(AtomicU64::new(0));
+    let server_rx = Arc::new(AtomicU64::new(0));
+
+    let start = Instant::now();
+
+    // Spawn 4 threads for bidirectional transfer
+    let handles: Vec<_> = vec![
+        // Client writer (client -> server)
+        {
+            let stream = Arc::clone(client_stream);
+            let chunk = chunk.clone();
+            let tx_bytes = Arc::clone(&client_tx);
+            thread::spawn(move || {
+                let iterations = (total_bytes as usize) / chunk.len();
+                let mut sent: u64 = 0;
+                for _ in 0..iterations {
+                    match stream.write_data(&chunk) {
+                        Ok(n) => sent += n as u64,
+                        Err(_) => break,
                     }
                 }
-                Err(_) => break,
-            }
-            
-            // Timeout after 30 seconds
-            if start.elapsed() > Duration::from_secs(30) {
-                println!("[bench] Warning: Timeout waiting for data");
-                break;
-            }
-        }
-        
-        let _ = done_tx.send(server_bytes);
-    });
+                tx_bytes.store(sent, Ordering::SeqCst);
+            })
+        },
+        // Client reader (server -> client)
+        {
+            let stream = Arc::clone(client_stream);
+            let rx_bytes = Arc::clone(&client_rx);
+            let chunk_bytes = chunk_bytes;
+            thread::spawn(move || {
+                let mut buf = vec![0u8; chunk_bytes * 4];
+                let mut recv: u64 = 0;
+                let deadline = Instant::now() + Duration::from_secs(120);
+                while recv < total_bytes && Instant::now() < deadline {
+                    match stream.read_data(&mut buf) {
+                        Ok(n) if n > 0 => recv += n as u64,
+                        Ok(_) => thread::yield_now(), // Yield CPU instead of spin
+                        Err(_) => break,
+                    }
+                }
+                rx_bytes.store(recv, Ordering::SeqCst);
+            })
+        },
+        // Server writer (server -> client)
+        {
+            let stream = Arc::clone(server_stream);
+            let chunk = chunk.clone();
+            let tx_bytes = Arc::clone(&server_tx);
+            thread::spawn(move || {
+                let iterations = (total_bytes as usize) / chunk.len();
+                let mut sent: u64 = 0;
+                for _ in 0..iterations {
+                    match stream.write_data(&chunk) {
+                        Ok(n) => sent += n as u64,
+                        Err(_) => break,
+                    }
+                }
+                tx_bytes.store(sent, Ordering::SeqCst);
+            })
+        },
+        // Server reader (client -> server)
+        {
+            let stream = Arc::clone(server_stream);
+            let rx_bytes = Arc::clone(&server_rx);
+            let chunk_bytes = chunk_bytes;
+            thread::spawn(move || {
+                let mut buf = vec![0u8; chunk_bytes * 4];
+                let mut recv: u64 = 0;
+                let deadline = Instant::now() + Duration::from_secs(120);
+                while recv < total_bytes && Instant::now() < deadline {
+                    match stream.read_data(&mut buf) {
+                        Ok(n) if n > 0 => recv += n as u64,
+                        Ok(_) => thread::yield_now(), // Yield CPU instead of spin
+                        Err(_) => break,
+                    }
+                }
+                rx_bytes.store(recv, Ordering::SeqCst);
+            })
+        },
+    ];
 
-    // Client sends all data
-    let start = Instant::now();
-    let mut sent_bytes: u64 = 0;
-    let iterations = (total_bytes as usize) / chunk_bytes;
-
-    for i in 0..iterations {
-        match client_stream.write_data(&chunk) {
-            Ok(n) => {
-                sent_bytes += n as u64;
-            }
-            Err(e) => {
-                panic!("[bench] Write failed at iteration {}: {}", i, e);
-            }
-        }
-
-        // Progress update every 10%
-        if (i + 1) % (iterations / 10 + 1) == 0 {
-            let progress = (i + 1) as f64 / iterations as f64 * 100.0;
-            print!("\r[bench] Progress: {:.0}% ({}/{} MB)", progress, sent_bytes / 1024 / 1024, data_size_mb);
-            io::stdout().flush().unwrap();
-        }
+    // Wait for all threads
+    for h in handles {
+        let _ = h.join();
     }
-    println!();
-
-    // Wait for server to receive all data
-    let server_bytes = done_rx
-        .recv_timeout(Duration::from_secs(30))
-        .unwrap_or(0);
 
     let elapsed = start.elapsed();
 
     // Calculate throughput
-    let throughput_mbps = (server_bytes as f64) / elapsed.as_secs_f64() / 1024.0 / 1024.0;
+    let ctx = client_tx.load(Ordering::SeqCst);
+    let crx = client_rx.load(Ordering::SeqCst);
+    let stx = server_tx.load(Ordering::SeqCst);
+    let srx = server_rx.load(Ordering::SeqCst);
+    let total_transfer = ctx + crx + stx + srx;
+    let throughput_mbps = (total_transfer as f64) / elapsed.as_secs_f64() / 1024.0 / 1024.0;
 
-    println!("[bench] ========== KCP Results ==========");
-    println!("[bench] Sent:       {} bytes ({:.2} MB)", sent_bytes, sent_bytes as f64 / 1024.0 / 1024.0);
-    println!("[bench] Received:   {} bytes ({:.2} MB)", server_bytes, server_bytes as f64 / 1024.0 / 1024.0);
+    println!("[bench] ========== KCP Bidirectional Results ==========");
+    println!("[bench] Client TX:  {} bytes ({:.2} MB)", ctx, ctx as f64 / 1024.0 / 1024.0);
+    println!("[bench] Client RX:  {} bytes ({:.2} MB)", crx, crx as f64 / 1024.0 / 1024.0);
+    println!("[bench] Server TX:  {} bytes ({:.2} MB)", stx, stx as f64 / 1024.0 / 1024.0);
+    println!("[bench] Server RX:  {} bytes ({:.2} MB)", srx, srx as f64 / 1024.0 / 1024.0);
+    println!("[bench] Total:      {} bytes ({:.2} GB)", total_transfer, total_transfer as f64 / 1024.0 / 1024.0 / 1024.0);
     println!("[bench] Time:       {:?}", elapsed);
-    println!("[bench] Throughput: {:.2} MB/s", throughput_mbps);
-    println!("[bench] ==================================");
+    println!("[bench] Throughput: {:.2} MB/s (bidirectional)", throughput_mbps);
+    println!("[bench] ================================================");
 }
 
 /// Read from stream with polling since read_data() is non-blocking.

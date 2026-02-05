@@ -88,9 +88,10 @@ pub const Kcp = struct {
     }
 
     /// Apply default fast mode configuration.
+    /// Matches Go/Rust settings for optimal throughput.
     pub fn setDefaultConfig(self: *Kcp) void {
-        self.setNodelay(1, 10, 2, 1);
-        self.setWndSize(128, 128);
+        self.setNodelay(1, 1, 2, 1); // Fast mode with 1ms interval (same as Go/Rust)
+        self.setWndSize(4096, 4096); // Large window for high throughput (same as Go/Rust)
         self.setMtu(1400);
     }
 

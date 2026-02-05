@@ -51,10 +51,11 @@ jobs:
           echo "has_targets=$([[ -n "$TARGETS" ]] && echo true || echo false)" >> $GITHUB_OUTPUT
           
           # Detect language changes for native tests
+          # Include both main SDK dirs and examples
           changed=$(git diff --name-only "$BASE" HEAD)
-          echo "has_go=$(echo "$changed" | grep -q '^go/' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_rust=$(echo "$changed" | grep -q '^rust/' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_zig=$(echo "$changed" | grep -q '^zig/' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_go=$(echo "$changed" | grep -qE '^(go/|examples/.*/go/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|examples/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|examples/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build affected targets
   build:
@@ -113,6 +114,18 @@ jobs:
         with:
           go-version: '1.23'
           cache-dependency-path: go/go.sum
+
+      - name: Prepare KCP source
+        run: |
+          # Download KCP 1.7 and apply patches for native Go build
+          curl -sL https://github.com/skywind3000/kcp/archive/refs/tags/1.7.tar.gz | tar xz
+          cd kcp-1.7
+          # Convert CRLF to LF and apply patch
+          tr -d '\r' < ikcp.c > ikcp_unix.c && mv ikcp_unix.c ikcp.c
+          tr -d '\r' < ikcp.h > ikcp_unix.h && mv ikcp_unix.h ikcp.h
+          patch -p1 < ../third_party/kcp/ikcp.patch
+          # Copy to go/pkg/kcp for CGo
+          cp ikcp.c ikcp.h ../go/pkg/kcp/
 
       - name: Test
         working-directory: go

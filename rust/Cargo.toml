@@ -46,10 +46,8 @@ path = "examples/host_test.rs"
 name = "throughput_rust"
 path = "../examples/throughput/rust/main.rs"
 
-[[example]]
-name = "stream_test"
-path = "examples/stream_test.rs"
+[[bin]]
+name = "async_bench"
+path = "../zig/src/async/benchmark/rust/main.rs"
 
-[[example]]
-name = "kcp_interop"
-path = "examples/kcp_interop.rs"
+# Note: stream_test and kcp_interop moved to examples/stream_test/rust/ and examples/kcp_test/rust/

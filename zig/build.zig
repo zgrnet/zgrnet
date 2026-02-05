@@ -4,9 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // KCP dependency
-    const kcp_dep = b.dependency("kcp", .{});
-    const kcp_path = kcp_dep.path("");
+    // KCP dependency - support both Bazel (external path) and native zig build (build.zig.zon)
+    const kcp_path: std.Build.LazyPath = blk: {
+        if (b.option([]const u8, "kcp_path", "External KCP path (from Bazel)")) |external_path| {
+            // Bazel provides KCP via -Dkcp_path (absolute path)
+            break :blk .{ .cwd_relative = external_path };
+        } else {
+            // Native zig build uses build.zig.zon dependency
+            const kcp_dep = b.dependency("kcp", .{});
+            break :blk kcp_dep.path("");
+        }
+    };
 
     const target_arch = target.result.cpu.arch;
     const target_os = target.result.os.tag;
@@ -98,6 +106,22 @@ pub fn build(b: *std.Build) void {
         }
     }.add;
 
+    // Helper to add minicoro C files (optional, for coroutine support)
+    const addMinicoroFiles = struct {
+        fn add(compile: *std.Build.Step.Compile, builder: *std.Build) void {
+            compile.linkLibC();
+            compile.addCSourceFile(.{
+                .file = builder.path("src/async/minicoro/wrapper.c"),
+                .flags = &.{"-O3"},
+            });
+            compile.addIncludePath(builder.path("src/async/minicoro"));
+        }
+    }.add;
+
+    // Minicoro option (disabled by default)
+    const enable_minicoro = b.option(bool, "minicoro", "Enable minicoro coroutine support") orelse false;
+    options.addOption(bool, "enable_minicoro", enable_minicoro);
+
     // Library module
     const lib_module = b.createModule(.{
         .root_source_file = b.path("src/noise.zig"),
@@ -114,7 +138,17 @@ pub fn build(b: *std.Build) void {
     if (effective_backend == .arm64_asm) addArm64AsmFiles(lib, b);
     if (effective_backend == .x86_64_asm) addX86AsmFiles(lib, b);
     addKcpFiles(lib, kcp_path);
+    if (enable_minicoro) addMinicoroFiles(lib, b);
     b.installArtifact(lib);
+
+    // Export module for dependents (e.g., examples/kcp_test/zig)
+    // This allows other packages to do: dep.module("noise")
+    _ = b.addModule("noise", .{
+        .root_source_file = b.path("src/noise.zig"),
+        .imports = &.{
+            .{ .name = "build_options", .module = options.createModule() },
+        },
+    });
 
     // Test module
     const test_module = b.createModule(.{
@@ -131,6 +165,7 @@ pub fn build(b: *std.Build) void {
     if (effective_backend == .arm64_asm) addArm64AsmFiles(main_tests, b);
     if (effective_backend == .x86_64_asm) addX86AsmFiles(main_tests, b);
     addKcpFiles(main_tests, kcp_path);
+    if (enable_minicoro) addMinicoroFiles(main_tests, b);
 
     const run_main_tests = b.addRunArtifact(main_tests);
     const test_step = b.step("test", "Run library tests");
@@ -157,6 +192,34 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    // Async module for benchmarks
+    const async_module = b.createModule(.{
+        .root_source_file = b.path("src/async/mod.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    async_module.addOptions("build_options", options);
+
+    // Async runtime benchmarks
+    const async_bench_module = b.createModule(.{
+        .root_source_file = b.path("src/async/benchmark/zig/main.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    async_bench_module.addOptions("build_options", options);
+    async_bench_module.addImport("async", async_module);
+
+    const async_bench_exe = b.addExecutable(.{
+        .name = "async_bench",
+        .root_module = async_bench_module,
+    });
+    if (enable_minicoro) addMinicoroFiles(async_bench_exe, b);
+    b.installArtifact(async_bench_exe);
+
+    const run_async_bench = b.addRunArtifact(async_bench_exe);
+    const async_bench_step = b.step("async_bench", "Run async runtime benchmarks");
+    async_bench_step.dependOn(&run_async_bench.step);
 
     // Host test example (for cross-language testing)
     const host_test_module = b.createModule(.{
@@ -204,4 +267,50 @@ pub fn build(b: *std.Build) void {
     }
     const throughput_test_step = b.step("throughput", "Run throughput test");
     throughput_test_step.dependOn(&run_throughput_test.step);
+
+    // KCP Stream test (source in examples/stream_test/zig/)
+    const kcp_stream_test_module = b.createModule(.{
+        .root_source_file = b.path("../examples/stream_test/zig/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kcp_stream_test_module.addOptions("build_options", options);
+    kcp_stream_test_module.addImport("noise", lib_module);
+
+    const kcp_stream_test_exe = b.addExecutable(.{
+        .name = "stream_test",
+        .root_module = kcp_stream_test_module,
+    });
+    kcp_stream_test_exe.linkLibrary(lib);
+    b.installArtifact(kcp_stream_test_exe);
+
+    const run_kcp_stream_test = b.addRunArtifact(kcp_stream_test_exe);
+    if (b.args) |args| {
+        run_kcp_stream_test.addArgs(args);
+    }
+    const kcp_stream_test_step = b.step("stream_test", "Run KCP stream throughput test");
+    kcp_stream_test_step.dependOn(&run_kcp_stream_test.step);
+
+    // KCP Interop test (source in examples/kcp_test/zig/)
+    const kcp_interop_module = b.createModule(.{
+        .root_source_file = b.path("../examples/kcp_test/zig/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kcp_interop_module.addOptions("build_options", options);
+    kcp_interop_module.addImport("noise", lib_module);
+
+    const kcp_interop_exe = b.addExecutable(.{
+        .name = "kcp_test",
+        .root_module = kcp_interop_module,
+    });
+    kcp_interop_exe.linkLibrary(lib);
+    b.installArtifact(kcp_interop_exe);
+
+    const run_kcp_interop = b.addRunArtifact(kcp_interop_exe);
+    if (b.args) |args| {
+        run_kcp_interop.addArgs(args);
+    }
+    const kcp_interop_step = b.step("kcp_test", "Run KCP interop test");
+    kcp_interop_step.dependOn(&run_kcp_interop.step);
 }

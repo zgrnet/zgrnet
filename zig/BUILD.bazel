@@ -1,5 +1,5 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary")
-load("//bazel/zig:defs.bzl", "zig_run")
+load("//bazel/zig:defs.bzl", "zig_binary", "zig_run")
 
 # BoringSSL benchmark (C)
 cc_binary(
@@ -9,7 +9,7 @@ cc_binary(
     copts = ["-O3"],
 )
 
-# Zig source files (for examples to depend on)
+# Zig library source files (for examples to depend on)
 filegroup(
     name = "srcs",
     srcs = glob([
@@ -17,9 +17,13 @@ filegroup(
         "src/**/*.S",
         "src/**/*.c",
         "src/**/*.h",
+        "examples/**/*.zig",  # host_test.zig remains
     ]) + [
         "build.zig",
         "build.zig.zon",
+        "//examples/throughput/zig:main.zig",
+        "//examples/kcp_test/zig:srcs",
+        "//examples/stream_test/zig:srcs",
     ],
     visibility = ["//visibility:public"],
 )
@@ -31,4 +35,24 @@ zig_run(
     srcs = [":srcs"],
     build_args = ["test"],
     zig_root = "zig",
+)
+
+# KCP test binary (source in examples/kcp_test/zig/)
+# Usage: bazel build //zig:kcp_test
+zig_binary(
+    name = "kcp_test",
+    srcs = [":srcs"],
+    binary_name = "kcp_test",
+    zig_root = "zig",
+    visibility = ["//visibility:public"],
+)
+
+# Stream test binary (source in examples/stream_test/zig/)
+# Usage: bazel build //zig:stream_test
+zig_binary(
+    name = "stream_test",
+    srcs = [":srcs"],
+    binary_name = "stream_test",
+    zig_root = "zig",
+    visibility = ["//visibility:public"],
 )

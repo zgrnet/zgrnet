@@ -3,6 +3,8 @@
 
 load("//bazel/zig:defs.bzl", "zig_run")
 
+exports_files(["main.zig"])
+
 zig_run(
     name = "run",
     srcs = glob(["**/*"]) + ["//zig:srcs"],

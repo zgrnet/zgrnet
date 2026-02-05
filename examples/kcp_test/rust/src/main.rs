@@ -1,7 +1,7 @@
-//! KCP stream interoperability test between Rust and Go.
+//! KCP stream interoperability test between Rust, Go, and Zig.
 //!
 //! Usage:
-//!   cargo run --example kcp_interop -- --name rust --config ../examples/kcp_test/config.json
+//!   cargo run -- --name rust --config ../config.json
 
 use std::env;
 use std::fs;
@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use zgrnet::{Key, KeyPair, Stream};
 use zgrnet::{UDP, UdpOptions};
@@ -82,11 +83,11 @@ fn main() {
     let info = udp.host_info();
     println!("[{}] Listening on {}", name, info.addr);
 
-    // Find peer (skip zig for now)
+    // Find peer (first host that is not us)
     let peer_host = config
         .hosts
         .iter()
-        .find(|h| h.name != name && h.name != "zig")
+        .find(|h| h.name != name)
         .unwrap_or_else(|| panic!("No peer found in config"));
 
     let peer_priv_bytes = hex::decode(&peer_host.private_key).unwrap();
@@ -210,8 +211,6 @@ fn run_accepter_test(udp: &Arc<UDP>, peer_pk: &Key, peer_name: &str, test_cfg: &
     thread::sleep(Duration::from_secs(1));
     stream.shutdown();
 }
-
-use std::sync::atomic::{AtomicU64, Ordering};
 
 fn run_bidirectional_test(stream: &Arc<Stream>, role: &str, test_cfg: &TestConfig) {
     let total_bytes = (test_cfg.throughput_mb * 1024 * 1024) as u64;
