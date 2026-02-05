@@ -256,7 +256,7 @@ pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
     };
 
     // Set up sockaddr_in for address
-    var sin_addr: *posix.sockaddr.in = @ptrCast(&ifr_addr.ifr_ifru.ifru_addr);
+    var sin_addr: *posix.sockaddr.in = @ptrCast(@alignCast(&ifr_addr.ifr_ifru.ifru_addr));
     sin_addr.family = posix.AF.INET;
     sin_addr.port = 0;
     sin_addr.addr = @bitCast(addr);
@@ -267,7 +267,7 @@ pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
 
     // Set netmask
     var ifr_mask = ifr_addr;
-    var sin_mask: *posix.sockaddr.in = @ptrCast(&ifr_mask.ifr_ifru.ifru_addr);
+    var sin_mask: *posix.sockaddr.in = @ptrCast(@alignCast(&ifr_mask.ifr_ifru.ifru_addr));
     sin_mask.addr = @bitCast(netmask);
 
     if (posix.system.ioctl(sock, SIOCSIFNETMASK, @intFromPtr(&ifr_mask)) != 0) {

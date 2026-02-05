@@ -240,6 +240,8 @@ jobs:
       - name: Test Zig TUN
         shell: bash
         run: |
+          # Use MSYS_NO_PATHCONV to prevent path conversion on Windows
+          export MSYS_NO_PATHCONV=1
           if [ -n "${{ matrix.sudo }}" ]; then
             sudo env "PATH=$PATH" bazel run //zig:tun_test
           else
@@ -247,10 +249,16 @@ jobs:
           fi
 
       - name: Test Go TUN
-        run: ${{ matrix.sudo }} bazel test //go/pkg/tun:tun_test --test_output=errors
+        shell: bash
+        run: |
+          export MSYS_NO_PATHCONV=1
+          ${{ matrix.sudo }} bazel test //go/pkg/tun:tun_test --test_output=errors
 
       - name: Test Rust TUN
-        run: ${{ matrix.sudo }} bazel test //rust:tun_test --test_output=errors
+        shell: bash
+        run: |
+          export MSYS_NO_PATHCONV=1
+          ${{ matrix.sudo }} bazel test //rust:tun_test --test_output=errors
 
   # Format check
   format:
