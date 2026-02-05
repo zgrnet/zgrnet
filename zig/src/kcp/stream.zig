@@ -450,21 +450,22 @@ pub fn Mux(comptime TimerServiceT: type) type {
 
             const current: u32 = @intCast(@mod(std.time.milliTimestamp(), std.math.maxInt(u32)));
 
-            // Update all streams
+            // Collect all streams with dynamic array to avoid missing any
+            var stream_list: std.ArrayListUnmanaged(*Stream) = .{};
+            defer stream_list.deinit(self.allocator);
+
             self.mutex.lock();
             var iter = self.streams.valueIterator();
-            var stream_list: [64]*Stream = undefined;
-            var count: usize = 0;
             while (iter.next()) |stream_ptr| {
-                if (count < stream_list.len) {
-                    stream_list[count] = stream_ptr.*;
-                    count += 1;
-                }
+                stream_list.append(self.allocator, stream_ptr.*) catch {
+                    // On OOM, update what we have so far
+                    break;
+                };
             }
             self.mutex.unlock();
 
             // Update outside lock
-            for (stream_list[0..count]) |stream| {
+            for (stream_list.items) |stream| {
                 stream.kcpUpdate(current);
                 _ = stream.kcpRecv();
             }
