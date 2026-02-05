@@ -102,6 +102,18 @@ jobs:
           go-version: '1.23'
           cache-dependency-path: go/go.sum
 
+      - name: Prepare KCP source
+        run: |
+          # Download KCP 1.7 and apply patches for native Go build
+          curl -sL https://github.com/skywind3000/kcp/archive/refs/tags/1.7.tar.gz | tar xz
+          cd kcp-1.7
+          # Convert CRLF to LF and apply patch
+          tr -d '\r' < ikcp.c > ikcp_unix.c && mv ikcp_unix.c ikcp.c
+          tr -d '\r' < ikcp.h > ikcp_unix.h && mv ikcp_unix.h ikcp.h
+          patch -p1 < ../third_party/kcp/ikcp.patch
+          # Copy to go/pkg/kcp for CGo
+          cp ikcp.c ikcp.h ../go/pkg/kcp/
+
       - name: Test
         working-directory: go
         run: go test -v -race -coverprofile=coverage.out ./...
