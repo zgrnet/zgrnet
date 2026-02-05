@@ -158,17 +158,17 @@ def _zig_binary_impl(ctx):
     kcp_files = ctx.attr._kcp.files.to_list()
 
     # Generate copy commands for source files
-    # Note: shell.quote adds single quotes, which become literal inside double quotes
-    # So we use shell.quote only for the cp source (outside double quotes)
-    # For paths inside "$WORK/...", they're already protected by the double quotes
+    # Use shell.quote for all paths to prevent command injection
+    # shell.quote wraps values in single quotes, making them safe from shell expansion
     src_copy_commands = []
     for f in src_files:
-        rel_path = f.short_path
-        src_path = f.path
-        src_copy_commands.append('mkdir -p "$WORK/$(dirname "{}")" && cp {} "$WORK/{}"'.format(
-            rel_path,                    # inside double quotes for dirname
-            shell.quote(src_path),       # shell.quote for cp source (unquoted context)
-            rel_path,                    # inside $WORK double quotes
+        quoted_rel_path = shell.quote(f.short_path)
+        quoted_src_path = shell.quote(f.path)
+        # Command: mkdir -p "$WORK/"$(dirname 'rel_path') && cp 'src' "$WORK/"'rel_path'
+        src_copy_commands.append('mkdir -p "$WORK/"$(dirname {}) && cp {} "$WORK/"{}'.format(
+            quoted_rel_path,             # shell.quote prevents injection in dirname
+            quoted_src_path,             # shell.quote for cp source
+            quoted_rel_path,             # shell.quote for destination
         ))
 
     # Generate copy commands for KCP files
