@@ -151,17 +151,18 @@ def _zig_binary_impl(ctx):
     zig_bin = ctx.file._zig
     zig_files = ctx.attr._zig_toolchain.files.to_list()
 
-    # Generate copy commands for source files (with proper shell quoting)
+    # Generate copy commands for source files
+    # Note: shell.quote adds single quotes, which become literal inside double quotes
+    # So we use shell.quote only for the cp source (outside double quotes)
+    # For paths inside "$WORK/...", they're already protected by the double quotes
     src_copy_commands = []
     for f in src_files:
         rel_path = f.short_path
-        # Use shell.quote to prevent command injection from file paths
-        quoted_rel = shell.quote(rel_path)
-        quoted_src = shell.quote(f.path)
-        src_copy_commands.append('mkdir -p "$WORK/$(dirname {})" && cp {} "$WORK/{}"'.format(
-            quoted_rel,
-            quoted_src,
-            quoted_rel,
+        src_path = f.path
+        src_copy_commands.append('mkdir -p "$WORK/$(dirname "{}")" && cp {} "$WORK/{}"'.format(
+            rel_path,                    # inside double quotes for dirname
+            shell.quote(src_path),       # shell.quote for cp source (unquoted context)
+            rel_path,                    # inside $WORK double quotes
         ))
 
     # Determine zig_root and target (with shell quoting for safety)
@@ -221,8 +222,10 @@ cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
         command = command,
         mnemonic = "ZigBuild",
         progress_message = "Building Zig binary %s" % ctx.attr.binary_name,
-        execution_requirements = {"no-sandbox": "1"},  # Zig needs access to its lib directory
-        use_default_shell_env = True,  # Zig needs HOME for cache directory
+        # TODO: Make hermetic by fixing file path resolution in sandbox
+        # Currently, files from different packages have path issues in sandbox
+        execution_requirements = {"no-sandbox": "1"},
+        use_default_shell_env = True,
     )
 
     return [
