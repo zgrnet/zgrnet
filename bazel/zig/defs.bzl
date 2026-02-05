@@ -137,6 +137,9 @@ def _zig_binary_impl(ctx):
     
     This rule compiles a Zig project and produces an executable binary
     that can be used as a dependency in other Bazel rules (e.g., sh_test).
+    
+    External dependencies (KCP) are downloaded by Bazel and passed to zig build
+    via -Dkcp_path option, enabling fully hermetic builds.
     """
 
     # Declare the output binary
@@ -151,6 +154,9 @@ def _zig_binary_impl(ctx):
     zig_bin = ctx.file._zig
     zig_files = ctx.attr._zig_toolchain.files.to_list()
 
+    # Get KCP files
+    kcp_files = ctx.attr._kcp.files.to_list()
+
     # Generate copy commands for source files
     # Note: shell.quote adds single quotes, which become literal inside double quotes
     # So we use shell.quote only for the cp source (outside double quotes)
@@ -164,6 +170,12 @@ def _zig_binary_impl(ctx):
             shell.quote(src_path),       # shell.quote for cp source (unquoted context)
             rel_path,                    # inside $WORK double quotes
         ))
+
+    # Generate copy commands for KCP files
+    kcp_copy_commands = []
+    for f in kcp_files:
+        # KCP files go to $WORK/.deps/kcp/
+        kcp_copy_commands.append('cp {} "$WORK/.deps/kcp/"'.format(shell.quote(f.path)))
 
     # Determine zig_root and target (with shell quoting for safety)
     zig_root = ctx.attr.zig_root if ctx.attr.zig_root else "zig"
@@ -201,9 +213,13 @@ mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 # Copy source files (preserving directory structure)
 {src_copy_commands}
 
-# Build all artifacts (don't use step name which may run the binary)
+# Copy KCP dependency (downloaded by Bazel)
+mkdir -p "$WORK/.deps/kcp"
+{kcp_copy_commands}
+
+# Build all artifacts with KCP path from Bazel
 cd "$WORK"/{zig_root}
-"$ZIG" build -Doptimize={optimize}
+"$ZIG" build -Doptimize={optimize} -Dkcp_path="$WORK/.deps/kcp"
 
 # Copy output to Bazel's output directory
 cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
@@ -211,6 +227,7 @@ cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
         zig_path = zig_bin.path,
         zig_root = quoted_zig_root,
         src_copy_commands = "\n".join(src_copy_commands),
+        kcp_copy_commands = "\n".join(kcp_copy_commands),
         optimize = quoted_optimize,
         binary_name = quoted_binary_name,
         output = out.path,
@@ -218,14 +235,11 @@ cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
 
     ctx.actions.run_shell(
         outputs = [out],
-        inputs = src_files + zig_files + [zig_bin],
+        inputs = src_files + zig_files + kcp_files + [zig_bin],
         command = command,
         mnemonic = "ZigBuild",
         progress_message = "Building Zig binary %s" % ctx.attr.binary_name,
-        # TODO: Make hermetic by fixing file path resolution in sandbox
-        # Currently, files from different packages have path issues in sandbox
-        execution_requirements = {"no-sandbox": "1"},
-        use_default_shell_env = True,
+        # Hermetic build: all dependencies downloaded by Bazel
     )
 
     return [
@@ -267,6 +281,10 @@ zig_binary = rule(
         "_zig_toolchain": attr.label(
             default = "@zig_toolchain//:zig_files",
             doc = "Zig compiler toolchain (lib, etc.)",
+        ),
+        "_kcp": attr.label(
+            default = "//third_party/kcp:srcs",
+            doc = "KCP library source files (from //third_party/kcp)",
         ),
     },
     doc = "Build a Zig binary and output to Bazel's output directory",

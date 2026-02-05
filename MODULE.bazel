@@ -41,6 +41,10 @@ use_repo(
 zig_toolchain = use_extension("//:extensions.bzl", "zig_toolchain")
 use_repo(zig_toolchain, "zig_toolchain")
 
+# KCP library (skywind3000/kcp)
+kcp_lib = use_extension("//:extensions.bzl", "kcp_lib")
+use_repo(kcp_lib, "kcp")
+
 # C/C++ rules
 bazel_dep(name = "rules_cc", version = "0.1.1")
 

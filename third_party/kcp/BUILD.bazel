@@ -1,0 +1,103 @@
+load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Apply patches to KCP source
+genrule(
+    name = "kcp_patched",
+    srcs = [
+        "@kcp//:srcs",
+        "ikcp.patch",
+    ],
+    outs = [
+        "patched/ikcp.c",
+        "patched/ikcp.h",
+    ],
+    cmd = """
+        set -e
+        PATCHDIR=$$(dirname $(location patched/ikcp.c))
+        mkdir -p "$$PATCHDIR"
+
+        # Copy original files and convert CRLF to LF
+        for f in $(locations @kcp//:srcs); do
+            case "$$f" in
+                */ikcp.c) tr -d '\r' < "$$f" > "$$PATCHDIR/ikcp.c" ;;
+                */ikcp.h) tr -d '\r' < "$$f" > "$$PATCHDIR/ikcp.h" ;;
+            esac
+        done
+
+        # Apply patch (-p1 strips 'a/' and 'b/' prefixes)
+        patch -p1 -d "$$PATCHDIR" < $(location ikcp.patch)
+    """,
+)
+
+# Compile patched KCP using zig cc
+genrule(
+    name = "kcp_static",
+    srcs = [":kcp_patched"],
+    outs = ["libkcp.a"],
+    cmd = """
+        set -e
+        # Set up zig cache directories
+        export HOME=/tmp
+        export ZIG_LOCAL_CACHE_DIR=/tmp/zig-cache
+        export ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache
+        mkdir -p /tmp/zig-cache
+
+        OUTDIR=$$(mktemp -d)
+
+        # Find patched ikcp.c
+        for src in $(SRCS); do
+            case "$$src" in
+                */ikcp.c)
+                    zig cc -c "$$src" -o "$$OUTDIR/ikcp.o" \
+                        -O3 \
+                        -DNDEBUG \
+                        -fno-sanitize=undefined \
+                        -w
+                    ;;
+            esac
+        done
+
+        # Create static library
+        ar rcs $@ "$$OUTDIR/ikcp.o"
+        rm -rf "$$OUTDIR"
+    """,
+    tools = ["@zig_toolchain//:zig"],
+)
+
+# Export patched headers for C/C++ consumers
+genrule(
+    name = "kcp_headers",
+    srcs = [":kcp_patched"],
+    outs = ["ikcp.h"],
+    cmd = """
+        for f in $(SRCS); do
+            case "$$f" in
+                */ikcp.h)
+                    cp "$$f" $@
+                    ;;
+            esac
+        done
+    """,
+)
+
+cc_import(
+    name = "kcp_import",
+    static_library = ":kcp_static",
+    visibility = ["//visibility:private"],
+)
+
+# Main library target for cc_library consumers
+cc_library(
+    name = "kcp",
+    hdrs = [":kcp_headers"],
+    includes = ["."],
+    deps = [":kcp_import"],
+)
+
+# Export patched source files for languages that compile C themselves (Go CGo, Zig)
+filegroup(
+    name = "srcs",
+    srcs = [":kcp_patched"],
+)

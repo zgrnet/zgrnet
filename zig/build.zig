@@ -4,9 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // KCP dependency
-    const kcp_dep = b.dependency("kcp", .{});
-    const kcp_path = kcp_dep.path("");
+    // KCP dependency - support both Bazel (external path) and native zig build (build.zig.zon)
+    const kcp_path: std.Build.LazyPath = blk: {
+        if (b.option([]const u8, "kcp_path", "External KCP path (from Bazel)")) |external_path| {
+            // Bazel provides KCP via -Dkcp_path (absolute path)
+            break :blk .{ .cwd_relative = external_path };
+        } else {
+            // Native zig build uses build.zig.zon dependency
+            const kcp_dep = b.dependency("kcp", .{});
+            break :blk kcp_dep.path("");
+        }
+    };
 
     const target_arch = target.result.cpu.arch;
     const target_os = target.result.os.tag;
