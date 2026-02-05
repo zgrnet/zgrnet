@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     // - x86_64 Linux: AVX2/SSE4.1 ASM (~12 Gbps)
     // - Other: Pure Zig (~6 Gbps)
     const BackendEnum = enum { arm64_asm, x86_64_asm, simd, pure_zig };
-    
+
     const default_backend: BackendEnum = if (target_arch == .aarch64)
         .arm64_asm
     else if (target_arch == .x86_64 and target_os == .linux)
@@ -318,12 +318,28 @@ pub fn build(b: *std.Build) void {
     // TUN Module
     // ========================================================================
 
+    // Wintun DLL path option (for Windows builds)
+    // Usage: zig build -Dwintun_dll=path/to/wintun.dll
+    const wintun_dll_path = b.option([]const u8, "wintun_dll", "Path to wintun.dll for embedding (Windows only)");
+
+    // TUN build options
+    const tun_options = b.addOptions();
+    tun_options.addOption(bool, "has_wintun_dll", wintun_dll_path != null);
+
     // TUN library module (cross-platform TUN device abstraction)
     const tun_lib_module = b.createModule(.{
         .root_source_file = b.path("src/tun/cabi.zig"),
         .target = target,
         .optimize = optimize,
     });
+    tun_lib_module.addOptions("tun_build_options", tun_options);
+
+    // Embed wintun.dll if provided
+    if (wintun_dll_path) |dll_path| {
+        tun_lib_module.addAnonymousImport("wintun_dll", .{
+            .root_source_file = .{ .cwd_relative = dll_path },
+        });
+    }
 
     // TUN library (static library with C ABI)
     const tun_lib = b.addLibrary(.{
@@ -335,12 +351,23 @@ pub fn build(b: *std.Build) void {
     // Install C header
     b.installFile("include/tun.h", "include/tun.h");
 
+    // Copy wintun.dll to output directory if provided (for runtime loading)
+    if (wintun_dll_path) |dll_path| {
+        b.installFile(dll_path, "bin/wintun.dll");
+    }
+
     // TUN tests
     const tun_test_module = b.createModule(.{
         .root_source_file = b.path("src/tun/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
+    tun_test_module.addOptions("tun_build_options", tun_options);
+    if (wintun_dll_path) |dll_path| {
+        tun_test_module.addAnonymousImport("wintun_dll", .{
+            .root_source_file = .{ .cwd_relative = dll_path },
+        });
+    }
 
     const tun_tests = b.addTest(.{
         .root_module = tun_test_module,

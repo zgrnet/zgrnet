@@ -280,8 +280,10 @@ pub fn setIPv6(tun: *Tun, addr: [16]u8, prefix_len: u8) TunError!void {
     // Use ip command for IPv6 as ioctl is more complex
     const name = tun.name_buf[0..tun.name_len];
 
+    // Format IPv6 as standard notation: xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx/prefix
+    // Each group is a 16-bit value formatted as 4 hex digits
     var addr_str_buf: [64]u8 = undefined;
-    const addr_str = std.fmt.bufPrint(&addr_str_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}/{d}", .{
+    const addr_str = std.fmt.bufPrint(&addr_str_buf, "{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}/{d}", .{
         @as(u16, addr[0]) << 8 | addr[1],
         @as(u16, addr[2]) << 8 | addr[3],
         @as(u16, addr[4]) << 8 | addr[5],

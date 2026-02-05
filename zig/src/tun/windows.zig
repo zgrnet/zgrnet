@@ -1,7 +1,10 @@
 //! Windows TUN implementation using Wintun driver.
 //!
 //! Wintun is a high-performance user-space TUN driver for Windows.
-//! This implementation embeds wintun.dll and loads it at runtime.
+//! This implementation can embed wintun.dll and load it at runtime.
+//!
+//! To embed the DLL, compile with:
+//!   zig build -Dwintun_dll=path/to/wintun.dll
 //!
 //! See: https://www.wintun.net/
 
@@ -18,15 +21,14 @@ const HMODULE = windows.HMODULE;
 const GUID = windows.GUID;
 const LPCWSTR = windows.LPCWSTR;
 
-// Wintun DLL embedding
-// For production builds, the DLL should be embedded via build system.
-// For development, we try to load from system path.
-//
-// To embed the DLL, compile with:
-//   zig build -Dwintun_dll_path=/path/to/wintun.dll
-//
-// The embedded data is set via build.zig options or Bazel.
-const wintun_dll_data: ?[]const u8 = null; // Set by build system if embedding
+// Build options for Wintun DLL embedding
+const tun_build_options = @import("tun_build_options");
+
+// Wintun DLL data - embedded at compile time if -Dwintun_dll is provided
+const wintun_dll_data: ?[]const u8 = if (tun_build_options.has_wintun_dll)
+    @embedFile("wintun_dll")
+else
+    null;
 
 // Wintun types
 const WINTUN_ADAPTER_HANDLE = *opaque {};
@@ -44,9 +46,11 @@ const WintunAllocateSendPacketFn = *const fn (WINTUN_SESSION_HANDLE, DWORD) call
 const WintunSendPacketFn = *const fn (WINTUN_SESSION_HANDLE, [*]const u8) callconv(.C) void;
 const WintunGetAdapterLUIDFn = *const fn (WINTUN_ADAPTER_HANDLE, *u64) callconv(.C) void;
 
-// Global state for Wintun
+// Global state for Wintun - protected by mutex for thread safety
+var global_mutex: std.Thread.Mutex = .{};
 var wintun_module: ?HMODULE = null;
 var wintun_dll_path: ?[]u8 = null;
+var init_done: bool = false;
 
 var WintunCreateAdapter: ?WintunCreateAdapterFn = null;
 var WintunCloseAdapter: ?WintunCloseAdapterFn = null;
@@ -70,7 +74,7 @@ const WinTunState = struct {
 };
 
 var tun_states: std.AutoHashMap(usize, *WinTunState) = undefined;
-var states_initialized = false;
+var states_initialized: bool = false;
 
 fn initStates() void {
     if (!states_initialized) {
@@ -80,32 +84,44 @@ fn initStates() void {
 }
 
 /// Initialize Wintun (extract and load DLL)
+/// Thread-safe - can be called from multiple threads.
 pub fn init() TunError!void {
-    if (wintun_module != null) return; // Already initialized
+    global_mutex.lock();
+    defer global_mutex.unlock();
+
+    if (init_done) return; // Already initialized
 
     initStates();
 
     // Check if embedded DLL is available
     const dll_data = wintun_dll_data orelse {
-        // Try to load from system path
+        // Try to load from current directory first, then system path
         wintun_module = windows.kernel32.LoadLibraryA("wintun.dll");
         if (wintun_module == null) {
             return TunError.WintunNotFound;
         }
         loadFunctions() catch return TunError.WintunInitFailed;
+        init_done = true;
         return;
     };
 
-    // Extract DLL to temp directory
-    const temp_dir = std.fs.path.join(std.heap.page_allocator, &.{
-        std.process.getenv("TEMP") orelse "C:\\Windows\\Temp",
+    // Get the executable's directory for secure DLL extraction
+    var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
+        return TunError.WintunInitFailed;
+    };
+    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+
+    // Extract DLL to executable's directory (more secure than TEMP)
+    const dll_path = std.fs.path.join(std.heap.page_allocator, &.{
+        exe_dir,
         "wintun.dll",
     }) catch return TunError.WintunInitFailed;
 
-    wintun_dll_path = temp_dir;
+    wintun_dll_path = dll_path;
 
-    // Write DLL to temp file
-    const file = std.fs.createFileAbsolute(temp_dir, .{}) catch {
+    // Write DLL to file
+    const file = std.fs.createFileAbsolute(dll_path, .{}) catch {
         return TunError.WintunInitFailed;
     };
     defer file.close();
@@ -114,14 +130,14 @@ pub fn init() TunError!void {
         return TunError.WintunInitFailed;
     };
 
-    // Load the DLL
-    const path_w = std.unicode.utf8ToUtf16LeStringLiteral(temp_dir);
-    wintun_module = windows.kernel32.LoadLibraryW(path_w.ptr);
+    // Load the DLL from the extracted path
+    wintun_module = windows.kernel32.LoadLibraryA(dll_path.ptr);
     if (wintun_module == null) {
         return TunError.WintunNotFound;
     }
 
     loadFunctions() catch return TunError.WintunInitFailed;
+    init_done = true;
 }
 
 fn loadFunctions() !void {
@@ -150,13 +166,17 @@ fn loadFunctions() !void {
 }
 
 /// Cleanup Wintun
+/// Thread-safe - should be called once when the application exits.
 pub fn deinit() void {
+    global_mutex.lock();
+    defer global_mutex.unlock();
+
     if (wintun_module) |module| {
         _ = windows.kernel32.FreeLibrary(module);
         wintun_module = null;
     }
 
-    // Delete temp DLL file
+    // Delete extracted DLL file
     if (wintun_dll_path) |path| {
         std.fs.deleteFileAbsolute(path) catch {};
         std.heap.page_allocator.free(path);
@@ -189,21 +209,21 @@ pub fn create(name: ?[]const u8) TunError!Tun {
     var guid: GUID = undefined;
     std.crypto.random.bytes(std.mem.asBytes(&guid));
 
-    // Convert name to wide string
+    // Convert name to wide string - buffer must be in function scope to avoid dangling pointer
     var name_buf: [16]u8 = undefined;
     var name_len: u8 = 0;
+    var wide_buf: [16]u16 = undefined; // Keep in function scope for lifetime
 
     const adapter_name: LPCWSTR = if (name) |n| blk: {
         @memcpy(name_buf[0..@min(n.len, 15)], n[0..@min(n.len, 15)]);
         name_len = @intCast(@min(n.len, 15));
         name_buf[name_len] = 0;
-        // Convert to wide string (simplified - ASCII only)
-        var wide: [16]u16 = undefined;
+        // Convert to wide string (ASCII only - for full Unicode use std.unicode)
         for (n[0..@min(n.len, 15)], 0..) |c, i| {
-            wide[i] = c;
+            wide_buf[i] = c;
         }
-        wide[@min(n.len, 15)] = 0;
-        break :blk @ptrCast(&wide);
+        wide_buf[@min(n.len, 15)] = 0;
+        break :blk @ptrCast(&wide_buf);
     } else blk: {
         const default_name = "ZigNet";
         @memcpy(name_buf[0..default_name.len], default_name);

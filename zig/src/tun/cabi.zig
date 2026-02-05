@@ -285,11 +285,15 @@ fn parseIPv6(addr_str: []const u8) ?[16]u8 {
     // Expand :: if present
     if (double_colon_idx) |dci| {
         const zeros = 8 - group_idx;
-        var j: usize = 7;
-        while (j >= dci + zeros) : (j -= 1) {
+        // Shift groups after :: to the right to make room for zeros
+        // Iterate in reverse to avoid overwriting values we need
+        const shift_start = dci + zeros;
+        var j: usize = 8;
+        while (j > shift_start) {
+            j -= 1;
             groups[j] = groups[j - zeros];
-            if (j == 0) break;
         }
+        // Fill the gap with zeros
         for (dci..dci + zeros) |k| {
             groups[k] = 0;
         }

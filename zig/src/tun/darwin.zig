@@ -78,10 +78,10 @@ const In6IfaliasReq = extern struct {
 
 // IPv6 address lifetime (time_t is i64 on arm64 macOS)
 const In6AddrLifetime = extern struct {
-    ia6t_expire: i64,    // time_t - valid lifetime expiration
+    ia6t_expire: i64, // time_t - valid lifetime expiration
     ia6t_preferred: i64, // time_t - preferred lifetime expiration
-    ia6t_vltime: u32,    // valid lifetime
-    ia6t_pltime: u32,    // prefix lifetime
+    ia6t_vltime: u32, // valid lifetime
+    ia6t_pltime: u32, // prefix lifetime
 };
 
 /// Create a new utun device
@@ -182,31 +182,38 @@ pub fn create(name: ?[]const u8) TunError!Tun {
     };
 }
 
+/// Maximum MTU for TUN devices (standard Ethernet jumbo frame)
+const MAX_MTU = 9000;
+
 /// Read a packet from the TUN device
 ///
 /// On macOS, the first 4 bytes are the address family (AF_INET or AF_INET6).
 /// We strip this header and return only the IP packet.
 pub fn read(tun: *Tun, buf: []u8) TunError!usize {
     // Need extra 4 bytes for address family header
-    var read_buf: [4 + 65535]u8 = undefined;
-    const max_read = @min(buf.len + 4, read_buf.len);
+    // Use stack buffer sized to user buffer + 4, capped at MAX_MTU + 4
+    // This avoids the 64KB stack allocation that could cause overflow
+    const header_size = 4;
+    const read_size = @min(buf.len + header_size, MAX_MTU + header_size);
+    var read_buf: [MAX_MTU + header_size]u8 = undefined;
 
-    const n = posix.read(tun.handle, read_buf[0..max_read]) catch |err| {
+    const n = posix.read(tun.handle, read_buf[0..read_size]) catch |err| {
         return switch (err) {
             error.WouldBlock => TunError.WouldBlock,
             else => TunError.IoError,
         };
     };
 
-    if (n <= 4) {
+    if (n <= header_size) {
         return TunError.IoError;
     }
 
     // Skip the 4-byte address family header
-    const payload_len = n - 4;
-    @memcpy(buf[0..payload_len], read_buf[4..n]);
+    const payload_len = n - header_size;
+    const copy_len = @min(payload_len, buf.len);
+    @memcpy(buf[0..copy_len], read_buf[header_size..][0..copy_len]);
 
-    return payload_len;
+    return copy_len;
 }
 
 /// Write a packet to the TUN device
@@ -218,8 +225,10 @@ pub fn write(tun: *Tun, data: []const u8) TunError!usize {
     }
 
     // Prepend address family header
-    var write_buf: [4 + 65535]u8 = undefined;
-    const total_len = data.len + 4;
+    // Use stack buffer capped at MAX_MTU + 4 to avoid stack overflow
+    const header_size = 4;
+    var write_buf: [MAX_MTU + header_size]u8 = undefined;
+    const total_len = data.len + header_size;
 
     if (total_len > write_buf.len) {
         return TunError.InvalidArgument;
@@ -238,7 +247,7 @@ pub fn write(tun: *Tun, data: []const u8) TunError!usize {
     write_buf[1] = 0;
     write_buf[2] = @truncate(af >> 8);
     write_buf[3] = @truncate(af);
-    @memcpy(write_buf[4..total_len], data);
+    @memcpy(write_buf[header_size..total_len], data);
 
     const written = posix.write(tun.handle, write_buf[0..total_len]) catch |err| {
         return switch (err) {
@@ -247,11 +256,11 @@ pub fn write(tun: *Tun, data: []const u8) TunError!usize {
         };
     };
 
-    if (written <= 4) {
+    if (written <= header_size) {
         return TunError.IoError;
     }
 
-    return written - 4;
+    return written - header_size;
 }
 
 /// Close the TUN device

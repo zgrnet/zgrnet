@@ -31,7 +31,7 @@ mod ffi;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Once;
+use std::sync::{Mutex, OnceLock};
 
 pub use ffi::RawHandle;
 
@@ -127,8 +127,8 @@ fn code_to_error(code: i32) -> Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-static INIT: Once = Once::new();
-static mut INIT_RESULT: i32 = 0;
+/// Thread-safe storage for initialization result.
+static INIT_RESULT: OnceLock<i32> = OnceLock::new();
 
 /// Initialize the TUN subsystem.
 ///
@@ -137,13 +137,8 @@ static mut INIT_RESULT: i32 = 0;
 ///
 /// This function is safe to call multiple times; initialization happens once.
 pub fn init() -> Result<()> {
-    INIT.call_once(|| {
-        unsafe {
-            INIT_RESULT = ffi::tun_init();
-        }
-    });
+    let result = *INIT_RESULT.get_or_init(|| unsafe { ffi::tun_init() });
 
-    let result = unsafe { INIT_RESULT };
     if result == ffi::TUN_OK {
         Ok(())
     } else {
@@ -161,14 +156,18 @@ pub fn deinit() {
 }
 
 /// A TUN device.
+///
+/// This struct is thread-safe and can be shared between threads using `Arc<Device>`.
+/// Internal synchronization is handled by a Mutex.
 pub struct Device {
-    handle: *mut ffi::TunHandle,
+    handle: Mutex<*mut ffi::TunHandle>,
     name: String,
 }
 
-// SAFETY: The underlying TUN handle is thread-safe for basic operations.
-// However, concurrent read/write operations may produce undefined behavior.
+// SAFETY: The handle is protected by a Mutex, ensuring thread-safe access.
+// The underlying FFI handle points to memory managed by the Zig library.
 unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
 
 impl Device {
     /// Create a new TUN device.
@@ -196,7 +195,7 @@ impl Device {
         };
 
         Ok(Device {
-            handle,
+            handle: Mutex::new(handle),
             name: dev_name,
         })
     }
@@ -208,12 +207,14 @@ impl Device {
 
     /// Get the underlying file descriptor (Unix) or HANDLE (Windows).
     pub fn raw_handle(&self) -> RawHandle {
-        unsafe { ffi::tun_get_handle(self.handle) }
+        let handle = self.handle.lock().unwrap();
+        unsafe { ffi::tun_get_handle(*handle) }
     }
 
     /// Get the MTU (Maximum Transmission Unit).
     pub fn mtu(&self) -> Result<i32> {
-        let mtu = unsafe { ffi::tun_get_mtu(self.handle) };
+        let handle = self.handle.lock().unwrap();
+        let mtu = unsafe { ffi::tun_get_mtu(*handle) };
         if mtu < 0 {
             Err(code_to_error(mtu))
         } else {
@@ -224,8 +225,9 @@ impl Device {
     /// Set the MTU (Maximum Transmission Unit).
     ///
     /// Requires root/admin privileges.
-    pub fn set_mtu(&mut self, mtu: i32) -> Result<()> {
-        let rc = unsafe { ffi::tun_set_mtu(self.handle, mtu) };
+    pub fn set_mtu(&self, mtu: i32) -> Result<()> {
+        let handle = self.handle.lock().unwrap();
+        let rc = unsafe { ffi::tun_set_mtu(*handle, mtu) };
         if rc == ffi::TUN_OK {
             Ok(())
         } else {
@@ -236,9 +238,10 @@ impl Device {
     /// Set non-blocking mode.
     ///
     /// In non-blocking mode, read returns `Error::WouldBlock` if no data is available.
-    pub fn set_nonblocking(&mut self, enabled: bool) -> Result<()> {
+    pub fn set_nonblocking(&self, enabled: bool) -> Result<()> {
+        let handle = self.handle.lock().unwrap();
         let flag = if enabled { 1 } else { 0 };
-        let rc = unsafe { ffi::tun_set_nonblocking(self.handle, flag) };
+        let rc = unsafe { ffi::tun_set_nonblocking(*handle, flag) };
         if rc == ffi::TUN_OK {
             Ok(())
         } else {
@@ -249,8 +252,9 @@ impl Device {
     /// Bring the interface up.
     ///
     /// Requires root/admin privileges.
-    pub fn up(&mut self) -> Result<()> {
-        let rc = unsafe { ffi::tun_set_up(self.handle) };
+    pub fn up(&self) -> Result<()> {
+        let handle = self.handle.lock().unwrap();
+        let rc = unsafe { ffi::tun_set_up(*handle) };
         if rc == ffi::TUN_OK {
             Ok(())
         } else {
@@ -261,8 +265,9 @@ impl Device {
     /// Bring the interface down.
     ///
     /// Requires root/admin privileges.
-    pub fn down(&mut self) -> Result<()> {
-        let rc = unsafe { ffi::tun_set_down(self.handle) };
+    pub fn down(&self) -> Result<()> {
+        let handle = self.handle.lock().unwrap();
+        let rc = unsafe { ffi::tun_set_down(*handle) };
         if rc == ffi::TUN_OK {
             Ok(())
         } else {
@@ -273,11 +278,12 @@ impl Device {
     /// Set IPv4 address and netmask.
     ///
     /// Requires root/admin privileges.
-    pub fn set_ipv4(&mut self, addr: Ipv4Addr, netmask: Ipv4Addr) -> Result<()> {
+    pub fn set_ipv4(&self, addr: Ipv4Addr, netmask: Ipv4Addr) -> Result<()> {
+        let handle = self.handle.lock().unwrap();
         let addr_str = CString::new(addr.to_string()).map_err(|_| Error::InvalidArgument)?;
         let mask_str = CString::new(netmask.to_string()).map_err(|_| Error::InvalidArgument)?;
 
-        let rc = unsafe { ffi::tun_set_ipv4(self.handle, addr_str.as_ptr(), mask_str.as_ptr()) };
+        let rc = unsafe { ffi::tun_set_ipv4(*handle, addr_str.as_ptr(), mask_str.as_ptr()) };
         if rc == ffi::TUN_OK {
             Ok(())
         } else {
@@ -288,14 +294,15 @@ impl Device {
     /// Set IPv6 address with prefix length.
     ///
     /// Requires root/admin privileges.
-    pub fn set_ipv6(&mut self, addr: Ipv6Addr, prefix_len: i32) -> Result<()> {
+    pub fn set_ipv6(&self, addr: Ipv6Addr, prefix_len: i32) -> Result<()> {
         if prefix_len < 0 || prefix_len > 128 {
             return Err(Error::InvalidArgument);
         }
 
+        let handle = self.handle.lock().unwrap();
         let addr_str = CString::new(addr.to_string()).map_err(|_| Error::InvalidArgument)?;
 
-        let rc = unsafe { ffi::tun_set_ipv6(self.handle, addr_str.as_ptr(), prefix_len) };
+        let rc = unsafe { ffi::tun_set_ipv6(*handle, addr_str.as_ptr(), prefix_len) };
         if rc == ffi::TUN_OK {
             Ok(())
         } else {
@@ -306,12 +313,13 @@ impl Device {
     /// Read a packet from the TUN device.
     ///
     /// Returns the number of bytes read.
-    pub fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
+    pub fn read_packet(&self, buf: &mut [u8]) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
 
-        let n = unsafe { ffi::tun_read(self.handle, buf.as_mut_ptr() as *mut _, buf.len()) };
+        let handle = self.handle.lock().unwrap();
+        let n = unsafe { ffi::tun_read(*handle, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n < 0 {
             Err(code_to_error(n as i32))
         } else {
@@ -322,12 +330,13 @@ impl Device {
     /// Write a packet to the TUN device.
     ///
     /// Returns the number of bytes written.
-    pub fn write_packet(&mut self, buf: &[u8]) -> Result<usize> {
+    pub fn write_packet(&self, buf: &[u8]) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
 
-        let n = unsafe { ffi::tun_write(self.handle, buf.as_ptr() as *const _, buf.len()) };
+        let handle = self.handle.lock().unwrap();
+        let n = unsafe { ffi::tun_write(*handle, buf.as_ptr() as *const _, buf.len()) };
         if n < 0 {
             Err(code_to_error(n as i32))
         } else {
@@ -338,11 +347,12 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
+        let mut handle = self.handle.lock().unwrap();
+        if !handle.is_null() {
             unsafe {
-                ffi::tun_close(self.handle);
+                ffi::tun_close(*handle);
             }
-            self.handle = std::ptr::null_mut();
+            *handle = std::ptr::null_mut();
         }
     }
 }
@@ -367,11 +377,12 @@ impl Write for Device {
 mod tests {
     use super::*;
 
-    fn needs_root() -> bool {
+    /// Returns true if the current process is NOT running with root/admin privileges.
+    /// Used to skip tests that require elevated permissions.
+    fn is_unprivileged() -> bool {
         #[cfg(unix)]
         {
-            // Check if running as root using nix::unistd::getuid or raw syscall
-            // Use std::process::Command as a portable alternative
+            // Check if running as root using id -u command
             std::process::Command::new("id")
                 .arg("-u")
                 .output()
@@ -392,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_create_close() {
-        if needs_root() {
+        if is_unprivileged() {
             eprintln!("Skipping test: requires root privileges");
             return;
         }
@@ -404,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_mtu() {
-        if needs_root() {
+        if is_unprivileged() {
             eprintln!("Skipping test: requires root privileges");
             return;
         }
@@ -417,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_set_ipv4() {
-        if needs_root() {
+        if is_unprivileged() {
             eprintln!("Skipping test: requires root privileges");
             return;
         }
@@ -434,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_nonblocking() {
-        if needs_root() {
+        if is_unprivileged() {
             eprintln!("Skipping test: requires root privileges");
             return;
         }
@@ -446,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_up_down() {
-        if needs_root() {
+        if is_unprivileged() {
             eprintln!("Skipping test: requires root privileges");
             return;
         }
@@ -463,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_read_write_two_devices() {
-        if needs_root() {
+        if is_unprivileged() {
             eprintln!("Skipping test: requires root privileges");
             return;
         }
@@ -520,10 +531,9 @@ mod tests {
         packet[12..16].copy_from_slice(&src.octets());
         packet[16..20].copy_from_slice(&dst.octets());
 
-        // IP checksum
+        // IP checksum - use to_be_bytes for idiomatic byte conversion
         let ip_checksum = calculate_checksum(&packet[..20]);
-        packet[10] = (ip_checksum >> 8) as u8;
-        packet[11] = ip_checksum as u8;
+        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
 
         // ICMP header
         packet[20] = 8;  // Type: Echo request
@@ -533,10 +543,9 @@ mod tests {
         packet[26] = 0;  // Sequence high
         packet[27] = 1;  // Sequence low
 
-        // ICMP checksum
+        // ICMP checksum - use to_be_bytes for idiomatic byte conversion
         let icmp_checksum = calculate_checksum(&packet[20..]);
-        packet[22] = (icmp_checksum >> 8) as u8;
-        packet[23] = icmp_checksum as u8;
+        packet[22..24].copy_from_slice(&icmp_checksum.to_be_bytes());
 
         packet
     }

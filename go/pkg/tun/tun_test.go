@@ -295,8 +295,8 @@ func calculateChecksum(data []byte) uint16 {
 	return ^uint16(sum)
 }
 
-func TestInvalidArgs(t *testing.T) {
-	// Test nil mask
+func TestCodeToErrorMapping(t *testing.T) {
+	// Test that error codes map to correct Go errors
 	err := codeToError(-8)
 	if err != ErrInvalidArgument {
 		t.Errorf("expected ErrInvalidArgument, got %v", err)
