@@ -640,22 +640,28 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Update peer state (session must be set before initMux)
+	// Create mux resources before acquiring the lock
+	muxRes := u.createMux(peer)
+
+	// Update peer state and mux in the same lock
+	// This ensures mux is ready when packets start routing to this peer
 	peer.mu.Lock()
 	peer.endpoint = from
 	peer.session = session
+	peer.mux = muxRes.mux
+	peer.acceptChan = muxRes.acceptChan
+	peer.inboundChan = muxRes.inboundChan
 	peer.state = PeerStateEstablished
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
 
-	// Initialize mux BEFORE registering in byIndex
-	// This ensures mux is ready when packets start routing to this peer
-	u.initMux(peer)
-
-	// Now register in index map (makes peer visible for packet routing)
+	// Register in index map
 	u.mu.Lock()
 	u.byIndex[localIdx] = peer
 	u.mu.Unlock()
+
+	// Start the mux update loop
+	u.startMuxUpdateLoop(muxRes.mux)
 }
 
 // handleHandshakeResp processes an incoming handshake response.
@@ -722,23 +728,29 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Update peer state (session must be set before initMux)
+	// Create mux resources before acquiring the lock
 	peer := pending.peer
+	muxRes := u.createMux(peer)
+
+	// Update peer state and mux in the same lock
+	// This ensures mux is ready when packets start routing to this peer
 	peer.mu.Lock()
 	peer.endpoint = from // Roaming: update endpoint
 	peer.session = session
+	peer.mux = muxRes.mux
+	peer.acceptChan = muxRes.acceptChan
+	peer.inboundChan = muxRes.inboundChan
 	peer.state = PeerStateEstablished
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
 
-	// Initialize mux BEFORE registering in byIndex
-	// This ensures mux is ready when packets start routing to this peer
-	u.initMux(peer)
-
-	// Now register in index map (makes peer visible for packet routing)
+	// Register in index map
 	u.mu.Lock()
 	u.byIndex[pending.localIdx] = peer
 	u.mu.Unlock()
+
+	// Start the mux update loop
+	u.startMuxUpdateLoop(muxRes.mux)
 
 	// Signal completion
 	if pending.done != nil {
