@@ -401,38 +401,52 @@ test "tun read write" {
         return err;
     };
 
-    if (ready > 0 and (fds[0].revents & std.posix.POLL.IN) != 0) {
-        // Data available, read it
-        var read_buf: [1500]u8 = undefined;
-        const n = tun.read(&read_buf) catch |err| {
-            std.debug.print("read() failed: {}\n", .{err});
-            return err;
-        };
+    // Read packets until we find the IPv4 UDP packet we sent
+    // (Skip any IPv6 packets like router solicitations)
+    var attempts: usize = 0;
+    const max_attempts = 10;
 
-        std.debug.print("Read {d} bytes from TUN\n", .{n});
+    while (attempts < max_attempts) : (attempts += 1) {
+        if (ready > 0 and (fds[0].revents & std.posix.POLL.IN) != 0) {
+            // Data available, read it
+            var read_buf: [1500]u8 = undefined;
+            const n = tun.read(&read_buf) catch |err| {
+                std.debug.print("read() failed: {}\n", .{err});
+                return err;
+            };
 
-        // Verify it's a valid IP packet
-        try std.testing.expect(n >= 20); // At least IP header
+            std.debug.print("Read {d} bytes from TUN\n", .{n});
 
-        // Check IP version
-        const version = read_buf[0] >> 4;
-        try std.testing.expectEqual(@as(u8, 4), version);
+            // Verify it's a valid IP packet
+            try std.testing.expect(n >= 20); // At least IP header
 
-        // Verify destination IP is 10.0.0.2
-        const dst_ip = getDstIp(read_buf[0..n]) orelse unreachable;
-        try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 2 }, &dst_ip);
+            // Check IP version
+            const version = read_buf[0] >> 4;
+            if (version != 4) {
+                std.debug.print("Skipping non-IPv4 packet (version {d})\n", .{version});
+                continue;
+            }
 
-        // Check protocol is UDP (17)
-        try std.testing.expectEqual(@as(u8, 17), read_buf[9]);
+            // Verify destination IP is 10.0.0.2
+            const dst_ip = getDstIp(read_buf[0..n]) orelse unreachable;
+            try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 2 }, &dst_ip);
 
-        std.debug.print("Verified: UDP packet to {d}.{d}.{d}.{d}\n", .{
-            dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
-        });
-    } else {
-        // No packet within timeout - this is a test failure
-        std.debug.print("ERROR: No packet received within 100ms\n", .{});
-        return error.TestUnexpectedResult;
+            // Check protocol is UDP (17)
+            try std.testing.expectEqual(@as(u8, 17), read_buf[9]);
+
+            std.debug.print("Verified: UDP packet to {d}.{d}.{d}.{d}\n", .{
+                dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
+            });
+            return; // Success!
+        } else {
+            // No packet within timeout - this is a test failure
+            std.debug.print("ERROR: No packet received within 100ms\n", .{});
+            return error.TestUnexpectedResult;
+        }
     }
+
+    std.debug.print("ERROR: No IPv4 packet found after {d} attempts\n", .{max_attempts});
+    return error.TestUnexpectedResult;
 }
 
 test "tun handle" {
