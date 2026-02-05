@@ -275,10 +275,11 @@ jobs:
           export MSYS_NO_PATHCONV=1
           # Build first (as user), then run with sudo
           bazel build //go/pkg/tun:tun_test
+          BAZEL_BIN=$(bazel info bazel-bin)
           if [ -n "${{ matrix.sudo }}" ]; then
-            sudo $(bazel info bazel-bin)/go/pkg/tun/tun_test_/tun_test
+            sudo "$BAZEL_BIN/go/pkg/tun/tun_test_/tun_test"
           else
-            $(bazel info bazel-bin)/go/pkg/tun/tun_test_/tun_test
+            "$BAZEL_BIN/go/pkg/tun/tun_test_/tun_test"
           fi
 
       - name: Test Rust TUN
@@ -287,10 +288,11 @@ jobs:
           export MSYS_NO_PATHCONV=1
           # Build first (as user), then run with sudo
           bazel build //rust:tun_test
+          BAZEL_BIN=$(bazel info bazel-bin)
           if [ -n "${{ matrix.sudo }}" ]; then
-            sudo $(bazel info bazel-bin)/rust/tun_test
+            sudo "$BAZEL_BIN/rust/tun_test"
           else
-            $(bazel info bazel-bin)/rust/tun_test
+            "$BAZEL_BIN/rust/tun_test"
           fi
 
   # Skip job when no targets affected
