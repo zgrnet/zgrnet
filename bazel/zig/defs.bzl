@@ -262,9 +262,6 @@ zig_binary = rule(
             mandatory = True,
             doc = "Name of the output binary (must match zig-out/bin/<name>)",
         ),
-        "target": attr.string(
-            doc = "Zig build target name (defaults to binary_name)",
-        ),
         "optimize": attr.string(
             default = "ReleaseFast",
             doc = "Optimization level: Debug, ReleaseSafe, ReleaseFast, ReleaseSmall",
