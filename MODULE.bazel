@@ -54,9 +54,9 @@ bazel_dep(name = "boringssl", version = "0.20250212.0")
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 http_archive(
     name = "minicoro",
-    urls = ["https://github.com/edubart/minicoro/archive/refs/heads/main.tar.gz"],
-    strip_prefix = "minicoro-main",
-    integrity = "sha256-VC+XUbdzpL0FzEZu8PGxXAuc0jIv+RRQrBckiQe8G1k=",
+    urls = ["https://github.com/edubart/minicoro/archive/02dad0f8b7cbb12fe6e216ae7a76db15ca55cd7b.tar.gz"],
+    strip_prefix = "minicoro-02dad0f8b7cbb12fe6e216ae7a76db15ca55cd7b",
+    integrity = "sha256-fDYa+zYvaflWrAkLJZcZa3O6OCDg9+xNKXQWGxmuHFM=",
     build_file_content = """
 cc_library(
     name = "minicoro",
