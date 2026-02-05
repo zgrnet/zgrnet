@@ -299,14 +299,20 @@ pub fn setIPv6(tun: *Tun, addr: [16]u8, prefix_len: u8) TunError!void {
 
     // Use absolute path to prevent PATH hijacking
     // Try /sbin/ip first (common on most distros), fallback to /usr/sbin/ip
+    // Use explicit empty environment to avoid FFI issues with env inheritance
+    var env_map = std.process.EnvMap.init(std.heap.page_allocator);
+    defer env_map.deinit();
+
     const result = std.process.Child.run(.{
         .allocator = std.heap.page_allocator,
         .argv = &.{ "/sbin/ip", "-6", "addr", "add", addr_str, "dev", name },
+        .env_map = &env_map,
     }) catch {
         // Fallback to /usr/sbin/ip
         const result2 = std.process.Child.run(.{
             .allocator = std.heap.page_allocator,
             .argv = &.{ "/usr/sbin/ip", "-6", "addr", "add", addr_str, "dev", name },
+            .env_map = &env_map,
         }) catch {
             return TunError.SetAddressFailed;
         };

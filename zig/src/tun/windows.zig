@@ -428,6 +428,10 @@ pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
     // Get interface index from LUID
     _ = state.luid;
 
+    // Use explicit empty environment to avoid FFI issues with env inheritance
+    var env_map = std.process.EnvMap.init(std.heap.page_allocator);
+    defer env_map.deinit();
+
     // Use absolute path to prevent PATH hijacking
     const result = std.process.Child.run(.{
         .allocator = std.heap.page_allocator,
@@ -442,6 +446,7 @@ pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
             addr_str[0..addr_len],
             mask_str[0..mask_len],
         },
+        .env_map = &env_map,
     }) catch {
         return TunError.SetAddressFailed;
     };
@@ -479,6 +484,10 @@ pub fn setIPv6(tun: *Tun, addr: [16]u8, prefix_len: u8) TunError!void {
         return TunError.InvalidArgument;
     };
 
+    // Use explicit empty environment to avoid FFI issues with env inheritance
+    var env_map = std.process.EnvMap.init(std.heap.page_allocator);
+    defer env_map.deinit();
+
     // Use absolute path to prevent PATH hijacking
     const result = std.process.Child.run(.{
         .allocator = std.heap.page_allocator,
@@ -492,6 +501,7 @@ pub fn setIPv6(tun: *Tun, addr: [16]u8, prefix_len: u8) TunError!void {
             addr_str[0..addr_len],
             prefix_len_str,
         },
+        .env_map = &env_map,
     }) catch {
         return TunError.SetAddressFailed;
     };

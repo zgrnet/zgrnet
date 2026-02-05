@@ -533,6 +533,8 @@ func (u *UDP) ReadFrom(buf []byte) (pk noise.PublicKey, n int, err error) {
 		case <-pkt.ready:
 			// Decryption done
 		case <-u.closeChan:
+			// Still need to wait for decryption to complete before releasing
+			<-pkt.ready
 			releasePacket(pkt)
 			return pk, 0, ErrClosed
 		}
