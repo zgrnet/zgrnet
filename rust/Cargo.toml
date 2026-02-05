@@ -6,6 +6,10 @@ description = "Noise Protocol implementation for zgrnet"
 license = "MIT"
 build = "build.rs"
 
+[features]
+default = []
+tun = []  # Enable TUN device support (requires libtun.a from Zig build)
+
 [build-dependencies]
 cc = "1.2"
 

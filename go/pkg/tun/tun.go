@@ -1,3 +1,5 @@
+//go:build tun
+
 // Package tun provides a cross-platform TUN device interface.
 //
 // This package wraps the Zig TUN library via CGo, providing

@@ -154,13 +154,14 @@ jobs:
       - name: Test (excluding TUN)
         working-directory: rust
         run: |
-          # Run tests excluding TUN module (requires root)
-          cargo test --all-features -- --skip tun::
+          # Run tests excluding TUN module (requires root and libtun.a)
+          # TUN feature is disabled by default, so no --features flag needed
+          cargo test
 
       - name: Clippy
         if: matrix.os == 'ubuntu-latest'
         working-directory: rust
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy -- -D warnings
 
   # Zig tests (native) - no root required
   # Excludes TUN tests which require elevated privileges

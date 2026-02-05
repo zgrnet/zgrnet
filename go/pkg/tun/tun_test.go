@@ -1,3 +1,5 @@
+//go:build tun
+
 package tun
 
 import (
