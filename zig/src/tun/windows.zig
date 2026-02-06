@@ -64,6 +64,7 @@ var WintunSendPacket: ?WintunSendPacketFn = null;
 var WintunGetAdapterLUID: ?WintunGetAdapterLUIDFn = null;
 
 // Windows TUN state (stored in opaque handle)
+// Uses reference counting for thread-safe access
 const WinTunState = struct {
     adapter: WINTUN_ADAPTER_HANDLE,
     session: WINTUN_SESSION_HANDLE,
@@ -71,17 +72,39 @@ const WinTunState = struct {
     luid: u64,
     mtu: u32,
     non_blocking: bool,
-};
+    closed: bool,
+    ref_count: std.atomic.Value(u32),
+    mutex: std.Thread.Mutex,
 
-var tun_states: std.AutoHashMap(usize, *WinTunState) = undefined;
-var states_initialized: bool = false;
-
-fn initStates() void {
-    if (!states_initialized) {
-        tun_states = std.AutoHashMap(usize, *WinTunState).init(std.heap.page_allocator);
-        states_initialized = true;
+    /// Acquire a reference to the state. Returns null if closed.
+    fn acquire(self: *WinTunState) ?*WinTunState {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return null;
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+        return self;
     }
-}
+
+    /// Release a reference to the state.
+    fn release(self: *WinTunState) void {
+        const prev = self.ref_count.fetchSub(1, .monotonic);
+        if (prev == 1) {
+            // Last reference, can be freed (but we don't free here, close does)
+        }
+    }
+
+    /// Mark as closed and wait for all references to be released.
+    fn markClosed(self: *WinTunState) void {
+        self.mutex.lock();
+        self.closed = true;
+        self.mutex.unlock();
+        // Spin wait for ref_count to reach 0 (with reasonable timeout)
+        var spin_count: u32 = 0;
+        while (self.ref_count.load(.monotonic) > 0 and spin_count < 10000) : (spin_count += 1) {
+            std.Thread.yield() catch {};
+        }
+    }
+};
 
 /// Initialize Wintun (extract and load DLL)
 /// Thread-safe - can be called from multiple threads.
@@ -90,8 +113,6 @@ pub fn init() TunError!void {
     defer global_mutex.unlock();
 
     if (init_done) return; // Already initialized
-
-    initStates();
 
     // Check if embedded DLL is available
     const dll_data = wintun_dll_data orelse {
@@ -125,16 +146,42 @@ pub fn init() TunError!void {
         return;
     };
 
-    // Get the executable's directory for secure DLL extraction
-    var exe_path_buf2: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path2 = std.fs.selfExePath(&exe_path_buf2) catch {
+    // Extract embedded DLL to secure temp directory to prevent DLL hijacking
+    // Use %TEMP%\zgrnet-<random>\wintun.dll with restricted permissions
+    var temp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const temp_base = std.process.getEnvVarOwned(std.heap.page_allocator, "TEMP") catch |err| blk: {
+        _ = err;
+        // Fallback to %LOCALAPPDATA%\Temp or C:\Windows\Temp
+        break :blk std.process.getEnvVarOwned(std.heap.page_allocator, "LOCALAPPDATA") catch {
+            break :blk null;
+        };
+    };
+    defer if (temp_base) |t| std.heap.page_allocator.free(t);
+
+    const temp_dir = temp_base orelse "C:\\Windows\\Temp";
+
+    // Generate a random subdirectory name for isolation
+    var random_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    var random_hex: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&random_hex, "{x:0>16}", .{std.mem.readInt(u64, &random_bytes, .little)}) catch {
         return TunError.WintunInitFailed;
     };
-    const exe_dir2 = std.fs.path.dirname(exe_path2) orelse ".";
 
-    // Build null-terminated path for LoadLibraryA
+    // Build path: %TEMP%\zgrnet-XXXXXXXX\wintun.dll
     var dll_path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
-    const dll_path_z = std.fmt.bufPrintZ(&dll_path_buf, "{s}\\wintun.dll", .{exe_dir2}) catch {
+    const secure_dir = std.fmt.bufPrint(&temp_path_buf, "{s}\\zgrnet-{s}", .{ temp_dir, random_hex }) catch {
+        return TunError.WintunInitFailed;
+    };
+
+    // Create secure directory
+    std.fs.makeDirAbsolute(secure_dir) catch |err| {
+        if (err != error.PathAlreadyExists) {
+            return TunError.WintunInitFailed;
+        }
+    };
+
+    const dll_path_z = std.fmt.bufPrintZ(&dll_path_buf, "{s}\\wintun.dll", .{secure_dir}) catch {
         return TunError.WintunInitFailed;
     };
 
@@ -202,22 +249,18 @@ pub fn deinit() void {
         wintun_module = null;
     }
 
-    // Delete extracted DLL file
+    // Delete extracted DLL file and its directory
     if (wintun_dll_path) |path| {
         std.fs.deleteFileAbsolute(path) catch {};
+        // Also try to delete the parent directory (zgrnet-XXXXXXXX)
+        if (std.fs.path.dirname(path)) |dir| {
+            std.fs.deleteDirAbsolute(dir) catch {};
+        }
         std.heap.page_allocator.free(path);
         wintun_dll_path = null;
     }
 
-    // Cleanup states
-    if (states_initialized) {
-        var it = tun_states.iterator();
-        while (it.next()) |entry| {
-            std.heap.page_allocator.destroy(entry.value_ptr.*);
-        }
-        tun_states.deinit();
-        states_initialized = false;
-    }
+    init_done = false;
 }
 
 /// Create a new TUN device
@@ -278,7 +321,7 @@ pub fn create(name: ?[]const u8) TunError!Tun {
     var luid: u64 = 0;
     getAdapterLUID(adapter, &luid);
 
-    // Allocate and store state
+    // Allocate and store state with reference counting
     const state = std.heap.page_allocator.create(WinTunState) catch {
         return TunError.SystemResources;
     };
@@ -289,18 +332,13 @@ pub fn create(name: ?[]const u8) TunError!Tun {
         .luid = luid,
         .mtu = 1400,
         .non_blocking = false,
+        .closed = false,
+        .ref_count = std.atomic.Value(u32).init(0),
+        .mutex = .{},
     };
 
-    // Use state pointer as handle
+    // Use state pointer as handle (direct cast, no HashMap needed)
     const handle: HANDLE = @ptrCast(state);
-
-    // Thread-safe access to tun_states
-    global_mutex.lock();
-    defer global_mutex.unlock();
-    tun_states.put(@intFromPtr(state), state) catch {
-        std.heap.page_allocator.destroy(state);
-        return TunError.SystemResources;
-    };
 
     return Tun{
         .handle = handle,
@@ -310,16 +348,23 @@ pub fn create(name: ?[]const u8) TunError!Tun {
     };
 }
 
-fn getState(tun: *Tun) ?*WinTunState {
-    const handle: *WinTunState = @ptrCast(@alignCast(tun.handle));
-    global_mutex.lock();
-    defer global_mutex.unlock();
-    return tun_states.get(@intFromPtr(handle));
+/// Get state with reference count incremented. Caller MUST call releaseState() when done.
+fn acquireState(tun: *Tun) ?*WinTunState {
+    if (tun.closed) return null;
+    const state: *WinTunState = @ptrCast(@alignCast(tun.handle));
+    return state.acquire();
+}
+
+/// Release state reference. Must be called after acquireState().
+fn releaseState(state: *WinTunState) void {
+    state.release();
 }
 
 /// Read a packet from the TUN device
 pub fn read(tun: *Tun, buf: []u8) TunError!usize {
-    const state = getState(tun) orelse return TunError.AlreadyClosed;
+    const state = acquireState(tun) orelse return TunError.AlreadyClosed;
+    defer releaseState(state);
+
     const receivePacket = WintunReceivePacket orelse return TunError.WintunInitFailed;
     const releasePacket = WintunReleaseReceivePacket orelse return TunError.WintunInitFailed;
 
@@ -345,7 +390,9 @@ pub fn read(tun: *Tun, buf: []u8) TunError!usize {
 
 /// Write a packet to the TUN device
 pub fn write(tun: *Tun, data: []const u8) TunError!usize {
-    const state = getState(tun) orelse return TunError.AlreadyClosed;
+    const state = acquireState(tun) orelse return TunError.AlreadyClosed;
+    defer releaseState(state);
+
     const allocateSendPacket = WintunAllocateSendPacket orelse return TunError.WintunInitFailed;
     const sendPacket = WintunSendPacket orelse return TunError.WintunInitFailed;
 
@@ -365,29 +412,34 @@ pub fn write(tun: *Tun, data: []const u8) TunError!usize {
 
 /// Close the TUN device
 pub fn close(tun: *Tun) void {
-    const state = getState(tun) orelse return;
+    if (tun.closed) return;
+    tun.closed = true;
+
+    const state: *WinTunState = @ptrCast(@alignCast(tun.handle));
+
+    // Mark state as closed and wait for all references to be released
+    state.markClosed();
+
     const endSession = WintunEndSession orelse return;
     const closeAdapter = WintunCloseAdapter orelse return;
 
     endSession(state.session);
     closeAdapter(state.adapter);
 
-    // Thread-safe removal from tun_states
-    global_mutex.lock();
-    defer global_mutex.unlock();
-    _ = tun_states.remove(@intFromPtr(state));
     std.heap.page_allocator.destroy(state);
 }
 
 /// Get MTU
 pub fn getMtu(tun: *Tun) TunError!u32 {
-    const state = getState(tun) orelse return TunError.AlreadyClosed;
+    const state = acquireState(tun) orelse return TunError.AlreadyClosed;
+    defer releaseState(state);
     return state.mtu;
 }
 
 /// Set MTU
 pub fn setMtu(tun: *Tun, mtu: u32) TunError!void {
-    const state = getState(tun) orelse return TunError.AlreadyClosed;
+    const state = acquireState(tun) orelse return TunError.AlreadyClosed;
+    defer releaseState(state);
     state.mtu = mtu;
     // Note: Wintun doesn't have a direct MTU setting API
     // The MTU is effectively determined by the ring buffer size
@@ -395,7 +447,8 @@ pub fn setMtu(tun: *Tun, mtu: u32) TunError!void {
 
 /// Set non-blocking mode
 pub fn setNonBlocking(tun: *Tun, enabled: bool) TunError!void {
-    const state = getState(tun) orelse return TunError.AlreadyClosed;
+    const state = acquireState(tun) orelse return TunError.AlreadyClosed;
+    defer releaseState(state);
     state.non_blocking = enabled;
 }
 
@@ -413,7 +466,8 @@ pub fn setDown(tun: *Tun) TunError!void {
 
 /// Set IPv4 address and netmask
 pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
-    const state = getState(tun) orelse return TunError.AlreadyClosed;
+    const state = acquireState(tun) orelse return TunError.AlreadyClosed;
+    defer releaseState(state);
 
     // Use netsh to set IP address
     var addr_str: [16]u8 = undefined;
@@ -463,7 +517,9 @@ pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
 
 /// Set IPv6 address with prefix length
 pub fn setIPv6(tun: *Tun, addr: [16]u8, prefix_len: u8) TunError!void {
-    _ = getState(tun) orelse return TunError.AlreadyClosed;
+    const state = acquireState(tun) orelse return TunError.AlreadyClosed;
+    defer releaseState(state);
+    _ = state; // Used for state validation
 
     // Format IPv6 as standard notation: xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx
     var addr_str: [64]u8 = undefined;

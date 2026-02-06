@@ -130,7 +130,7 @@ func (d *Device) Read(buf []byte) (int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return 0, io.ErrClosedPipe
 	}
 
@@ -151,7 +151,7 @@ func (d *Device) Write(buf []byte) (int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return 0, io.ErrClosedPipe
 	}
 
@@ -177,7 +177,7 @@ func (d *Device) Handle() int {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return -1
 	}
 
@@ -189,7 +189,7 @@ func (d *Device) MTU() (int, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return 0, io.ErrClosedPipe
 	}
 
@@ -206,7 +206,7 @@ func (d *Device) SetMTU(mtu int) error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return io.ErrClosedPipe
 	}
 
@@ -223,7 +223,7 @@ func (d *Device) SetNonblocking(enabled bool) error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return io.ErrClosedPipe
 	}
 
@@ -245,7 +245,7 @@ func (d *Device) Up() error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return io.ErrClosedPipe
 	}
 
@@ -262,7 +262,7 @@ func (d *Device) Down() error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return io.ErrClosedPipe
 	}
 
@@ -279,7 +279,7 @@ func (d *Device) SetIPv4(addr net.IP, mask net.IPMask) error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return io.ErrClosedPipe
 	}
 
@@ -313,7 +313,7 @@ func (d *Device) SetIPv6(addr net.IP, prefixLen int) error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed || d.handle == nil {
+	if d.closed {
 		return io.ErrClosedPipe
 	}
 

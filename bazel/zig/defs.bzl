@@ -25,6 +25,79 @@ Run:
 
 load("@bazel_skylib//lib:shell.bzl", "shell")
 
+# =============================================================================
+# Shared template for hermetic Zig builds
+# =============================================================================
+
+# Common shell script setup for zig_binary and zig_library rules
+_ZIG_BUILD_SETUP_TEMPLATE = """
+set -e
+
+WORK=$(mktemp -d)
+cleanup() {{ rm -rf "$WORK"; }}
+trap cleanup EXIT
+
+# Save absolute paths before we cd elsewhere
+ZIG="$PWD/{zig_path}"
+OUTPUT="$PWD/{output}"
+
+if [ ! -x "$ZIG" ]; then
+    echo "ERROR: Zig binary not found at $ZIG" >&2
+    exit 1
+fi
+
+# Set zig cache directories (zig needs these to function)
+export ZIG_LOCAL_CACHE_DIR="$WORK/.zig-cache"
+export ZIG_GLOBAL_CACHE_DIR="$WORK/.zig-global-cache"
+mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+# Copy source files (preserving directory structure)
+{src_copy_commands}
+
+# Copy KCP dependency (downloaded by Bazel)
+mkdir -p "$WORK/.deps/kcp"
+{kcp_copy_commands}
+
+# Remove kcp from build.zig.zon to prevent network fetch in sandbox
+# Create a stripped version that only uses external path
+cat > "$WORK"/{zig_root}/build.zig.zon << 'ZONEOF'
+.{{
+    .name = .zgrnet_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xf6953e9e15a197f8,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{{}},
+    .paths = .{{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    }},
+}}
+ZONEOF
+
+# Build with KCP path from Bazel
+cd "$WORK"/{zig_root}
+"$ZIG" build -Doptimize={optimize} -Dkcp_path="$WORK/.deps/kcp" {extra_args}
+"""
+
+def _generate_copy_commands(src_files, kcp_files):
+    """Generate shell commands to copy source and KCP files."""
+    src_copy_commands = []
+    for f in src_files:
+        quoted_rel_path = shell.quote(f.short_path)
+        quoted_src_path = shell.quote(f.path)
+        src_copy_commands.append('mkdir -p "$WORK/"$(dirname {}) && cp {} "$WORK/"{}'.format(
+            quoted_rel_path,
+            quoted_src_path,
+            quoted_rel_path,
+        ))
+
+    kcp_copy_commands = []
+    for f in kcp_files:
+        kcp_copy_commands.append('cp {} "$WORK/.deps/kcp/"'.format(shell.quote(f.path)))
+
+    return "\n".join(src_copy_commands), "\n".join(kcp_copy_commands)
+
 def _zig_run_impl(ctx):
     """Run a standalone Zig project.
     
@@ -178,97 +251,27 @@ def _zig_binary_impl(ctx):
     # Get KCP files
     kcp_files = ctx.attr._kcp.files.to_list()
 
-    # Generate copy commands for source files
-    # Use shell.quote for all paths to prevent command injection
-    # shell.quote wraps values in single quotes, making them safe from shell expansion
-    src_copy_commands = []
-    for f in src_files:
-        quoted_rel_path = shell.quote(f.short_path)
-        quoted_src_path = shell.quote(f.path)
-        # Command: mkdir -p "$WORK/"$(dirname 'rel_path') && cp 'src' "$WORK/"'rel_path'
-        src_copy_commands.append('mkdir -p "$WORK/"$(dirname {}) && cp {} "$WORK/"{}'.format(
-            quoted_rel_path,             # shell.quote prevents injection in dirname
-            quoted_src_path,             # shell.quote for cp source
-            quoted_rel_path,             # shell.quote for destination
-        ))
-
-    # Generate copy commands for KCP files
-    kcp_copy_commands = []
-    for f in kcp_files:
-        # KCP files go to $WORK/.deps/kcp/
-        kcp_copy_commands.append('cp {} "$WORK/.deps/kcp/"'.format(shell.quote(f.path)))
+    # Generate copy commands using shared helper
+    src_copy_commands, kcp_copy_commands = _generate_copy_commands(src_files, kcp_files)
 
     # Determine zig_root and target
     zig_root = ctx.attr.zig_root if ctx.attr.zig_root else "zig"
     optimize = ctx.attr.optimize
     binary_name = ctx.attr.binary_name
 
-    # Only quote zig_root which is used in path context
-    # optimize and binary_name are simple identifiers from BUILD files
-    # and don't need quoting (shell.quote would add unwanted single quotes)
-    quoted_zig_root = shell.quote(zig_root)
-
-    # Build command - use absolute path to zig binary
-    # After cd to work directory, relative paths don't work anymore
-    command = """
-set -e
-
-WORK=$(mktemp -d)
-cleanup() {{ rm -rf "$WORK"; }}
-trap cleanup EXIT
-
-# Save absolute paths before we cd elsewhere
-ZIG="$PWD/{zig_path}"
-OUTPUT="$PWD/{output}"
-
-if [ ! -x "$ZIG" ]; then
-    echo "ERROR: Zig binary not found at $ZIG" >&2
-    exit 1
-fi
-
-# Set zig cache directories (zig needs these to function)
-export ZIG_LOCAL_CACHE_DIR="$WORK/.zig-cache"
-export ZIG_GLOBAL_CACHE_DIR="$WORK/.zig-global-cache"
-mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
-
-# Copy source files (preserving directory structure)
-{src_copy_commands}
-
-# Copy KCP dependency (downloaded by Bazel)
-mkdir -p "$WORK/.deps/kcp"
-{kcp_copy_commands}
-
-# Remove kcp from build.zig.zon to prevent network fetch in sandbox
-cat > "$WORK"/{zig_root}/build.zig.zon << 'ZONEOF'
-.{{
-    .name = .zgrnet_zig,
-    .version = "0.1.0",
-    .fingerprint = 0xf6953e9e15a197f8,
-    .minimum_zig_version = "0.14.0",
-    .dependencies = .{{}},
-    .paths = .{{
-        "build.zig",
-        "build.zig.zon",
-        "src",
-    }},
-}}
-ZONEOF
-
-# Build all artifacts with KCP path from Bazel
-cd "$WORK"/{zig_root}
-"$ZIG" build -Doptimize={optimize} -Dkcp_path="$WORK/.deps/kcp"
-
+    # Build command using shared template + binary-specific copy step
+    command = _ZIG_BUILD_SETUP_TEMPLATE.format(
+        zig_path = zig_bin.path,
+        zig_root = shell.quote(zig_root),
+        src_copy_commands = src_copy_commands,
+        kcp_copy_commands = kcp_copy_commands,
+        optimize = optimize,
+        extra_args = "",
+        output = out.path,
+    ) + """
 # Copy output to Bazel's output directory
 cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
-""".format(
-        zig_path = zig_bin.path,
-        zig_root = quoted_zig_root,
-        src_copy_commands = "\n".join(src_copy_commands),
-        kcp_copy_commands = "\n".join(kcp_copy_commands),
-        optimize = optimize,
-        binary_name = binary_name,
-        output = out.path,
-    )
+""".format(zig_root = shell.quote(zig_root), binary_name = binary_name)
 
     ctx.actions.run_shell(
         outputs = [out],
@@ -276,7 +279,6 @@ cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
         command = command,
         mnemonic = "ZigBuild",
         progress_message = "Building Zig binary %s" % ctx.attr.binary_name,
-        # Hermetic build: all dependencies downloaded by Bazel
     )
 
     return [
@@ -361,91 +363,27 @@ def _zig_library_impl(ctx):
     # Get KCP files
     kcp_files = ctx.attr._kcp.files.to_list()
 
-    # Generate copy commands for source files
-    src_copy_commands = []
-    for f in src_files:
-        quoted_rel_path = shell.quote(f.short_path)
-        quoted_src_path = shell.quote(f.path)
-        src_copy_commands.append('mkdir -p "$WORK/"$(dirname {}) && cp {} "$WORK/"{}'.format(
-            quoted_rel_path,
-            quoted_src_path,
-            quoted_rel_path,
-        ))
-
-    # Generate copy commands for KCP files
-    kcp_copy_commands = []
-    for f in kcp_files:
-        kcp_copy_commands.append('cp {} "$WORK/.deps/kcp/"'.format(shell.quote(f.path)))
+    # Generate copy commands using shared helper
+    src_copy_commands, kcp_copy_commands = _generate_copy_commands(src_files, kcp_files)
 
     # Determine zig_root
     zig_root = ctx.attr.zig_root if ctx.attr.zig_root else "zig"
     optimize = ctx.attr.optimize
-
-    # Build extra args
     extra_args = " ".join(ctx.attr.build_args) if ctx.attr.build_args else ""
 
-    # Build command
-    command = """
-set -e
-
-WORK=$(mktemp -d)
-cleanup() {{ rm -rf "$WORK"; }}
-trap cleanup EXIT
-
-# Save absolute paths before we cd elsewhere
-ZIG="$PWD/{zig_path}"
-OUTPUT="$PWD/{output}"
-
-if [ ! -x "$ZIG" ]; then
-    echo "ERROR: Zig binary not found at $ZIG" >&2
-    exit 1
-fi
-
-# Set zig cache directories
-export ZIG_LOCAL_CACHE_DIR="$WORK/.zig-cache"
-export ZIG_GLOBAL_CACHE_DIR="$WORK/.zig-global-cache"
-mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
-
-# Copy source files (preserving directory structure)
-{src_copy_commands}
-
-# Copy KCP dependency (downloaded by Bazel)
-mkdir -p "$WORK/.deps/kcp"
-{kcp_copy_commands}
-
-# Remove kcp from build.zig.zon to prevent network fetch in sandbox
-# Create a stripped version that only uses external path
-cat > "$WORK"/{zig_root}/build.zig.zon << 'ZONEOF'
-.{{
-    .name = .zgrnet_zig,
-    .version = "0.1.0",
-    .fingerprint = 0xf6953e9e15a197f8,
-    .minimum_zig_version = "0.14.0",
-    .dependencies = .{{}},
-    .paths = .{{
-        "build.zig",
-        "build.zig.zon",
-        "src",
-    }},
-}}
-ZONEOF
-
-# Build the library with KCP path from Bazel
-cd "$WORK"/{zig_root}
-"$ZIG" build -Doptimize={optimize} -Dkcp_path="$WORK/.deps/kcp" {extra_args}
-
-# Copy output to Bazel's output directory
-cp "$WORK"/{zig_root}/{zig_out_path} "$OUTPUT"
-""".format(
+    # Build command using shared template + library-specific copy step
+    command = _ZIG_BUILD_SETUP_TEMPLATE.format(
         zig_path = zig_bin.path,
         zig_root = shell.quote(zig_root),
-        src_copy_commands = "\n".join(src_copy_commands),
-        kcp_copy_commands = "\n".join(kcp_copy_commands),
+        src_copy_commands = src_copy_commands,
+        kcp_copy_commands = kcp_copy_commands,
         optimize = optimize,
         extra_args = extra_args,
-        zig_out_path = zig_out_path,
         output = out.path,
-    )
+    ) + """
+# Copy output to Bazel's output directory
+cp "$WORK"/{zig_root}/{zig_out_path} "$OUTPUT"
+""".format(zig_root = shell.quote(zig_root), zig_out_path = zig_out_path)
 
     ctx.actions.run_shell(
         outputs = [out],

@@ -401,7 +401,13 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            false
+            // Check if running as Administrator using "net session"
+            // This command only succeeds when run with admin privileges
+            std::process::Command::new("net")
+                .arg("session")
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true)
         }
     }
 
