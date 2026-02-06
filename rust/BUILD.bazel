@@ -17,3 +17,13 @@ rust_test(
     crate = ":zgrnet",
     deps = all_crate_deps(normal_dev = True) + ["//third_party/kcp"],
 )
+
+# TUN-specific tests (requires root/admin privileges)
+rust_test(
+    name = "tun_test",
+    crate = ":zgrnet",
+    deps = all_crate_deps(normal_dev = True) + ["//third_party/kcp"],
+    env = {"RUST_TEST_THREADS": "1"},
+    args = ["tun::"],
+    tags = ["requires-root"],
+)

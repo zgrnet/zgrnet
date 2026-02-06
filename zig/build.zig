@@ -5,14 +5,17 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // KCP dependency - support both Bazel (external path) and native zig build (build.zig.zon)
+    // Uses lazyDependency to avoid network fetch when external path is provided
     const kcp_path: std.Build.LazyPath = blk: {
         if (b.option([]const u8, "kcp_path", "External KCP path (from Bazel)")) |external_path| {
             // Bazel provides KCP via -Dkcp_path (absolute path)
             break :blk .{ .cwd_relative = external_path };
-        } else {
-            // Native zig build uses build.zig.zon dependency
-            const kcp_dep = b.dependency("kcp", .{});
+        } else if (b.lazyDependency("kcp", .{})) |kcp_dep| {
+            // Native zig build uses build.zig.zon dependency (lazy - only fetches if needed)
             break :blk kcp_dep.path("");
+        } else {
+            // Dependency not available yet (being fetched)
+            @panic("KCP dependency not available. Run 'zig build' again after fetch completes, or provide -Dkcp_path");
         }
     };
 
@@ -24,7 +27,7 @@ pub fn build(b: *std.Build) void {
     // - x86_64 Linux: AVX2/SSE4.1 ASM (~12 Gbps)
     // - Other: Pure Zig (~6 Gbps)
     const BackendEnum = enum { arm64_asm, x86_64_asm, simd, pure_zig };
-    
+
     const default_backend: BackendEnum = if (target_arch == .aarch64)
         .arm64_asm
     else if (target_arch == .x86_64 and target_os == .linux)
@@ -313,4 +316,73 @@ pub fn build(b: *std.Build) void {
     }
     const kcp_interop_step = b.step("kcp_test", "Run KCP interop test");
     kcp_interop_step.dependOn(&run_kcp_interop.step);
+
+    // ========================================================================
+    // TUN Module
+    // ========================================================================
+
+    // Wintun DLL path option (for Windows builds)
+    // Usage: zig build -Dwintun_dll=path/to/wintun.dll
+    const wintun_dll_path = b.option([]const u8, "wintun_dll", "Path to wintun.dll for embedding (Windows only)");
+
+    // TUN build options
+    const tun_options = b.addOptions();
+    tun_options.addOption(bool, "has_wintun_dll", wintun_dll_path != null);
+
+    // TUN library module (cross-platform TUN device abstraction)
+    const tun_lib_module = b.createModule(.{
+        .root_source_file = b.path("src/tun/cabi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .pic = true, // Required for linking with Go/Rust
+    });
+    tun_lib_module.addOptions("tun_build_options", tun_options);
+
+    // Embed wintun.dll if provided
+    if (wintun_dll_path) |dll_path| {
+        tun_lib_module.addAnonymousImport("wintun_dll", .{
+            .root_source_file = .{ .cwd_relative = dll_path },
+        });
+    }
+
+    // TUN library (static library with C ABI)
+    const tun_lib = b.addLibrary(.{
+        .name = "tun",
+        .root_module = tun_lib_module,
+    });
+    b.installArtifact(tun_lib);
+
+    // Install C header
+    b.installFile("include/tun.h", "include/tun.h");
+
+    // Copy wintun.dll to output directory if provided (for runtime loading)
+    if (wintun_dll_path) |dll_path| {
+        b.installFile(dll_path, "bin/wintun.dll");
+    }
+
+    // TUN tests
+    const tun_test_module = b.createModule(.{
+        .root_source_file = b.path("src/tun/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tun_test_module.addOptions("tun_build_options", tun_options);
+    if (wintun_dll_path) |dll_path| {
+        tun_test_module.addAnonymousImport("wintun_dll", .{
+            .root_source_file = .{ .cwd_relative = dll_path },
+        });
+    }
+
+    const tun_tests = b.addTest(.{
+        .root_module = tun_test_module,
+    });
+
+    const run_tun_tests = b.addRunArtifact(tun_tests);
+    const tun_test_step = b.step("test-tun", "Run TUN tests (requires root/admin)");
+    tun_test_step.dependOn(&run_tun_tests.step);
+
+    // Export TUN module for dependents
+    _ = b.addModule("tun", .{
+        .root_source_file = b.path("src/tun/mod.zig"),
+    });
 }
