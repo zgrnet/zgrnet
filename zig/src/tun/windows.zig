@@ -241,14 +241,15 @@ pub fn create(name: ?[]const u8) TunError!Tun {
     var wide_buf: [16]u16 = undefined; // Keep in function scope for lifetime
 
     const adapter_name: LPCWSTR = if (name) |n| blk: {
-        @memcpy(name_buf[0..@min(n.len, 15)], n[0..@min(n.len, 15)]);
-        name_len = @intCast(@min(n.len, 15));
+        const truncated_len = @min(n.len, 15);
+        @memcpy(name_buf[0..truncated_len], n[0..truncated_len]);
+        name_len = @intCast(truncated_len);
         name_buf[name_len] = 0;
-        // Convert to wide string (ASCII only - for full Unicode use std.unicode)
-        for (n[0..@min(n.len, 15)], 0..) |c, i| {
-            wide_buf[i] = c;
-        }
-        wide_buf[@min(n.len, 15)] = 0;
+        // Convert UTF-8 to UTF-16LE (handles full Unicode)
+        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, n[0..truncated_len]) catch {
+            return TunError.InvalidArgument;
+        };
+        wide_buf[wide_len] = 0;
         break :blk @ptrCast(&wide_buf);
     } else blk: {
         const default_name = "ZigNet";

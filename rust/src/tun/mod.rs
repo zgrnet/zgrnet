@@ -31,7 +31,7 @@ mod ffi;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock};
 
 pub use ffi::RawHandle;
 
@@ -158,13 +158,13 @@ pub fn deinit() {
 /// A TUN device.
 ///
 /// This struct is thread-safe and can be shared between threads using `Arc<Device>`.
-/// Internal synchronization is handled by a Mutex.
+/// Internal synchronization is handled by an RwLock for better concurrent read performance.
 pub struct Device {
-    handle: Mutex<*mut ffi::TunHandle>,
+    handle: RwLock<*mut ffi::TunHandle>,
     name: String,
 }
 
-// SAFETY: The handle is protected by a Mutex, ensuring thread-safe access.
+// SAFETY: The handle is protected by an RwLock, ensuring thread-safe access.
 // The underlying FFI handle points to memory managed by the Zig library.
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
@@ -199,7 +199,7 @@ impl Device {
         };
 
         Ok(Device {
-            handle: Mutex::new(handle),
+            handle: RwLock::new(handle),
             name: dev_name,
         })
     }
@@ -211,13 +211,13 @@ impl Device {
 
     /// Get the underlying file descriptor (Unix) or HANDLE (Windows).
     pub fn raw_handle(&self) -> RawHandle {
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         unsafe { ffi::tun_get_handle(*handle) }
     }
 
     /// Get the MTU (Maximum Transmission Unit).
     pub fn mtu(&self) -> Result<i32> {
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let mtu = unsafe { ffi::tun_get_mtu(*handle) };
         if mtu < 0 {
             Err(code_to_error(mtu))
@@ -230,7 +230,7 @@ impl Device {
     ///
     /// Requires root/admin privileges.
     pub fn set_mtu(&self, mtu: i32) -> Result<()> {
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let rc = unsafe { ffi::tun_set_mtu(*handle, mtu) };
         if rc == ffi::TUN_OK {
             Ok(())
@@ -243,7 +243,7 @@ impl Device {
     ///
     /// In non-blocking mode, read returns `Error::WouldBlock` if no data is available.
     pub fn set_nonblocking(&self, enabled: bool) -> Result<()> {
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let flag = if enabled { 1 } else { 0 };
         let rc = unsafe { ffi::tun_set_nonblocking(*handle, flag) };
         if rc == ffi::TUN_OK {
@@ -257,7 +257,7 @@ impl Device {
     ///
     /// Requires root/admin privileges.
     pub fn up(&self) -> Result<()> {
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let rc = unsafe { ffi::tun_set_up(*handle) };
         if rc == ffi::TUN_OK {
             Ok(())
@@ -270,7 +270,7 @@ impl Device {
     ///
     /// Requires root/admin privileges.
     pub fn down(&self) -> Result<()> {
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let rc = unsafe { ffi::tun_set_down(*handle) };
         if rc == ffi::TUN_OK {
             Ok(())
@@ -283,7 +283,7 @@ impl Device {
     ///
     /// Requires root/admin privileges.
     pub fn set_ipv4(&self, addr: Ipv4Addr, netmask: Ipv4Addr) -> Result<()> {
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let addr_str = CString::new(addr.to_string()).map_err(|_| Error::InvalidArgument)?;
         let mask_str = CString::new(netmask.to_string()).map_err(|_| Error::InvalidArgument)?;
 
@@ -303,7 +303,7 @@ impl Device {
             return Err(Error::InvalidArgument);
         }
 
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let addr_str = CString::new(addr.to_string()).map_err(|_| Error::InvalidArgument)?;
 
         let rc = unsafe { ffi::tun_set_ipv6(*handle, addr_str.as_ptr(), prefix_len) };
@@ -322,7 +322,7 @@ impl Device {
             return Ok(0);
         }
 
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let n = unsafe { ffi::tun_read(*handle, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n < 0 {
             Err(code_to_error(n as i32))
@@ -339,7 +339,7 @@ impl Device {
             return Ok(0);
         }
 
-        let handle = self.handle.lock().unwrap();
+        let handle = self.handle.read().unwrap();
         let n = unsafe { ffi::tun_write(*handle, buf.as_ptr() as *const _, buf.len()) };
         if n < 0 {
             Err(code_to_error(n as i32))
@@ -351,7 +351,7 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        let mut handle = self.handle.lock().unwrap();
+        let mut handle = self.handle.write().unwrap();
         if !handle.is_null() {
             unsafe {
                 ffi::tun_close(*handle);
@@ -678,17 +678,23 @@ mod tests {
 
     fn calculate_checksum(data: &[u8]) -> u16 {
         let mut sum: u32 = 0;
-        let mut i = 0;
-        while i < data.len() - 1 {
-            sum += ((data[i] as u32) << 8) | (data[i + 1] as u32);
-            i += 2;
+
+        // Process complete 16-bit words using iterator
+        let mut chunks = data.chunks_exact(2);
+        for chunk in &mut chunks {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
         }
-        if data.len() % 2 == 1 {
-            sum += (data[data.len() - 1] as u32) << 8;
+
+        // Handle odd byte (if any)
+        if let Some(&last_byte) = chunks.remainder().first() {
+            sum += (last_byte as u32) << 8;
         }
+
+        // Fold 32-bit sum to 16 bits
         while sum > 0xFFFF {
             sum = (sum >> 16) + (sum & 0xFFFF);
         }
+
         !sum as u16
     }
 }

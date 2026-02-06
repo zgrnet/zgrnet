@@ -84,12 +84,12 @@ jobs:
       - name: Build affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Filter out TUN-related targets (require prebuilt libtun.a)
-          # TUN tests are handled separately in tun-test job
+          # Filter out TUN test targets (require root privileges)
+          # TUN library builds are now hermetic via zig_library rule
           FILTERED=""
           for t in $TARGETS; do
             case "$t" in
-              *tun:*|*tun_test*|*tun_lib*) echo "Skipping TUN target: $t" ;;
+              *tun_test*) echo "Skipping TUN test: $t (requires root)" ;;
               *) FILTERED="$FILTERED $t" ;;
             esac
           done
@@ -97,17 +97,17 @@ jobs:
           if [ -n "$FILTERED" ]; then
             bazel build $FILTERED
           else
-            echo "No non-TUN targets to build"
+            echo "No targets to build"
           fi
 
       - name: Test affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Filter out TUN-related targets (require prebuilt libtun.a)
+          # Filter out TUN test targets (require root privileges)
           FILTERED=""
           for t in $TARGETS; do
             case "$t" in
-              *tun:*|*tun_test*|*tun_lib*) echo "Skipping TUN target: $t" ;;
+              *tun_test*) echo "Skipping TUN test: $t (requires root)" ;;
               *) FILTERED="$FILTERED $t" ;;
             esac
           done
@@ -115,7 +115,7 @@ jobs:
             # Exit code 4 means "no test targets found", which is OK
             bazel test $FILTERED --test_output=errors || [ $? -eq 4 ]
           else
-            echo "No non-TUN targets to test"
+            echo "No targets to test"
           fi
 
   # Go tests (native, with race detector) - no root required
@@ -248,18 +248,8 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo modprobe tun
 
-      - name: Setup Zig
-        if: runner.os == 'Linux'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Build Zig TUN library
-        if: runner.os == 'Linux'
-        working-directory: zig
-        run: |
-          # Build the TUN library for Go/Rust FFI
-          zig build
+      # Note: Zig TUN library is now built hermetically via Bazel's zig_library rule
+      # No need for manual `zig build` step
 
       - name: Test Zig TUN
         if: runner.os == 'Linux'  # Zig toolchain doesn't support Windows
@@ -271,7 +261,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # Build and test in sequence (library built above)
+          # Build and test (Zig TUN library built hermetically via Bazel)
           bazel build //go/pkg/tun:tun_test
           sudo bazel-bin/go/pkg/tun/tun_test_/tun_test
 
@@ -279,7 +269,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # Build and test in sequence (library built above)
+          # Build and test (Zig TUN library built hermetically via Bazel)
           bazel build //rust:tun_test
           # Rust test binary is in a hash directory, find it
           RUST_TEST=$(find bazel-bin/rust -name 'tun_test' -type f -executable | head -1)

@@ -238,6 +238,22 @@ mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 mkdir -p "$WORK/.deps/kcp"
 {kcp_copy_commands}
 
+# Remove kcp from build.zig.zon to prevent network fetch in sandbox
+cat > "$WORK"/{zig_root}/build.zig.zon << 'ZONEOF'
+.{{
+    .name = .zgrnet_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xf6953e9e15a197f8,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{{}},
+    .paths = .{{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    }},
+}}
+ZONEOF
+
 # Build all artifacts with KCP path from Bazel
 cd "$WORK"/{zig_root}
 "$ZIG" build -Doptimize={optimize} -Dkcp_path="$WORK/.deps/kcp"
@@ -306,4 +322,202 @@ zig_binary = rule(
         ),
     },
     doc = "Build a Zig binary and output to Bazel's output directory",
+)
+
+# =============================================================================
+# zig_library - Build a Zig static library and output to Bazel's output directory
+# =============================================================================
+
+def _zig_library_impl(ctx):
+    """Build a Zig static library and output it to Bazel's output directory.
+    
+    This rule compiles a Zig project and produces a static library (.a or .lib)
+    that can be used as a dependency in other Bazel rules (e.g., cc_library).
+    """
+
+    # Determine output filename based on platform
+    lib_name = ctx.attr.lib_name
+    is_windows = ctx.target_platform_has_constraint(ctx.attr._windows_constraint[platform_common.ConstraintValueInfo])
+    
+    if is_windows:
+        out_filename = lib_name + ".lib"
+        zig_out_path = "zig-out/lib/" + lib_name + ".lib"
+    else:
+        out_filename = "lib" + lib_name + ".a"
+        zig_out_path = "zig-out/lib/lib" + lib_name + ".a"
+
+    # Declare the output library
+    out = ctx.actions.declare_file(out_filename)
+
+    # Collect source files
+    src_files = []
+    for src in ctx.attr.srcs:
+        src_files.extend(src.files.to_list())
+
+    # Get Zig binary and toolchain files
+    zig_bin = ctx.file._zig
+    zig_files = ctx.attr._zig_toolchain.files.to_list()
+
+    # Get KCP files
+    kcp_files = ctx.attr._kcp.files.to_list()
+
+    # Generate copy commands for source files
+    src_copy_commands = []
+    for f in src_files:
+        quoted_rel_path = shell.quote(f.short_path)
+        quoted_src_path = shell.quote(f.path)
+        src_copy_commands.append('mkdir -p "$WORK/"$(dirname {}) && cp {} "$WORK/"{}'.format(
+            quoted_rel_path,
+            quoted_src_path,
+            quoted_rel_path,
+        ))
+
+    # Generate copy commands for KCP files
+    kcp_copy_commands = []
+    for f in kcp_files:
+        kcp_copy_commands.append('cp {} "$WORK/.deps/kcp/"'.format(shell.quote(f.path)))
+
+    # Determine zig_root
+    zig_root = ctx.attr.zig_root if ctx.attr.zig_root else "zig"
+    optimize = ctx.attr.optimize
+
+    # Build extra args
+    extra_args = " ".join(ctx.attr.build_args) if ctx.attr.build_args else ""
+
+    # Build command
+    command = """
+set -e
+
+WORK=$(mktemp -d)
+cleanup() {{ rm -rf "$WORK"; }}
+trap cleanup EXIT
+
+# Save absolute paths before we cd elsewhere
+ZIG="$PWD/{zig_path}"
+OUTPUT="$PWD/{output}"
+
+if [ ! -x "$ZIG" ]; then
+    echo "ERROR: Zig binary not found at $ZIG" >&2
+    exit 1
+fi
+
+# Set zig cache directories
+export ZIG_LOCAL_CACHE_DIR="$WORK/.zig-cache"
+export ZIG_GLOBAL_CACHE_DIR="$WORK/.zig-global-cache"
+mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+# Copy source files (preserving directory structure)
+{src_copy_commands}
+
+# Copy KCP dependency (downloaded by Bazel)
+mkdir -p "$WORK/.deps/kcp"
+{kcp_copy_commands}
+
+# Remove kcp from build.zig.zon to prevent network fetch in sandbox
+# Create a stripped version that only uses external path
+cat > "$WORK"/{zig_root}/build.zig.zon << 'ZONEOF'
+.{{
+    .name = .zgrnet_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xf6953e9e15a197f8,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{{}},
+    .paths = .{{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    }},
+}}
+ZONEOF
+
+# Build the library with KCP path from Bazel
+cd "$WORK"/{zig_root}
+"$ZIG" build -Doptimize={optimize} -Dkcp_path="$WORK/.deps/kcp" {extra_args}
+
+# Copy output to Bazel's output directory
+cp "$WORK"/{zig_root}/{zig_out_path} "$OUTPUT"
+""".format(
+        zig_path = zig_bin.path,
+        zig_root = shell.quote(zig_root),
+        src_copy_commands = "\n".join(src_copy_commands),
+        kcp_copy_commands = "\n".join(kcp_copy_commands),
+        optimize = optimize,
+        extra_args = extra_args,
+        zig_out_path = zig_out_path,
+        output = out.path,
+    )
+
+    ctx.actions.run_shell(
+        outputs = [out],
+        inputs = src_files + zig_files + kcp_files + [zig_bin],
+        command = command,
+        mnemonic = "ZigLibrary",
+        progress_message = "Building Zig library %s" % lib_name,
+    )
+
+    return [
+        DefaultInfo(
+            files = depset([out]),
+        ),
+        CcInfo(
+            compilation_context = cc_common.create_compilation_context(
+                headers = depset([]),
+            ),
+            linking_context = cc_common.create_linking_context(
+                linker_inputs = depset([
+                    cc_common.create_linker_input(
+                        owner = ctx.label,
+                        libraries = depset([
+                            cc_common.create_library_to_link(
+                                actions = ctx.actions,
+                                static_library = out,
+                            ),
+                        ]),
+                    ),
+                ]),
+            ),
+        ),
+    ]
+
+zig_library = rule(
+    implementation = _zig_library_impl,
+    attrs = {
+        "srcs": attr.label_list(
+            allow_files = True,
+            mandatory = True,
+            doc = "Source files for the Zig project",
+        ),
+        "lib_name": attr.string(
+            mandatory = True,
+            doc = "Name of the output library (e.g., 'tun' produces libtun.a or tun.lib)",
+        ),
+        "build_args": attr.string_list(
+            doc = "Additional arguments to pass to zig build",
+        ),
+        "optimize": attr.string(
+            default = "ReleaseFast",
+            doc = "Optimization level: Debug, ReleaseSafe, ReleaseFast, ReleaseSmall",
+        ),
+        "zig_root": attr.string(
+            default = "zig",
+            doc = "Directory containing build.zig (relative to workspace root)",
+        ),
+        "_zig": attr.label(
+            default = "@zig_toolchain//:zig",
+            allow_single_file = True,
+            doc = "Zig compiler binary",
+        ),
+        "_zig_toolchain": attr.label(
+            default = "@zig_toolchain//:zig_files",
+            doc = "Zig compiler toolchain (lib, etc.)",
+        ),
+        "_kcp": attr.label(
+            default = "//third_party/kcp:srcs",
+            doc = "KCP library source files (from //third_party/kcp)",
+        ),
+        "_windows_constraint": attr.label(
+            default = "@platforms//os:windows",
+        ),
+    },
+    doc = "Build a Zig static library and output to Bazel's output directory",
 )

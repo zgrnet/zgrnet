@@ -5,14 +5,17 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // KCP dependency - support both Bazel (external path) and native zig build (build.zig.zon)
+    // Uses lazyDependency to avoid network fetch when external path is provided
     const kcp_path: std.Build.LazyPath = blk: {
         if (b.option([]const u8, "kcp_path", "External KCP path (from Bazel)")) |external_path| {
             // Bazel provides KCP via -Dkcp_path (absolute path)
             break :blk .{ .cwd_relative = external_path };
-        } else {
-            // Native zig build uses build.zig.zon dependency
-            const kcp_dep = b.dependency("kcp", .{});
+        } else if (b.lazyDependency("kcp", .{})) |kcp_dep| {
+            // Native zig build uses build.zig.zon dependency (lazy - only fetches if needed)
             break :blk kcp_dep.path("");
+        } else {
+            // Dependency not available yet (being fetched)
+            @panic("KCP dependency not available. Run 'zig build' again after fetch completes, or provide -Dkcp_path");
         }
     };
 

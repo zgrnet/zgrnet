@@ -262,6 +262,9 @@ export fn tun_set_ipv4(tun: ?*Tun, addr: ?[*:0]const u8, netmask: ?[*:0]const u8
 
 /// Parse IPv6 address string to bytes
 fn parseIPv6(addr_str: []const u8) ?[16]u8 {
+    // Reject empty input
+    if (addr_str.len == 0) return null;
+
     // Simplified IPv6 parsing - handles common formats
     var addr: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     var groups: [8]u16 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -323,4 +326,152 @@ export fn tun_set_ipv6(tun: ?*Tun, addr: ?[*:0]const u8, prefix_len: c_int) c_in
     };
 
     return TUN_OK;
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+test "parseIPv4" {
+    const testing = std.testing;
+
+    // Standard addresses
+    try testing.expectEqual([4]u8{ 192, 168, 1, 1 }, parseIPv4("192.168.1.1").?);
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, parseIPv4("0.0.0.0").?);
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, parseIPv4("255.255.255.255").?);
+    try testing.expectEqual([4]u8{ 10, 0, 0, 1 }, parseIPv4("10.0.0.1").?);
+    try testing.expectEqual([4]u8{ 127, 0, 0, 1 }, parseIPv4("127.0.0.1").?);
+
+    // Edge cases - single digit octets
+    try testing.expectEqual([4]u8{ 1, 2, 3, 4 }, parseIPv4("1.2.3.4").?);
+    try testing.expectEqual([4]u8{ 0, 0, 0, 1 }, parseIPv4("0.0.0.1").?);
+
+    // Edge cases - leading zeros (should work, parsed as decimal)
+    try testing.expectEqual([4]u8{ 1, 2, 3, 4 }, parseIPv4("01.02.03.04").?);
+
+    // Invalid addresses
+    try testing.expect(parseIPv4("") == null);
+    try testing.expect(parseIPv4("192.168.1") == null); // Too few octets
+    try testing.expect(parseIPv4("192.168.1.1.1") == null); // Too many octets
+    try testing.expect(parseIPv4("256.0.0.1") == null); // Out of range
+    try testing.expect(parseIPv4("abc.def.ghi.jkl") == null); // Non-numeric
+    try testing.expect(parseIPv4("192.168.1.") == null); // Trailing dot
+    try testing.expect(parseIPv4(".192.168.1.1") == null); // Leading dot
+    try testing.expect(parseIPv4("192..168.1") == null); // Double dot
+    try testing.expect(parseIPv4(" 192.168.1.1") == null); // Leading space
+    try testing.expect(parseIPv4("192.168.1.1 ") == null); // Trailing space
+    try testing.expect(parseIPv4("-1.0.0.1") == null); // Negative
+    try testing.expect(parseIPv4("192.168.1.1a") == null); // Trailing char
+}
+
+test "errorToCode" {
+    const testing = std.testing;
+
+    // Verify all error codes are correctly mapped
+    try testing.expectEqual(TUN_ERR_CREATE_FAILED, errorToCode(TunError.CreateFailed));
+    try testing.expectEqual(TUN_ERR_OPEN_FAILED, errorToCode(TunError.OpenFailed));
+    try testing.expectEqual(TUN_ERR_INVALID_NAME, errorToCode(TunError.InvalidName));
+    try testing.expectEqual(TUN_ERR_PERMISSION_DENIED, errorToCode(TunError.PermissionDenied));
+    try testing.expectEqual(TUN_ERR_DEVICE_NOT_FOUND, errorToCode(TunError.DeviceNotFound));
+    try testing.expectEqual(TUN_ERR_NOT_SUPPORTED, errorToCode(TunError.NotSupported));
+    try testing.expectEqual(TUN_ERR_DEVICE_BUSY, errorToCode(TunError.DeviceBusy));
+    try testing.expectEqual(TUN_ERR_INVALID_ARGUMENT, errorToCode(TunError.InvalidArgument));
+    try testing.expectEqual(TUN_ERR_SYSTEM_RESOURCES, errorToCode(TunError.SystemResources));
+    try testing.expectEqual(TUN_ERR_WOULD_BLOCK, errorToCode(TunError.WouldBlock));
+    try testing.expectEqual(TUN_ERR_IO_ERROR, errorToCode(TunError.IoError));
+    try testing.expectEqual(TUN_ERR_SET_MTU_FAILED, errorToCode(TunError.SetMtuFailed));
+    try testing.expectEqual(TUN_ERR_SET_ADDRESS_FAILED, errorToCode(TunError.SetAddressFailed));
+    try testing.expectEqual(TUN_ERR_SET_STATE_FAILED, errorToCode(TunError.SetStateFailed));
+    try testing.expectEqual(TUN_ERR_ALREADY_CLOSED, errorToCode(TunError.AlreadyClosed));
+    try testing.expectEqual(TUN_ERR_WINTUN_NOT_FOUND, errorToCode(TunError.WintunNotFound));
+    try testing.expectEqual(TUN_ERR_WINTUN_INIT_FAILED, errorToCode(TunError.WintunInitFailed));
+
+    // Verify all error codes are negative
+    try testing.expect(TUN_ERR_CREATE_FAILED < 0);
+    try testing.expect(TUN_ERR_WINTUN_INIT_FAILED < 0);
+}
+
+test "parseIPv6" {
+    const testing = std.testing;
+
+    // Full addresses (no ::)
+    try testing.expectEqual(
+        [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+        parseIPv6("2001:db8:0:0:0:0:0:1").?,
+    );
+    try testing.expectEqual(
+        [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0x00, 0x00, 0x8a, 0x2e, 0x03, 0x70, 0x73, 0x34, 0x00, 0x01 },
+        parseIPv6("2001:db8:85a3:0:8a2e:370:7334:1").?,
+    );
+
+    // Addresses with :: (zero compression)
+    try testing.expectEqual(
+        [16]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+        parseIPv6("::1").?,
+    );
+    try testing.expectEqual(
+        [16]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        parseIPv6("::").?,
+    );
+    try testing.expectEqual(
+        [16]u8{ 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+        parseIPv6("fd00::1").?,
+    );
+    try testing.expectEqual(
+        [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+        parseIPv6("2001:db8::1").?,
+    );
+    try testing.expectEqual(
+        [16]u8{ 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+        parseIPv6("fe80::1").?,
+    );
+
+    // :: in the middle
+    try testing.expectEqual(
+        [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02 },
+        parseIPv6("2001:db8::1:2").?,
+    );
+
+    // :: at the end
+    try testing.expectEqual(
+        [16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        parseIPv6("2001:db8::").?,
+    );
+
+    // Loopback and all-zeros
+    try testing.expectEqual(
+        [16]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 },
+        parseIPv6("0:0:0:0:0:0:0:1").?,
+    );
+
+    // Link-local addresses
+    try testing.expectEqual(
+        [16]u8{ 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        parseIPv6("fe80::").?,
+    );
+
+    // Max value groups
+    try testing.expectEqual(
+        [16]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff },
+        parseIPv6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff").?,
+    );
+
+    // Case insensitive
+    try testing.expectEqual(
+        [16]u8{ 0xAB, 0xCD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34 },
+        parseIPv6("ABCD::1234").?,
+    );
+    try testing.expectEqual(
+        [16]u8{ 0xab, 0xcd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34 },
+        parseIPv6("abcd::1234").?,
+    );
+
+    // Invalid addresses
+    try testing.expect(parseIPv6("") == null);
+    try testing.expect(parseIPv6("2001:db8:85a3:0:8a2e:370:7334:1:extra") == null); // Too many groups
+    try testing.expect(parseIPv6("gggg::1") == null); // Invalid hex
+    try testing.expect(parseIPv6("12345::1") == null); // Group too large (>4 hex digits)
+    // Note: This is a simplified parser - some edge cases like ":::" or multiple "::"
+    // are not explicitly rejected but would produce incorrect results.
+    // For production use, consider std.net.Address.parseIp if allocator is available.
 }

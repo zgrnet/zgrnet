@@ -235,6 +235,102 @@ test "isIcmpReply" {
     try std.testing.expect(!isIcmpReply(&buf));
 }
 
+test "calculateIcmpChecksum" {
+    // Test with known ICMP packet
+    const icmp_data = [_]u8{
+        8, 0, // Type: Echo Request, Code: 0
+        0, 0, // Checksum placeholder
+        0, 1, // Identifier
+        0, 1, // Sequence
+    };
+    const checksum = calculateIcmpChecksum(&icmp_data);
+
+    // Verify checksum is non-zero
+    try std.testing.expect(checksum != 0);
+
+    // Create packet with correct checksum and verify it sums to 0xFFFF
+    var packet: [8]u8 = icmp_data;
+    packet[2] = @truncate(checksum >> 8);
+    packet[3] = @truncate(checksum);
+
+    // Sum should be 0xFFFF (ones' complement check)
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i + 1 < packet.len) : (i += 2) {
+        sum += (@as(u32, packet[i]) << 8) | packet[i + 1];
+    }
+    while (sum >> 16 != 0) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    try std.testing.expectEqual(@as(u32, 0xFFFF), sum);
+}
+
+test "calculateIcmpChecksum odd length" {
+    // Test with odd-length data
+    const data = [_]u8{ 0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00 }; // 7 bytes
+    const checksum = calculateIcmpChecksum(&data);
+    try std.testing.expect(checksum != 0);
+}
+
+test "verifyIpv4Checksum" {
+    var header: [20]u8 = undefined;
+    buildIpv4Header(&header, .{ 192, 168, 1, 1 }, .{ 192, 168, 1, 2 }, .icmp, 8);
+
+    // Valid checksum
+    try std.testing.expect(verifyIpv4Checksum(&header));
+
+    // Corrupt checksum
+    header[10] ^= 0xFF;
+    try std.testing.expect(!verifyIpv4Checksum(&header));
+
+    // Too short
+    try std.testing.expect(!verifyIpv4Checksum(header[0..10]));
+}
+
+test "getSrcIp and getDstIp" {
+    var buf: [64]u8 = undefined;
+    _ = buildIcmpPacket(&buf, .{ 192, 168, 1, 100 }, .{ 10, 0, 0, 1 }, .echo_request);
+
+    // Get source IP
+    const src = getSrcIp(&buf);
+    try std.testing.expect(src != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 100 }, &src.?);
+
+    // Get destination IP
+    const dst = getDstIp(&buf);
+    try std.testing.expect(dst != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 1 }, &dst.?);
+
+    // Too short packet
+    try std.testing.expect(getSrcIp(buf[0..10]) == null);
+    try std.testing.expect(getDstIp(buf[0..15]) == null);
+}
+
+test "buildIpv4Header various protocols" {
+    var buf: [20]u8 = undefined;
+
+    // TCP
+    buildIpv4Header(&buf, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, .tcp, 20);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(IpProtocol.tcp)), buf[9]);
+    try std.testing.expect(verifyIpv4Checksum(&buf));
+
+    // UDP
+    buildIpv4Header(&buf, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, .udp, 8);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(IpProtocol.udp)), buf[9]);
+    try std.testing.expect(verifyIpv4Checksum(&buf));
+
+    // ICMP
+    buildIpv4Header(&buf, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, .icmp, 8);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(IpProtocol.icmp)), buf[9]);
+    try std.testing.expect(verifyIpv4Checksum(&buf));
+}
+
+test "buildIcmpPacket buffer too small" {
+    var small_buf: [20]u8 = undefined;
+    const len = buildIcmpPacket(&small_buf, .{ 10, 0, 0, 1 }, .{ 10, 0, 0, 2 }, .echo_request);
+    try std.testing.expectEqual(@as(usize, 0), len);
+}
+
 // ============================================================================
 // TUN Device Tests (require root/admin privileges)
 // ============================================================================

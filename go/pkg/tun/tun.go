@@ -115,9 +115,8 @@ func (d *Device) Close() error {
 	if d.closed {
 		return ErrAlreadyClosed
 	}
-	if d.handle == nil {
-		return ErrNilDevice
-	}
+	// Note: d.handle == nil check removed as redundant - if d.closed is false,
+	// the handle should always be valid (set by constructor, cleared only by Close)
 
 	C.tun_close(d.handle)
 	d.handle = nil
