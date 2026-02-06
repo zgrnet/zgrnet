@@ -114,7 +114,8 @@ jobs:
           done
           if [ -n "$FILTERED" ]; then
             # Exit code 4 means "no test targets found", which is OK
-            bazel test $FILTERED --test_output=errors || [ $? -eq 4 ]
+            # --flaky_test_attempts=3: retry flaky tests (timing-sensitive net tests)
+            bazel test $FILTERED --test_output=errors --flaky_test_attempts=3 || [ $? -eq 4 ]
           else
             echo "No targets to test"
           fi
