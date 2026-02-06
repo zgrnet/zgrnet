@@ -42,7 +42,6 @@ var (
 	ErrAlreadyClosed    = errors.New("tun: already closed")
 	ErrWintunNotFound   = errors.New("tun: wintun not found")
 	ErrWintunInitFailed = errors.New("tun: wintun init failed")
-	ErrNilDevice        = errors.New("tun: nil device")
 )
 
 var initOnce sync.Once

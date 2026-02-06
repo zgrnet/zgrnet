@@ -225,20 +225,10 @@ export fn tun_set_down(tun: ?*Tun) c_int {
 // IP Configuration
 // ============================================================================
 
-/// Parse IPv4 address string to bytes
+/// Parse IPv4 address string to bytes using std.net.Ip4Address
 fn parseIPv4(addr_str: []const u8) ?[4]u8 {
-    var addr: [4]u8 = undefined;
-    var it = std.mem.splitScalar(u8, addr_str, '.');
-    var i: usize = 0;
-
-    while (it.next()) |part| {
-        if (i >= 4) return null;
-        addr[i] = std.fmt.parseInt(u8, part, 10) catch return null;
-        i += 1;
-    }
-
-    if (i != 4) return null;
-    return addr;
+    const a = std.net.Ip4Address.parse(addr_str, 0) catch return null;
+    return @bitCast(a.sa.addr);
 }
 
 /// Set IPv4 address and netmask
@@ -260,55 +250,10 @@ export fn tun_set_ipv4(tun: ?*Tun, addr: ?[*:0]const u8, netmask: ?[*:0]const u8
     return TUN_OK;
 }
 
-/// Parse IPv6 address string to bytes
+/// Parse IPv6 address string to bytes using std.net.Ip6Address
 fn parseIPv6(addr_str: []const u8) ?[16]u8 {
-    // Reject empty input
-    if (addr_str.len == 0) return null;
-
-    // Simplified IPv6 parsing - handles common formats
-    var addr: [16]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-    var groups: [8]u16 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
-    var group_idx: usize = 0;
-    var double_colon_idx: ?usize = null;
-
-    var it = std.mem.splitScalar(u8, addr_str, ':');
-    while (it.next()) |part| {
-        if (part.len == 0) {
-            if (double_colon_idx == null) {
-                double_colon_idx = group_idx;
-            }
-            continue;
-        }
-
-        if (group_idx >= 8) return null;
-        groups[group_idx] = std.fmt.parseInt(u16, part, 16) catch return null;
-        group_idx += 1;
-    }
-
-    // Expand :: if present
-    if (double_colon_idx) |dci| {
-        const zeros = 8 - group_idx;
-        // Shift groups after :: to the right to make room for zeros
-        // Iterate in reverse to avoid overwriting values we need
-        const shift_start = dci + zeros;
-        var j: usize = 8;
-        while (j > shift_start) {
-            j -= 1;
-            groups[j] = groups[j - zeros];
-        }
-        // Fill the gap with zeros
-        for (dci..dci + zeros) |k| {
-            groups[k] = 0;
-        }
-    }
-
-    // Convert to bytes
-    for (groups, 0..) |g, i| {
-        addr[i * 2] = @truncate(g >> 8);
-        addr[i * 2 + 1] = @truncate(g);
-    }
-
-    return addr;
+    const a = std.net.Ip6Address.parse(addr_str, 0) catch return null;
+    return a.sa.addr;
 }
 
 /// Set IPv6 address with prefix length
@@ -346,8 +291,8 @@ test "parseIPv4" {
     try testing.expectEqual([4]u8{ 1, 2, 3, 4 }, parseIPv4("1.2.3.4").?);
     try testing.expectEqual([4]u8{ 0, 0, 0, 1 }, parseIPv4("0.0.0.1").?);
 
-    // Edge cases - leading zeros (should work, parsed as decimal)
-    try testing.expectEqual([4]u8{ 1, 2, 3, 4 }, parseIPv4("01.02.03.04").?);
+    // Leading zeros - rejected by std.net.Ip4Address per RFC (avoids octal ambiguity)
+    try testing.expect(parseIPv4("01.02.03.04") == null);
 
     // Invalid addresses
     try testing.expect(parseIPv4("") == null);
@@ -471,7 +416,8 @@ test "parseIPv6" {
     try testing.expect(parseIPv6("2001:db8:85a3:0:8a2e:370:7334:1:extra") == null); // Too many groups
     try testing.expect(parseIPv6("gggg::1") == null); // Invalid hex
     try testing.expect(parseIPv6("12345::1") == null); // Group too large (>4 hex digits)
-    // Note: This is a simplified parser - some edge cases like ":::" or multiple "::"
-    // are not explicitly rejected but would produce incorrect results.
-    // For production use, consider std.net.Address.parseIp if allocator is available.
+    // std.net.Ip6Address properly rejects malformed addresses
+    try testing.expect(parseIPv6(":::1") == null);
+    try testing.expect(parseIPv6("2001:db8:::1") == null);
+    try testing.expect(parseIPv6("2001:db8::1::2") == null);
 }

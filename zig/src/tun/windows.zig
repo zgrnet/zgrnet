@@ -519,7 +519,6 @@ pub fn setIPv4(tun: *Tun, addr: [4]u8, netmask: [4]u8) TunError!void {
 pub fn setIPv6(tun: *Tun, addr: [16]u8, prefix_len: u8) TunError!void {
     const state = acquireState(tun) orelse return TunError.AlreadyClosed;
     defer releaseState(state);
-    _ = state; // Used for state validation
 
     // Format IPv6 as standard notation: xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx
     var addr_str: [64]u8 = undefined;
