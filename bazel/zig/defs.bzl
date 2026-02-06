@@ -25,6 +25,79 @@ Run:
 
 load("@bazel_skylib//lib:shell.bzl", "shell")
 
+# =============================================================================
+# Shared template for hermetic Zig builds
+# =============================================================================
+
+# Common shell script setup for zig_binary and zig_library rules
+_ZIG_BUILD_SETUP_TEMPLATE = """
+set -e
+
+WORK=$(mktemp -d)
+cleanup() {{ rm -rf "$WORK"; }}
+trap cleanup EXIT
+
+# Save absolute paths before we cd elsewhere
+ZIG="$PWD/{zig_path}"
+OUTPUT="$PWD/{output}"
+
+if [ ! -x "$ZIG" ]; then
+    echo "ERROR: Zig binary not found at $ZIG" >&2
+    exit 1
+fi
+
+# Set zig cache directories (zig needs these to function)
+export ZIG_LOCAL_CACHE_DIR="$WORK/.zig-cache"
+export ZIG_GLOBAL_CACHE_DIR="$WORK/.zig-global-cache"
+mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+
+# Copy source files (preserving directory structure)
+{src_copy_commands}
+
+# Copy KCP dependency (downloaded by Bazel)
+mkdir -p "$WORK/.deps/kcp"
+{kcp_copy_commands}
+
+# Remove kcp from build.zig.zon to prevent network fetch in sandbox
+# Create a stripped version that only uses external path
+cat > "$WORK"/{zig_root}/build.zig.zon << 'ZONEOF'
+.{{
+    .name = .zgrnet_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xf6953e9e15a197f8,
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{{}},
+    .paths = .{{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    }},
+}}
+ZONEOF
+
+# Build with KCP path from Bazel
+cd "$WORK"/{zig_root}
+"$ZIG" build -Doptimize={optimize} -Dkcp_path="$WORK/.deps/kcp" {extra_args}
+"""
+
+def _generate_copy_commands(src_files, kcp_files):
+    """Generate shell commands to copy source and KCP files."""
+    src_copy_commands = []
+    for f in src_files:
+        quoted_rel_path = shell.quote(f.short_path)
+        quoted_src_path = shell.quote(f.path)
+        src_copy_commands.append('mkdir -p "$WORK/"$(dirname {}) && cp {} "$WORK/"{}'.format(
+            quoted_rel_path,
+            quoted_src_path,
+            quoted_rel_path,
+        ))
+
+    kcp_copy_commands = []
+    for f in kcp_files:
+        kcp_copy_commands.append('cp {} "$WORK/.deps/kcp/"'.format(shell.quote(f.path)))
+
+    return "\n".join(src_copy_commands), "\n".join(kcp_copy_commands)
+
 def _zig_run_impl(ctx):
     """Run a standalone Zig project.
     
@@ -71,20 +144,41 @@ def _zig_run_impl(ctx):
     script_content = """#!/bin/bash
 set -e
 
+# Find runfiles directory
+if [[ -d "$0.runfiles" ]]; then
+    RUNFILES_DIR="$0.runfiles"
+elif [[ -d "${{RUNFILES_DIR:-}}" ]]; then
+    RUNFILES_DIR="${{RUNFILES_DIR}}"
+else
+    # Fallback: derive from script location
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    RUNFILES_DIR="${{SCRIPT_DIR}}/{script_name}.runfiles"
+fi
+
 WORK=$(mktemp -d)
 trap "rm -rf $WORK" EXIT
 
 # Copy source files (preserving directory structure)
 {src_copy_commands}
 
-# Set up Zig path
-export PATH="{zig_dir}:$PATH"
+# Set up Zig path using runfiles
+# In bzlmod, external repos are at root level of runfiles
+ZIG_REPO="+zig_toolchain+zig_toolchain"
+if [[ -x "$RUNFILES_DIR/$ZIG_REPO/zig" ]]; then
+    export PATH="$RUNFILES_DIR/$ZIG_REPO:$PATH"
+elif [[ -x "$RUNFILES_DIR/_main/{zig_dir}/zig" ]]; then
+    export PATH="$RUNFILES_DIR/_main/{zig_dir}:$PATH"
+else
+    # Fallback: try relative path (for local builds)
+    export PATH="{zig_dir}:$PATH"
+fi
 
 # Run zig build from zig_root
 cd "$WORK/{zig_root}"
 echo "[zig_run] Building with: zig build {build_args}"
 zig build {build_args}
 """.format(
+        script_name = ctx.label.name,
         zig_dir = zig_bin.dirname,
         zig_root = zig_root,
         src_copy_commands = "\n".join(src_copy_commands),
@@ -157,81 +251,27 @@ def _zig_binary_impl(ctx):
     # Get KCP files
     kcp_files = ctx.attr._kcp.files.to_list()
 
-    # Generate copy commands for source files
-    # Use shell.quote for all paths to prevent command injection
-    # shell.quote wraps values in single quotes, making them safe from shell expansion
-    src_copy_commands = []
-    for f in src_files:
-        quoted_rel_path = shell.quote(f.short_path)
-        quoted_src_path = shell.quote(f.path)
-        # Command: mkdir -p "$WORK/"$(dirname 'rel_path') && cp 'src' "$WORK/"'rel_path'
-        src_copy_commands.append('mkdir -p "$WORK/"$(dirname {}) && cp {} "$WORK/"{}'.format(
-            quoted_rel_path,             # shell.quote prevents injection in dirname
-            quoted_src_path,             # shell.quote for cp source
-            quoted_rel_path,             # shell.quote for destination
-        ))
-
-    # Generate copy commands for KCP files
-    kcp_copy_commands = []
-    for f in kcp_files:
-        # KCP files go to $WORK/.deps/kcp/
-        kcp_copy_commands.append('cp {} "$WORK/.deps/kcp/"'.format(shell.quote(f.path)))
+    # Generate copy commands using shared helper
+    src_copy_commands, kcp_copy_commands = _generate_copy_commands(src_files, kcp_files)
 
     # Determine zig_root and target
     zig_root = ctx.attr.zig_root if ctx.attr.zig_root else "zig"
     optimize = ctx.attr.optimize
     binary_name = ctx.attr.binary_name
 
-    # Only quote zig_root which is used in path context
-    # optimize and binary_name are simple identifiers from BUILD files
-    # and don't need quoting (shell.quote would add unwanted single quotes)
-    quoted_zig_root = shell.quote(zig_root)
-
-    # Build command - use absolute path to zig binary
-    # After cd to work directory, relative paths don't work anymore
-    command = """
-set -e
-
-WORK=$(mktemp -d)
-cleanup() {{ rm -rf "$WORK"; }}
-trap cleanup EXIT
-
-# Save absolute paths before we cd elsewhere
-ZIG="$PWD/{zig_path}"
-OUTPUT="$PWD/{output}"
-
-if [ ! -x "$ZIG" ]; then
-    echo "ERROR: Zig binary not found at $ZIG" >&2
-    exit 1
-fi
-
-# Set zig cache directories (zig needs these to function)
-export ZIG_LOCAL_CACHE_DIR="$WORK/.zig-cache"
-export ZIG_GLOBAL_CACHE_DIR="$WORK/.zig-global-cache"
-mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
-
-# Copy source files (preserving directory structure)
-{src_copy_commands}
-
-# Copy KCP dependency (downloaded by Bazel)
-mkdir -p "$WORK/.deps/kcp"
-{kcp_copy_commands}
-
-# Build all artifacts with KCP path from Bazel
-cd "$WORK"/{zig_root}
-"$ZIG" build -Doptimize={optimize} -Dkcp_path="$WORK/.deps/kcp"
-
+    # Build command using shared template + binary-specific copy step
+    command = _ZIG_BUILD_SETUP_TEMPLATE.format(
+        zig_path = zig_bin.path,
+        zig_root = shell.quote(zig_root),
+        src_copy_commands = src_copy_commands,
+        kcp_copy_commands = kcp_copy_commands,
+        optimize = optimize,
+        extra_args = "",
+        output = out.path,
+    ) + """
 # Copy output to Bazel's output directory
 cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
-""".format(
-        zig_path = zig_bin.path,
-        zig_root = quoted_zig_root,
-        src_copy_commands = "\n".join(src_copy_commands),
-        kcp_copy_commands = "\n".join(kcp_copy_commands),
-        optimize = optimize,
-        binary_name = binary_name,
-        output = out.path,
-    )
+""".format(zig_root = shell.quote(zig_root), binary_name = shell.quote(binary_name))
 
     ctx.actions.run_shell(
         outputs = [out],
@@ -239,7 +279,6 @@ cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
         command = command,
         mnemonic = "ZigBuild",
         progress_message = "Building Zig binary %s" % ctx.attr.binary_name,
-        # Hermetic build: all dependencies downloaded by Bazel
     )
 
     return [
@@ -285,4 +324,112 @@ zig_binary = rule(
         ),
     },
     doc = "Build a Zig binary and output to Bazel's output directory",
+)
+
+# =============================================================================
+# zig_library - Build a Zig static library and output to Bazel's output directory
+# =============================================================================
+
+def _zig_library_impl(ctx):
+    """Build a Zig static library and output it to Bazel's output directory.
+    
+    This rule compiles a Zig project and produces a static library (.a or .lib)
+    that can be used as a dependency in other Bazel rules (e.g., cc_library).
+    """
+
+    # Determine output filename
+    # Note: Windows (.lib) support can be added later when needed
+    lib_name = ctx.attr.lib_name
+    out_filename = "lib" + lib_name + ".a"
+    zig_out_path = "zig-out/lib/lib" + lib_name + ".a"
+
+    # Declare the output library
+    out = ctx.actions.declare_file(out_filename)
+
+    # Collect source files
+    src_files = []
+    for src in ctx.attr.srcs:
+        src_files.extend(src.files.to_list())
+
+    # Get Zig binary and toolchain files
+    zig_bin = ctx.file._zig
+    zig_files = ctx.attr._zig_toolchain.files.to_list()
+
+    # Get KCP files
+    kcp_files = ctx.attr._kcp.files.to_list()
+
+    # Generate copy commands using shared helper
+    src_copy_commands, kcp_copy_commands = _generate_copy_commands(src_files, kcp_files)
+
+    # Determine zig_root
+    zig_root = ctx.attr.zig_root if ctx.attr.zig_root else "zig"
+    optimize = ctx.attr.optimize
+    extra_args = " ".join(ctx.attr.build_args) if ctx.attr.build_args else ""
+
+    # Build command using shared template + library-specific copy step
+    command = _ZIG_BUILD_SETUP_TEMPLATE.format(
+        zig_path = zig_bin.path,
+        zig_root = shell.quote(zig_root),
+        src_copy_commands = src_copy_commands,
+        kcp_copy_commands = kcp_copy_commands,
+        optimize = optimize,
+        extra_args = extra_args,
+        output = out.path,
+    ) + """
+# Copy output to Bazel's output directory
+cp "$WORK"/{zig_root}/{zig_out_path} "$OUTPUT"
+""".format(zig_root = shell.quote(zig_root), zig_out_path = shell.quote(zig_out_path))
+
+    ctx.actions.run_shell(
+        outputs = [out],
+        inputs = src_files + zig_files + kcp_files + [zig_bin],
+        command = command,
+        mnemonic = "ZigLibrary",
+        progress_message = "Building Zig library %s" % lib_name,
+    )
+
+    return [
+        DefaultInfo(
+            files = depset([out]),
+        ),
+    ]
+
+zig_library = rule(
+    implementation = _zig_library_impl,
+    attrs = {
+        "srcs": attr.label_list(
+            allow_files = True,
+            mandatory = True,
+            doc = "Source files for the Zig project",
+        ),
+        "lib_name": attr.string(
+            mandatory = True,
+            doc = "Name of the output library (e.g., 'tun' produces libtun.a or tun.lib)",
+        ),
+        "build_args": attr.string_list(
+            doc = "Additional arguments to pass to zig build",
+        ),
+        "optimize": attr.string(
+            default = "ReleaseFast",
+            doc = "Optimization level: Debug, ReleaseSafe, ReleaseFast, ReleaseSmall",
+        ),
+        "zig_root": attr.string(
+            default = "zig",
+            doc = "Directory containing build.zig (relative to workspace root)",
+        ),
+        "_zig": attr.label(
+            default = "@zig_toolchain//:zig",
+            allow_single_file = True,
+            doc = "Zig compiler binary",
+        ),
+        "_zig_toolchain": attr.label(
+            default = "@zig_toolchain//:zig_files",
+            doc = "Zig compiler toolchain (lib, etc.)",
+        ),
+        "_kcp": attr.label(
+            default = "//third_party/kcp:srcs",
+            doc = "KCP library source files (from //third_party/kcp)",
+        ),
+    },
+    doc = "Build a Zig static library and output to Bazel's output directory",
 )

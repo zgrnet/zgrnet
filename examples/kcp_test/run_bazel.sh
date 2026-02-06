@@ -18,14 +18,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # The paths are relative to the workspace root
 GO_BIN="${SCRIPT_DIR}/examples/kcp_test/go/kcp_test_/kcp_test"
 RUST_BIN="${SCRIPT_DIR}/examples/kcp_test/rust/kcp_test"
-ZIG_BIN="${SCRIPT_DIR}/examples/kcp_test/zig/kcp_test"
+ZIG_BIN="${SCRIPT_DIR}/zig/kcp_test"
 
 # Alternative: use TEST_SRCDIR if available (Bazel test environment)
 if [ -n "$TEST_SRCDIR" ]; then
     RUNFILES="$TEST_SRCDIR/_main"
     GO_BIN="$RUNFILES/examples/kcp_test/go/kcp_test_/kcp_test"
     RUST_BIN="$RUNFILES/examples/kcp_test/rust/kcp_test"
-    ZIG_BIN="$RUNFILES/examples/kcp_test/zig/kcp_test"
+    # Zig binary is at //zig:kcp_test (alias from examples/kcp_test/zig)
+    ZIG_BIN="$RUNFILES/zig/kcp_test"
     SCRIPT_DIR="$RUNFILES/examples/kcp_test"
 fi
 

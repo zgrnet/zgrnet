@@ -27,6 +27,9 @@ pub mod noise;
 pub mod net;
 pub mod kcp;
 
+#[cfg(feature = "tun")]
+pub mod tun;
+
 // Re-export commonly used types at crate root for convenience
 pub use noise::{
     // Core types
