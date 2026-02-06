@@ -94,11 +94,13 @@ pub fn assertTimerService(comptime T: type) void {
 /// - `registerWrite(self: *T, fd: fd_t, callback: ReadyCallback) void`
 /// - `unregister(self: *T, fd: fd_t) void`
 /// - `poll(self: *T, timeout_ms: i32) usize`
+/// - `wake(self: *T) void`
 pub fn isIOService(comptime T: type) bool {
     if (!@hasDecl(T, "registerRead")) return false;
     if (!@hasDecl(T, "registerWrite")) return false;
     if (!@hasDecl(T, "unregister")) return false;
     if (!@hasDecl(T, "poll")) return false;
+    if (!@hasDecl(T, "wake")) return false;
 
     return true;
 }
@@ -108,7 +110,7 @@ pub fn assertIOService(comptime T: type) void {
     if (!isIOService(T)) {
         @compileError(std.fmt.comptimePrint(
             "Type '{s}' does not implement IOService interface. " ++
-                "Required: registerRead(), registerWrite(), unregister(), poll()",
+                "Required: registerRead(), registerWrite(), unregister(), poll(), wake()",
             .{@typeName(T)},
         ));
     }
@@ -158,6 +160,7 @@ test "isIOService checks all required methods" {
         pub fn poll(_: *@This(), _: i32) usize {
             return 0;
         }
+        pub fn wake(_: *@This()) void {}
     };
 
     const InvalidIO = struct {

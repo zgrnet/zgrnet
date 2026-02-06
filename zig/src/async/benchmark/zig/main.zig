@@ -8,9 +8,19 @@
 //! Run with minicoro: zig build async_bench -Dminicoro=true
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const thread_bench = @import("thread.zig");
 const minicoro_bench = @import("minicoro.zig");
+const io_bench = if (builtin.os.tag == .macos or
+    builtin.os.tag == .freebsd or
+    builtin.os.tag == .netbsd or
+    builtin.os.tag == .openbsd)
+    @import("io.zig")
+else
+    struct {
+        pub fn runAll(_: std.mem.Allocator) void {}
+    };
 
 pub fn main() !void {
     std.debug.print("\n", .{});
@@ -27,6 +37,9 @@ pub fn main() !void {
 
     // Run minicoro benchmarks
     minicoro_bench.runAll(allocator);
+
+    // Run IO benchmarks (kqueue platforms only)
+    io_bench.runAll(allocator);
 
     std.debug.print("\n", .{});
 }

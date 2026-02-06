@@ -29,11 +29,11 @@ const Atomic = std.atomic.Value;
 
 const noise = @import("../noise/mod.zig");
 const async_mod = @import("../async/mod.zig");
-const os_mod = @import("../os/mod.zig");
 const kcp_mod = @import("../kcp/mod.zig");
 const Channel = async_mod.channel.Channel;
 const Signal = async_mod.channel.Signal;
-const Reactor = os_mod.Os.Reactor;
+const IOService = async_mod.IOService;
+const KqueueIO = async_mod.KqueueIO;
 pub const SimpleTimerService = async_mod.SimpleTimerService;
 pub const KcpMux = kcp_mod.Mux(SimpleTimerService);
 pub const KcpStream = kcp_mod.Stream;
@@ -333,8 +333,9 @@ pub const UDP = struct {
     workers: []Thread,
     num_workers: usize,
 
-    // IO reactor (kqueue on macOS)
-    reactor: Reactor,
+    // IO service (platform-agnostic)
+    io: IOService,
+    io_backend: *KqueueIO,
 
     // Timer service for KCP updates
     timer_service: SimpleTimerService,
@@ -407,20 +408,16 @@ pub const UDP = struct {
         // Allocate worker array
         const workers = allocator.alloc(Thread, num_workers) catch return UdpError.OutOfMemory;
 
-        // Initialize kqueue reactor for efficient I/O
-        var reactor = Reactor.init() catch return UdpError.BindFailed;
-        errdefer reactor.deinit();
-
-        // Register socket for read events (platform-specific flags)
-        const builtin = @import("builtin");
-        const register_flags: u16 = switch (builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd => os_mod.Kqueue.Flags.ADD | os_mod.Kqueue.Flags.ENABLE,
-            else => 0, // Stub on non-kqueue platforms
+        // Initialize IO backend
+        const io_backend = allocator.create(KqueueIO) catch return UdpError.OutOfMemory;
+        io_backend.* = KqueueIO.init(allocator) catch {
+            allocator.destroy(io_backend);
+            return UdpError.BindFailed;
         };
-        reactor.register(@intCast(socket), .read, register_flags) catch return UdpError.BindFailed;
-
-        // Register user event for shutdown signaling (ident = 1)
-        reactor.registerUser(1) catch return UdpError.BindFailed;
+        errdefer {
+            io_backend.deinit();
+            allocator.destroy(io_backend);
+        }
 
         self.* = Self{
             .allocator = allocator,
@@ -440,7 +437,8 @@ pub const UDP = struct {
             .timer_thread = null,
             .workers = workers,
             .num_workers = num_workers,
-            .reactor = reactor,
+            .io = io_backend.ioService(),
+            .io_backend = io_backend,
             .timer_service = SimpleTimerService.init(allocator),
             .closed = Atomic(bool).init(false),
             .close_signal = Signal.init(),
@@ -470,8 +468,8 @@ pub const UDP = struct {
         self.closed.store(true, .release);
         self.close_signal.signal();
 
-        // Trigger user event to wake ioLoop
-        self.reactor.triggerUser(1) catch {};
+        // Wake ioLoop from blocking poll
+        self.io.wake();
 
         // Close channels to wake blocked threads
         self.decrypt_chan.close();
@@ -523,7 +521,8 @@ pub const UDP = struct {
         self.pending.deinit();
 
         // Now cleanup internal resources
-        self.reactor.deinit();
+        self.io_backend.deinit();
+        self.allocator.destroy(self.io_backend);
         self.timer_service.deinit();
         self.decrypt_chan.deinit();
         self.output_chan.deinit();
@@ -900,86 +899,72 @@ pub const UDP = struct {
     // ========================================================================
 
     fn ioLoop(self: *Self) void {
+        // Register socket for read readiness via IOService callback
+        self.io.registerRead(@intCast(self.socket), .{
+            .ptr = @ptrCast(self),
+            .callback = onSocketReady,
+        });
+
+        // Poll loop — blocks until events, callbacks fire inside poll()
         while (!self.closed.load(.acquire)) {
-            // Wait for socket readability using kqueue (efficient, no busy poll)
-            // null timeout = block indefinitely until event
-            const events = self.reactor.wait(null) catch {
-                if (self.closed.load(.acquire)) return;
+            _ = self.io.poll(-1); // block indefinitely, wake() interrupts
+        }
+    }
+
+    /// Callback invoked by IOService when socket is readable.
+    fn onSocketReady(ptr: ?*anyopaque, _: posix.fd_t) void {
+        const self: *Self = @ptrCast(@alignCast(ptr.?));
+
+        // Drain all available packets from socket
+        while (!self.closed.load(.acquire)) {
+            // Acquire packet from pool
+            const pkt = self.packet_pool.acquire() orelse {
+                // Pool exhausted, yield and retry
+                std.Thread.yield() catch {};
                 continue;
             };
 
-            if (self.closed.load(.acquire)) return;
+            // Read from socket (non-blocking)
+            var from_addr: posix.sockaddr.in = undefined;
+            var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
-            // Check for shutdown signal (user event ident=1)
-            // Only on kqueue platforms where USER events are supported
-            const builtin_os = @import("builtin");
-            var should_exit = false;
-            if (builtin_os.os.tag == .macos or builtin_os.os.tag == .ios or
-                builtin_os.os.tag == .tvos or builtin_os.os.tag == .watchos or
-                builtin_os.os.tag == .freebsd or builtin_os.os.tag == .netbsd or
-                builtin_os.os.tag == .openbsd)
-            {
-                for (events) |ev| {
-                    if (ev.filter == posix.system.EVFILT.USER) {
-                        should_exit = true;
-                        break;
-                    }
+            const nr = posix.recvfrom(
+                self.socket,
+                pkt.data,
+                0,
+                @ptrCast(&from_addr),
+                &from_len,
+            ) catch |err| {
+                self.packet_pool.release(pkt);
+                if (err == error.WouldBlock) {
+                    break; // No more data, wait for next event
                 }
+                return; // Other errors: exit callback
+            };
+
+            if (nr < 1) {
+                self.packet_pool.release(pkt);
+                continue;
             }
-            if (should_exit) return;
 
-            // Process all available packets (drain the socket)
-            while (!self.closed.load(.acquire)) {
-                // Acquire packet from pool
-                const pkt = self.packet_pool.acquire() orelse {
-                    // Pool exhausted, yield and retry
-                    std.Thread.yield() catch {};
-                    continue;
-                };
+            pkt.len = nr;
+            pkt.from_addr = from_addr;
+            pkt.from_len = from_len;
 
-                // Read from socket (non-blocking)
-                var from_addr: posix.sockaddr.in = undefined;
-                var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+            // Update stats
+            _ = self.total_rx.fetchAdd(@intCast(nr), .release);
+            self.last_seen.store(std.time.nanoTimestamp(), .release);
 
-                const nr = posix.recvfrom(
-                    self.socket,
-                    pkt.data,
-                    0,
-                    @ptrCast(&from_addr),
-                    &from_len,
-                ) catch |err| {
-                    self.packet_pool.release(pkt);
-                    if (err == error.WouldBlock) {
-                        break; // No more data, wait for next event
-                    }
-                    if (self.closed.load(.acquire)) return;
-                    return; // Other errors: exit
-                };
-
-                if (nr < 1) {
-                    self.packet_pool.release(pkt);
-                    continue;
-                }
-
-                pkt.len = nr;
-                pkt.from_addr = from_addr;
-                pkt.from_len = from_len;
-
-                // Update stats
-                _ = self.total_rx.fetchAdd(@intCast(nr), .release);
-                self.last_seen.store(std.time.nanoTimestamp(), .release);
-
-                // Send to decrypt channel (non-blocking)
-                if (!self.decrypt_chan.trySend(pkt)) {
-                    // Queue full, drop packet
-                    self.packet_pool.release(pkt);
-                    continue;
-                }
-
-                // Send to output channel (non-blocking)
-                // If full, packet is still in decrypt queue, just won't be delivered to readFrom
-                _ = self.output_chan.trySend(pkt);
+            // Send to decrypt channel (non-blocking)
+            if (!self.decrypt_chan.trySend(pkt)) {
+                // Queue full, drop packet
+                self.packet_pool.release(pkt);
+                continue;
             }
+
+            // Send to output channel (non-blocking)
+            // If full, packet is still in decrypt queue, just won't be delivered to readFrom
+            _ = self.output_chan.trySend(pkt);
         }
     }
 
@@ -1344,6 +1329,76 @@ test "PacketPool basic" {
     pool.release(p3);
     pool.release(p4);
     pool.release(p5);
+}
+
+test "UDP end-to-end: handshake + send/recv" {
+    const allocator = std.testing.allocator;
+
+    // Create two keypairs
+    var priv1: [32]u8 = undefined;
+    var priv2: [32]u8 = undefined;
+    @memset(&priv1, 0);
+    @memset(&priv2, 0);
+    priv1[31] = 1;
+    priv2[31] = 2;
+    const kp1 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv1));
+    const kp2 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv2));
+
+    // Create two UDP instances on random ports
+    const udp1 = try UDP.init(allocator, &kp1, .{
+        .bind_addr = "127.0.0.1:0",
+        .allow_unknown = true,
+        .decrypt_workers = 1,
+    });
+    defer udp1.deinit();
+
+    const udp2 = try UDP.init(allocator, &kp2, .{
+        .bind_addr = "127.0.0.1:0",
+        .allow_unknown = true,
+        .decrypt_workers = 1,
+    });
+    defer udp2.deinit();
+
+    const port1 = udp1.getLocalPort();
+    const port2 = udp2.getLocalPort();
+
+    // Set peer endpoints
+    var ep1: posix.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = mem.nativeToBig(u16, port1),
+        .addr = mem.nativeToBig(u32, 0x7F000001),
+    };
+    var ep2: posix.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = mem.nativeToBig(u16, port2),
+        .addr = mem.nativeToBig(u32, 0x7F000001),
+    };
+
+    udp1.setPeerEndpoint(kp2.public, @as(*posix.sockaddr, @ptrCast(&ep2)).*, @sizeOf(posix.sockaddr.in));
+    udp2.setPeerEndpoint(kp1.public, @as(*posix.sockaddr, @ptrCast(&ep1)).*, @sizeOf(posix.sockaddr.in));
+
+    // Handshake: udp1 connects to udp2
+    try udp1.connect(&kp2.public);
+
+    // Send a message from udp1 to udp2
+    const msg = "hello from udp1";
+    try udp1.writeTo(&kp2.public, msg);
+
+    // Read on udp2
+    var buf: [256]u8 = undefined;
+    const result = try udp2.readFrom(&buf);
+    try std.testing.expectEqual(msg.len, result.n);
+    try std.testing.expectEqualSlices(u8, msg, buf[0..result.n]);
+    try std.testing.expectEqualSlices(u8, &kp1.public.data, &result.pk.data);
+
+    // Send reply from udp2 to udp1
+    const reply = "hello back from udp2";
+    try udp2.writeTo(&kp1.public, reply);
+
+    // Read on udp1
+    const result2 = try udp1.readFrom(&buf);
+    try std.testing.expectEqual(reply.len, result2.n);
+    try std.testing.expectEqualSlices(u8, reply, buf[0..result2.n]);
 }
 
 test "Channel with Packet pointers" {

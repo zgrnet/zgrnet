@@ -59,18 +59,9 @@ pub fn build(b: *std.Build) void {
         .pure_zig => .native_zig,
     };
 
-    // OS backend selection
-    const OsBackend = enum { darwin, none };
-    const default_os_backend: OsBackend = switch (target_os) {
-        .macos, .ios, .tvos, .watchos => .darwin,
-        else => .none,
-    };
-    const os_backend = b.option(OsBackend, "os_backend", "OS backend: darwin (kqueue), none (single-threaded)") orelse default_os_backend;
-
     // Build options
     const options = b.addOptions();
     options.addOption(CipherBackend, "backend", cipher_backend);
-    options.addOption(OsBackend, "os_backend", os_backend);
 
     // Helper to add ARM64 ASM files
     const addArm64AsmFiles = struct {
