@@ -271,7 +271,7 @@ def _zig_binary_impl(ctx):
     ) + """
 # Copy output to Bazel's output directory
 cp "$WORK"/{zig_root}/zig-out/bin/{binary_name} "$OUTPUT"
-""".format(zig_root = shell.quote(zig_root), binary_name = binary_name)
+""".format(zig_root = shell.quote(zig_root), binary_name = shell.quote(binary_name))
 
     ctx.actions.run_shell(
         outputs = [out],
@@ -383,7 +383,7 @@ def _zig_library_impl(ctx):
     ) + """
 # Copy output to Bazel's output directory
 cp "$WORK"/{zig_root}/{zig_out_path} "$OUTPUT"
-""".format(zig_root = shell.quote(zig_root), zig_out_path = zig_out_path)
+""".format(zig_root = shell.quote(zig_root), zig_out_path = shell.quote(zig_out_path))
 
     ctx.actions.run_shell(
         outputs = [out],

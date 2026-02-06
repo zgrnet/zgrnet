@@ -64,7 +64,8 @@ var WintunSendPacket: ?WintunSendPacketFn = null;
 var WintunGetAdapterLUID: ?WintunGetAdapterLUIDFn = null;
 
 // Windows TUN state (stored in opaque handle)
-// Uses reference counting for thread-safe access
+// Uses reference counting + condition variable for thread-safe access.
+// close() blocks until all active read/write operations complete.
 const WinTunState = struct {
     adapter: WINTUN_ADAPTER_HANDLE,
     session: WINTUN_SESSION_HANDLE,
@@ -73,35 +74,38 @@ const WinTunState = struct {
     mtu: u32,
     non_blocking: bool,
     closed: bool,
-    ref_count: std.atomic.Value(u32),
+    ref_count: u32,
     mutex: std.Thread.Mutex,
+    ref_zero_cond: std.Thread.Condition,
 
     /// Acquire a reference to the state. Returns null if closed.
     fn acquire(self: *WinTunState) ?*WinTunState {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.closed) return null;
-        _ = self.ref_count.fetchAdd(1, .monotonic);
+        self.ref_count += 1;
         return self;
     }
 
     /// Release a reference to the state.
+    /// Signals the condition variable when ref_count reaches 0.
     fn release(self: *WinTunState) void {
-        const prev = self.ref_count.fetchSub(1, .monotonic);
-        if (prev == 1) {
-            // Last reference, can be freed (but we don't free here, close does)
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.ref_count -= 1;
+        if (self.ref_count == 0) {
+            self.ref_zero_cond.signal();
         }
     }
 
-    /// Mark as closed and wait for all references to be released.
+    /// Mark as closed and block until all references are released.
+    /// Guarantees no UAF: close() only returns after all active I/O completes.
     fn markClosed(self: *WinTunState) void {
         self.mutex.lock();
+        defer self.mutex.unlock();
         self.closed = true;
-        self.mutex.unlock();
-        // Spin wait for ref_count to reach 0 (with reasonable timeout)
-        var spin_count: u32 = 0;
-        while (self.ref_count.load(.monotonic) > 0 and spin_count < 10000) : (spin_count += 1) {
-            std.Thread.yield() catch {};
+        while (self.ref_count > 0) {
+            self.ref_zero_cond.wait(&self.mutex);
         }
     }
 };
@@ -158,7 +162,7 @@ pub fn init() TunError!void {
     };
     defer if (temp_base) |t| std.heap.page_allocator.free(t);
 
-    const temp_dir = temp_base orelse "C:\\Windows\\Temp";
+    const temp_dir = temp_base orelse return TunError.WintunInitFailed;
 
     // Generate a random subdirectory name for isolation
     var random_bytes: [8]u8 = undefined;
@@ -333,8 +337,9 @@ pub fn create(name: ?[]const u8) TunError!Tun {
         .mtu = 1400,
         .non_blocking = false,
         .closed = false,
-        .ref_count = std.atomic.Value(u32).init(0),
+        .ref_count = 0,
         .mutex = .{},
+        .ref_zero_cond = .{},
     };
 
     // Use state pointer as handle (direct cast, no HashMap needed)
