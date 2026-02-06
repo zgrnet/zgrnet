@@ -49,6 +49,7 @@ zig_library(
 # TUN library with headers and linkopts for Go CGo and Rust FFI
 cc_library(
     name = "tun_lib",
+    srcs = [":tun_static"],
     hdrs = ["include/tun.h"],
     includes = ["include"],
     linkopts = select({
@@ -62,7 +63,6 @@ cc_library(
             "-liphlpapi",
         ],
     }),
-    deps = [":tun_static"],
     visibility = ["//visibility:public"],
 )
 

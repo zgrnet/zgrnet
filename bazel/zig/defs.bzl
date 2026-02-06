@@ -337,16 +337,11 @@ def _zig_library_impl(ctx):
     that can be used as a dependency in other Bazel rules (e.g., cc_library).
     """
 
-    # Determine output filename based on platform
+    # Determine output filename
+    # Note: Windows (.lib) support can be added later when needed
     lib_name = ctx.attr.lib_name
-    is_windows = ctx.target_platform_has_constraint(ctx.attr._windows_constraint[platform_common.ConstraintValueInfo])
-    
-    if is_windows:
-        out_filename = lib_name + ".lib"
-        zig_out_path = "zig-out/lib/" + lib_name + ".lib"
-    else:
-        out_filename = "lib" + lib_name + ".a"
-        zig_out_path = "zig-out/lib/lib" + lib_name + ".a"
+    out_filename = "lib" + lib_name + ".a"
+    zig_out_path = "zig-out/lib/lib" + lib_name + ".a"
 
     # Declare the output library
     out = ctx.actions.declare_file(out_filename)
@@ -397,24 +392,6 @@ cp "$WORK"/{zig_root}/{zig_out_path} "$OUTPUT"
         DefaultInfo(
             files = depset([out]),
         ),
-        CcInfo(
-            compilation_context = cc_common.create_compilation_context(
-                headers = depset([]),
-            ),
-            linking_context = cc_common.create_linking_context(
-                linker_inputs = depset([
-                    cc_common.create_linker_input(
-                        owner = ctx.label,
-                        libraries = depset([
-                            cc_common.create_library_to_link(
-                                actions = ctx.actions,
-                                static_library = out,
-                            ),
-                        ]),
-                    ),
-                ]),
-            ),
-        ),
     ]
 
 zig_library = rule(
@@ -452,9 +429,6 @@ zig_library = rule(
         "_kcp": attr.label(
             default = "//third_party/kcp:srcs",
             doc = "KCP library source files (from //third_party/kcp)",
-        ),
-        "_windows_constraint": attr.label(
-            default = "@platforms//os:windows",
         ),
     },
     doc = "Build a Zig static library and output to Bazel's output directory",
