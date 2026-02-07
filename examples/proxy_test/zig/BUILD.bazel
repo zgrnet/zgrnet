@@ -1,0 +1,16 @@
+# Zig source files for this example
+filegroup(
+    name = "srcs",
+    srcs = glob([
+        "src/**/*.zig",
+    ]),
+    visibility = ["//visibility:public"],
+)
+
+# Proxy interop test binary
+# Built from main zig/ directory (due to C dependency complexity)
+alias(
+    name = "proxy_test",
+    actual = "//zig:proxy_test",
+    visibility = ["//visibility:public"],
+)

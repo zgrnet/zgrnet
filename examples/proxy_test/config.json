@@ -1,0 +1,21 @@
+{
+  "_WARNING": "TEST KEYS ONLY - DO NOT USE IN PRODUCTION",
+  "hosts": [
+    {
+      "name": "handler",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "port": 20001,
+      "role": "handler"
+    },
+    {
+      "name": "proxy",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "port": 20002,
+      "role": "proxy"
+    }
+  ],
+  "echo_port": 19999,
+  "test": {
+    "message": "cross-lang proxy test!"
+  }
+}
