@@ -154,8 +154,8 @@ type UDP struct {
 	allowUnknown bool
 
 	// Relay forwarding
-	router       relay.Router       // nil = no relay forwarding
-	localMetrics relay.NodeMetrics  // local metrics for PONG responses
+	router       relay.Router      // nil = no relay forwarding
+	localMetrics relay.NodeMetrics // local metrics for PONG responses
 
 	// Peer management
 	mu      sync.RWMutex

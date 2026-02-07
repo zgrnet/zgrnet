@@ -990,7 +990,7 @@ impl UDP {
                 let router_guard = self.router.read().unwrap();
                 if router_guard.is_some() {
                     drop(router_guard);
-                    let metrics = self.local_metrics.lock().unwrap().clone();
+                    let metrics = *self.local_metrics.lock().unwrap();
                     if let Ok(action) = relay::handle_ping(&peer_pk.0, payload, &metrics) {
                         self.execute_relay_action(&action);
                     }

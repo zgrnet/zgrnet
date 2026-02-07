@@ -121,9 +121,9 @@ func DecodeRelay2(data []byte) (*Relay2, error) {
 
 // Errors.
 var (
-	ErrTooShort  = errors.New("relay: message too short")
+	ErrTooShort   = errors.New("relay: message too short")
 	ErrTTLExpired = errors.New("relay: TTL expired")
-	ErrNoRoute   = errors.New("relay: no route to destination")
+	ErrNoRoute    = errors.New("relay: no route to destination")
 )
 
 // DefaultTTL is the default time-to-live for relay messages.
