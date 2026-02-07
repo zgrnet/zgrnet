@@ -19,6 +19,7 @@ go_library(
     deps = [
         "//go:noise",
         "//go/pkg/kcp",
+        "//go/pkg/relay",
     ],
 )
 
@@ -41,5 +42,6 @@ go_test(
     deps = [
         "//go:noise",
         "//go/pkg/kcp",
+        "//go/pkg/relay",
     ],
 )
