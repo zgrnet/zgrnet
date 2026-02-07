@@ -582,7 +582,8 @@ pub fn Mux(comptime TimerServiceT: type) type {
 
             // Send SYN with proto + metadata as payload
             const syn_payload = if (proto != 0 or metadata.len > 0) blk: {
-                const buf = self.allocator.alloc(u8, 1 + metadata.len) catch return MuxError.OutOfMemory;
+                const total = std.math.add(usize, 1, metadata.len) catch return MuxError.OutOfMemory;
+                const buf = self.allocator.alloc(u8, total) catch return MuxError.OutOfMemory;
                 buf[0] = proto;
                 if (metadata.len > 0) {
                     @memcpy(buf[1..], metadata);

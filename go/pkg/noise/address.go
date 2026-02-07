@@ -60,9 +60,6 @@ func (a *Address) Encode() []byte {
 			return nil
 		}
 		ip6 := ip.To16()
-		if ip6 == nil {
-			return nil
-		}
 		buf := make([]byte, 1+16+2)
 		buf[0] = AddressTypeIPv6
 		copy(buf[1:17], ip6)
