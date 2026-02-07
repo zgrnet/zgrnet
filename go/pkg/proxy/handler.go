@@ -4,6 +4,8 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vibing/zgrnet/pkg/noise"
@@ -47,4 +49,110 @@ func HandleTCPProxy(stream io.ReadWriteCloser, metadata []byte, dial DialFunc) e
 func DefaultDial(addr *noise.Address) (io.ReadWriteCloser, error) {
 	target := net.JoinHostPort(addr.Host, strconv.Itoa(int(addr.Port)))
 	return net.DialTimeout("tcp", target, 10*time.Second)
+}
+
+// UDPProxyHandler forwards UDP_PROXY (protocol=65) packets between the
+// tunnel and real UDP targets. It maintains a single UDP socket for
+// forwarding and listens for responses to route them back.
+//
+// Wire format (both directions): addr.Encode() + data
+type UDPProxyHandler struct {
+	conn   *net.UDPConn           // local socket for forwarding to targets
+	send   func(response []byte) error // send response back through tunnel
+	closed atomic.Bool
+	wg     sync.WaitGroup
+}
+
+// NewUDPProxyHandler creates a handler and starts a response receive loop.
+// send is called with the encoded response (addr + data) for each reply
+// received from a real UDP target.
+func NewUDPProxyHandler(send func(response []byte) error) (*UDPProxyHandler, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		return nil, err
+	}
+
+	h := &UDPProxyHandler{
+		conn: conn,
+		send: send,
+	}
+
+	// Start response receive loop
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.receiveLoop()
+	}()
+
+	return h, nil
+}
+
+// HandlePacket processes a single UDP_PROXY payload.
+// payload format: addr.Encode() + data
+// It decodes the target address and forwards the data via UDP.
+func (h *UDPProxyHandler) HandlePacket(payload []byte) error {
+	addr, consumed, err := noise.DecodeAddress(payload)
+	if err != nil {
+		return err
+	}
+	data := payload[consumed:]
+
+	target, err := net.ResolveUDPAddr("udp",
+		net.JoinHostPort(addr.Host, strconv.Itoa(int(addr.Port))))
+	if err != nil {
+		return err
+	}
+
+	_, err = h.conn.WriteToUDP(data, target)
+	return err
+}
+
+// receiveLoop reads responses from real UDP targets and sends them back
+// through the tunnel with the source address prepended.
+func (h *UDPProxyHandler) receiveLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, from, err := h.conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+
+		// Build source address
+		var addr noise.Address
+		if ip4 := from.IP.To4(); ip4 != nil {
+			addr = noise.Address{
+				Type: noise.AddressTypeIPv4,
+				Host: from.IP.String(),
+				Port: uint16(from.Port),
+			}
+		} else {
+			addr = noise.Address{
+				Type: noise.AddressTypeIPv6,
+				Host: from.IP.String(),
+				Port: uint16(from.Port),
+			}
+		}
+
+		encoded := addr.Encode()
+		if encoded == nil {
+			continue
+		}
+
+		// Build response: addr.Encode() + data
+		response := make([]byte, len(encoded)+n)
+		copy(response, encoded)
+		copy(response[len(encoded):], buf[:n])
+
+		h.send(response)
+	}
+}
+
+// Close stops the handler and waits for the receive loop to exit.
+func (h *UDPProxyHandler) Close() error {
+	if h.closed.Swap(true) {
+		return nil
+	}
+	err := h.conn.Close()
+	h.wg.Wait()
+	return err
 }
