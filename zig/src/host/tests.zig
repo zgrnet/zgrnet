@@ -298,8 +298,8 @@ test "Host: ICMP forwarding A->B" {
     // Build ICMP echo request: A -> B
     const icmp_data = "ping";
     const icmp = makeICMPEcho(8, 0, 1, 1, icmp_data);
-    var build_buf: [1500]u8 = undefined;
-    const ip_pkt = buildIpv4Packet(&build_buf, .{ 100, 64, 0, 1 }, ip_b_on_a, 1, icmp[0 .. 8 + icmp_data.len]) catch return error.SkipZigTest;
+    const ip_pkt = buildIpv4Packet(allocator, .{ 100, 64, 0, 1 }, ip_b_on_a, 1, icmp[0 .. 8 + icmp_data.len]) catch return error.SkipZigTest;
+    defer allocator.free(ip_pkt);
 
     // Inject into Host A's TUN
     tun_a.inject(ip_pkt);
@@ -367,8 +367,8 @@ test "Host: bidirectional forwarding" {
 
     // A -> B
     const icmp_req = makeICMPEcho(8, 0, 1, 1, "ping");
-    var buf_ab: [1500]u8 = undefined;
-    const pkt_ab = buildIpv4Packet(&buf_ab, .{ 100, 64, 0, 1 }, ip_b_on_a, 1, icmp_req[0..12]) catch return error.SkipZigTest;
+    const pkt_ab = buildIpv4Packet(allocator, .{ 100, 64, 0, 1 }, ip_b_on_a, 1, icmp_req[0..12]) catch return error.SkipZigTest;
+    defer allocator.free(pkt_ab);
     tun_a.inject(pkt_ab);
 
     const recv_b = tun_b.receive(3000) orelse return error.SkipZigTest;
@@ -378,8 +378,8 @@ test "Host: bidirectional forwarding" {
 
     // B -> A
     const icmp_reply = makeICMPEcho(0, 0, 1, 1, "pong");
-    var buf_ba: [1500]u8 = undefined;
-    const pkt_ba = buildIpv4Packet(&buf_ba, .{ 100, 64, 0, 1 }, ip_a_on_b, 1, icmp_reply[0..12]) catch return error.SkipZigTest;
+    const pkt_ba = buildIpv4Packet(allocator, .{ 100, 64, 0, 1 }, ip_a_on_b, 1, icmp_reply[0..12]) catch return error.SkipZigTest;
+    defer allocator.free(pkt_ba);
     tun_b.inject(pkt_ba);
 
     const recv_a = tun_a.receive(3000) orelse return error.SkipZigTest;
@@ -429,8 +429,8 @@ test "Host: TCP forwarding with checksum" {
 
     // Build TCP SYN
     const tcp = makeTCPSYN(12345, 80);
-    var build_buf: [1500]u8 = undefined;
-    const ip_pkt = buildIpv4Packet(&build_buf, .{ 100, 64, 0, 1 }, ip_b_on_a, 6, &tcp) catch return error.SkipZigTest;
+    const ip_pkt = buildIpv4Packet(allocator, .{ 100, 64, 0, 1 }, ip_b_on_a, 6, &tcp) catch return error.SkipZigTest;
+    defer allocator.free(ip_pkt);
 
     tun_a.inject(ip_pkt);
 

@@ -5,6 +5,7 @@
 //! the TUN device and encrypted UDP transport.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 /// Parsed information from an IP packet.
 pub const PacketInfo = struct {
@@ -68,18 +69,20 @@ fn parseIpv6(pkt: []const u8) PacketError!PacketInfo {
 /// Build an IPv4 packet from components into the provided buffer.
 /// Constructs a minimal 20-byte IPv4 header and appends the transport payload.
 /// Recalculates both IP header checksum and transport checksums (TCP/UDP).
-/// Returns the slice of `buf` containing the complete packet.
+/// Allocates exactly the needed size. Caller must free the returned slice.
 pub fn buildIpv4Packet(
-    buf: []u8,
+    allocator: Allocator,
     src_ip: [4]u8,
     dst_ip: [4]u8,
     protocol: u8,
     payload: []const u8,
-) PacketError![]u8 {
+) (PacketError || Allocator.Error)![]u8 {
     const header_len: usize = 20;
     const total_len = header_len + payload.len;
     if (total_len > 65535) return PacketError.TooLarge;
-    if (buf.len < total_len) return PacketError.TooLarge;
+
+    const buf = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(buf);
 
     // IPv4 header
     buf[0] = 0x45; // Version 4, IHL 5 (20 bytes)
@@ -106,21 +109,24 @@ pub fn buildIpv4Packet(
     // Fix transport layer checksum (TCP/UDP use pseudo-header with IPs)
     fixTransportChecksum(buf[header_len .. header_len + payload.len], &src_ip, &dst_ip, protocol);
 
-    return buf[0..total_len];
+    return buf;
 }
 
-/// Build an IPv6 packet from components into the provided buffer.
+/// Build an IPv6 packet from components.
+/// Allocates exactly the needed size. Caller must free the returned slice.
 pub fn buildIpv6Packet(
-    buf: []u8,
+    allocator: Allocator,
     src_ip: [16]u8,
     dst_ip: [16]u8,
     protocol: u8,
     payload: []const u8,
-) PacketError![]u8 {
+) (PacketError || Allocator.Error)![]u8 {
     const header_len: usize = 40;
     const total_len = header_len + payload.len;
     if (payload.len > 65535) return PacketError.TooLarge;
-    if (buf.len < total_len) return PacketError.TooLarge;
+
+    const buf = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(buf);
 
     // IPv6 header
     buf[0] = 0x60; // Version 6
@@ -139,7 +145,7 @@ pub fn buildIpv6Packet(
     // Fix transport layer checksum
     fixTransportChecksumV6(buf[header_len .. header_len + payload.len], &src_ip, &dst_ip, protocol);
 
-    return buf[0..total_len];
+    return buf;
 }
 
 /// Recalculates TCP/UDP checksums for IPv4.
@@ -332,9 +338,10 @@ test "parseIpPacket: invalid version" {
 }
 
 test "buildIpv4Packet: ICMP" {
-    var buf: [1500]u8 = undefined;
+    const allocator = std.testing.allocator;
     const payload = [_]u8{ 0x08, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01 };
-    const pkt = try buildIpv4Packet(&buf, .{ 100, 64, 0, 1 }, .{ 100, 64, 0, 2 }, 1, &payload);
+    const pkt = try buildIpv4Packet(allocator, .{ 100, 64, 0, 1 }, .{ 100, 64, 0, 2 }, 1, &payload);
+    defer allocator.free(pkt);
 
     try std.testing.expectEqual(@as(usize, 28), pkt.len);
     try std.testing.expectEqual(@as(u8, 0x45), pkt[0]);
@@ -351,12 +358,13 @@ test "buildIpv4Packet: ICMP" {
 }
 
 test "buildIpv4Packet: round-trip" {
-    var buf: [1500]u8 = undefined;
+    const allocator = std.testing.allocator;
     const src = [4]u8{ 10, 0, 0, 1 };
     const dst = [4]u8{ 10, 0, 0, 2 };
     const payload = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
-    const pkt = try buildIpv4Packet(&buf, src, dst, 1, &payload);
+    const pkt = try buildIpv4Packet(allocator, src, dst, 1, &payload);
+    defer allocator.free(pkt);
     const info = try parseIpPacket(pkt);
 
     try std.testing.expectEqual(@as(u8, 4), info.version);

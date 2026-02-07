@@ -344,10 +344,8 @@ pub fn Host(comptime UDPType: type) type {
                 // Transport payload without IP header — rebuild and write to TUN
                 const src_ip = self.ip_alloc.lookupByPubkey(pk) orelse return;
 
-                // TODO(async-tun): Use pre-allocated buffer pool or io_uring
-                // registered buffers instead of 64KB stack allocation.
-                var pkt_buf: [65535]u8 = undefined;
-                const ip_pkt = buildIpv4Packet(&pkt_buf, src_ip, self.tun_ipv4, proto, payload) catch return;
+                const ip_pkt = buildIpv4Packet(self.allocator, src_ip, self.tun_ipv4, proto, payload) catch return;
+                defer self.allocator.free(ip_pkt);
 
                 _ = self.tun.write(ip_pkt) catch {};
             }
