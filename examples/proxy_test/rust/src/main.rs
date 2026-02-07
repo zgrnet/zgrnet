@@ -108,9 +108,20 @@ fn run_handler(config: &Config, my_host: &HostInfo, key_pair: KeyPair) {
     let endpoint: SocketAddr = format!("127.0.0.1:{}", peer.port).parse().unwrap();
     udp.set_peer_endpoint(peer_kp.public, endpoint);
 
-    // 4. Accept stream
+    // 4. Wait for session, then accept stream
+    println!("[handler] Waiting for session from proxy...");
+    for _ in 0..100 {
+        if let Some(info) = udp.peer_info(&peer_kp.public) {
+            if info.state == zgrnet::PeerState::Established {
+                println!("[handler] Session established!");
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
     println!("[handler] Waiting for TCP_PROXY stream...");
-    let stream = udp.accept_stream(peer_kp.public).expect("accept stream");
+    let stream = udp.accept_stream(&peer_kp.public).expect("accept stream");
     println!(
         "[handler] Got stream id={} proto={} metadata={}B",
         stream.id(),
@@ -148,7 +159,7 @@ fn run_handler(config: &Config, my_host: &HostInfo, key_pair: KeyPair) {
         loop {
             match tcp.read(&mut buf) {
                 Ok(0) => return,
-                Ok(n) => { if stream.write(&buf[..n]).is_err() { return; } }
+                Ok(n) => { if stream.write_data(&buf[..n]).is_err() { return; } }
                 Err(_) => return,
             }
         }
@@ -184,7 +195,7 @@ fn run_proxy(config: &Config, my_host: &HostInfo, key_pair: KeyPair) {
     udp.set_peer_endpoint(handler_kp.public, endpoint);
 
     println!("[proxy] Connecting to handler...");
-    udp.connect(handler_kp.public).expect("connect");
+    udp.connect(&handler_kp.public).expect("connect");
     println!("[proxy] Connected!");
     thread::sleep(Duration::from_millis(200));
 
@@ -197,7 +208,7 @@ fn run_proxy(config: &Config, my_host: &HostInfo, key_pair: KeyPair) {
     );
 
     let stream = udp
-        .open_stream(handler_kp.public, protocol::TCP_PROXY, &metadata)
+        .open_stream(&handler_kp.public, protocol::TCP_PROXY, &metadata)
         .expect("open stream");
     println!("[proxy] Stream opened id={}", stream.id());
     thread::sleep(Duration::from_millis(500));
@@ -205,7 +216,7 @@ fn run_proxy(config: &Config, my_host: &HostInfo, key_pair: KeyPair) {
     // 4. Send test data and verify echo
     let msg = config.test.message.as_bytes();
     println!("[proxy] Sending: {:?}", config.test.message);
-    stream.write(msg).expect("write");
+    stream.write_data(msg).expect("write");
 
     let mut buf = vec![0u8; msg.len()];
     let mut total = 0;
@@ -227,7 +238,7 @@ fn run_proxy(config: &Config, my_host: &HostInfo, key_pair: KeyPair) {
 /// Blocking read from KCP stream (polls with short sleep).
 fn blocking_read(stream: &Stream, buf: &mut [u8]) -> usize {
     loop {
-        match stream.read(buf) {
+        match stream.read_data(buf) {
             Ok(n) if n > 0 => return n,
             Ok(_) => thread::sleep(Duration::from_millis(1)),
             Err(_) => return 0,

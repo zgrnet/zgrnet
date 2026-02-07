@@ -119,7 +119,17 @@ func runHandler(config *Config, myInfo *HostInfo, myKey *noise.KeyPair) {
 	peerKey := loadKey(peerInfo.PrivateKey)
 	udp.SetPeerEndpoint(peerKey.Public, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: peerInfo.Port})
 
-	// 4. Wait for stream
+	// 4. Wait for session, then accept stream
+	log.Printf("[handler] Waiting for session from proxy...")
+	for i := 0; i < 100; i++ {
+		info := udp.PeerInfo(peerKey.Public)
+		if info != nil && info.State == znet.PeerStateEstablished {
+			log.Printf("[handler] Session established!")
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	log.Printf("[handler] Waiting for TCP_PROXY stream...")
 	stream, err := udp.AcceptStream(peerKey.Public)
 	if err != nil {
