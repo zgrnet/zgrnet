@@ -150,10 +150,25 @@ func (h *Host) addPeerLocked(p *PeerConfig) error {
 }
 
 // AddPeer dynamically adds a peer to the host.
+// An IPv4 address is automatically allocated from the CGNAT pool.
 func (h *Host) AddPeer(pk noise.PublicKey, endpoint string) error {
 	p := &PeerConfig{
 		PublicKey: pk,
 		Endpoint:  endpoint,
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.addPeerLocked(p)
+}
+
+// AddPeerWithIP dynamically adds a peer with a specific static IPv4 address.
+func (h *Host) AddPeerWithIP(pk noise.PublicKey, endpoint string, ipv4 net.IP) error {
+	p := &PeerConfig{
+		PublicKey: pk,
+		Endpoint:  endpoint,
+		IPv4:      ipv4,
 	}
 
 	h.mu.Lock()
