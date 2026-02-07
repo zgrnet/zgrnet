@@ -238,8 +238,9 @@ pub fn main() !void {
         std.process.exit(1);
     }
     print("All tests passed!\n", .{});
-    // Exit immediately — close() would block because TUN read threads
-    // can't be interrupted. OS cleans up all resources on process exit.
+    // TODO(async-tun): Replace process.exit(0) with graceful host.close()
+    // once TUN uses async I/O (kqueue/io_uring). Currently close(fd) cannot
+    // reliably interrupt blocking read(fd) on macOS. See design/14-async-tun.md.
     std.process.exit(0);
 }
 

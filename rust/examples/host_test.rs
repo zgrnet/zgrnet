@@ -37,7 +37,9 @@ impl TunDevice for RealTun {
     }
 
     fn close(&self) -> io::Result<()> {
-        // Device is closed on drop
+        // TODO(async-tun): Implement real close — call tun_close() on the
+        // underlying fd to interrupt blocking reads. Currently Device only
+        // closes on Drop (blocked by Arc). See design/14-async-tun.md.
         Ok(())
     }
 }
@@ -206,9 +208,10 @@ fn run_test() {
         process::exit(1);
     }
     println!("All tests passed!");
-    // Exit immediately — close() would block because TUN read threads
-    // can't be interrupted (RealTun::close is a no-op).
-    // OS cleans up all resources on process exit.
+    // TODO(async-tun): Replace process::exit(0) with graceful host.close()
+    // once TUN uses async I/O. Currently RealTun::close() is a no-op and
+    // close(fd) cannot reliably interrupt blocking read(fd) on macOS.
+    // See design/14-async-tun.md.
     process::exit(0);
 }
 

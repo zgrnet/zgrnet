@@ -278,14 +278,12 @@ pub fn Host(comptime UDPType: type) type {
             var buf: [1500 + 40]u8 = undefined; // MTU + extra room
 
             while (!self.closed.load(.acquire)) {
+                // TODO(async-tun): Replace blocking read with async I/O
+                // (kqueue/io_uring). Currently TUN read is blocking, so
+                // WouldBlock never triggers. See design/14-async-tun.md.
                 const n = self.tun.read(&buf) catch |err| {
                     if (self.closed.load(.acquire)) return;
-                    if (err == TunDevice.ReadError.WouldBlock) {
-                        // Non-blocking: brief sleep then retry
-                        std.Thread.sleep(1 * std.time.ns_per_ms);
-                    } else {
-                        std.debug.print("host: tun read error: {}\n", .{err});
-                    }
+                    std.debug.print("host: tun read error: {}\n", .{err});
                     continue;
                 };
 
@@ -346,6 +344,8 @@ pub fn Host(comptime UDPType: type) type {
                 // Transport payload without IP header — rebuild and write to TUN
                 const src_ip = self.ip_alloc.lookupByPubkey(pk) orelse return;
 
+                // TODO(async-tun): Use pre-allocated buffer pool or io_uring
+                // registered buffers instead of 64KB stack allocation.
                 var pkt_buf: [65535]u8 = undefined;
                 const ip_pkt = buildIpv4Packet(&pkt_buf, src_ip, self.tun_ipv4, proto, payload) catch return;
 

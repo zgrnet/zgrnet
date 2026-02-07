@@ -145,10 +145,6 @@ func main() {
 		failed++
 	}
 
-	// Cleanup
-	hostA.Close()
-	hostB.Close()
-
 	// Summary
 	fmt.Println()
 	fmt.Println("=== Results ===")
@@ -161,6 +157,9 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("All tests passed!")
+	// TODO(async-tun): Replace os.Exit(0) with graceful host.Close() once TUN
+	// uses async I/O (kqueue/io_uring). Currently close(fd) cannot reliably
+	// interrupt a blocking read(fd) on macOS. See design/14-async-tun.md.
 	os.Exit(0)
 }
 
