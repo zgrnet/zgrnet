@@ -949,6 +949,179 @@ func TestBuildSOCKS5UDP(t *testing.T) {
 	}
 }
 
+// === HTTP CONNECT tests ===
+
+func TestHTTPConnect_Basic(t *testing.T) {
+	echoAddr, cleanup := echoServer(t)
+	defer cleanup()
+
+	_, addr := startServer(t, dialFixed(echoAddr))
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Send HTTP CONNECT request
+	req := "CONNECT 10.0.0.1:443 HTTP/1.1\r\nHost: 10.0.0.1:443\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read response line
+	resp := make([]byte, 256)
+	n, err := conn.Read(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respStr := string(resp[:n])
+	if !bytes.Contains(resp[:n], []byte("200")) {
+		t.Fatalf("expected 200 response, got: %s", respStr)
+	}
+
+	// Test relay through echo server
+	testData := []byte("hello http connect")
+	if _, err := conn.Write(testData); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(testData))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, testData) {
+		t.Fatalf("expected %q, got %q", testData, buf)
+	}
+}
+
+func TestHTTPConnect_Domain(t *testing.T) {
+	echoAddr, cleanup := echoServer(t)
+	defer cleanup()
+
+	// Verify the dial function receives the correct parsed address
+	var mu sync.Mutex
+	var got *noise.Address
+
+	dial := func(a *noise.Address) (io.ReadWriteCloser, error) {
+		mu.Lock()
+		got = a
+		mu.Unlock()
+		return net.Dial("tcp", echoAddr)
+	}
+
+	_, addr := startServer(t, dial)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	req := "CONNECT example.com:8443 HTTP/1.1\r\nHost: example.com:8443\r\n\r\n"
+	conn.Write([]byte(req))
+
+	// Read response
+	resp := make([]byte, 256)
+	conn.Read(resp)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got == nil {
+		t.Fatal("dial was not called")
+	}
+	if got.Type != noise.AddressTypeDomain {
+		t.Errorf("type: got 0x%02x, want 0x%02x (domain)", got.Type, noise.AddressTypeDomain)
+	}
+	if got.Host != "example.com" {
+		t.Errorf("host: got %q, want %q", got.Host, "example.com")
+	}
+	if got.Port != 8443 {
+		t.Errorf("port: got %d, want %d", got.Port, 8443)
+	}
+}
+
+func TestHTTPConnect_IPv6(t *testing.T) {
+	echoAddr, cleanup := echoServer(t)
+	defer cleanup()
+
+	var mu sync.Mutex
+	var got *noise.Address
+
+	dial := func(a *noise.Address) (io.ReadWriteCloser, error) {
+		mu.Lock()
+		got = a
+		mu.Unlock()
+		return net.Dial("tcp", echoAddr)
+	}
+
+	_, addr := startServer(t, dial)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	req := "CONNECT [::1]:443 HTTP/1.1\r\n\r\n"
+	conn.Write([]byte(req))
+
+	resp := make([]byte, 256)
+	conn.Read(resp)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got == nil {
+		t.Fatal("dial was not called")
+	}
+	if got.Type != noise.AddressTypeIPv6 {
+		t.Errorf("type: got 0x%02x, want 0x%02x (IPv6)", got.Type, noise.AddressTypeIPv6)
+	}
+	if got.Host != "::1" {
+		t.Errorf("host: got %q, want %q", got.Host, "::1")
+	}
+}
+
+func TestHTTPConnect_DialError(t *testing.T) {
+	_, addr := startServer(t, func(a *noise.Address) (io.ReadWriteCloser, error) {
+		return nil, errors.New("connection refused")
+	})
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	req := "CONNECT example.com:443 HTTP/1.1\r\n\r\n"
+	conn.Write([]byte(req))
+
+	resp := make([]byte, 256)
+	n, _ := conn.Read(resp)
+	if !bytes.Contains(resp[:n], []byte("502")) {
+		t.Fatalf("expected 502 response, got: %s", string(resp[:n]))
+	}
+}
+
+func TestHTTPConnect_BadRequest(t *testing.T) {
+	_, addr := startServer(t, nil)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Not a CONNECT method
+	req := "CGET / HTTP/1.1\r\n\r\n"
+	conn.Write([]byte(req))
+
+	resp := make([]byte, 256)
+	n, _ := conn.Read(resp)
+	if !bytes.Contains(resp[:n], []byte("400")) {
+		t.Fatalf("expected 400 response, got: %s", string(resp[:n]))
+	}
+}
+
 func TestBuildSOCKS5UDP_Domain(t *testing.T) {
 	addr := &noise.Address{Type: noise.AddressTypeDomain, Host: "example.com", Port: 53}
 	data := []byte("query")

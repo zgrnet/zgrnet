@@ -7,11 +7,14 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -171,6 +174,8 @@ func (s *Server) handleConn(conn net.Conn) {
 	switch first[0] {
 	case Version5:
 		s.handleSOCKS5(conn)
+	case 'C':
+		s.handleHTTPConnect(conn)
 	default:
 		// Unknown protocol
 		return
@@ -366,6 +371,105 @@ func (s *Server) handleUDPAssociate(conn net.Conn, addr *noise.Address) {
 	udpConn.Close()
 	relay.Close()
 	wg.Wait()
+}
+
+// handleHTTPConnect handles an HTTP CONNECT request.
+//
+// Format: "CONNECT host:port HTTP/1.x\r\n" + headers + "\r\n"
+// The first byte 'C' has already been consumed by handleConn.
+func (s *Server) handleHTTPConnect(conn net.Conn) {
+	reader := bufio.NewReader(conn)
+
+	// Read the rest of the first line (we already consumed 'C')
+	restOfLine, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	firstLine := "C" + restOfLine
+
+	// Parse: "CONNECT host:port HTTP/1.x\r\n"
+	parts := strings.SplitN(strings.TrimSpace(firstLine), " ", 3)
+	if len(parts) < 2 || parts[0] != "CONNECT" {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	target := parts[1] // "host:port"
+
+	// Read remaining headers until empty line
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	// Parse target address
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		// Try as host-only (default port 443 for CONNECT)
+		host = target
+		portStr = "443"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		return
+	}
+
+	// Determine address type
+	addr := &noise.Address{Port: uint16(port)}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			addr.Type = noise.AddressTypeIPv4
+		} else {
+			addr.Type = noise.AddressTypeIPv6
+		}
+		addr.Host = ip.String()
+	} else {
+		addr.Type = noise.AddressTypeDomain
+		addr.Host = host
+	}
+
+	// Clear deadline for relay phase
+	conn.SetDeadline(time.Time{})
+
+	// Dial the target
+	remote, err := s.dial(addr)
+	if err != nil {
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+	defer remote.Close()
+
+	// Send success response
+	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// Relay using buffered reader (may have data buffered beyond headers)
+	bc := &bufferedConn{reader: reader, conn: conn}
+	Relay(bc, remote)
+}
+
+// bufferedConn wraps a net.Conn with a bufio.Reader for reads.
+// This ensures any data buffered during HTTP header parsing is not lost.
+type bufferedConn struct {
+	reader *bufio.Reader
+	conn   net.Conn
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error)  { return c.reader.Read(p) }
+func (c *bufferedConn) Write(p []byte) (int, error) { return c.conn.Write(p) }
+func (c *bufferedConn) Close() error                { return c.conn.Close() }
+
+// CloseWrite supports half-close for the relay.
+func (c *bufferedConn) CloseWrite() error {
+	if tc, ok := c.conn.(*net.TCPConn); ok {
+		return tc.CloseWrite()
+	}
+	return nil
 }
 
 // sendReply sends a SOCKS5 reply to the client.
