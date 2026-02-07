@@ -29,6 +29,7 @@ pub mod kcp;
 pub mod relay;
 pub mod host;
 pub mod proxy;
+pub mod dns;
 
 #[cfg(feature = "tun")]
 pub mod tun;
