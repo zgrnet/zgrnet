@@ -259,10 +259,11 @@ impl Host {
             match self.tun.read(&mut buf) {
                 Ok(0) => continue,
                 Ok(n) => self.handle_outbound(&buf[..n]),
-                Err(_) => {
+                Err(e) => {
                     if self.closed.load(Ordering::SeqCst) {
                         return;
                     }
+                    eprintln!("host: tun read error: {e}");
                     continue;
                 }
             }
@@ -334,10 +335,11 @@ impl Host {
                     }
                     self.handle_inbound(pk, proto, &buf[..n]);
                 }
-                Err(_) => {
+                Err(e) => {
                     if self.closed.load(Ordering::SeqCst) {
                         return;
                     }
+                    eprintln!("host: udp read error: {e:?}");
                     continue;
                 }
             }

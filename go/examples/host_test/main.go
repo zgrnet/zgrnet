@@ -32,8 +32,10 @@ func main() {
 	}
 
 	// Generate keypairs
-	keyA, _ := noise.GenerateKeyPair()
-	keyB, _ := noise.GenerateKeyPair()
+	keyA, err := noise.GenerateKeyPair()
+	must(err, "generate key A")
+	keyB, err := noise.GenerateKeyPair()
+	must(err, "generate key B")
 	fmt.Printf("Host A pubkey: %s\n", keyA.Public.ShortString())
 	fmt.Printf("Host B pubkey: %s\n", keyB.Public.ShortString())
 	fmt.Println()

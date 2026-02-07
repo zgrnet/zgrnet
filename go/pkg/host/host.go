@@ -2,6 +2,7 @@ package host
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -240,6 +241,7 @@ func (h *Host) outboundLoop() {
 			if h.closed.Load() {
 				return
 			}
+			log.Printf("host: tun read error: %v", err)
 			continue
 		}
 
@@ -296,6 +298,7 @@ func (h *Host) inboundLoop() {
 			if h.closed.Load() {
 				return
 			}
+			log.Printf("host: udp read error: %v", err)
 			continue
 		}
 

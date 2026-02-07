@@ -283,6 +283,8 @@ pub fn Host(comptime UDPType: type) type {
                     if (err == TunDevice.ReadError.WouldBlock) {
                         // Non-blocking: brief sleep then retry
                         std.Thread.sleep(1 * std.time.ns_per_ms);
+                    } else {
+                        std.debug.print("host: tun read error: {}\n", .{err});
                     }
                     continue;
                 };
@@ -318,8 +320,9 @@ pub fn Host(comptime UDPType: type) type {
             var buf: [message.max_packet_size]u8 = undefined;
 
             while (!self.closed.load(.acquire)) {
-                const result = self.udp.readPacket(&buf) catch {
+                const result = self.udp.readPacket(&buf) catch |err| {
                     if (self.closed.load(.acquire)) return;
+                    std.debug.print("host: udp read error: {}\n", .{err});
                     continue;
                 };
 
