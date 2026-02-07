@@ -148,6 +148,9 @@ pub fn handle_ping(from: &[u8; 32], data: &[u8], metrics: &NodeMetrics) -> Resul
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use crate::noise::cipher;
+    use crate::noise::{Key, Session, SessionConfig};
+    use crate::noise::message::{build_transport_message, parse_transport_message, encode_payload, decode_payload};
 
     /// Simple static router for testing.
     struct StaticRouter {
@@ -371,5 +374,134 @@ mod tests {
         let (src, inner) = handle_relay2(&a2.data).unwrap();
         assert_eq!(src, key_a);
         assert_eq!(inner, payload);
+    }
+
+    /// Test full relay chain A -> B(relay) -> C with real Noise session encryption.
+    /// Verifies that the encrypted payload survives the relay chain and can be
+    /// decrypted by the final destination.
+    #[test]
+    fn test_relay_chain_with_noise_session() {
+        // Create A-C end-to-end session (symmetric keys, swapped between sides)
+        let send_key = Key(cipher::hash(&[b"A-to-C send key"]));
+        let recv_key = Key(cipher::hash(&[b"A-to-C recv key"]));
+
+        let session_a = Session::new(SessionConfig {
+            local_index: 1,
+            remote_index: 2,
+            send_key: send_key.clone(),
+            recv_key: recv_key.clone(),
+            remote_pk: Key([0u8; 32]),
+        });
+
+        let session_c = Session::new(SessionConfig {
+            local_index: 2,
+            remote_index: 1,
+            send_key: recv_key, // swapped
+            recv_key: send_key, // swapped
+            remote_pk: Key([0u8; 32]),
+        });
+
+        let key_a = key_from_byte(0x0A);
+        let key_c = key_from_byte(0x0C);
+
+        // Step 1: A encrypts data with A-C session
+        let original_data = b"hello through relay!";
+        let payload = encode_payload(protocol::CHAT, original_data);
+        let (ciphertext, nonce) = session_a.encrypt(&payload).unwrap();
+
+        // Build Type 4 transport message
+        let type4msg = build_transport_message(session_a.remote_index(), nonce, &ciphertext);
+
+        // Step 2: Wrap in RELAY_0(dst=C)
+        let r0_data = encode_relay0(&Relay0 {
+            ttl: 8, strategy: Strategy::Auto, dst_key: key_c, payload: type4msg,
+        });
+
+        // Step 3: B (relay) processes RELAY_0 → RELAY_2 to C
+        let mut routes = HashMap::new();
+        routes.insert(key_c, key_c); // C is direct
+        let router = StaticRouter { routes };
+        let action = handle_relay0(&router, &key_a, &r0_data).unwrap();
+        assert_eq!(action.protocol, protocol::RELAY_2);
+        assert_eq!(action.dst, key_c);
+
+        // Step 4: C processes RELAY_2
+        let (src, inner_payload) = handle_relay2(&action.data).unwrap();
+        assert_eq!(src, key_a);
+
+        // Step 5: C decrypts the inner Type 4 message
+        let msg = parse_transport_message(&inner_payload).unwrap();
+        assert_eq!(msg.receiver_index, session_c.local_index());
+
+        let plaintext = session_c.decrypt(msg.ciphertext, msg.counter).unwrap();
+        let (proto, data) = decode_payload(&plaintext).unwrap();
+        assert_eq!(proto, protocol::CHAT);
+        assert_eq!(data, original_data);
+    }
+
+    /// Test multi-hop relay A -> B -> C -> D with real Noise encryption.
+    /// B and C are relay nodes that cannot see the payload.
+    #[test]
+    fn test_relay_multi_hop_with_noise_session() {
+        let send_key = Key(cipher::hash(&[b"A-to-D send key"]));
+        let recv_key = Key(cipher::hash(&[b"A-to-D recv key"]));
+
+        let session_a = Session::new(SessionConfig {
+            local_index: 10,
+            remote_index: 20,
+            send_key: send_key.clone(),
+            recv_key: recv_key.clone(),
+            remote_pk: Key([0u8; 32]),
+        });
+
+        let session_d = Session::new(SessionConfig {
+            local_index: 20,
+            remote_index: 10,
+            send_key: recv_key,
+            recv_key: send_key,
+            remote_pk: Key([0u8; 32]),
+        });
+
+        let key_a = key_from_byte(0x0A);
+        let key_c = key_from_byte(0x0C);
+        let key_d = key_from_byte(0x0D);
+
+        // Step 1: A encrypts
+        let original_data = b"multi-hop relay with real encryption!";
+        let payload = encode_payload(0, original_data); // 0 = RAW
+        let (ciphertext, nonce) = session_a.encrypt(&payload).unwrap();
+        let type4msg = build_transport_message(session_a.remote_index(), nonce, &ciphertext);
+
+        // Step 2: RELAY_0(dst=D)
+        let r0_data = encode_relay0(&Relay0 {
+            ttl: 8, strategy: Strategy::Fastest, dst_key: key_d, payload: type4msg,
+        });
+
+        // Step 3: B → RELAY_1 to C (D is via C)
+        let mut routes_b = HashMap::new();
+        routes_b.insert(key_d, key_c);
+        let router_b = StaticRouter { routes: routes_b };
+        let action1 = handle_relay0(&router_b, &key_a, &r0_data).unwrap();
+        assert_eq!(action1.protocol, protocol::RELAY_1);
+
+        // Step 4: C → RELAY_2 to D (D is direct)
+        let mut routes_c = HashMap::new();
+        routes_c.insert(key_d, key_d);
+        let router_c = StaticRouter { routes: routes_c };
+        let action2 = handle_relay1(&router_c, &action1.data).unwrap();
+        assert_eq!(action2.protocol, protocol::RELAY_2);
+
+        // Step 5: D processes RELAY_2
+        let (src, inner_payload) = handle_relay2(&action2.data).unwrap();
+        assert_eq!(src, key_a);
+
+        // Step 6: D decrypts
+        let msg = parse_transport_message(&inner_payload).unwrap();
+        assert_eq!(msg.receiver_index, session_d.local_index());
+
+        let plaintext = session_d.decrypt(msg.ciphertext, msg.counter).unwrap();
+        let (proto, data) = decode_payload(&plaintext).unwrap();
+        assert_eq!(proto, 0); // 0 = RAW
+        assert_eq!(data, original_data);
     }
 }

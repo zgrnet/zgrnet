@@ -6,6 +6,9 @@
 const std = @import("std");
 const message = @import("message.zig");
 const noise_message = @import("../noise/message.zig");
+const session_mod = @import("../noise/session.zig");
+const keypair_mod = @import("../noise/keypair.zig");
+const crypto_mod = @import("../noise/crypto.zig");
 
 pub const Strategy = message.Strategy;
 pub const RelayError = message.RelayError;
@@ -429,4 +432,157 @@ test "multi-hop relay A->C->D->B" {
     const result = try handleRelay2(a2.data());
     try std.testing.expectEqualSlices(u8, &key_a, &result.src_key);
     try std.testing.expectEqualStrings(payload, result.payload);
+}
+
+test "relay chain with noise session A->B->C" {
+    const allocator = std.testing.allocator;
+
+    // Generate keys via BLAKE2s hash (same approach as Go/Rust tests)
+    const send_key_data = crypto_mod.hash(&.{"A-to-C send key"});
+    const recv_key_data = crypto_mod.hash(&.{"A-to-C recv key"});
+    const send_key = keypair_mod.Key{ .data = send_key_data };
+    const recv_key = keypair_mod.Key{ .data = recv_key_data };
+
+    // Create A-C end-to-end sessions (keys swapped between sides)
+    var session_a = session_mod.Session.init(.{
+        .local_index = 1,
+        .remote_index = 2,
+        .send_key = send_key,
+        .recv_key = recv_key,
+    });
+    var session_c = session_mod.Session.init(.{
+        .local_index = 2,
+        .remote_index = 1,
+        .send_key = recv_key, // swapped
+        .recv_key = send_key, // swapped
+    });
+
+    const key_a = keyFromByte(0x0A);
+    const key_c = keyFromByte(0x0C);
+
+    // Step 1: A encrypts data with A-C session
+    const original_data = "hello through relay!";
+    const payload_enc = try noise_message.encodePayload(allocator, .chat, original_data);
+    defer allocator.free(payload_enc);
+
+    var cipher_buf: [1024]u8 = undefined;
+    const nonce = try session_a.encrypt(payload_enc, &cipher_buf);
+    const ciphertext_len = payload_enc.len + session_mod.tag_size;
+
+    // Build Type 4 transport message
+    const type4msg = try noise_message.buildTransportMessage(
+        allocator,
+        session_a.remote_index,
+        nonce,
+        cipher_buf[0..ciphertext_len],
+    );
+    defer allocator.free(type4msg);
+
+    // Step 2: Wrap in RELAY_0(dst=C)
+    var r0_buf: [2048]u8 = undefined;
+    const r0 = Relay0{ .ttl = 8, .strategy = .auto, .dst_key = key_c, .payload = type4msg };
+    const r0_n = try message.encodeRelay0(&r0, &r0_buf);
+
+    // Step 3: B (relay) processes RELAY_0 → RELAY_2 to C
+    var sr = StaticRouter.init(allocator);
+    defer sr.deinit();
+    try sr.addRoute(key_c, key_c); // C is direct
+
+    const action = try handleRelay0(sr.router(), &key_a, r0_buf[0..r0_n]);
+    try std.testing.expectEqual(@intFromEnum(noise_message.Protocol.relay_2), action.protocol);
+    try std.testing.expectEqualSlices(u8, &key_c, &action.dst);
+
+    // Step 4: C processes RELAY_2
+    const result = try handleRelay2(action.data());
+    try std.testing.expectEqualSlices(u8, &key_a, &result.src_key);
+
+    // Step 5: C decrypts the inner Type 4 message using A-C session
+    const inner_msg = try noise_message.parseTransportMessage(result.payload);
+    try std.testing.expectEqual(@as(u32, 2), inner_msg.receiver_index);
+
+    var decrypt_buf: [1024]u8 = undefined;
+    const pt_len = try session_c.decrypt(inner_msg.ciphertext, inner_msg.counter, &decrypt_buf);
+    const plaintext = decrypt_buf[0..pt_len];
+
+    const decoded = try noise_message.decodePayload(plaintext);
+    try std.testing.expectEqual(noise_message.Protocol.chat, decoded.protocol);
+    try std.testing.expectEqualStrings(original_data, decoded.payload);
+}
+
+test "relay multi-hop with noise session A->B->C->D" {
+    const allocator = std.testing.allocator;
+
+    // A-D end-to-end session
+    const send_key_data = crypto_mod.hash(&.{"A-to-D send key"});
+    const recv_key_data = crypto_mod.hash(&.{"A-to-D recv key"});
+    const send_key = keypair_mod.Key{ .data = send_key_data };
+    const recv_key = keypair_mod.Key{ .data = recv_key_data };
+
+    var session_a = session_mod.Session.init(.{
+        .local_index = 10,
+        .remote_index = 20,
+        .send_key = send_key,
+        .recv_key = recv_key,
+    });
+    var session_d = session_mod.Session.init(.{
+        .local_index = 20,
+        .remote_index = 10,
+        .send_key = recv_key,
+        .recv_key = send_key,
+    });
+
+    const key_a = keyFromByte(0x0A);
+    const key_c = keyFromByte(0x0C);
+    const key_d = keyFromByte(0x0D);
+
+    // Step 1: A encrypts
+    const original_data = "multi-hop relay with real encryption!";
+    const payload_enc = try noise_message.encodePayload(allocator, .icmp, original_data);
+    defer allocator.free(payload_enc);
+
+    var cipher_buf: [1024]u8 = undefined;
+    const nonce = try session_a.encrypt(payload_enc, &cipher_buf);
+    const ct_len = payload_enc.len + session_mod.tag_size;
+    const type4msg = try noise_message.buildTransportMessage(
+        allocator,
+        session_a.remote_index,
+        nonce,
+        cipher_buf[0..ct_len],
+    );
+    defer allocator.free(type4msg);
+
+    // Step 2: RELAY_0(dst=D)
+    var r0_buf: [2048]u8 = undefined;
+    const r0 = Relay0{ .ttl = 8, .strategy = .fastest, .dst_key = key_d, .payload = type4msg };
+    const r0_n = try message.encodeRelay0(&r0, &r0_buf);
+
+    // Step 3: B → RELAY_1 to C (D is via C)
+    var sr_b = StaticRouter.init(allocator);
+    defer sr_b.deinit();
+    try sr_b.addRoute(key_d, key_c);
+    const action1 = try handleRelay0(sr_b.router(), &key_a, r0_buf[0..r0_n]);
+    try std.testing.expectEqual(@intFromEnum(noise_message.Protocol.relay_1), action1.protocol);
+
+    // Step 4: C → RELAY_2 to D (D is direct)
+    var sr_c = StaticRouter.init(allocator);
+    defer sr_c.deinit();
+    try sr_c.addRoute(key_d, key_d);
+    const action2 = try handleRelay1(sr_c.router(), action1.data());
+    try std.testing.expectEqual(@intFromEnum(noise_message.Protocol.relay_2), action2.protocol);
+
+    // Step 5: D processes RELAY_2
+    const result = try handleRelay2(action2.data());
+    try std.testing.expectEqualSlices(u8, &key_a, &result.src_key);
+
+    // Step 6: D decrypts
+    const inner_msg = try noise_message.parseTransportMessage(result.payload);
+    try std.testing.expectEqual(@as(u32, 20), inner_msg.receiver_index);
+
+    var decrypt_buf: [1024]u8 = undefined;
+    const pt_len = try session_d.decrypt(inner_msg.ciphertext, inner_msg.counter, &decrypt_buf);
+    const plaintext = decrypt_buf[0..pt_len];
+
+    const decoded = try noise_message.decodePayload(plaintext);
+    try std.testing.expectEqual(noise_message.Protocol.icmp, decoded.protocol);
+    try std.testing.expectEqualStrings(original_data, decoded.payload);
 }

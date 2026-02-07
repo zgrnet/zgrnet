@@ -403,6 +403,208 @@ func TestMultiHopRelay(t *testing.T) {
 	}
 }
 
+// TestRelayChainWithNoiseSession tests the full relay chain A -> B(relay) -> C
+// with real Noise session encryption/decryption.
+// This manually wires up: A encrypts → RELAY_0 → B forwards → RELAY_2 → C decrypts.
+func TestRelayChainWithNoiseSession(t *testing.T) {
+	// Create A-C end-to-end session (symmetric keys, swapped between sides)
+	sendKey := noise.Hash([]byte("A-to-C send key"))
+	recvKey := noise.Hash([]byte("A-to-C recv key"))
+
+	sessionA, err := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  1,
+		RemoteIndex: 2,
+		SendKey:     sendKey,
+		RecvKey:     recvKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionC, err := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  2,
+		RemoteIndex: 1,
+		SendKey:     recvKey, // swapped
+		RecvKey:     sendKey, // swapped
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Keys for relay routing (just identifiers, not real crypto keys)
+	keyA := keyFromByte(0x0A)
+	keyC := keyFromByte(0x0C)
+
+	// Step 1: A encrypts data with A-C session
+	originalData := []byte("hello through relay!")
+	payload := noise.EncodePayload(noise.ProtocolChat, originalData)
+	ciphertext, nonce, err := sessionA.Encrypt(payload)
+	if err != nil {
+		t.Fatal("encrypt:", err)
+	}
+
+	// Build Type 4 transport message (wire format)
+	type4msg := noise.BuildTransportMessage(sessionA.RemoteIndex(), nonce, ciphertext)
+
+	// Step 2: A wraps in RELAY_0(dst=C), sends to B
+	r0Data := EncodeRelay0(&Relay0{
+		TTL:      8,
+		Strategy: StrategyAuto,
+		DstKey:   keyC,
+		Payload:  type4msg,
+	})
+
+	// Step 3: B (relay) processes RELAY_0 → RELAY_2 to C
+	router := &staticRouter{routes: map[[32]byte][32]byte{keyC: keyC}}
+	action, err := HandleRelay0(router, keyA, r0Data)
+	if err != nil {
+		t.Fatal("HandleRelay0:", err)
+	}
+	if action.Protocol != noise.ProtocolRelay2 {
+		t.Fatalf("expected RELAY_2, got protocol %d", action.Protocol)
+	}
+	if action.Dst != keyC {
+		t.Fatalf("expected dst=C, got %x", action.Dst[0])
+	}
+
+	// Step 4: C processes RELAY_2 → extract src + inner payload
+	src, innerPayload, err := HandleRelay2(action.Data)
+	if err != nil {
+		t.Fatal("HandleRelay2:", err)
+	}
+	if src != keyA {
+		t.Errorf("src: got %x, want %x", src[0], keyA[0])
+	}
+
+	// Step 5: C decrypts the inner Type 4 message using A-C session
+	msg, err := noise.ParseTransportMessage(innerPayload)
+	if err != nil {
+		t.Fatal("ParseTransportMessage:", err)
+	}
+	if msg.ReceiverIndex != sessionC.LocalIndex() {
+		t.Fatalf("receiver index: got %d, want %d", msg.ReceiverIndex, sessionC.LocalIndex())
+	}
+
+	plaintext, err := sessionC.Decrypt(msg.Ciphertext, msg.Counter)
+	if err != nil {
+		t.Fatal("decrypt:", err)
+	}
+
+	protocol, data, err := noise.DecodePayload(plaintext)
+	if err != nil {
+		t.Fatal("DecodePayload:", err)
+	}
+	if protocol != noise.ProtocolChat {
+		t.Errorf("protocol: got %d, want %d", protocol, noise.ProtocolChat)
+	}
+	if !bytes.Equal(data, originalData) {
+		t.Errorf("data mismatch: got %q, want %q", data, originalData)
+	}
+}
+
+// TestRelayMultiHopWithNoiseSession tests multi-hop relay: A -> B -> C -> D
+// with real Noise encryption. B and C are relay nodes that cannot see the payload.
+func TestRelayMultiHopWithNoiseSession(t *testing.T) {
+	// A-D end-to-end session
+	sendKey := noise.Hash([]byte("A-to-D send key"))
+	recvKey := noise.Hash([]byte("A-to-D recv key"))
+
+	sessionA, err := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  10,
+		RemoteIndex: 20,
+		SendKey:     sendKey,
+		RecvKey:     recvKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionD, err := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  20,
+		RemoteIndex: 10,
+		SendKey:     recvKey,
+		RecvKey:     sendKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyA := keyFromByte(0x0A)
+	keyC := keyFromByte(0x0C)
+	keyD := keyFromByte(0x0D)
+
+	// Step 1: A encrypts data
+	originalData := []byte("multi-hop relay with real encryption!")
+	payload := noise.EncodePayload(noise.ProtocolRaw, originalData)
+	ciphertext, nonce, err := sessionA.Encrypt(payload)
+	if err != nil {
+		t.Fatal("encrypt:", err)
+	}
+	type4msg := noise.BuildTransportMessage(sessionA.RemoteIndex(), nonce, ciphertext)
+
+	// Step 2: Wrap in RELAY_0(dst=D)
+	r0Data := EncodeRelay0(&Relay0{
+		TTL:      8,
+		Strategy: StrategyFastest,
+		DstKey:   keyD,
+		Payload:  type4msg,
+	})
+
+	// Step 3: B handles RELAY_0 → RELAY_1 to C (D is via C)
+	routerB := &staticRouter{routes: map[[32]byte][32]byte{keyD: keyC}}
+	action1, err := HandleRelay0(routerB, keyA, r0Data)
+	if err != nil {
+		t.Fatal("HandleRelay0:", err)
+	}
+	if action1.Protocol != noise.ProtocolRelay1 {
+		t.Fatalf("step 3: expected RELAY_1, got %d", action1.Protocol)
+	}
+
+	// Step 4: C handles RELAY_1 → RELAY_2 to D (D is direct)
+	routerC := &staticRouter{routes: map[[32]byte][32]byte{keyD: keyD}}
+	action2, err := HandleRelay1(routerC, action1.Data)
+	if err != nil {
+		t.Fatal("HandleRelay1:", err)
+	}
+	if action2.Protocol != noise.ProtocolRelay2 {
+		t.Fatalf("step 4: expected RELAY_2, got %d", action2.Protocol)
+	}
+
+	// Step 5: D processes RELAY_2
+	src, innerPayload, err := HandleRelay2(action2.Data)
+	if err != nil {
+		t.Fatal("HandleRelay2:", err)
+	}
+	if src != keyA {
+		t.Errorf("src: got %x, want %x", src[0], keyA[0])
+	}
+
+	// Step 6: D decrypts using A-D session
+	msg, err := noise.ParseTransportMessage(innerPayload)
+	if err != nil {
+		t.Fatal("ParseTransportMessage:", err)
+	}
+	if msg.ReceiverIndex != sessionD.LocalIndex() {
+		t.Fatalf("receiver index: got %d, want %d", msg.ReceiverIndex, sessionD.LocalIndex())
+	}
+
+	plaintext, err := sessionD.Decrypt(msg.Ciphertext, msg.Counter)
+	if err != nil {
+		t.Fatal("decrypt:", err)
+	}
+
+	protocol, data, err := noise.DecodePayload(plaintext)
+	if err != nil {
+		t.Fatal("DecodePayload:", err)
+	}
+	if protocol != noise.ProtocolRaw {
+		t.Errorf("protocol: got %d, want %d", protocol, noise.ProtocolRaw)
+	}
+	if !bytes.Equal(data, originalData) {
+		t.Errorf("data mismatch: got %q, want %q", data, originalData)
+	}
+}
+
 // TestTTLDecrementChain verifies TTL decrements through a chain.
 func TestTTLDecrementChain(t *testing.T) {
 	keyA := keyFromByte(0x0A)
