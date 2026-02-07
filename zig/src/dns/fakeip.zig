@@ -188,3 +188,53 @@ test "FakeIPPool LRU touch" {
     try std.testing.expect(pool.lookupDomain("a.com") != null);
     try std.testing.expect(pool.lookupDomain("b.com") == null);
 }
+
+test "FakeIPPool wrap around" {
+    var pool = FakeIPPool.init(std.testing.allocator, 200000);
+    defer pool.deinit();
+
+    pool.next_off = pool.max_off;
+    _ = pool.assign("last.com");
+
+    const ip = pool.assign("wrap.com");
+    // Should wrap to offset 1 = 198.18.0.1
+    try std.testing.expectEqual(@as(u8, 198), ip[0]);
+    try std.testing.expectEqual(@as(u8, 18), ip[1]);
+    try std.testing.expectEqual(@as(u8, 0), ip[2]);
+    try std.testing.expectEqual(@as(u8, 1), ip[3]);
+}
+
+test "FakeIPPool default size" {
+    var pool = FakeIPPool.init(std.testing.allocator, 0);
+    defer pool.deinit();
+    try std.testing.expectEqual(@as(usize, 65536), pool.max_size);
+}
+
+test "FakeIPPool evict empty" {
+    var pool = FakeIPPool.init(std.testing.allocator, 1);
+    defer pool.deinit();
+    pool.evictLRU(); // should not panic
+    try std.testing.expectEqual(@as(usize, 0), pool.size());
+}
+
+test "FakeIPPool lookup unknown" {
+    var pool = FakeIPPool.init(std.testing.allocator, 10);
+    defer pool.deinit();
+    try std.testing.expect(pool.lookup(.{ 1, 2, 3, 4 }) == null);
+    try std.testing.expect(pool.lookupDomain("nothere.com") == null);
+}
+
+test "ipFromU32 and u32FromIp roundtrip" {
+    const ip = [4]u8{ 198, 18, 0, 1 };
+    const val = u32FromIp(ip);
+    const back = ipFromU32(val);
+    try std.testing.expectEqualSlices(u8, &ip, &back);
+}
+
+test "ipFromU32 edge cases" {
+    const zero = ipFromU32(0);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, &zero);
+
+    const max = ipFromU32(0xFFFFFFFF);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 255, 255, 255, 255 }, &max);
+}

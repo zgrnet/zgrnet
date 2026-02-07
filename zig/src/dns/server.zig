@@ -362,3 +362,64 @@ test "isHexString" {
     try testing.expect(!isHexString(""));
     try testing.expect(!isHexString("0123g"));
 }
+
+test "server: bare zigor.net -> NXDOMAIN" {
+    const alloc = testing.allocator;
+    const srv = Server.init(alloc, .{ .tun_ipv4 = .{ 100, 64, 0, 1 } });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const query = try buildQuery(arena.allocator(), "zigor.net", protocol.TYPE_A);
+    var resp_buf: [512]u8 = undefined;
+    const resp_data = try srv.handleQuery(query, &resp_buf);
+
+    const resp = try Message.decode(arena.allocator(), resp_data);
+    try testing.expectEqual(protocol.RCODE_NXDOMAIN, resp.header.rcode());
+}
+
+test "server: fake IP AAAA -> empty" {
+    const alloc = testing.allocator;
+    var pool = FakeIPPool.init(alloc, 100);
+    defer pool.deinit();
+
+    const match_domains = [_][]const u8{".example.com"};
+    const srv = Server.init(alloc, .{
+        .fake_pool = &pool,
+        .match_domains = &match_domains,
+    });
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    const query = try buildQuery(arena.allocator(), "test.example.com", protocol.TYPE_AAAA);
+    var resp_buf: [512]u8 = undefined;
+    const resp_data = try srv.handleQuery(query, &resp_buf);
+
+    const resp = try Message.decode(arena.allocator(), resp_data);
+    try testing.expectEqual(protocol.RCODE_NOERROR, resp.header.rcode());
+    try testing.expectEqual(@as(usize, 0), resp.answers.len);
+}
+
+test "server: malformed query" {
+    const alloc = testing.allocator;
+    const srv = Server.init(alloc, .{});
+    var resp_buf: [512]u8 = undefined;
+    const result = srv.handleQuery(&[_]u8{ 0x00, 0x01 }, &resp_buf);
+    try testing.expectError(error.InvalidQuery, result);
+}
+
+test "endsWith" {
+    try testing.expect(endsWith("localhost.zigor.net", ".zigor.net"));
+    try testing.expect(endsWith(".zigor.net", ".zigor.net"));
+    try testing.expect(!endsWith("google.com", ".zigor.net"));
+    try testing.expect(!endsWith("net", ".zigor.net"));
+}
+
+test "hexByte" {
+    try testing.expectEqual(@as(?u8, 0xAB), hexByte('a', 'b'));
+    try testing.expectEqual(@as(?u8, 0x00), hexByte('0', '0'));
+    try testing.expectEqual(@as(?u8, 0xFF), hexByte('f', 'f'));
+    try testing.expectEqual(@as(?u8, null), hexByte('g', '0'));
+    try testing.expectEqual(@as(?u8, null), hexByte('0', 'z'));
+}
