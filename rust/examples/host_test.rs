@@ -194,10 +194,6 @@ fn run_test() {
         failed += 1;
     }
 
-    // Cleanup
-    host_a.close();
-    host_b.close();
-
     // Summary
     println!();
     println!("=== Results ===");
@@ -210,6 +206,9 @@ fn run_test() {
         process::exit(1);
     }
     println!("All tests passed!");
+    // Exit immediately — close() would block because TUN read threads
+    // can't be interrupted (RealTun::close is a no-op).
+    // OS cleans up all resources on process exit.
     process::exit(0);
 }
 
