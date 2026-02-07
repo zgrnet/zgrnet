@@ -111,10 +111,16 @@ pub const KqueueIO = struct {
 
         const already_registered = if (is_read) result.value_ptr.read_registered else result.value_ptr.write_registered;
         if (!already_registered) {
+            // Use level-triggered (no EV_CLEAR). Edge-triggered events
+            // require the caller to fully drain the fd on each callback;
+            // if it cannot (e.g. pool exhaustion in UDP), remaining data
+            // in the socket buffer would never trigger a new event, causing
+            // an indefinite stall. Level-triggered keeps firing while the
+            // condition holds, so a transient inability to drain is safe.
             const changelist = [_]posix.system.Kevent{.{
                 .ident = @intCast(fd),
                 .filter = filter,
-                .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
+                .flags = posix.system.EV.ADD,
                 .fflags = 0,
                 .data = 0,
                 .udata = 0,

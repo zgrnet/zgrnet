@@ -215,98 +215,105 @@ pub fn build(b: *std.Build) void {
     const async_bench_step = b.step("async_bench", "Run async runtime benchmarks");
     async_bench_step.dependOn(&run_async_bench.step);
 
-    // Host test example (for cross-language testing)
-    const host_test_module = b.createModule(.{
-        .root_source_file = b.path("examples/host_test.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    host_test_module.addOptions("build_options", options);
-    host_test_module.addImport("noise", lib_module);
+    // UDP examples require kqueue backend (macOS/BSD only).
+    // On other platforms these are skipped since no IO backend is available yet.
+    const os_tag = target.result.os.tag;
+    const has_kqueue = (os_tag == .macos or os_tag == .freebsd or
+        os_tag == .netbsd or os_tag == .openbsd);
 
-    // Link against the library to avoid duplicate symbols
-    const host_test_exe = b.addExecutable(.{
-        .name = "host_test",
-        .root_module = host_test_module,
-    });
-    host_test_exe.linkLibrary(lib);
-    b.installArtifact(host_test_exe);
+    if (has_kqueue) {
+        // Host test example (for cross-language testing)
+        const host_test_module = b.createModule(.{
+            .root_source_file = b.path("examples/host_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        host_test_module.addOptions("build_options", options);
+        host_test_module.addImport("noise", lib_module);
 
-    const run_host_test = b.addRunArtifact(host_test_exe);
-    if (b.args) |args| {
-        run_host_test.addArgs(args);
+        const host_test_exe = b.addExecutable(.{
+            .name = "host_test",
+            .root_module = host_test_module,
+        });
+        host_test_exe.linkLibrary(lib);
+        b.installArtifact(host_test_exe);
+
+        const run_host_test = b.addRunArtifact(host_test_exe);
+        if (b.args) |args| {
+            run_host_test.addArgs(args);
+        }
+        const host_test_step = b.step("host_test", "Run host test example");
+        host_test_step.dependOn(&run_host_test.step);
+
+        // Throughput test example
+        const throughput_test_module = b.createModule(.{
+            .root_source_file = b.path("../examples/throughput/zig/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        throughput_test_module.addOptions("build_options", options);
+        throughput_test_module.addImport("noise", lib_module);
+
+        const throughput_test_exe = b.addExecutable(.{
+            .name = "throughput_test",
+            .root_module = throughput_test_module,
+        });
+        throughput_test_exe.linkLibrary(lib);
+        b.installArtifact(throughput_test_exe);
+
+        const run_throughput_test = b.addRunArtifact(throughput_test_exe);
+        if (b.args) |args| {
+            run_throughput_test.addArgs(args);
+        }
+        const throughput_test_step = b.step("throughput", "Run throughput test");
+        throughput_test_step.dependOn(&run_throughput_test.step);
+
+        // KCP Stream test (source in examples/stream_test/zig/)
+        const kcp_stream_test_module = b.createModule(.{
+            .root_source_file = b.path("../examples/stream_test/zig/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        kcp_stream_test_module.addOptions("build_options", options);
+        kcp_stream_test_module.addImport("noise", lib_module);
+
+        const kcp_stream_test_exe = b.addExecutable(.{
+            .name = "stream_test",
+            .root_module = kcp_stream_test_module,
+        });
+        kcp_stream_test_exe.linkLibrary(lib);
+        b.installArtifact(kcp_stream_test_exe);
+
+        const run_kcp_stream_test = b.addRunArtifact(kcp_stream_test_exe);
+        if (b.args) |args| {
+            run_kcp_stream_test.addArgs(args);
+        }
+        const kcp_stream_test_step = b.step("stream_test", "Run KCP stream throughput test");
+        kcp_stream_test_step.dependOn(&run_kcp_stream_test.step);
+
+        // KCP Interop test (source in examples/kcp_test/zig/)
+        const kcp_interop_module = b.createModule(.{
+            .root_source_file = b.path("../examples/kcp_test/zig/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        kcp_interop_module.addOptions("build_options", options);
+        kcp_interop_module.addImport("noise", lib_module);
+
+        const kcp_interop_exe = b.addExecutable(.{
+            .name = "kcp_test",
+            .root_module = kcp_interop_module,
+        });
+        kcp_interop_exe.linkLibrary(lib);
+        b.installArtifact(kcp_interop_exe);
+
+        const run_kcp_interop = b.addRunArtifact(kcp_interop_exe);
+        if (b.args) |args| {
+            run_kcp_interop.addArgs(args);
+        }
+        const kcp_interop_step = b.step("kcp_test", "Run KCP interop test");
+        kcp_interop_step.dependOn(&run_kcp_interop.step);
     }
-    const host_test_step = b.step("host_test", "Run host test example");
-    host_test_step.dependOn(&run_host_test.step);
-
-    // Throughput test example
-    const throughput_test_module = b.createModule(.{
-        .root_source_file = b.path("../examples/throughput/zig/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    throughput_test_module.addOptions("build_options", options);
-    throughput_test_module.addImport("noise", lib_module);
-
-    const throughput_test_exe = b.addExecutable(.{
-        .name = "throughput_test",
-        .root_module = throughput_test_module,
-    });
-    throughput_test_exe.linkLibrary(lib);
-    b.installArtifact(throughput_test_exe);
-
-    const run_throughput_test = b.addRunArtifact(throughput_test_exe);
-    if (b.args) |args| {
-        run_throughput_test.addArgs(args);
-    }
-    const throughput_test_step = b.step("throughput", "Run throughput test");
-    throughput_test_step.dependOn(&run_throughput_test.step);
-
-    // KCP Stream test (source in examples/stream_test/zig/)
-    const kcp_stream_test_module = b.createModule(.{
-        .root_source_file = b.path("../examples/stream_test/zig/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    kcp_stream_test_module.addOptions("build_options", options);
-    kcp_stream_test_module.addImport("noise", lib_module);
-
-    const kcp_stream_test_exe = b.addExecutable(.{
-        .name = "stream_test",
-        .root_module = kcp_stream_test_module,
-    });
-    kcp_stream_test_exe.linkLibrary(lib);
-    b.installArtifact(kcp_stream_test_exe);
-
-    const run_kcp_stream_test = b.addRunArtifact(kcp_stream_test_exe);
-    if (b.args) |args| {
-        run_kcp_stream_test.addArgs(args);
-    }
-    const kcp_stream_test_step = b.step("stream_test", "Run KCP stream throughput test");
-    kcp_stream_test_step.dependOn(&run_kcp_stream_test.step);
-
-    // KCP Interop test (source in examples/kcp_test/zig/)
-    const kcp_interop_module = b.createModule(.{
-        .root_source_file = b.path("../examples/kcp_test/zig/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    kcp_interop_module.addOptions("build_options", options);
-    kcp_interop_module.addImport("noise", lib_module);
-
-    const kcp_interop_exe = b.addExecutable(.{
-        .name = "kcp_test",
-        .root_module = kcp_interop_module,
-    });
-    kcp_interop_exe.linkLibrary(lib);
-    b.installArtifact(kcp_interop_exe);
-
-    const run_kcp_interop = b.addRunArtifact(kcp_interop_exe);
-    if (b.args) |args| {
-        run_kcp_interop.addArgs(args);
-    }
-    const kcp_interop_step = b.step("kcp_test", "Run KCP interop test");
-    kcp_interop_step.dependOn(&run_kcp_interop.step);
 
     // ========================================================================
     // TUN Module

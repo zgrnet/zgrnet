@@ -930,9 +930,12 @@ pub fn UDP(comptime IOBackend: type) type {
         while (!self.closed.load(.acquire)) {
             // Acquire packet from pool
             const pkt = self.packet_pool.acquire() orelse {
-                // Pool exhausted — stop draining and wait for next event.
-                // Packets will be released by consumers, making pool available again.
-                break;
+                // Pool exhausted — stop draining and return.
+                // The IO backend uses level-triggered events, so the
+                // callback will fire again on the next poll() while data
+                // remains in the socket buffer. Consumers will release
+                // packets back to the pool in the meantime.
+                return;
             };
 
             // Read from socket (non-blocking)
