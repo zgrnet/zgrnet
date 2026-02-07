@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vibing/zgrnet/pkg/noise"
+	"github.com/vibing/zgrnet/pkg/relay"
 )
 
 // PeerState represents the connection state of a peer.
@@ -152,6 +153,10 @@ type UDP struct {
 	// Options
 	allowUnknown bool
 
+	// Relay forwarding
+	router       relay.Router      // nil = no relay forwarding
+	localMetrics relay.NodeMetrics // local metrics for PONG responses
+
 	// Peer management
 	mu      sync.RWMutex
 	peers   map[noise.PublicKey]*peerState
@@ -211,6 +216,8 @@ type options struct {
 	bindAddr       string
 	allowUnknown   bool
 	decryptWorkers int // 0 = runtime.NumCPU()
+	router         relay.Router
+	localMetrics   relay.NodeMetrics
 }
 
 // WithBindAddr sets the local address to bind to.
@@ -233,6 +240,21 @@ func WithAllowUnknown(allow bool) Option {
 func WithDecryptWorkers(n int) Option {
 	return func(o *options) {
 		o.decryptWorkers = n
+	}
+}
+
+// WithRouter sets the relay router for forwarding relay packets.
+// If nil (default), relay packets are dropped.
+func WithRouter(r relay.Router) Option {
+	return func(o *options) {
+		o.router = r
+	}
+}
+
+// WithLocalMetrics sets the local node metrics for PONG responses.
+func WithLocalMetrics(m relay.NodeMetrics) Option {
+	return func(o *options) {
+		o.localMetrics = m
 	}
 }
 
@@ -265,6 +287,8 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		socket:       socket,
 		localKey:     key,
 		allowUnknown: o.allowUnknown,
+		router:       o.router,
+		localMetrics: o.localMetrics,
 		peers:        make(map[noise.PublicKey]*peerState),
 		byIndex:      make(map[uint32]*peerState),
 		pending:      make(map[uint32]*pendingHandshake),
@@ -349,6 +373,16 @@ func (u *UDP) RemovePeer(pk noise.PublicKey) {
 	}
 
 	delete(u.peers, pk)
+}
+
+// SetRouter sets the relay router for forwarding relay packets at runtime.
+func (u *UDP) SetRouter(r relay.Router) {
+	u.router = r
+}
+
+// SetLocalMetrics updates the local node metrics for PONG responses.
+func (u *UDP) SetLocalMetrics(m relay.NodeMetrics) {
+	u.localMetrics = m
 }
 
 // HostInfo returns information about the local host.
@@ -1087,6 +1121,54 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		// Don't deliver KCP to ReadFrom
 		pkt.err = ErrNoData
 
+	case noise.ProtocolRelay0:
+		if u.router != nil {
+			action, err := relay.HandleRelay0(u.router, pkt.pk, payload)
+			if err == nil {
+				u.executeRelayAction(action)
+			}
+		}
+		pkt.err = ErrNoData // Relay packets are not delivered to ReadFrom
+
+	case noise.ProtocolRelay1:
+		if u.router != nil {
+			action, err := relay.HandleRelay1(u.router, payload)
+			if err == nil {
+				u.executeRelayAction(action)
+			}
+		}
+		pkt.err = ErrNoData
+
+	case noise.ProtocolRelay2:
+		// Last hop: extract src and inner payload.
+		// The inner payload is a complete Type 4 transport message.
+		// We re-process it through the normal decrypt pipeline.
+		src, innerPayload, err := relay.HandleRelay2(payload)
+		if err == nil && len(innerPayload) > 0 {
+			u.processRelayedPacket(pkt, src, innerPayload, from)
+			return // pkt fields already set by processRelayedPacket
+		}
+		pkt.err = ErrNoData
+
+	case noise.ProtocolPing:
+		if u.router != nil {
+			action, err := relay.HandlePing(pkt.pk, payload, u.localMetrics)
+			if err == nil {
+				u.executeRelayAction(action)
+			}
+		}
+		pkt.err = ErrNoData
+
+	case noise.ProtocolPong:
+		// PONG responses are delivered to ReadFrom for upper layer processing.
+		// The caller can decode them with relay.DecodePong().
+		if inboundChan != nil {
+			select {
+			case inboundChan <- protoPacket{protocol: protocol, payload: pkt.payload}:
+			default:
+			}
+		}
+
 	default:
 		// Route to inboundChan for Peer.Read() callers (non-blocking)
 		if inboundChan != nil {
@@ -1099,5 +1181,102 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		}
 		// Always leave pkt valid for ReadFrom callers
 		// pkt.err remains nil so ReadFrom can deliver it
+	}
+}
+
+// executeRelayAction sends a relay forwarding action to the target peer.
+func (u *UDP) executeRelayAction(action *relay.Action) {
+	pk := noise.PublicKey(action.Dst)
+
+	u.mu.RLock()
+	peer, exists := u.peers[pk]
+	u.mu.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	_ = u.sendToPeer(peer, action.Protocol, action.Data)
+}
+
+// processRelayedPacket handles a RELAY_2 inner payload.
+// The inner payload is a Type 4 transport message that was encrypted under
+// the A-B session. We decrypt it and fill in the packet fields.
+func (u *UDP) processRelayedPacket(pkt *packet, src [32]byte, innerPayload []byte, from *net.UDPAddr) {
+	// The inner payload should be a complete Type 4 transport message.
+	// Parse and decrypt it using the normal transport pipeline.
+	msg, err := noise.ParseTransportMessage(innerPayload)
+	if err != nil {
+		pkt.err = ErrNoData
+		return
+	}
+
+	// Find the session by receiver index
+	u.mu.RLock()
+	innerPeer, exists := u.byIndex[msg.ReceiverIndex]
+	u.mu.RUnlock()
+
+	if !exists {
+		pkt.err = ErrPeerNotFound
+		return
+	}
+
+	innerPeer.mu.RLock()
+	session := innerPeer.session
+	innerPeer.mu.RUnlock()
+
+	if session == nil {
+		pkt.err = ErrNoSession
+		return
+	}
+
+	// Decrypt the inner payload
+	innerPlaintext, err := session.Decrypt(msg.Ciphertext, msg.Counter)
+	if err != nil {
+		pkt.err = ErrNoData
+		return
+	}
+
+	if len(innerPlaintext) == 0 {
+		pkt.err = ErrNoData
+		return
+	}
+
+	// Decode the inner protocol + payload
+	innerProto, innerData, err := noise.DecodePayload(innerPlaintext)
+	if err != nil {
+		pkt.err = ErrNoData
+		return
+	}
+
+	// Fill packet fields with the decrypted inner data
+	pkt.pk = noise.PublicKey(src)
+	pkt.protocol = innerProto
+	pkt.payload = make([]byte, len(innerData))
+	copy(pkt.payload, innerData)
+	pkt.payloadN = len(innerData)
+	pkt.err = nil
+
+	// Route KCP internally
+	if innerProto == noise.ProtocolKCP {
+		innerPeer.mu.RLock()
+		mux := innerPeer.mux
+		innerPeer.mu.RUnlock()
+		if mux != nil {
+			mux.Input(innerData)
+		}
+		pkt.err = ErrNoData
+		return
+	}
+
+	// Route to inboundChan for non-KCP
+	innerPeer.mu.RLock()
+	inChan := innerPeer.inboundChan
+	innerPeer.mu.RUnlock()
+	if inChan != nil {
+		select {
+		case inChan <- protoPacket{protocol: innerProto, payload: pkt.payload}:
+		default:
+		}
 	}
 }

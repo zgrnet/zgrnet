@@ -41,6 +41,12 @@ pub mod protocol {
     pub const RELAY_1: u8 = 67;
     /// Relay last hop
     pub const RELAY_2: u8 = 68;
+    /// TCP proxy via KCP stream
+    pub const TCP_PROXY: u8 = 69;
+    /// Ping probe request
+    pub const PING: u8 = 70;
+    /// Pong probe response
+    pub const PONG: u8 = 71;
 
     // Application layer protocols (128-255)
     /// Chat messages

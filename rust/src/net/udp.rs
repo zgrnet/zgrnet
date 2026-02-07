@@ -12,6 +12,7 @@ use crate::noise::{
     message, encode_payload, decode_payload,
 };
 use crate::kcp::{Mux, MuxConfig, Stream as KcpStream};
+use crate::relay;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::collections::HashMap;
@@ -180,6 +181,10 @@ pub struct UDP {
     local_key: KeyPair,
     allow_unknown: bool,
 
+    // Relay forwarding
+    router: RwLock<Option<Box<dyn relay::Router + Send + Sync>>>,
+    local_metrics: Mutex<relay::NodeMetrics>,
+
     // Peer management
     peers: RwLock<HashMap<Key, Arc<Mutex<PeerStateInternal>>>>,
     by_index: RwLock<HashMap<u32, Key>>,
@@ -209,6 +214,8 @@ impl UDP {
             socket,
             local_key: key,
             allow_unknown: opts.allow_unknown,
+            router: RwLock::new(None),
+            local_metrics: Mutex::new(relay::NodeMetrics::default()),
             peers: RwLock::new(HashMap::new()),
             by_index: RwLock::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -217,6 +224,16 @@ impl UDP {
             last_seen: Mutex::new(None),
             closed: AtomicBool::new(false),
         })
+    }
+
+    /// Sets the relay router for forwarding relay packets.
+    pub fn set_router(&self, router: Box<dyn relay::Router + Send + Sync>) {
+        *self.router.write().unwrap() = Some(router);
+    }
+
+    /// Updates the local node metrics for PONG responses.
+    pub fn set_local_metrics(&self, metrics: relay::NodeMetrics) {
+        *self.local_metrics.lock().unwrap() = metrics;
     }
 
     /// Sets or updates a peer's endpoint address.
@@ -936,11 +953,131 @@ impl UDP {
                 // Return 0 bytes - KCP data is handled internally
                 Ok((peer_pk, 0))
             }
+
+            message::protocol::RELAY_0 => {
+                let router_guard = self.router.read().unwrap();
+                if let Some(ref router) = *router_guard {
+                    if let Ok(action) = relay::handle_relay0(router.as_ref(), &peer_pk.0, payload) {
+                        drop(router_guard);
+                        self.execute_relay_action(&action);
+                    }
+                }
+                Ok((peer_pk, 0))
+            }
+
+            message::protocol::RELAY_1 => {
+                let router_guard = self.router.read().unwrap();
+                if let Some(ref router) = *router_guard {
+                    if let Ok(action) = relay::handle_relay1(router.as_ref(), payload) {
+                        drop(router_guard);
+                        self.execute_relay_action(&action);
+                    }
+                }
+                Ok((peer_pk, 0))
+            }
+
+            message::protocol::RELAY_2 => {
+                // Last hop: extract src and inner payload, then decrypt
+                if let Ok((src, inner_payload)) = relay::handle_relay2(payload) {
+                    if let Ok((inner_pk, n)) = self.process_relayed_packet(&src, &inner_payload, out_buf) {
+                        return Ok((inner_pk, n));
+                    }
+                }
+                Ok((peer_pk, 0))
+            }
+
+            message::protocol::PING => {
+                let router_guard = self.router.read().unwrap();
+                if router_guard.is_some() {
+                    drop(router_guard);
+                    let metrics = *self.local_metrics.lock().unwrap();
+                    if let Ok(action) = relay::handle_ping(&peer_pk.0, payload, &metrics) {
+                        self.execute_relay_action(&action);
+                    }
+                }
+                Ok((peer_pk, 0))
+            }
+
+            message::protocol::PONG => {
+                // PONG delivered to caller for upper-layer processing
+                let n = payload.len().min(out_buf.len());
+                out_buf[..n].copy_from_slice(&payload[..n]);
+                Ok((peer_pk, n))
+            }
+
             _ => {
                 // Non-KCP protocol, copy to output buffer
                 let n = payload.len().min(out_buf.len());
                 out_buf[..n].copy_from_slice(&payload[..n]);
                 Ok((peer_pk, n))
+            }
+        }
+    }
+
+    /// Execute a relay forwarding action by sending to the target peer.
+    fn execute_relay_action(&self, action: &relay::Action) {
+        let pk = Key(action.dst);
+
+        let peers = self.peers.read().unwrap();
+        let peer = match peers.get(&pk) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        drop(peers);
+
+        let p = peer.lock().unwrap();
+        if let (Some(ref session), Some(endpoint)) = (&p.session, p.endpoint) {
+            let payload_buf = encode_payload(action.protocol, &action.data);
+            if let Ok((ct, nonce)) = session.encrypt(&payload_buf) {
+                let msg = build_transport_message(session.remote_index(), nonce, &ct);
+                let _ = self.socket.send_to(&msg, endpoint);
+            }
+        }
+    }
+
+    /// Process an inner payload from a RELAY_2 message.
+    fn process_relayed_packet(
+        &self,
+        src: &[u8; 32],
+        inner_payload: &[u8],
+        out_buf: &mut [u8],
+    ) -> Result<(Key, usize)> {
+        let msg = parse_transport_message(inner_payload).map_err(|_| UdpError::NoSession)?;
+
+        let inner_pk = {
+            let by_index = self.by_index.read().unwrap();
+            *by_index.get(&msg.receiver_index).ok_or(UdpError::PeerNotFound)?
+        };
+
+        let (plaintext, mux) = {
+            let peers = self.peers.read().unwrap();
+            let peer = peers.get(&inner_pk).ok_or(UdpError::PeerNotFound)?;
+            let mut p = peer.lock().unwrap();
+            let session = p.session.as_mut().ok_or(UdpError::NoSession)?;
+            let plaintext = session.decrypt(msg.ciphertext, msg.counter)
+                .map_err(|e| UdpError::Session(e.to_string()))?;
+            let mux = p.mux.clone();
+            (plaintext, mux)
+        };
+
+        if plaintext.is_empty() {
+            return Ok((Key(*src), 0));
+        }
+
+        let (inner_proto, inner_data) = decode_payload(&plaintext)
+            .map_err(|_| UdpError::Session("invalid payload".to_string()))?;
+
+        match inner_proto {
+            message::protocol::KCP => {
+                if let Some(ref mux) = mux {
+                    let _ = mux.input(inner_data);
+                }
+                Ok((Key(*src), 0))
+            }
+            _ => {
+                let n = inner_data.len().min(out_buf.len());
+                out_buf[..n].copy_from_slice(&inner_data[..n]);
+                Ok((Key(*src), n))
             }
         }
     }

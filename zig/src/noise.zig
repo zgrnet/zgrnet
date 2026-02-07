@@ -11,6 +11,7 @@ pub const noise = @import("noise/mod.zig");
 pub const net = @import("net/mod.zig");
 pub const async_mod = @import("async/mod.zig");
 pub const kcp_mod = @import("kcp/mod.zig");
+pub const relay_mod = @import("relay/mod.zig");
 
 // KCP multiplexing (re-export submodules)
 pub const kcp = kcp_mod.kcp;
@@ -86,6 +87,9 @@ pub const StreamError = stream.StreamError;
 pub const Mux = stream.Mux;
 pub const MuxConfig = stream.MuxConfig;
 
+// Relay types
+pub const relay = relay_mod;
+
 /// Returns the name of the active cipher backend.
 pub fn backendName() []const u8 {
     return noise.backendName();
@@ -96,4 +100,5 @@ test {
     _ = noise;
     _ = net;
     _ = kcp_mod;
+    _ = relay_mod;
 }

@@ -32,6 +32,9 @@ const (
 	ProtocolRelay0   byte = 66 // Relay first hop
 	ProtocolRelay1   byte = 67 // Relay middle hop
 	ProtocolRelay2   byte = 68 // Relay last hop
+	ProtocolTCPProxy byte = 69 // TCP proxy via KCP stream
+	ProtocolPing     byte = 70 // Ping probe request
+	ProtocolPong     byte = 71 // Pong probe response
 
 	// Application layer protocols (128-255)
 	ProtocolChat   byte = 128 // Chat messages

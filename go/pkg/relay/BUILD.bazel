@@ -1,0 +1,26 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "relay",
+    srcs = [
+        "message.go",
+        "relay.go",
+    ],
+    importpath = "github.com/vibing/zgrnet/pkg/relay",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go:noise",
+    ],
+)
+
+go_test(
+    name = "relay_test",
+    srcs = [
+        "message_test.go",
+        "relay_test.go",
+    ],
+    embed = [":relay"],
+    deps = [
+        "//go:noise",
+    ],
+)

@@ -28,6 +28,7 @@ const Mutex = Thread.Mutex;
 const Atomic = std.atomic.Value;
 
 const noise = @import("../noise/mod.zig");
+const relay_mod = @import("../relay/mod.zig");
 const async_mod = @import("../async/mod.zig");
 const kcp_mod = @import("../kcp/mod.zig");
 const Channel = async_mod.channel.Channel;
@@ -330,6 +331,10 @@ pub fn UDP(comptime IOBackend: type) type {
     // Options
     allow_unknown: bool,
 
+    // Relay forwarding
+    router: ?relay_mod.Router,
+    local_metrics: relay_mod.NodeMetrics,
+
     // Peer management
     peers_mutex: Mutex,
     peers: std.AutoHashMap([32]u8, *PeerState),
@@ -442,6 +447,8 @@ pub fn UDP(comptime IOBackend: type) type {
             .socket = socket,
             .local_port = local_port,
             .allow_unknown = options.allow_unknown,
+            .router = null,
+            .local_metrics = .{},
             .peers_mutex = .{},
             .peers = std.AutoHashMap([32]u8, *PeerState).init(allocator),
             .by_index = std.AutoHashMap(u32, Key).init(allocator),
@@ -561,6 +568,16 @@ pub fn UDP(comptime IOBackend: type) type {
     /// Get local port.
     pub fn getLocalPort(self: *Self) u16 {
         return self.local_port;
+    }
+
+    /// Set the relay router for forwarding relay packets.
+    pub fn setRouter(self: *Self, router: relay_mod.Router) void {
+        self.router = router;
+    }
+
+    /// Update the local node metrics for PONG responses.
+    pub fn setLocalMetrics(self: *Self, metrics: relay_mod.NodeMetrics) void {
+        self.local_metrics = metrics;
     }
 
     /// Set peer endpoint.
@@ -1107,6 +1124,54 @@ pub fn UDP(comptime IOBackend: type) type {
             return;
         }
 
+        // Route relay protocols
+        if (protocol == @intFromEnum(message.Protocol.relay_0)) {
+            if (self.router) |router| {
+                if (relay_mod.handleRelay0(router, &pk.data, payload)) |action| {
+                    self.executeRelayAction(&action);
+                } else |_| {}
+            }
+            pkt.err = UdpError.NoData;
+            return;
+        }
+
+        if (protocol == @intFromEnum(message.Protocol.relay_1)) {
+            if (self.router) |router| {
+                if (relay_mod.handleRelay1(router, payload)) |action| {
+                    self.executeRelayAction(&action);
+                } else |_| {}
+            }
+            pkt.err = UdpError.NoData;
+            return;
+        }
+
+        if (protocol == @intFromEnum(message.Protocol.relay_2)) {
+            if (relay_mod.handleRelay2(payload)) |result| {
+                if (result.payload.len > 0) {
+                    self.processRelayedPacket(pkt, &result.src_key, result.payload);
+                } else {
+                    pkt.err = UdpError.NoData;
+                }
+            } else |_| {
+                pkt.err = UdpError.NoData;
+            }
+            _ = peer.rx_bytes.fetchAdd(@intCast(pkt.len), .release);
+            return;
+        }
+
+        if (protocol == @intFromEnum(message.Protocol.ping)) {
+            if (self.router != null) {
+                if (relay_mod.handlePing(&pk.data, payload, &self.local_metrics)) |action| {
+                    self.executeRelayAction(&action);
+                } else |_| {}
+            }
+            pkt.err = UdpError.NoData;
+            return;
+        }
+
+        // PONG: deliver to upper layer (ReadFrom)
+        // Other protocols: also deliver to upper layer
+
         // Extract protocol and payload for other protocols
         pkt.pk = pk;
         pkt.protocol = protocol;
@@ -1116,6 +1181,93 @@ pub fn UDP(comptime IOBackend: type) type {
 
         // Update stats
         _ = peer.rx_bytes.fetchAdd(@intCast(pkt.len), .release);
+    }
+
+    /// Execute a relay forwarding action by sending to the target peer.
+    fn executeRelayAction(self: *Self, action: *const relay_mod.Action) void {
+        const pk = Key{ .data = action.dst };
+
+        self.peers_mutex.lock();
+        const peer_opt = self.peers.get(pk.data);
+        self.peers_mutex.unlock();
+
+        const peer = peer_opt orelse return;
+        self.sendToPeer(peer, action.protocol, action.data()) catch {};
+    }
+
+    /// Process a RELAY_2 inner payload: parse Type 4, find session, decrypt.
+    /// The inner_payload points into pkt.out_buf, so we copy ciphertext to
+    /// pkt.data (already consumed) before decrypting back into pkt.out_buf.
+    fn processRelayedPacket(self: *Self, pkt: *Packet, src_key: *const [32]u8, inner_payload: []const u8) void {
+        // Parse the inner Type 4 transport message
+        const inner_msg = message.parseTransportMessage(inner_payload) catch {
+            pkt.err = UdpError.NoData;
+            return;
+        };
+
+        // Find the session by receiver index (our local index for the A-C session)
+        const inner_pk = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.by_index.get(inner_msg.receiver_index) orelse {
+                pkt.err = UdpError.PeerNotFound;
+                return;
+            };
+        };
+
+        const inner_peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers.get(inner_pk.data) orelse {
+                pkt.err = UdpError.PeerNotFound;
+                return;
+            };
+        };
+
+        const inner_session = inner_peer.session orelse {
+            pkt.err = UdpError.NoData;
+            return;
+        };
+
+        // Copy inner ciphertext to pkt.data (temp buffer).
+        // inner_msg.ciphertext points into pkt.out_buf which we'll overwrite.
+        const ct_len = inner_msg.ciphertext.len;
+        if (ct_len > pkt.data.len) {
+            pkt.err = UdpError.NoData;
+            return;
+        }
+        @memcpy(pkt.data[0..ct_len], inner_msg.ciphertext);
+
+        // Decrypt into pkt.out_buf
+        const inner_pt_len = inner_session.decrypt(pkt.data[0..ct_len], inner_msg.counter, &pkt.out_buf) catch {
+            pkt.err = UdpError.DecryptFailed;
+            return;
+        };
+
+        if (inner_pt_len < 1) {
+            pkt.err = UdpError.NoData;
+            return;
+        }
+
+        // Decode inner protocol + payload
+        const inner_protocol = pkt.out_buf[0];
+        const inner_data = pkt.out_buf[1..inner_pt_len];
+
+        // Fill packet fields
+        pkt.pk = Key{ .data = src_key.* };
+        pkt.protocol = inner_protocol;
+        pkt.payload = inner_data;
+        pkt.payload_len = inner_pt_len - 1;
+        pkt.err = null;
+
+        // Route KCP internally
+        if (inner_protocol == @intFromEnum(message.Protocol.kcp)) {
+            if (inner_peer.mux) |mux| {
+                mux.input(inner_data) catch {};
+            }
+            pkt.err = UdpError.NoData;
+            return;
+        }
     }
 
     // ========================================================================
