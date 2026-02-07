@@ -34,6 +34,9 @@ pub mod dns;
 #[cfg(feature = "tun")]
 pub mod tun;
 
+#[cfg(feature = "dnsmgr")]
+pub mod dnsmgr;
+
 // Re-export commonly used types at crate root for convenience
 pub use noise::{
     // Core types
