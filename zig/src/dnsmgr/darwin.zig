@@ -27,8 +27,30 @@ pub const DarwinState = struct {
     }
 };
 
+/// Validate domain name: only alphanumeric, dots, hyphens allowed.
+/// Rejects path traversal sequences (..) and path separators (/).
+fn validateDomain(domain: []const u8) bool {
+    if (domain.len == 0) return false;
+    // Reject path separators and traversal
+    for (domain) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-') {
+            return false;
+        }
+    }
+    // Reject ".." sequences (path traversal)
+    if (std.mem.indexOf(u8, domain, "..") != null) return false;
+    return true;
+}
+
 /// Set DNS configuration by writing /etc/resolver/ files.
 pub fn setDNS(state: *DarwinState, nameserver: []const u8, domains: []const []const u8) DnsMgrError!void {
+    // Validate all domains to prevent path traversal attacks.
+    // Since we use domain as a filename under /etc/resolver/, a domain like
+    // "../crontab" would write to /etc/crontab with root privileges.
+    for (domains) |domain| {
+        if (!validateDomain(domain)) return DnsMgrError.InvalidArgument;
+    }
+
     // Ensure /etc/resolver/ directory exists
     std.fs.makeDirAbsolute(RESOLVER_DIR) catch |err| switch (err) {
         error.PathAlreadyExists => {},

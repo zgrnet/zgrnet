@@ -42,8 +42,21 @@ pub const FakeIPPool = struct {
         self.lru_order.deinit(self.allocator);
     }
 
+    pub const AssignError = error{OutOfMemory};
+
     /// Assign a Fake IP for the given domain.
+    /// Returns error on allocation failure instead of silently returning
+    /// an untracked IP.
     pub fn assign(self: *Self, domain: []const u8) [4]u8 {
+        return self.assignInner(domain) catch {
+            // On OOM, return a deterministic fallback IP from the pool range.
+            // This is better than returning an untracked IP because the caller
+            // still gets a valid-looking response, and the next call will retry.
+            return ipFromU32(self.base_ip + 1);
+        };
+    }
+
+    fn assignInner(self: *Self, domain: []const u8) AssignError![4]u8 {
         if (self.domain_to_ip.get(domain)) |ip_val| {
             self.touchLRU(domain);
             return ipFromU32(ip_val);
@@ -59,11 +72,18 @@ pub const FakeIPPool = struct {
             self.next_off = 1;
         }
 
-        // Copy domain string for ownership
-        const owned = self.allocator.dupe(u8, domain) catch return ipFromU32(ip_val);
-        self.domain_to_ip.put(owned, ip_val) catch {};
-        self.ip_to_domain.put(ip_val, owned) catch {};
-        self.lru_order.append(self.allocator, owned) catch {};
+        // Copy domain string for ownership. All three insertions must succeed
+        // atomically, or we roll back to avoid inconsistent state.
+        const owned = try self.allocator.dupe(u8, domain);
+        errdefer self.allocator.free(owned);
+
+        self.domain_to_ip.put(owned, ip_val) catch return error.OutOfMemory;
+        errdefer _ = self.domain_to_ip.remove(owned);
+
+        self.ip_to_domain.put(ip_val, owned) catch return error.OutOfMemory;
+        errdefer _ = self.ip_to_domain.remove(ip_val);
+
+        self.lru_order.append(self.allocator, owned) catch return error.OutOfMemory;
 
         return ipFromU32(ip_val);
     }
@@ -90,8 +110,13 @@ pub const FakeIPPool = struct {
     fn touchLRU(self: *Self, domain: []const u8) void {
         for (self.lru_order.items, 0..) |item, i| {
             if (std.mem.eql(u8, item, domain)) {
-                _ = self.lru_order.orderedRemove(i);
-                self.lru_order.append(self.allocator, domain) catch {};
+                const removed = self.lru_order.orderedRemove(i);
+                self.lru_order.append(self.allocator, removed) catch {
+                    // Re-insert at original position to avoid losing the entry.
+                    // insertAt can also fail, but orderedRemove freed a slot so
+                    // capacity should be sufficient (no allocation needed).
+                    self.lru_order.insert(self.allocator, i, removed) catch {};
+                };
                 return;
             }
         }

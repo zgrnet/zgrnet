@@ -98,12 +98,8 @@ pub const Server = struct {
             return self.respondWithTunIP(alloc, query, name, qtype, buf);
         }
 
-        // Full 64-char hex pubkey
-        if (subdomain.len == 64 and isHexString(subdomain)) {
-            return self.respondWithPeerIP(alloc, query, name, subdomain, qtype, buf);
-        }
-
-        // Split pubkey: {first32}.{last32}.zigor.net
+        // Split pubkey: {first32hex}.{last32hex}.zigor.net
+        // Pubkey is split into two 32-char labels to comply with RFC 1035 (max 63 chars/label).
         if (std.mem.indexOfScalar(u8, subdomain, '.')) |dot_pos| {
             const first = subdomain[0..dot_pos];
             const rest = subdomain[dot_pos + 1 ..];

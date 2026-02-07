@@ -37,8 +37,28 @@ pub const WindowsState = struct {
     }
 };
 
+/// Validate that a string contains only safe DNS/IP characters.
+/// Allowed: a-z, A-Z, 0-9, '.', '-', ':' (for IPv6)
+/// Rejects anything that could be used for command injection.
+fn validateSafeString(s: []const u8) bool {
+    for (s) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-' and c != ':') {
+            return false;
+        }
+    }
+    return s.len > 0;
+}
+
 /// Set DNS via NRPT rules using PowerShell.
 pub fn setDNS(state: *WindowsState, nameserver: []const u8, domains: []const []const u8) DnsMgrError!void {
+    // Validate inputs to prevent command injection.
+    // Since we embed these in a PowerShell -Command string, any metacharacters
+    // (quotes, semicolons, pipes, etc.) could execute arbitrary code.
+    if (!validateSafeString(nameserver)) return DnsMgrError.InvalidArgument;
+    for (domains) |domain| {
+        if (!validateSafeString(domain)) return DnsMgrError.InvalidArgument;
+    }
+
     // First, remove any existing zgrnet NRPT rules
     removeExistingRules() catch {};
 

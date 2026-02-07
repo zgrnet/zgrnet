@@ -47,12 +47,21 @@ impl Default for ServerConfig {
 /// Magic DNS server.
 pub struct Server {
     config: ServerConfig,
+    /// Persistent upstream UDP socket for connection reuse.
+    upstream_socket: Option<UdpSocket>,
 }
 
 impl Server {
     /// Create a new DNS server.
     pub fn new(config: ServerConfig) -> Self {
-        Server { config }
+        // Eagerly initialize upstream connection for performance.
+        let upstream_socket = config.upstream.parse::<SocketAddr>().ok().and_then(|addr| {
+            let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+            socket.connect(addr).ok()?;
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+            Some(socket)
+        });
+        Server { config, upstream_socket }
     }
 
     /// Handle a DNS query and return the response bytes.
@@ -98,12 +107,8 @@ impl Server {
             return self.respond_with_tun_ip(query, name, qtype);
         }
 
-        // Full 64-char hex pubkey (single label, if somehow fits)
-        if subdomain.len() == 64 && is_hex_string(subdomain) {
-            return self.respond_with_peer_ip(query, name, subdomain, qtype);
-        }
-
-        // Split pubkey: {first32}.{last32}.zigor.net
+        // Split pubkey: {first32hex}.{last32hex}.zigor.net
+        // Pubkey is split into two 32-char labels to comply with RFC 1035 (max 63 chars/label).
         if let Some(dot_pos) = subdomain.find('.') {
             let first = &subdomain[..dot_pos];
             let rest = &subdomain[dot_pos + 1..];
@@ -203,10 +208,22 @@ impl Server {
         Ok(resp.encode()?)
     }
 
+    /// Forward a DNS query to the upstream resolver.
+    /// Uses a persistent UDP socket for performance. Falls back to
+    /// a per-query socket if the persistent one is unavailable.
     fn forward_upstream(
         &self,
         query_data: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if let Some(ref socket) = self.upstream_socket {
+            socket.send(query_data)?;
+            let mut buf = vec![0u8; 4096];
+            let n = socket.recv(&mut buf)?;
+            buf.truncate(n);
+            return Ok(buf);
+        }
+
+        // Fallback: one-off connection
         let upstream: SocketAddr = self.config.upstream.parse()?;
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;

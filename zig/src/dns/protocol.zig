@@ -261,14 +261,19 @@ const DecodeNameResult = struct {
 };
 
 /// Decode a domain name from wire format with compression pointer support.
+/// Maximum number of compression pointer jumps allowed during name decoding.
+/// A DNS message is max 65535 bytes, but practically 512 without EDNS.
+/// 128 jumps is far more than any legitimate message needs, and prevents
+/// infinite loops from malicious pointer chains.
+const MAX_POINTER_JUMPS: usize = 128;
+
 pub fn decodeName(allocator: std.mem.Allocator, data: []const u8, offset: usize) DnsError!DecodeNameResult {
     var name_buf: [256]u8 = undefined;
     var name_len: usize = 0;
     var consumed: usize = 0;
     var jumped = false;
     var pos = offset;
-    var seen: [16]usize = undefined;
-    var seen_count: usize = 0;
+    var jump_count: usize = 0;
 
     while (true) {
         if (pos >= data.len) return DnsError.Truncated;
@@ -289,14 +294,8 @@ pub fn decodeName(allocator: std.mem.Allocator, data: []const u8, offset: usize)
                 consumed = pos - offset + 2;
             }
             const ptr = (@as(usize, data[pos] & 0x3F) << 8) | @as(usize, data[pos + 1]);
-            // Check for loops
-            for (seen[0..seen_count]) |s| {
-                if (s == ptr) return DnsError.PointerLoop;
-            }
-            if (seen_count < seen.len) {
-                seen[seen_count] = ptr;
-                seen_count += 1;
-            }
+            jump_count += 1;
+            if (jump_count > MAX_POINTER_JUMPS) return DnsError.PointerLoop;
             pos = ptr;
             jumped = true;
             continue;
