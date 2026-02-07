@@ -144,7 +144,10 @@ func (u *UDP) sendToPeer(peer *peerState, protocol byte, data []byte) error {
 
 // OpenStream opens a new KCP stream to the specified peer.
 // The peer must be in established state with mux initialized.
-func (u *UDP) OpenStream(pk noise.PublicKey) (*Stream, error) {
+// proto specifies the stream protocol type (e.g., noise.ProtocolTCPProxy).
+// metadata contains additional data sent with the SYN frame (e.g., encoded Address).
+// Use proto=0 and metadata=nil for untyped streams.
+func (u *UDP) OpenStream(pk noise.PublicKey, proto byte, metadata []byte) (*Stream, error) {
 	if u.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -170,7 +173,7 @@ func (u *UDP) OpenStream(pk noise.PublicKey) (*Stream, error) {
 		return nil, ErrNoSession
 	}
 
-	return m.OpenStream()
+	return m.OpenStream(proto, metadata)
 }
 
 // AcceptStream accepts an incoming KCP stream from the specified peer.

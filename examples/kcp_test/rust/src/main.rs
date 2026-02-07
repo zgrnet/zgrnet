@@ -142,7 +142,7 @@ fn main() {
 fn run_opener_test(udp: &Arc<UDP>, peer_pk: &Key, peer_name: &str, test_cfg: &TestConfig) {
     println!("[opener] Opening stream to {}...", peer_name);
 
-    let stream = udp.open_stream(peer_pk)
+    let stream = udp.open_stream(peer_pk, 0, &[])
         .unwrap_or_else(|e| panic!("Failed to open stream: {}", e));
 
     println!("[opener] Opened stream {}", stream.id());

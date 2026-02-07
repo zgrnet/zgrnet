@@ -18,6 +18,7 @@ pub const replay = @import("replay.zig");
 pub const session = @import("session.zig");
 pub const message = @import("message.zig");
 pub const transport = @import("transport.zig");
+pub const address = @import("address.zig");
 
 // Re-export main types
 pub const Key = keypair.Key;
@@ -50,6 +51,9 @@ pub const Addr = transport.Addr;
 pub const MockTransport = transport.MockTransport;
 pub const MockAddr = transport.MockAddr;
 
+pub const Address = address.Address;
+pub const AddressError = address.AddressError;
+
 // Crypto constants
 pub const tag_size = crypto.tag_size;
 pub const hash_size = crypto.hash_size;
@@ -70,4 +74,5 @@ test {
     _ = session;
     _ = message;
     _ = transport;
+    _ = address;
 }

@@ -109,7 +109,7 @@ func runKCPBenchmark(client, server *znet.UDP, clientKey, serverKey *noise.KeyPa
 
 	// Client opens stream
 	log.Printf("[client] Opening stream...")
-	clientStream, err := client.OpenStream(serverKey.Public)
+	clientStream, err := client.OpenStream(serverKey.Public, 0, nil)
 	if err != nil {
 		log.Fatalf("[client] OpenStream failed: %v", err)
 	}

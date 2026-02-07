@@ -69,6 +69,8 @@ pub const OnNewStreamFn = *const fn (stream: *Stream, user_data: ?*anyopaque) vo
 /// Uses fine-grained locking for better concurrency.
 pub const Stream = struct {
     id: u32,
+    proto: u8, // Stream protocol type (from SYN payload)
+    metadata: []const u8, // Stream metadata (from SYN payload), owned
     mux_ptr: *anyopaque, // Type-erased Mux pointer (to avoid circular comptime dependency)
     send_frame_fn: *const fn (mux: *anyopaque, cmd: kcp.Cmd, stream_id: u32, payload: []const u8) anyerror!void,
     kcp_instance: ?kcp.Kcp,
@@ -92,10 +94,12 @@ pub const Stream = struct {
     // Condition variable for blocking read
     data_available: std.Thread.Condition,
 
-    /// Initialize a new stream.
+    /// Initialize a new stream with protocol type and metadata.
     pub fn init(
         allocator: std.mem.Allocator,
         id: u32,
+        proto: u8,
+        metadata: []const u8,
         mux_ptr: *anyopaque,
         send_frame_fn: *const fn (*anyopaque, kcp.Cmd, u32, []const u8) anyerror!void,
         max_recv_buf: usize,
@@ -103,8 +107,16 @@ pub const Stream = struct {
         const self = try allocator.create(Stream);
         errdefer allocator.destroy(self);
 
+        // Copy metadata to owned memory
+        const meta_copy = if (metadata.len > 0)
+            try allocator.dupe(u8, metadata)
+        else
+            &[_]u8{};
+
         self.* = Stream{
             .id = id,
+            .proto = proto,
+            .metadata = meta_copy,
             .mux_ptr = mux_ptr,
             .send_frame_fn = send_frame_fn,
             .kcp_instance = null,
@@ -154,6 +166,9 @@ pub const Stream = struct {
         if (self.kcp_instance) |*k| {
             k.deinit();
         }
+        if (self.metadata.len > 0) {
+            self.allocator.free(@constCast(self.metadata));
+        }
         self.recv_buf.deinit();
         self.allocator.destroy(self);
     }
@@ -161,6 +176,18 @@ pub const Stream = struct {
     /// Get stream ID.
     pub fn getId(self: *const Stream) u32 {
         return self.id;
+    }
+
+    /// Get stream protocol type (from SYN payload).
+    /// Returns 0 (RAW) if no protocol was specified.
+    pub fn getProto(self: *const Stream) u8 {
+        return self.proto;
+    }
+
+    /// Get stream metadata (from SYN payload).
+    /// Returns empty slice if no metadata was specified.
+    pub fn getMetadata(self: *const Stream) []const u8 {
+        return self.metadata;
     }
 
     /// Get stream state.
@@ -525,8 +552,11 @@ pub fn Mux(comptime TimerServiceT: type) type {
             return self.closed.load(.acquire);
         }
 
-        /// Open a new stream.
-        pub fn openStream(self: *Self) MuxError!*Stream {
+        /// Open a new stream with protocol type and metadata.
+        /// The proto and metadata are sent in the SYN frame payload so the remote
+        /// side can identify the stream type upon acceptance.
+        /// Use proto=0 (RAW) and metadata=&.{} for untyped streams.
+        pub fn openStream(self: *Self, proto: u8, metadata: []const u8) MuxError!*Stream {
             if (self.closed.load(.acquire)) return MuxError.MuxClosed;
 
             self.mutex.lock();
@@ -538,6 +568,8 @@ pub fn Mux(comptime TimerServiceT: type) type {
             const stream = Stream.init(
                 self.allocator,
                 id,
+                proto,
+                metadata,
                 self,
                 sendFrameWrapper,
                 self.config.max_receive_buffer,
@@ -548,8 +580,17 @@ pub fn Mux(comptime TimerServiceT: type) type {
                 return MuxError.OutOfMemory;
             };
 
-            // Send SYN
-            self.sendFrameInternal(.syn, id, &[_]u8{}) catch {
+            // Send SYN with proto + metadata as payload
+            var syn_payload_buf: [256]u8 = undefined;
+            const syn_payload = if (proto != 0 or metadata.len > 0) blk: {
+                syn_payload_buf[0] = proto;
+                if (metadata.len > 0) {
+                    @memcpy(syn_payload_buf[1 .. 1 + metadata.len], metadata);
+                }
+                break :blk syn_payload_buf[0 .. 1 + metadata.len];
+            } else &[_]u8{};
+
+            self.sendFrameInternal(.syn, id, syn_payload) catch {
                 _ = self.streams.remove(id);
                 _ = stream.release();
                 return MuxError.OutOfMemory;
@@ -585,19 +626,25 @@ pub fn Mux(comptime TimerServiceT: type) type {
             defer self.mutex.unlock();
 
             switch (frame.cmd) {
-                .syn => self.handleSyn(frame.stream_id),
+                .syn => self.handleSynWithPayload(frame.stream_id, frame.payload),
                 .fin => self.handleFin(frame.stream_id),
                 .psh => self.handlePsh(frame.stream_id, frame.payload),
                 .nop => {},
             }
         }
 
-        fn handleSyn(self: *Self, id: u32) void {
+        fn handleSynWithPayload(self: *Self, id: u32, payload: []const u8) void {
             if (self.streams.contains(id)) return;
+
+            // Parse proto + metadata from SYN payload
+            const proto: u8 = if (payload.len >= 1) payload[0] else 0;
+            const metadata: []const u8 = if (payload.len > 1) payload[1..] else &[_]u8{};
 
             const stream = Stream.init(
                 self.allocator,
                 id,
+                proto,
+                metadata,
                 self,
                 sendFrameWrapper,
                 self.config.max_receive_buffer,
@@ -709,9 +756,11 @@ test "Stream init deinit" {
     };
 
     var dummy: u8 = 0;
-    const stream = try Stream.init(allocator, 1, &dummy, DummyMux.sendFrame, 256 * 1024);
+    const stream = try Stream.init(allocator, 1, 0, &[_]u8{}, &dummy, DummyMux.sendFrame, 256 * 1024);
     defer _ = stream.release();
 
     try std.testing.expectEqual(@as(u32, 1), stream.getId());
+    try std.testing.expectEqual(@as(u8, 0), stream.getProto());
+    try std.testing.expectEqual(@as(usize, 0), stream.getMetadata().len);
     try std.testing.expectEqual(StreamState.open, stream.getState());
 }

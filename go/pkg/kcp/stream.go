@@ -47,9 +47,11 @@ func (s StreamState) String() string {
 // Stream represents a multiplexed stream over KCP.
 // It implements io.ReadWriteCloser.
 type Stream struct {
-	id  uint32
-	mux *Mux
-	kcp *KCP
+	id       uint32
+	mux      *Mux
+	kcp      *KCP
+	proto    byte   // Stream protocol type (from SYN payload)
+	metadata []byte // Stream metadata (from SYN payload)
 
 	// Receive buffer
 	recvBuf []byte
@@ -65,12 +67,14 @@ type Stream struct {
 	writeDeadline atomic.Value // time.Time
 }
 
-// newStream creates a new stream.
-func newStream(id uint32, mux *Mux) *Stream {
+// newStream creates a new stream with protocol type and metadata.
+func newStream(id uint32, mux *Mux, proto byte, metadata []byte) *Stream {
 	s := &Stream{
-		id:      id,
-		mux:     mux,
-		closeCh: make(chan struct{}),
+		id:       id,
+		mux:      mux,
+		proto:    proto,
+		metadata: metadata,
+		closeCh:  make(chan struct{}),
 	}
 
 	// Create KCP instance
@@ -89,6 +93,18 @@ func newStream(id uint32, mux *Mux) *Stream {
 // ID returns the stream ID.
 func (s *Stream) ID() uint32 {
 	return s.id
+}
+
+// Proto returns the stream protocol type (from SYN payload).
+// Returns 0 (RAW) if no protocol was specified.
+func (s *Stream) Proto() byte {
+	return s.proto
+}
+
+// Metadata returns the stream metadata (from SYN payload).
+// Returns nil if no metadata was specified.
+func (s *Stream) Metadata() []byte {
+	return s.metadata
 }
 
 // State returns the current stream state.

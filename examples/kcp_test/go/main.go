@@ -165,7 +165,7 @@ func main() {
 func runOpenerTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, testCfg TestConfig) {
 	log.Printf("[opener] Opening stream to %s...", peerName)
 
-	stream, err := udp.OpenStream(peerKey)
+	stream, err := udp.OpenStream(peerKey, 0, nil)
 	if err != nil {
 		log.Fatalf("[opener] Failed to open stream: %v", err)
 	}

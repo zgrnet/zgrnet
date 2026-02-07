@@ -874,8 +874,11 @@ pub fn UDP(comptime IOBackend: type) type {
         };
     }
 
-    /// Open a new stream to a peer.
-    pub fn openStream(self: *Self, pk: *const Key) UdpError!*KcpStream {
+    /// Open a new stream to a peer with protocol type and metadata.
+    /// proto specifies the stream protocol type (e.g., noise_mod.Protocol.tcp_proxy).
+    /// metadata contains additional data sent with the SYN frame (e.g., encoded Address).
+    /// Use proto=0 and metadata=&.{} for untyped streams.
+    pub fn openStream(self: *Self, pk: *const Key, proto: u8, metadata: []const u8) UdpError!*KcpStream {
         if (self.closed.load(.acquire)) return UdpError.Closed;
 
         const peer = blk: {
@@ -890,7 +893,7 @@ pub fn UDP(comptime IOBackend: type) type {
         }
 
         const mux = peer.mux orelse return UdpError.PeerNotFound;
-        return mux.openStream() catch return UdpError.OutOfMemory;
+        return mux.openStream(proto, metadata) catch return UdpError.OutOfMemory;
     }
 
     /// Accept an incoming stream from a peer.

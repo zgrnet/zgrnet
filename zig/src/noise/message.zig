@@ -26,6 +26,8 @@ pub const MessageType = enum(u8) {
 /// Protocol field values (inside encrypted payload).
 pub const Protocol = enum(u8) {
     // Transport layer protocols (0-63, matching IP protocol numbers)
+    /// Raw data (default)
+    raw = 0,
     /// ICMP in ZigNet (no IP header)
     icmp = 1,
     /// IP in ZigNet (complete IP packet)

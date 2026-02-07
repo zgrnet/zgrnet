@@ -13,7 +13,7 @@
 //! const mux = try MuxType.init(allocator, timer_service, ...);
 //! defer mux.deinit();
 //!
-//! const stream = try mux.openStream();
+//! const stream = try mux.openStream(0, &.{});
 //! defer stream.close();
 //! ```
 

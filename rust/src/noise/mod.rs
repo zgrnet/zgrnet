@@ -11,6 +11,7 @@ mod replay;
 mod session;
 pub mod message;
 pub mod transport;
+pub mod address;
 
 pub use keypair::{Key, KeyPair, KEY_SIZE};
 pub use cipher::{Hash, HASH_SIZE, TAG_SIZE};
@@ -26,6 +27,9 @@ pub use message::{
     HandshakeInit, HandshakeResp, MessageError, TransportMessage, MAX_PACKET_SIZE,
     protocol,
 };
+
+// Re-export address types
+pub use address::{Address, AddressError, ATYP_IPV4, ATYP_DOMAIN, ATYP_IPV6};
 
 // Re-export transport types
 pub use transport::{Addr, MockAddr, MockTransport, Transport, TransportError};

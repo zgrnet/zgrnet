@@ -176,7 +176,7 @@ pub fn main() !void {
 fn runOpenerTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key, peer_name: []const u8, test_cfg: *const TestConfig, my_name: []const u8) !void {
     std.debug.print("[opener] Opening stream to {s}...\n", .{peer_name});
 
-    const stream = udp.openStream(peer_pk) catch |e| {
+    const stream = udp.openStream(peer_pk, 0, &[_]u8{}) catch |e| {
         std.debug.print("[opener] Failed to open stream: {}\n", .{e});
         return e;
     };
