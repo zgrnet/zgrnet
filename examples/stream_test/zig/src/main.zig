@@ -19,7 +19,7 @@ const noise = @import("noise");
 
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
-const UDP = noise.UDP;
+const UDP = noise.UDP(noise.KqueueIO);
 const UdpOptions = noise.UdpOptions;
 const KcpStream = noise.net.KcpStream;
 

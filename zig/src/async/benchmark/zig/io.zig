@@ -11,7 +11,7 @@ const ReadyCallback = async_mod.ReadyCallback;
 
 /// Benchmark: poll + callback throughput via pipe
 ///
-/// Writer thread writes 1 byte at a time, KqueueIO polls and fires read callback.
+/// Writer thread writes in chunks, KqueueIO polls and fires read callback.
 /// Measures how many IO events per second the kqueue backend can dispatch.
 pub fn benchPollCallback(allocator: std.mem.Allocator) void {
     const iterations: usize = 64 * 1024 * 1024; // 64 MB

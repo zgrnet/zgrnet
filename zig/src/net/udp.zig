@@ -33,7 +33,6 @@ const kcp_mod = @import("../kcp/mod.zig");
 const Channel = async_mod.channel.Channel;
 const Signal = async_mod.channel.Signal;
 const IOService = async_mod.IOService;
-const KqueueIO = async_mod.KqueueIO;
 pub const SimpleTimerService = async_mod.SimpleTimerService;
 pub const KcpMux = kcp_mod.Mux(SimpleTimerService);
 pub const KcpStream = kcp_mod.Stream;
@@ -297,12 +296,30 @@ pub const UdpOptions = struct {
 };
 
 // ============================================================================
+// ReadResult (module-level, independent of IO backend)
+// ============================================================================
+
+/// Read result from UDP.
+pub const ReadResult = struct {
+    pk: Key,
+    n: usize,
+};
+
+// ============================================================================
 // UDP
 // ============================================================================
 
 /// UDP network layer with Noise Protocol encryption.
-pub const UDP = struct {
-    const Self = @This();
+///
+/// Generic over `IOBackend` to support platform-specific I/O backends
+/// (e.g., KqueueIO on macOS/BSD, EpollIO on Linux).
+/// The backend must implement the IOService interface.
+pub fn UDP(comptime IOBackend: type) type {
+    // Compile-time check that IOBackend implements IOService
+    comptime async_mod.assertIOService(IOBackend);
+
+    return struct {
+        const Self = @This();
 
     // Core state
     allocator: Allocator,
@@ -335,7 +352,7 @@ pub const UDP = struct {
 
     // IO service (platform-agnostic)
     io: IOService,
-    io_backend: *KqueueIO,
+    io_backend: *IOBackend,
 
     // Timer service for KCP updates
     timer_service: SimpleTimerService,
@@ -409,8 +426,8 @@ pub const UDP = struct {
         const workers = allocator.alloc(Thread, num_workers) catch return UdpError.OutOfMemory;
 
         // Initialize IO backend
-        const io_backend = allocator.create(KqueueIO) catch return UdpError.OutOfMemory;
-        io_backend.* = KqueueIO.init(allocator) catch {
+        const io_backend = allocator.create(IOBackend) catch return UdpError.OutOfMemory;
+        io_backend.* = IOBackend.init(allocator) catch {
             allocator.destroy(io_backend);
             return UdpError.BindFailed;
         };
@@ -713,12 +730,6 @@ pub const UDP = struct {
         _ = self.total_tx.fetchAdd(@intCast(n), .release);
         _ = peer.tx_bytes.fetchAdd(@intCast(n), .release);
     }
-
-    /// Read result.
-    pub const ReadResult = struct {
-        pk: Key,
-        n: usize,
-    };
 
     /// Read decrypted data from any peer.
     /// Blocks until data is available or closed.
@@ -1304,7 +1315,8 @@ pub const UDP = struct {
 
         return result;
     }
-};
+    };
+}
 
 // ============================================================================
 // Tests
@@ -1340,6 +1352,9 @@ test "PacketPool basic" {
 }
 
 test "UDP end-to-end: handshake + send/recv" {
+    const KqueueIO = async_mod.KqueueIO;
+    const UDPImpl = UDP(KqueueIO);
+
     const allocator = std.testing.allocator;
 
     // Create two keypairs
@@ -1353,14 +1368,14 @@ test "UDP end-to-end: handshake + send/recv" {
     const kp2 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv2));
 
     // Create two UDP instances on random ports
-    const udp1 = try UDP.init(allocator, &kp1, .{
+    const udp1 = try UDPImpl.init(allocator, &kp1, .{
         .bind_addr = "127.0.0.1:0",
         .allow_unknown = true,
         .decrypt_workers = 1,
     });
     defer udp1.deinit();
 
-    const udp2 = try UDP.init(allocator, &kp2, .{
+    const udp2 = try UDPImpl.init(allocator, &kp2, .{
         .bind_addr = "127.0.0.1:0",
         .allow_unknown = true,
         .decrypt_workers = 1,

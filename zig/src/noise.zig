@@ -9,6 +9,7 @@ const std = @import("std");
 // Submodules
 pub const noise = @import("noise/mod.zig");
 pub const net = @import("net/mod.zig");
+pub const async_mod = @import("async/mod.zig");
 pub const kcp_mod = @import("kcp/mod.zig");
 
 // KCP multiplexing (re-export submodules)
@@ -65,8 +66,13 @@ pub const UdpAddr = net.UdpAddr;
 pub const UDP = net.UDP;
 pub const UdpError = net.UdpError;
 pub const UdpOptions = net.UdpOptions;
+pub const ReadResult = net.ReadResult;
 pub const Packet = net.Packet;
 pub const PacketPool = net.PacketPool;
+
+// IO backend types (for UDP generic parameter)
+pub const IOService = async_mod.IOService;
+pub const KqueueIO = async_mod.KqueueIO;
 
 // KCP types
 pub const Kcp = kcp.Kcp;

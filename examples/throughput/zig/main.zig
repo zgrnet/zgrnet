@@ -14,7 +14,7 @@ const noise = @import("noise");
 const Allocator = std.mem.Allocator;
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
-const UDP = noise.UDP;
+const UDP = noise.UDP(noise.KqueueIO);
 const UdpError = noise.UdpError;
 
 const CHUNK_SIZE = 1200;
