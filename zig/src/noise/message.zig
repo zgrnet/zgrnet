@@ -46,6 +46,12 @@ pub const Protocol = enum(u8) {
     relay_1 = 67,
     /// Relay last hop
     relay_2 = 68,
+    /// TCP proxy via KCP stream
+    tcp_proxy = 69,
+    /// Ping probe request
+    ping = 70,
+    /// Pong probe response
+    pong = 71,
 
     // Application layer protocols (128-255)
     /// Chat messages

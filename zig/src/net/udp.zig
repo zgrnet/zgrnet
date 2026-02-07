@@ -28,6 +28,7 @@ const Mutex = Thread.Mutex;
 const Atomic = std.atomic.Value;
 
 const noise = @import("../noise/mod.zig");
+const relay_mod = @import("../relay/mod.zig");
 const async_mod = @import("../async/mod.zig");
 const kcp_mod = @import("../kcp/mod.zig");
 const Channel = async_mod.channel.Channel;
@@ -330,6 +331,10 @@ pub fn UDP(comptime IOBackend: type) type {
     // Options
     allow_unknown: bool,
 
+    // Relay forwarding
+    router: ?relay_mod.Router,
+    local_metrics: relay_mod.NodeMetrics,
+
     // Peer management
     peers_mutex: Mutex,
     peers: std.AutoHashMap([32]u8, *PeerState),
@@ -442,6 +447,8 @@ pub fn UDP(comptime IOBackend: type) type {
             .socket = socket,
             .local_port = local_port,
             .allow_unknown = options.allow_unknown,
+            .router = null,
+            .local_metrics = .{},
             .peers_mutex = .{},
             .peers = std.AutoHashMap([32]u8, *PeerState).init(allocator),
             .by_index = std.AutoHashMap(u32, Key).init(allocator),
@@ -561,6 +568,16 @@ pub fn UDP(comptime IOBackend: type) type {
     /// Get local port.
     pub fn getLocalPort(self: *Self) u16 {
         return self.local_port;
+    }
+
+    /// Set the relay router for forwarding relay packets.
+    pub fn setRouter(self: *Self, router: relay_mod.Router) void {
+        self.router = router;
+    }
+
+    /// Update the local node metrics for PONG responses.
+    pub fn setLocalMetrics(self: *Self, metrics: relay_mod.NodeMetrics) void {
+        self.local_metrics = metrics;
     }
 
     /// Set peer endpoint.
@@ -1107,6 +1124,63 @@ pub fn UDP(comptime IOBackend: type) type {
             return;
         }
 
+        // Route relay protocols
+        if (protocol == @intFromEnum(message.Protocol.relay_0)) {
+            if (self.router) |router| {
+                if (relay_mod.handleRelay0(router, &pk.data, payload)) |action| {
+                    self.executeRelayAction(&action);
+                } else |_| {}
+            }
+            pkt.err = UdpError.NoData;
+            return;
+        }
+
+        if (protocol == @intFromEnum(message.Protocol.relay_1)) {
+            if (self.router) |router| {
+                if (relay_mod.handleRelay1(router, payload)) |action| {
+                    self.executeRelayAction(&action);
+                } else |_| {}
+            }
+            pkt.err = UdpError.NoData;
+            return;
+        }
+
+        if (protocol == @intFromEnum(message.Protocol.relay_2)) {
+            if (relay_mod.handleRelay2(payload)) |result| {
+                // Inner payload is an end-to-end encrypted message.
+                // Copy to pkt.out_buf and set packet fields for upper layer.
+                pkt.pk = Key{ .data = result.src_key };
+                if (result.payload.len > 0) {
+                    // Copy payload into the packet's out_buf for safe mutable reference
+                    const copy_len = @min(result.payload.len, pkt.out_buf.len);
+                    @memcpy(pkt.out_buf[0..copy_len], result.payload[0..copy_len]);
+                    pkt.protocol = pkt.out_buf[0];
+                    pkt.payload = pkt.out_buf[0..copy_len];
+                    pkt.payload_len = copy_len;
+                    pkt.err = null;
+                } else {
+                    pkt.err = UdpError.NoData;
+                }
+            } else |_| {
+                pkt.err = UdpError.NoData;
+            }
+            _ = peer.rx_bytes.fetchAdd(@intCast(pkt.len), .release);
+            return;
+        }
+
+        if (protocol == @intFromEnum(message.Protocol.ping)) {
+            if (self.router != null) {
+                if (relay_mod.handlePing(&pk.data, payload, &self.local_metrics)) |action| {
+                    self.executeRelayAction(&action);
+                } else |_| {}
+            }
+            pkt.err = UdpError.NoData;
+            return;
+        }
+
+        // PONG: deliver to upper layer (ReadFrom)
+        // Other protocols: also deliver to upper layer
+
         // Extract protocol and payload for other protocols
         pkt.pk = pk;
         pkt.protocol = protocol;
@@ -1116,6 +1190,18 @@ pub fn UDP(comptime IOBackend: type) type {
 
         // Update stats
         _ = peer.rx_bytes.fetchAdd(@intCast(pkt.len), .release);
+    }
+
+    /// Execute a relay forwarding action by sending to the target peer.
+    fn executeRelayAction(self: *Self, action: *const relay_mod.Action) void {
+        const pk = Key{ .data = action.dst };
+
+        self.peers_mutex.lock();
+        const peer_opt = self.peers.get(pk.data);
+        self.peers_mutex.unlock();
+
+        const peer = peer_opt orelse return;
+        self.sendToPeer(peer, action.protocol, action.data()) catch {};
     }
 
     // ========================================================================
