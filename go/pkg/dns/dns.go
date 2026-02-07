@@ -14,9 +14,9 @@ import (
 
 // DNS record types.
 const (
-	TypeA     uint16 = 1  // IPv4 address
-	TypeAAAA  uint16 = 28 // IPv6 address
-	ClassIN   uint16 = 1  // Internet class
+	TypeA     uint16 = 1   // IPv4 address
+	TypeAAAA  uint16 = 28  // IPv6 address
+	ClassIN   uint16 = 1   // Internet class
 	MaxUDPLen        = 512 // Max UDP DNS message size (without EDNS)
 )
 
@@ -377,7 +377,6 @@ func encodeRR(rr *ResourceRecord) ([]byte, error) {
 	buf = append(buf, rr.RData...)
 	return buf, nil
 }
-
 
 // FormatQuestion returns a human-readable representation of a question.
 func (q *Question) String() string {

@@ -6,11 +6,12 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Default constants.
 const (
-	DefaultTTL      = 60     // 60 seconds, short TTL for quick peer updates
+	DefaultTTL      = 60 // 60 seconds, short TTL for quick peer updates
 	DefaultUpstream = "8.8.8.8:53"
 	ZigorNetSuffix  = ".zigor.net"
 	LocalhostLabel  = "localhost"
@@ -66,6 +67,9 @@ func NewServer(config ServerConfig) *Server {
 	s.initUpstream()
 	return s
 }
+
+// upstreamTimeout is the maximum time to wait for an upstream DNS response.
+const upstreamTimeout = 5 * time.Second
 
 // initUpstream creates the persistent upstream UDP connection.
 func (s *Server) initUpstream() {
@@ -297,6 +301,10 @@ func (s *Server) forwardUpstream(queryData []byte) ([]byte, error) {
 
 // forwardVia sends a query through the given connection.
 func (s *Server) forwardVia(conn *net.UDPConn, queryData []byte) ([]byte, error) {
+	// Set read deadline to avoid hanging forever (especially on Windows
+	// where UDP to unreachable ports doesn't fail fast).
+	conn.SetReadDeadline(time.Now().Add(upstreamTimeout))
+
 	_, err := conn.Write(queryData)
 	if err != nil {
 		return nil, fmt.Errorf("dns: write upstream: %w", err)
