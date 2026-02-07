@@ -222,7 +222,14 @@ pub fn build(b: *std.Build) void {
         os_tag == .netbsd or os_tag == .openbsd);
 
     if (has_kqueue) {
-        // Host test example (for cross-language testing)
+        // TUN module for host_test (native Zig, not C ABI)
+        const tun_module_for_host = b.createModule(.{
+            .root_source_file = b.path("src/tun/mod.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        // Host test example (real TUN integration test)
         const host_test_module = b.createModule(.{
             .root_source_file = b.path("examples/host_test.zig"),
             .target = target,
@@ -230,12 +237,14 @@ pub fn build(b: *std.Build) void {
         });
         host_test_module.addOptions("build_options", options);
         host_test_module.addImport("noise", lib_module);
+        host_test_module.addImport("tun", tun_module_for_host);
 
         const host_test_exe = b.addExecutable(.{
             .name = "host_test",
             .root_module = host_test_module,
         });
         host_test_exe.linkLibrary(lib);
+        host_test_exe.linkLibC(); // for getuid()
         b.installArtifact(host_test_exe);
 
         const run_host_test = b.addRunArtifact(host_test_exe);
