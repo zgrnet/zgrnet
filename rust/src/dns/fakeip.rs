@@ -181,4 +181,33 @@ mod tests {
             assert!(octets[1] == 18 || octets[1] == 19);
         }
     }
+
+    #[test]
+    fn test_wrap_around() {
+        let mut pool = FakeIPPool::new(200000);
+        pool.next_off = pool.max_off;
+
+        pool.assign("last.com");
+        let ip = pool.assign("wrap.com");
+        assert_eq!(ip, Ipv4Addr::new(198, 18, 0, 1));
+    }
+
+    #[test]
+    fn test_default_size() {
+        let pool = FakeIPPool::new(0);
+        assert_eq!(pool.max_size, 65536);
+    }
+
+    #[test]
+    fn test_evict_empty() {
+        let mut pool = FakeIPPool::new(1);
+        pool.evict_lru(); // should not panic
+        assert_eq!(pool.size(), 0);
+    }
+
+    #[test]
+    fn test_lookup_unknown_ip() {
+        let pool = FakeIPPool::new(10);
+        assert_eq!(pool.lookup(Ipv4Addr::new(1, 2, 3, 4)), None);
+    }
 }

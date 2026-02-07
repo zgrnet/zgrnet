@@ -439,4 +439,153 @@ mod tests {
         assert!(!is_hex_string(""));
         assert!(!is_hex_string("0123g"));
     }
+
+    #[test]
+    fn test_upstream_forwarding() {
+        // Start a fake upstream DNS server
+        let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        let upstream_clone = upstream.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (n, remote) = upstream_clone.recv_from(&mut buf).unwrap();
+            let msg = Message::decode(&buf[..n]).unwrap();
+            let mut resp = Message::new_response(&msg, RCODE_NOERROR);
+            resp.answers.push(new_a_record(&msg.questions[0].name, 300, [93, 184, 216, 34]));
+            let data = resp.encode().unwrap();
+            upstream_clone.send_to(&data, remote).unwrap();
+        });
+
+        let srv = Server::new(ServerConfig {
+            tun_ipv4: Ipv4Addr::new(100, 64, 0, 1),
+            upstream: upstream_addr.to_string(),
+            ..Default::default()
+        });
+
+        let query = build_query("example.com", TYPE_A);
+        let resp_data = srv.handle_query(&query).unwrap();
+        let resp = Message::decode(&resp_data).unwrap();
+
+        assert_eq!(resp.header.rcode(), RCODE_NOERROR);
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].rdata, vec![93, 184, 216, 34]);
+    }
+
+    #[test]
+    fn test_malformed_query() {
+        let srv = Server::new(ServerConfig::default());
+        assert!(srv.handle_query(&[0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn test_localhost_no_ipv6() {
+        let srv = Server::new(ServerConfig {
+            tun_ipv4: Ipv4Addr::new(100, 64, 0, 1),
+            tun_ipv6: None,
+            ..Default::default()
+        });
+
+        let query = build_query("localhost.zigor.net", TYPE_AAAA);
+        let resp_data = srv.handle_query(&query).unwrap();
+        let resp = Message::decode(&resp_data).unwrap();
+
+        assert_eq!(resp.header.rcode(), RCODE_NOERROR);
+        assert_eq!(resp.answers.len(), 0); // No IPv6 configured
+    }
+
+    #[test]
+    fn test_fake_ip_aaaa() {
+        let pool = Arc::new(Mutex::new(FakeIPPool::new(100)));
+        let srv = Server::new(ServerConfig {
+            tun_ipv4: Ipv4Addr::new(100, 64, 0, 1),
+            fake_pool: Some(pool),
+            match_domains: vec![".example.com".to_string()],
+            ..Default::default()
+        });
+
+        let query = build_query("test.example.com", TYPE_AAAA);
+        let resp_data = srv.handle_query(&query).unwrap();
+        let resp = Message::decode(&resp_data).unwrap();
+
+        assert_eq!(resp.header.rcode(), RCODE_NOERROR);
+        assert_eq!(resp.answers.len(), 0); // No AAAA for fake IP
+    }
+
+    #[test]
+    fn test_pubkey_aaaa() {
+        let mut alloc = MockAllocator::new();
+        let mut pubkey = [0u8; 32];
+        for (i, b) in pubkey.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        alloc.add(pubkey, Ipv4Addr::new(100, 64, 0, 42));
+
+        let srv = Server::new(ServerConfig {
+            tun_ipv4: Ipv4Addr::new(100, 64, 0, 1),
+            ip_alloc: Some(Arc::new(alloc)),
+            ..Default::default()
+        });
+
+        let hex_pk = hex::encode(pubkey);
+        let split_name = format!("{}.{}.zigor.net", &hex_pk[..32], &hex_pk[32..]);
+        let query = build_query(&split_name, TYPE_AAAA);
+        let resp_data = srv.handle_query(&query).unwrap();
+        let resp = Message::decode(&resp_data).unwrap();
+
+        assert_eq!(resp.header.rcode(), RCODE_NOERROR);
+        assert_eq!(resp.answers.len(), 0); // No AAAA for peer
+    }
+
+    #[test]
+    fn test_bare_zigor_net() {
+        let srv = Server::new(ServerConfig {
+            tun_ipv4: Ipv4Addr::new(100, 64, 0, 1),
+            ..Default::default()
+        });
+
+        let query = build_query("zigor.net", TYPE_A);
+        let resp_data = srv.handle_query(&query).unwrap();
+        let resp = Message::decode(&resp_data).unwrap();
+
+        assert_eq!(resp.header.rcode(), RCODE_NXDOMAIN);
+    }
+
+    #[test]
+    fn test_authorities_additionals_roundtrip() {
+        let msg = Message {
+            header: Header {
+                id: 0x5555, flags: FLAG_QR | FLAG_AA,
+                qd_count: 1, an_count: 1, ns_count: 1, ar_count: 1,
+            },
+            questions: vec![Question {
+                name: "example.com".to_string(), qtype: TYPE_A, qclass: CLASS_IN,
+            }],
+            answers: vec![new_a_record("example.com", 60, [1, 2, 3, 4])],
+            authorities: vec![ResourceRecord {
+                name: "example.com".to_string(), rtype: 2, rclass: CLASS_IN,
+                ttl: 3600, rdata: encode_name("ns1.example.com").unwrap(),
+            }],
+            additionals: vec![new_a_record("ns1.example.com", 3600, [5, 6, 7, 8])],
+        };
+
+        let encoded = msg.encode().unwrap();
+        let decoded = Message::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.answers.len(), 1);
+        assert_eq!(decoded.authorities.len(), 1);
+        assert_eq!(decoded.additionals.len(), 1);
+        assert_eq!(decoded.additionals[0].name, "ns1.example.com");
+    }
+
+    #[test]
+    fn test_header_opcode_rcode() {
+        let h = Header { id: 0, flags: 0, qd_count: 0, an_count: 0, ns_count: 0, ar_count: 0 };
+        assert!(!h.is_response());
+        assert_eq!(h.rcode(), 0);
+
+        let h2 = Header { id: 0, flags: FLAG_QR | RCODE_NXDOMAIN, qd_count: 0, an_count: 0, ns_count: 0, ar_count: 0 };
+        assert!(h2.is_response());
+        assert_eq!(h2.rcode(), RCODE_NXDOMAIN);
+    }
 }
