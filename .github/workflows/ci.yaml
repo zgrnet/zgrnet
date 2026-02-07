@@ -64,7 +64,8 @@ jobs:
           echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|examples/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
           
           # Detect TUN-specific changes (requires root privileges to test)
-          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          # Includes host package since its integration test uses real TUN devices
+          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build and test affected targets with Bazel
   bazel:
@@ -153,7 +154,8 @@ jobs:
         working-directory: go
         run: |
           # Run tests excluding the tun package (requires root)
-          go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v '/tun$')
+          # Also exclude examples/host_test which imports tun via CGo
+          go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v '/tun$' | grep -v 'examples/host_test')
 
       - name: Coverage
         if: matrix.os == 'ubuntu-latest'
@@ -276,6 +278,23 @@ jobs:
           # Rust test binary is in a hash directory, find it
           RUST_TEST=$(find bazel-bin/rust -name 'tun_test' -type f -executable | head -1)
           sudo "$RUST_TEST"
+
+      - name: Test Go Host (TUN integration)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Build Host integration test binary (uses real TUN devices)
+          bazel build //go/examples/host_test
+          sudo bazel-bin/go/examples/host_test/host_test_/host_test
+
+      - name: Test Rust Host (TUN integration)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Build Rust Host integration test (uses real TUN devices)
+          # Uses zgrnet_tun library variant with TUN feature enabled
+          bazel build //rust:host_test
+          sudo bazel-bin/rust/host_test
 
   # Format check
   format:

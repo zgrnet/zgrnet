@@ -306,6 +306,13 @@ pub const ReadResult = struct {
     n: usize,
 };
 
+/// Read result from UDP including protocol byte.
+pub const ReadPacketResult = struct {
+    pk: Key,
+    protocol: u8,
+    n: usize,
+};
+
 // ============================================================================
 // UDP
 // ============================================================================
@@ -777,6 +784,39 @@ pub fn UDP(comptime IOBackend: type) type {
 
             self.packet_pool.release(pkt);
             return ReadResult{ .pk = pk, .n = n };
+        }
+    }
+
+    /// Read decrypted data from any peer, including the protocol byte.
+    /// Blocks until data is available or closed.
+    pub fn readPacket(self: *Self, buf: []u8) UdpError!ReadPacketResult {
+        while (true) {
+            if (self.closed.load(.acquire)) {
+                return UdpError.Closed;
+            }
+
+            // Get packet from output channel
+            const pkt = self.output_chan.recv() orelse {
+                return UdpError.Closed;
+            };
+
+            // Wait for decryption to complete
+            pkt.ready.wait();
+
+            // Check for errors
+            if (pkt.err != null) {
+                self.packet_pool.release(pkt);
+                continue; // Try next packet
+            }
+
+            // Copy data
+            const n = @min(buf.len, pkt.payload_len);
+            @memcpy(buf[0..n], pkt.payload[0..n]);
+            const pk = pkt.pk;
+            const protocol = pkt.protocol;
+
+            self.packet_pool.release(pkt);
+            return ReadPacketResult{ .pk = pk, .protocol = protocol, .n = n };
         }
     }
 

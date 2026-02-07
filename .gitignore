@@ -35,6 +35,10 @@ coverage.html
 *.so
 *.dylib
 
+# KCP C sources (managed by Bazel, copied locally for go test)
+go/pkg/kcp/ikcp.c
+go/pkg/kcp/ikcp.h
+
 # Design docs (local only)
 docs/design/
 go/examples/host_test/host_test

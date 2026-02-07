@@ -27,6 +27,7 @@ pub mod noise;
 pub mod net;
 pub mod kcp;
 pub mod relay;
+pub mod host;
 
 #[cfg(feature = "tun")]
 pub mod tun;

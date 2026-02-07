@@ -53,6 +53,7 @@ pub const UdpOptions = udp.UdpOptions;
 pub const Packet = udp.Packet;
 pub const PacketPool = udp.PacketPool;
 pub const ReadResult = udp.ReadResult;
+pub const ReadPacketResult = udp.ReadPacketResult;
 
 // KCP types (accessed via UDP)
 pub const KcpMux = udp.KcpMux;
