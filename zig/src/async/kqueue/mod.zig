@@ -87,7 +87,10 @@ pub const KqueueIO = struct {
 
     /// Shared implementation for registering a filter on a file descriptor.
     fn registerFilter(self: *Self, fd: posix.fd_t, filter: i8, callback: ReadyCallback) void {
-        const result = self.registrations.getOrPut(fd) catch return;
+        const result = self.registrations.getOrPut(fd) catch |err| {
+            std.log.err("KqueueIO: failed to update registration map for fd {d}: {s}", .{ fd, @errorName(err) });
+            return;
+        };
         if (!result.found_existing) {
             result.value_ptr.* = .{
                 .fd = fd,
@@ -115,7 +118,10 @@ pub const KqueueIO = struct {
                 .data = 0,
                 .udata = 0,
             }};
-            _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch return;
+            _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch |err| {
+                std.log.err("KqueueIO: failed to register fd {d} with kqueue: {s}", .{ fd, @errorName(err) });
+                return;
+            };
             if (is_read) {
                 result.value_ptr.read_registered = true;
             } else {

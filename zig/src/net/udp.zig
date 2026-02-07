@@ -955,19 +955,22 @@ pub const UDP = struct {
             _ = self.total_rx.fetchAdd(@intCast(nr), .release);
             self.last_seen.store(std.time.nanoTimestamp(), .release);
 
-            // Send to decrypt channel (non-blocking)
-            if (!self.decrypt_chan.trySend(pkt)) {
-                // Queue full, drop packet
+            // Dual-channel send: packet must be in both channels or neither.
+            // Send to output_chan FIRST — reader blocks on ready.wait() so it
+            // won't touch the packet until decrypt worker signals ready.
+            if (!self.output_chan.trySend(pkt)) {
+                // output_chan full, drop packet (nothing to undo)
                 self.packet_pool.release(pkt);
                 continue;
             }
 
-            // Send to output channel (non-blocking)
-            if (!self.output_chan.trySend(pkt)) {
-                // output_chan full — remove from decrypt_chan to avoid leak.
-                // This ensures the packet is either in both channels or neither.
-                _ = self.decrypt_chan.tryRecv();
-                self.packet_pool.release(pkt);
+            // Now send to decrypt_chan for worker processing.
+            if (!self.decrypt_chan.trySend(pkt)) {
+                // decrypt_chan full (rare). Packet is already in output_chan
+                // and reader will block on ready.wait(). Signal ready with
+                // error so reader can consume and release it — no leak.
+                pkt.err = UdpError.NoData;
+                pkt.ready.signal();
                 continue;
             }
         }
