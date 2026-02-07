@@ -1,5 +1,4 @@
 # Build options
-build --enable_bzlmod
 
 # Use C++17 for any C++ code
 build --cxxopt=-std=c++17

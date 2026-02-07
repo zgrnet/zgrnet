@@ -17,7 +17,7 @@ def _kcp_impl(ctx):
     ctx.download_and_extract(
         url = "https://github.com/skywind3000/kcp/archive/refs/tags/{}.tar.gz".format(_KCP_VERSION),
         sha256 = _KCP_SHA256,
-        stripPrefix = "kcp-{}".format(_KCP_VERSION),
+        strip_prefix = "kcp-{}".format(_KCP_VERSION),
     )
     ctx.file("BUILD.bazel", """
 package(default_visibility = ["//visibility:public"])
@@ -84,7 +84,7 @@ def _zig_toolchain_impl(ctx):
     ctx.download_and_extract(
         url = url,
         sha256 = _ZIG_SHA256.get(platform, ""),
-        stripPrefix = "zig-{}-{}".format(platform, _ZIG_VERSION),
+        strip_prefix = "zig-{}-{}".format(platform, _ZIG_VERSION),
     )
 
     ctx.file("BUILD.bazel", """
