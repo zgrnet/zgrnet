@@ -1,17 +1,30 @@
 //! Fake IP pool for route-matched domains.
 //!
 //! Range: 198.18.0.0/15 (RFC 5737 benchmarking).
-//! Bidirectional domain <-> IP mapping with LRU eviction.
+//! Bidirectional domain <-> IP mapping with O(1) amortized LRU eviction.
+//!
+//! Uses a generation-counter approach: each domain has a generation number.
+//! The LRU queue stores (domain_ptr, gen) pairs. On touch, we increment the
+//! generation and push a new entry. On eviction, we skip stale entries.
+//! This gives O(1) touch and O(1) amortized eviction.
 
 const std = @import("std");
+
+const LruEntry = struct {
+    domain: []const u8,
+    gen: u64,
+};
 
 pub const FakeIPPool = struct {
     allocator: std.mem.Allocator,
     domain_to_ip: std.StringHashMap(u32),
     ip_to_domain: std.AutoHashMap(u32, []const u8),
-    lru_order: std.ArrayListUnmanaged([]const u8),
+    /// Generation counter per domain.
+    domain_gen: std.StringHashMap(u64),
+    /// LRU queue with (domain, gen) pairs. Stale entries skipped on eviction.
+    lru_queue: std.ArrayListUnmanaged(LruEntry),
     max_size: usize,
-    base_ip: u32, // 198.18.0.0 = 0xC6120000
+    base_ip: u32,
     next_off: u32,
     max_off: u32,
 
@@ -23,7 +36,8 @@ pub const FakeIPPool = struct {
             .allocator = allocator,
             .domain_to_ip = std.StringHashMap(u32).init(allocator),
             .ip_to_domain = std.AutoHashMap(u32, []const u8).init(allocator),
-            .lru_order = .{},
+            .domain_gen = std.StringHashMap(u64).init(allocator),
+            .lru_queue = .{},
             .max_size = effective_size,
             .base_ip = 0xC612_0000,
             .next_off = 1,
@@ -32,26 +46,21 @@ pub const FakeIPPool = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Free owned domain strings
         var it = self.domain_to_ip.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
         }
         self.domain_to_ip.deinit();
         self.ip_to_domain.deinit();
-        self.lru_order.deinit(self.allocator);
+        self.domain_gen.deinit();
+        self.lru_queue.deinit(self.allocator);
     }
 
     pub const AssignError = error{OutOfMemory};
 
-    /// Assign a Fake IP for the given domain.
-    /// Returns error on allocation failure instead of silently returning
-    /// an untracked IP.
+    /// Assign a Fake IP for the given domain. O(1) amortized.
     pub fn assign(self: *Self, domain: []const u8) [4]u8 {
         return self.assignInner(domain) catch {
-            // On OOM, return a deterministic fallback IP from the pool range.
-            // This is better than returning an untracked IP because the caller
-            // still gets a valid-looking response, and the next call will retry.
             return ipFromU32(self.base_ip + 1);
         };
     }
@@ -72,8 +81,6 @@ pub const FakeIPPool = struct {
             self.next_off = 1;
         }
 
-        // Copy domain string for ownership. All three insertions must succeed
-        // atomically, or we roll back to avoid inconsistent state.
         const owned = try self.allocator.dupe(u8, domain);
         errdefer self.allocator.free(owned);
 
@@ -83,7 +90,10 @@ pub const FakeIPPool = struct {
         self.ip_to_domain.put(ip_val, owned) catch return error.OutOfMemory;
         errdefer _ = self.ip_to_domain.remove(ip_val);
 
-        self.lru_order.append(self.allocator, owned) catch return error.OutOfMemory;
+        self.domain_gen.put(owned, 0) catch return error.OutOfMemory;
+        errdefer _ = self.domain_gen.remove(owned);
+
+        self.lru_queue.append(self.allocator, .{ .domain = owned, .gen = 0 }) catch return error.OutOfMemory;
 
         return ipFromU32(ip_val);
     }
@@ -107,29 +117,36 @@ pub const FakeIPPool = struct {
         return self.domain_to_ip.count();
     }
 
+    /// Touch: increment generation and push new entry. O(1).
     fn touchLRU(self: *Self, domain: []const u8) void {
-        for (self.lru_order.items, 0..) |item, i| {
-            if (std.mem.eql(u8, item, domain)) {
-                const removed = self.lru_order.orderedRemove(i);
-                self.lru_order.append(self.allocator, removed) catch {
-                    // Re-insert at original position to avoid losing the entry.
-                    // insertAt can also fail, but orderedRemove freed a slot so
-                    // capacity should be sufficient (no allocation needed).
-                    self.lru_order.insert(self.allocator, i, removed) catch {};
-                };
-                return;
-            }
+        if (self.domain_gen.getPtr(domain)) |gen_ptr| {
+            gen_ptr.* += 1;
+            self.lru_queue.append(self.allocator, .{ .domain = domain, .gen = gen_ptr.* }) catch {};
         }
     }
 
+    /// Evict: pop front entries, skipping stale ones. O(1) amortized.
     fn evictLRU(self: *Self) void {
-        if (self.lru_order.items.len == 0) return;
-        const victim = self.lru_order.orderedRemove(0);
-        if (self.domain_to_ip.get(victim)) |ip_val| {
-            _ = self.ip_to_domain.remove(ip_val);
+        while (self.lru_queue.items.len > 0) {
+            const entry = self.lru_queue.orderedRemove(0);
+            // Check if this entry is still current
+            if (self.domain_gen.get(entry.domain)) |current_gen| {
+                if (current_gen == entry.gen) {
+                    // Current entry — evict it
+                    if (self.domain_to_ip.get(entry.domain)) |ip_val| {
+                        _ = self.ip_to_domain.remove(ip_val);
+                    }
+                    // Need to get the owned key before removing
+                    const key = self.domain_to_ip.getKey(entry.domain) orelse continue;
+                    _ = self.domain_to_ip.remove(entry.domain);
+                    _ = self.domain_gen.remove(entry.domain);
+                    self.allocator.free(key);
+                    return;
+                }
+                // Stale — skip
+            }
+            // Stale or already removed — skip
         }
-        _ = self.domain_to_ip.remove(victim);
-        self.allocator.free(victim);
     }
 };
 
@@ -158,11 +175,9 @@ test "FakeIPPool assign" {
     try std.testing.expectEqual(@as(u8, 198), ip1[0]);
     try std.testing.expectEqual(@as(u8, 18), ip1[1]);
 
-    // Same domain, same IP
     const ip2 = pool.assign("example.com");
     try std.testing.expectEqualSlices(u8, &ip1, &ip2);
 
-    // Different domain, different IP
     const ip3 = pool.assign("other.com");
     try std.testing.expect(!std.mem.eql(u8, &ip1, &ip3));
 }
@@ -176,7 +191,6 @@ test "FakeIPPool lookup" {
     try std.testing.expect(domain != null);
     try std.testing.expectEqualStrings("test.example.com", domain.?);
 
-    // Unknown IP
     try std.testing.expect(pool.lookup(.{ 1, 2, 3, 4 }) == null);
 }
 
@@ -189,7 +203,6 @@ test "FakeIPPool LRU eviction" {
     _ = pool.assign("c.com");
     try std.testing.expectEqual(@as(usize, 3), pool.size());
 
-    // Adding 4th evicts a.com
     _ = pool.assign("d.com");
     try std.testing.expectEqual(@as(usize, 3), pool.size());
     try std.testing.expect(pool.lookupDomain("a.com") == null);
@@ -205,11 +218,9 @@ test "FakeIPPool LRU touch" {
     _ = pool.assign("b.com");
     _ = pool.assign("c.com");
 
-    // Touch a.com
-    _ = pool.assign("a.com");
+    _ = pool.assign("a.com"); // touch
 
-    // Add d.com -> evicts b.com
-    _ = pool.assign("d.com");
+    _ = pool.assign("d.com"); // evicts b.com
     try std.testing.expect(pool.lookupDomain("a.com") != null);
     try std.testing.expect(pool.lookupDomain("b.com") == null);
 }
@@ -222,7 +233,6 @@ test "FakeIPPool wrap around" {
     _ = pool.assign("last.com");
 
     const ip = pool.assign("wrap.com");
-    // Should wrap to offset 1 = 198.18.0.1
     try std.testing.expectEqual(@as(u8, 198), ip[0]);
     try std.testing.expectEqual(@as(u8, 18), ip[1]);
     try std.testing.expectEqual(@as(u8, 0), ip[2]);
@@ -238,7 +248,7 @@ test "FakeIPPool default size" {
 test "FakeIPPool evict empty" {
     var pool = FakeIPPool.init(std.testing.allocator, 1);
     defer pool.deinit();
-    pool.evictLRU(); // should not panic
+    pool.evictLRU();
     try std.testing.expectEqual(@as(usize, 0), pool.size());
 }
 

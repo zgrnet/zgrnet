@@ -1,16 +1,25 @@
 //! Fake IP pool for route-matched domains.
 //!
 //! Range: 198.18.0.0/15 (RFC 5737 benchmarking).
-//! Bidirectional domain <-> IP mapping with LRU eviction.
+//! Bidirectional domain <-> IP mapping with O(1) amortized LRU eviction.
+//!
+//! Uses a generation-counter approach: each domain has a generation number.
+//! The LRU queue stores (domain, gen) pairs. On touch, we increment the
+//! generation and push a new entry. On eviction, we skip stale entries
+//! whose generation doesn't match. This gives O(1) touch and O(1) amortized
+//! eviction without needing a linked list.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 
-/// Fake IP pool with bidirectional mapping and LRU eviction.
+/// Fake IP pool with bidirectional mapping and O(1) amortized LRU eviction.
 pub struct FakeIPPool {
     domain_to_ip: HashMap<String, Ipv4Addr>,
     ip_to_domain: HashMap<u32, String>,
-    lru_order: Vec<String>,
+    /// Generation counter per domain (incremented on each touch).
+    domain_gen: HashMap<String, u64>,
+    /// LRU queue: (domain, generation_at_insert). Stale entries are skipped.
+    lru_queue: VecDeque<(String, u64)>,
     max_size: usize,
     base_ip: u32,   // 198.18.0.0 = 0xC6120000
     next_off: u32,
@@ -19,13 +28,13 @@ pub struct FakeIPPool {
 
 impl FakeIPPool {
     /// Create a new Fake IP pool.
-    /// If max_size <= 0, defaults to 65536.
     pub fn new(max_size: usize) -> Self {
         let max_size = if max_size == 0 { 65536 } else { max_size };
         FakeIPPool {
             domain_to_ip: HashMap::new(),
             ip_to_domain: HashMap::new(),
-            lru_order: Vec::new(),
+            domain_gen: HashMap::new(),
+            lru_queue: VecDeque::new(),
             max_size,
             base_ip: 0xC612_0000, // 198.18.0.0
             next_off: 1,          // Skip .0.0
@@ -33,8 +42,7 @@ impl FakeIPPool {
         }
     }
 
-    /// Assign a Fake IP for the given domain.
-    /// Returns the same IP for the same domain (idempotent).
+    /// Assign a Fake IP for the given domain. O(1) amortized.
     pub fn assign(&mut self, domain: &str) -> Ipv4Addr {
         if let Some(&ip) = self.domain_to_ip.get(domain) {
             self.touch_lru(domain);
@@ -50,7 +58,9 @@ impl FakeIPPool {
 
         self.domain_to_ip.insert(domain.to_string(), ip);
         self.ip_to_domain.insert(ip_key, domain.to_string());
-        self.lru_order.push(domain.to_string());
+        // Insert into LRU queue with generation 0
+        self.domain_gen.insert(domain.to_string(), 0);
+        self.lru_queue.push_back((domain.to_string(), 0));
 
         ip
     }
@@ -79,20 +89,31 @@ impl FakeIPPool {
         Ipv4Addr::from(ip_val)
     }
 
+    /// Touch: increment generation and push new entry. O(1).
     fn touch_lru(&mut self, domain: &str) {
-        if let Some(pos) = self.lru_order.iter().position(|d| d == domain) {
-            self.lru_order.remove(pos);
-            self.lru_order.push(domain.to_string());
-        }
+        let gen = self.domain_gen.get_mut(domain).unwrap();
+        *gen += 1;
+        self.lru_queue.push_back((domain.to_string(), *gen));
     }
 
+    /// Evict: pop front entries, skipping stale ones. O(1) amortized.
     fn evict_lru(&mut self) {
-        if self.lru_order.is_empty() {
-            return;
-        }
-        let victim = self.lru_order.remove(0);
-        if let Some(ip) = self.domain_to_ip.remove(&victim) {
-            self.ip_to_domain.remove(&u32::from(ip));
+        while let Some((domain, gen)) = self.lru_queue.pop_front() {
+            // Check if this entry is still current (not superseded by a touch)
+            match self.domain_gen.get(&domain) {
+                Some(&current_gen) if current_gen == gen => {
+                    // This is the current entry — evict it
+                    self.domain_gen.remove(&domain);
+                    if let Some(ip) = self.domain_to_ip.remove(&domain) {
+                        self.ip_to_domain.remove(&u32::from(ip));
+                    }
+                    return;
+                }
+                _ => {
+                    // Stale entry (domain was touched since), skip it
+                    continue;
+                }
+            }
         }
     }
 }
@@ -106,7 +127,6 @@ mod tests {
         let mut pool = FakeIPPool::new(100);
         let ip1 = pool.assign("example.com");
 
-        // In range 198.18.x.x
         let octets = ip1.octets();
         assert_eq!(octets[0], 198);
         assert_eq!(octets[1], 18);

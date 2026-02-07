@@ -13,15 +13,19 @@ const DnsMgrError = mod.DnsMgrError;
 const RESOLVER_DIR = "/etc/resolver";
 const FILE_HEADER = "# Added by zgrnet\n";
 const MAX_DOMAINS = 16;
+const MAX_DOMAIN_LEN = 128;
 
 pub const DarwinState = struct {
-    /// Domain files we've created (to clean up on close).
-    created_files: [MAX_DOMAINS]?[]const u8,
+    /// Domain names stored as owned fixed buffers (not slices into caller memory).
+    /// This avoids Use-After-Free when the caller frees the original C strings.
+    created_domains: [MAX_DOMAINS][MAX_DOMAIN_LEN]u8,
+    created_lens: [MAX_DOMAINS]usize,
     created_count: usize,
 
     pub fn init() DarwinState {
         return .{
-            .created_files = [_]?[]const u8{null} ** MAX_DOMAINS,
+            .created_domains = undefined,
+            .created_lens = [_]usize{0} ** MAX_DOMAINS,
             .created_count = 0,
         };
     }
@@ -31,22 +35,17 @@ pub const DarwinState = struct {
 /// Rejects path traversal sequences (..) and path separators (/).
 fn validateDomain(domain: []const u8) bool {
     if (domain.len == 0) return false;
-    // Reject path separators and traversal
     for (domain) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '.' and c != '-') {
             return false;
         }
     }
-    // Reject ".." sequences (path traversal)
     if (std.mem.indexOf(u8, domain, "..") != null) return false;
     return true;
 }
 
 /// Set DNS configuration by writing /etc/resolver/ files.
 pub fn setDNS(state: *DarwinState, nameserver: []const u8, domains: []const []const u8) DnsMgrError!void {
-    // Validate all domains to prevent path traversal attacks.
-    // Since we use domain as a filename under /etc/resolver/, a domain like
-    // "../crontab" would write to /etc/crontab with root privileges.
     for (domains) |domain| {
         if (!validateDomain(domain)) return DnsMgrError.InvalidArgument;
     }
@@ -61,12 +60,13 @@ pub fn setDNS(state: *DarwinState, nameserver: []const u8, domains: []const []co
     // Write a resolver file for each domain
     for (domains) |domain| {
         if (state.created_count >= MAX_DOMAINS) break;
+        if (domain.len > MAX_DOMAIN_LEN) continue;
 
-        // Build file content: "# Added by zgrnet\nnameserver 100.64.0.1\n"
+        // Build file content
         var content_buf: [256]u8 = undefined;
         const content = std.fmt.bufPrint(&content_buf, "{s}nameserver {s}\n", .{ FILE_HEADER, nameserver }) catch continue;
 
-        // Build path: "/etc/resolver/zigor.net"
+        // Build path
         var path_buf: [256]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ RESOLVER_DIR, domain }) catch continue;
 
@@ -78,16 +78,16 @@ pub fn setDNS(state: *DarwinState, nameserver: []const u8, domains: []const []co
         defer file.close();
         file.writeAll(content) catch return DnsMgrError.SetFailed;
 
-        // Track for cleanup
-        // We store a static copy of the domain for cleanup
-        state.created_files[state.created_count] = domain;
+        // Store an owned copy of the domain in a fixed buffer (not a slice into caller memory).
+        const idx = state.created_count;
+        @memcpy(state.created_domains[idx][0..domain.len], domain);
+        state.created_lens[idx] = domain.len;
         state.created_count += 1;
     }
 }
 
 /// Flush macOS DNS cache.
 pub fn flushCache() DnsMgrError!void {
-    // macOS uses dscacheutil -flushcache and killall -HUP mDNSResponder
     var child1 = std.process.Child.init(
         &.{ "dscacheutil", "-flushcache" },
         std.heap.page_allocator,
@@ -103,21 +103,20 @@ pub fn flushCache() DnsMgrError!void {
 
 /// Remove all resolver files created by us.
 pub fn close(state: *DarwinState) void {
-    for (state.created_files[0..state.created_count]) |maybe_domain| {
-        if (maybe_domain) |domain| {
-            var path_buf: [256]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ RESOLVER_DIR, domain }) catch continue;
+    for (0..state.created_count) |idx| {
+        const domain = state.created_domains[idx][0..state.created_lens[idx]];
+        var path_buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ RESOLVER_DIR, domain }) catch continue;
 
-            // Only remove if it's our file (check header)
-            if (std.fs.openFileAbsolute(path, .{})) |file| {
-                var header_buf: [FILE_HEADER.len]u8 = undefined;
-                const n = file.read(&header_buf) catch 0;
-                file.close();
-                if (n == FILE_HEADER.len and std.mem.eql(u8, &header_buf, FILE_HEADER)) {
-                    std.fs.deleteFileAbsolute(path) catch {};
-                }
-            } else |_| {}
-        }
+        // Only remove if it's our file (check header)
+        if (std.fs.openFileAbsolute(path, .{})) |file| {
+            var header_buf: [FILE_HEADER.len]u8 = undefined;
+            const n = file.read(&header_buf) catch 0;
+            file.close();
+            if (n == FILE_HEADER.len and std.mem.eql(u8, &header_buf, FILE_HEADER)) {
+                std.fs.deleteFileAbsolute(path) catch {};
+            }
+        } else |_| {}
     }
     state.created_count = 0;
 }

@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"container/list"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -8,7 +9,7 @@ import (
 
 // FakeIPPool manages a pool of fake IPs for route-matched domains.
 // Range: 198.18.0.0/15 (RFC 5737 benchmarking range, 131072 IPs).
-// Provides bidirectional domain <-> IP mapping with LRU eviction.
+// Provides bidirectional domain <-> IP mapping with O(1) LRU eviction.
 type FakeIPPool struct {
 	mu sync.Mutex
 
@@ -17,9 +18,10 @@ type FakeIPPool struct {
 	// Reverse mapping: IP (as uint32) -> domain
 	ipToDomain map[uint32]string
 
-	// LRU tracking: most recently used domains (newest at tail)
-	lruOrder []string
-	maxSize  int
+	// O(1) LRU: doubly linked list (front=LRU, back=MRU) + element map
+	lruList    *list.List
+	lruElement map[string]*list.Element // domain -> list element
+	maxSize    int
 
 	// IP allocation state
 	baseIP  uint32 // 198.18.0.0 = 0xC6120000
@@ -35,14 +37,11 @@ func NewFakeIPPool(maxSize int) *FakeIPPool {
 	if maxSize <= 0 {
 		maxSize = 65536
 	}
-	// 198.18.0.0/15 = 198.18.0.0 to 198.19.255.255 = 131072 addresses
-	// But we skip .0 and .255 per /24 to avoid broadcast addresses,
-	// which complicates things. For simplicity, just use the full range.
-	// The Fake IP pool is internal-only, so broadcast semantics don't apply.
 	return &FakeIPPool{
 		domainToIP: make(map[string]net.IP),
 		ipToDomain: make(map[uint32]string),
-		lruOrder:   make([]string, 0),
+		lruList:    list.New(),
+		lruElement: make(map[string]*list.Element),
 		maxSize:    maxSize,
 		baseIP:     0xC6120000, // 198.18.0.0
 		nextOff:    1,          // Skip .0.0
@@ -52,7 +51,7 @@ func NewFakeIPPool(maxSize int) *FakeIPPool {
 
 // Assign returns the Fake IP for the given domain.
 // If the domain already has an IP, it's returned and the entry is moved to
-// the tail of the LRU list. Otherwise, a new IP is allocated.
+// the back of the LRU list. Otherwise, a new IP is allocated.
 func (p *FakeIPPool) Assign(domain string) net.IP {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -74,7 +73,9 @@ func (p *FakeIPPool) Assign(domain string) net.IP {
 
 	p.domainToIP[domain] = ip
 	p.ipToDomain[ipKey] = domain
-	p.lruOrder = append(p.lruOrder, domain)
+	// Push to back (MRU end)
+	elem := p.lruList.PushBack(domain)
+	p.lruElement[domain] = elem
 
 	return ip
 }
@@ -123,25 +124,22 @@ func (p *FakeIPPool) allocIP() net.IP {
 	return ip
 }
 
-// touchLRU moves a domain to the end of the LRU list (most recently used).
+// touchLRU moves a domain to the back of the LRU list (most recently used). O(1).
 func (p *FakeIPPool) touchLRU(domain string) {
-	for i, d := range p.lruOrder {
-		if d == domain {
-			p.lruOrder = append(p.lruOrder[:i], p.lruOrder[i+1:]...)
-			p.lruOrder = append(p.lruOrder, domain)
-			return
-		}
+	if elem, ok := p.lruElement[domain]; ok {
+		p.lruList.MoveToBack(elem)
 	}
 }
 
-// evictLRU removes the least recently used entry.
+// evictLRU removes the least recently used entry. O(1).
 func (p *FakeIPPool) evictLRU() {
-	if len(p.lruOrder) == 0 {
+	front := p.lruList.Front()
+	if front == nil {
 		return
 	}
 
-	victim := p.lruOrder[0]
-	p.lruOrder = p.lruOrder[1:]
+	victim := p.lruList.Remove(front).(string)
+	delete(p.lruElement, victim)
 
 	if ip, ok := p.domainToIP[victim]; ok {
 		delete(p.ipToDomain, ipToUint32(ip))

@@ -44,14 +44,20 @@ const allocator = gpa.allocator();
 
 /// Create a new DNS manager.
 export fn dnsmgr_create(iface_name: ?[*:0]const u8) ?*DnsMgr {
-    const name_slice: ?[]const u8 = if (iface_name) |n| blk: {
+    // Duplicate the iface_name string to avoid Use-After-Free.
+    // The caller (Go/Rust) frees the original C string after this call returns,
+    // so we must own the memory.
+    const owned_name: ?[]const u8 = if (iface_name) |n| blk: {
         const len = std.mem.len(n);
-        break :blk n[0..len];
+        break :blk allocator.dupe(u8, n[0..len]) catch return null;
     } else null;
 
-    const mgr = allocator.create(DnsMgr) catch return null;
+    const mgr = allocator.create(DnsMgr) catch {
+        if (owned_name) |name| allocator.free(name);
+        return null;
+    };
     mgr.* = DnsMgr.init(.{
-        .iface_name = name_slice,
+        .iface_name = owned_name,
     });
     return mgr;
 }
@@ -61,6 +67,10 @@ export fn dnsmgr_create(iface_name: ?[*:0]const u8) ?*DnsMgr {
 export fn dnsmgr_close(mgr: ?*DnsMgr) void {
     if (mgr) |m| {
         m.close();
+        // Free the owned iface_name copy.
+        if (m.config.iface_name) |name| {
+            allocator.free(name);
+        }
         allocator.destroy(m);
     }
 }

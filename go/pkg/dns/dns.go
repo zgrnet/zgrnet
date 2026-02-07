@@ -174,8 +174,8 @@ func EncodeMessage(msg *Message) ([]byte, error) {
 			return nil, err
 		}
 		buf = append(buf, nameBytes...)
-		buf = appendUint16(buf, q.Type)
-		buf = appendUint16(buf, q.Class)
+		buf = binary.BigEndian.AppendUint16(buf, q.Type)
+		buf = binary.BigEndian.AppendUint16(buf, q.Class)
 	}
 
 	// Encode resource records
@@ -370,23 +370,14 @@ func encodeRR(rr *ResourceRecord) ([]byte, error) {
 
 	buf := make([]byte, 0, len(nameBytes)+10+len(rr.RData))
 	buf = append(buf, nameBytes...)
-	buf = appendUint16(buf, rr.Type)
-	buf = appendUint16(buf, rr.Class)
-	buf = appendUint32(buf, rr.TTL)
-	buf = appendUint16(buf, uint16(len(rr.RData)))
+	buf = binary.BigEndian.AppendUint16(buf, rr.Type)
+	buf = binary.BigEndian.AppendUint16(buf, rr.Class)
+	buf = binary.BigEndian.AppendUint32(buf, rr.TTL)
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(rr.RData)))
 	buf = append(buf, rr.RData...)
 	return buf, nil
 }
 
-// appendUint16 appends a big-endian uint16 to buf.
-func appendUint16(buf []byte, v uint16) []byte {
-	return append(buf, byte(v>>8), byte(v))
-}
-
-// appendUint32 appends a big-endian uint32 to buf.
-func appendUint32(buf []byte, v uint32) []byte {
-	return append(buf, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
-}
 
 // FormatQuestion returns a human-readable representation of a question.
 func (q *Question) String() string {
