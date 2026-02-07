@@ -1,6 +1,11 @@
 //! Host integration tests using MockTUN.
+//!
+//! These tests require a platform-specific IO backend (KqueueIO on macOS/BSD).
+//! On unsupported platforms (e.g., Linux without EpollIO), the Host tests are
+//! skipped at comptime. IP allocator and packet tests remain in their own files.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
@@ -19,8 +24,15 @@ const parseIpPacket = host_mod.parseIpPacket;
 const buildIpv4Packet = host_mod.buildIpv4Packet;
 
 const net_udp = @import("../net/udp.zig");
-const UDPType = net_udp.UDP(async_mod.KqueueIO);
-const HostType = host_mod.Host(UDPType);
+
+// KqueueIO is only available on macOS/BSD. On other platforms, Host tests are skipped.
+const has_io_backend = builtin.os.tag == .macos or
+    builtin.os.tag == .freebsd or
+    builtin.os.tag == .netbsd or
+    builtin.os.tag == .openbsd;
+
+const UDPType = if (has_io_backend) net_udp.UDP(async_mod.KqueueIO) else void;
+const HostType = if (has_io_backend) host_mod.Host(UDPType) else void;
 
 // ============================================================================
 // MockTUN
@@ -216,6 +228,7 @@ fn makeTCPSYN(src_port: u16, dst_port: u16) [20]u8 {
 // ============================================================================
 
 test "Host: create and close" {
+    if (!has_io_backend) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const key = KeyPair.generate();
 
@@ -235,6 +248,7 @@ test "Host: create and close" {
 }
 
 test "Host: ICMP forwarding A->B" {
+    if (!has_io_backend) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const key_a = KeyPair.generate();
     const key_b = KeyPair.generate();
@@ -312,6 +326,7 @@ test "Host: ICMP forwarding A->B" {
 }
 
 test "Host: bidirectional forwarding" {
+    if (!has_io_backend) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const key_a = KeyPair.generate();
     const key_b = KeyPair.generate();
@@ -374,6 +389,7 @@ test "Host: bidirectional forwarding" {
 }
 
 test "Host: TCP forwarding with checksum" {
+    if (!has_io_backend) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const key_a = KeyPair.generate();
     const key_b = KeyPair.generate();

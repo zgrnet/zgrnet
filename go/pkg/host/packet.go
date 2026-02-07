@@ -199,7 +199,7 @@ func fixTransportChecksum(transport []byte, srcIP, dstIP net.IP, protocol byte) 
 		}
 		binary.BigEndian.PutUint16(transport[6:8], cs)
 
-	// ICMP (protocol 1): checksum doesn't use pseudo-header, no fix needed
+		// ICMP (protocol 1): checksum doesn't use pseudo-header, no fix needed
 	}
 }
 

@@ -44,6 +44,7 @@ rust_binary(
     name = "host_test",
     srcs = ["examples/host_test.rs"],
     edition = "2021",
+    crate_features = ["tun"],
     deps = [":zgrnet_tun"] + all_crate_deps(),
     tags = ["requires-root"],
 )

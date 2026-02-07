@@ -23,6 +23,12 @@ struct AllocatorInner {
     by_ipv4: HashMap<Ipv4Addr, Key>,
 }
 
+impl Default for IPAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IPAllocator {
     /// Creates a new IP allocator.
     /// Addresses are allocated starting from 100.64.0.2 (skipping .0 network and .1 reserved).

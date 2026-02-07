@@ -183,13 +183,13 @@ func TestBuildIPv4Packet_TCPChecksum(t *testing.T) {
 
 	// Minimal TCP header (20 bytes) with data
 	tcpPayload := make([]byte, 24)
-	binary.BigEndian.PutUint16(tcpPayload[0:2], 12345)  // src port
+	binary.BigEndian.PutUint16(tcpPayload[0:2], 12345)   // src port
 	binary.BigEndian.PutUint16(tcpPayload[2:4], 80)      // dst port
 	binary.BigEndian.PutUint32(tcpPayload[4:8], 1)       // seq
 	binary.BigEndian.PutUint32(tcpPayload[8:12], 0)      // ack
-	tcpPayload[12] = 0x50                                 // data offset = 5 (20 bytes)
-	tcpPayload[13] = 0x02                                 // SYN flag
-	binary.BigEndian.PutUint16(tcpPayload[14:16], 65535)  // window
+	tcpPayload[12] = 0x50                                // data offset = 5 (20 bytes)
+	tcpPayload[13] = 0x02                                // SYN flag
+	binary.BigEndian.PutUint16(tcpPayload[14:16], 65535) // window
 	// checksum at [16:18] = 0 (will be set by BuildIPv4Packet)
 	copy(tcpPayload[20:24], []byte("test"))
 
@@ -229,9 +229,9 @@ func TestBuildIPv4Packet_UDPChecksum(t *testing.T) {
 
 	// UDP header (8 bytes) with data
 	udpPayload := make([]byte, 12)
-	binary.BigEndian.PutUint16(udpPayload[0:2], 5000)  // src port
-	binary.BigEndian.PutUint16(udpPayload[2:4], 53)     // dst port
-	binary.BigEndian.PutUint16(udpPayload[4:6], 12)     // length
+	binary.BigEndian.PutUint16(udpPayload[0:2], 5000) // src port
+	binary.BigEndian.PutUint16(udpPayload[2:4], 53)   // dst port
+	binary.BigEndian.PutUint16(udpPayload[4:6], 12)   // length
 	// Set non-zero checksum to trigger recalculation
 	udpPayload[6] = 0xFF
 	udpPayload[7] = 0xFF

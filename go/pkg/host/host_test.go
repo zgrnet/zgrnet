@@ -14,8 +14,8 @@ import (
 
 // mockTUN simulates a TUN device using channels.
 type mockTUN struct {
-	readCh  chan []byte    // packets to be "read" by the host (injected by test)
-	writeCh chan []byte    // packets "written" by the host (captured by test)
+	readCh  chan []byte // packets to be "read" by the host (injected by test)
+	writeCh chan []byte // packets "written" by the host (captured by test)
 	closeCh chan struct{}
 	closed  atomic.Bool
 }
@@ -456,8 +456,8 @@ func makeTCPSYN(srcPort, dstPort uint16) []byte {
 	pkt := make([]byte, 20)
 	binary.BigEndian.PutUint16(pkt[0:2], srcPort)
 	binary.BigEndian.PutUint16(pkt[2:4], dstPort)
-	binary.BigEndian.PutUint32(pkt[4:8], 1000)  // seq
-	binary.BigEndian.PutUint32(pkt[8:12], 0)     // ack
+	binary.BigEndian.PutUint32(pkt[4:8], 1000)    // seq
+	binary.BigEndian.PutUint32(pkt[8:12], 0)      // ack
 	pkt[12] = 0x50                                // data offset = 5 (20 bytes)
 	pkt[13] = 0x02                                // SYN flag
 	binary.BigEndian.PutUint16(pkt[14:16], 65535) // window

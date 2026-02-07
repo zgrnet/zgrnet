@@ -3,9 +3,10 @@
 // Requires root/sudo to create TUN devices.
 //
 // Usage:
-//   cd zig && zig build -Doptimize=ReleaseFast
-//   cd go && go build -o /tmp/host_test ./examples/host_test/
-//   sudo /tmp/host_test
+//
+//	cd zig && zig build -Doptimize=ReleaseFast
+//	cd go && go build -o /tmp/host_test ./examples/host_test/
+//	sudo /tmp/host_test
 package main
 
 import (
