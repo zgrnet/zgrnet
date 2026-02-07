@@ -985,7 +985,7 @@ impl UDP {
                         self.execute_relay_action(&action);
                     }
                 }
-                Ok((peer_pk, 0))
+                Ok((peer_pk, protocol, 0))
             }
 
             message::protocol::RELAY_1 => {
@@ -996,17 +996,17 @@ impl UDP {
                         self.execute_relay_action(&action);
                     }
                 }
-                Ok((peer_pk, 0))
+                Ok((peer_pk, protocol, 0))
             }
 
             message::protocol::RELAY_2 => {
                 // Last hop: extract src and inner payload, then decrypt
                 if let Ok((src, inner_payload)) = relay::handle_relay2(payload) {
-                    if let Ok((inner_pk, n)) = self.process_relayed_packet(&src, &inner_payload, out_buf) {
-                        return Ok((inner_pk, n));
+                    if let Ok((inner_pk, inner_proto, n)) = self.process_relayed_packet(&src, &inner_payload, out_buf) {
+                        return Ok((inner_pk, inner_proto, n));
                     }
                 }
-                Ok((peer_pk, 0))
+                Ok((peer_pk, protocol, 0))
             }
 
             message::protocol::PING => {
@@ -1018,14 +1018,14 @@ impl UDP {
                         self.execute_relay_action(&action);
                     }
                 }
-                Ok((peer_pk, 0))
+                Ok((peer_pk, protocol, 0))
             }
 
             message::protocol::PONG => {
                 // PONG delivered to caller for upper-layer processing
                 let n = payload.len().min(out_buf.len());
                 out_buf[..n].copy_from_slice(&payload[..n]);
-                Ok((peer_pk, n))
+                Ok((peer_pk, protocol, n))
             }
 
             _ => {
@@ -1064,7 +1064,7 @@ impl UDP {
         src: &[u8; 32],
         inner_payload: &[u8],
         out_buf: &mut [u8],
-    ) -> Result<(Key, usize)> {
+    ) -> Result<(Key, u8, usize)> {
         let msg = parse_transport_message(inner_payload).map_err(|_| UdpError::NoSession)?;
 
         let inner_pk = {
@@ -1084,7 +1084,7 @@ impl UDP {
         };
 
         if plaintext.is_empty() {
-            return Ok((Key(*src), 0));
+            return Ok((Key(*src), 0, 0));
         }
 
         let (inner_proto, inner_data) = decode_payload(&plaintext)
@@ -1095,12 +1095,12 @@ impl UDP {
                 if let Some(ref mux) = mux {
                     let _ = mux.input(inner_data);
                 }
-                Ok((Key(*src), 0))
+                Ok((Key(*src), inner_proto, 0))
             }
             _ => {
                 let n = inner_data.len().min(out_buf.len());
                 out_buf[..n].copy_from_slice(&inner_data[..n]);
-                Ok((Key(*src), n))
+                Ok((Key(*src), inner_proto, n))
             }
         }
     }

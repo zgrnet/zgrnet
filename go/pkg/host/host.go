@@ -198,7 +198,8 @@ func (h *Host) Run() error {
 }
 
 // Close gracefully shuts down the host.
-// Closes the TUN device, UDP transport, and waits for all goroutines to exit.
+// Signals the forwarding loops to exit and closes TUN and UDP to unblock them.
+// Run() will wait for the goroutines to finish before returning.
 func (h *Host) Close() error {
 	if h.closed.Swap(true) {
 		return nil
@@ -209,7 +210,6 @@ func (h *Host) Close() error {
 	h.tun.Close()
 	h.udp.Close()
 
-	h.wg.Wait()
 	return nil
 }
 
