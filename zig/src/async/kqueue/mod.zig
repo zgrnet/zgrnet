@@ -91,7 +91,8 @@ pub const KqueueIO = struct {
             std.log.err("KqueueIO: failed to update registration map for fd {d}: {s}", .{ fd, @errorName(err) });
             return;
         };
-        if (!result.found_existing) {
+        const is_new = !result.found_existing;
+        if (is_new) {
             result.value_ptr.* = .{
                 .fd = fd,
                 .read_cb = ReadyCallback.noop,
@@ -120,6 +121,10 @@ pub const KqueueIO = struct {
             }};
             _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch |err| {
                 std.log.err("KqueueIO: failed to register fd {d} with kqueue: {s}", .{ fd, @errorName(err) });
+                // Clean up map entry if it was newly created to prevent leak
+                if (is_new) {
+                    _ = self.registrations.fetchRemove(fd);
+                }
                 return;
             };
             if (is_read) {
