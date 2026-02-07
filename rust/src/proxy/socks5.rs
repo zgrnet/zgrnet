@@ -226,13 +226,18 @@ async fn handle_http_connect(stream: &mut TcpStream) -> Result<(), ProxyError> {
 
     let target = parts[1];
 
-    // Read remaining headers until empty line
+    // Read remaining headers until empty line.
+    // Limit line length to 4KB to prevent memory exhaustion DoS.
+    const MAX_HEADER_LINE: usize = 4096;
     loop {
         let mut line = Vec::new();
         loop {
             let mut b = [0u8; 1];
             stream.read_exact(&mut b).await?;
             line.push(b[0]);
+            if line.len() > MAX_HEADER_LINE {
+                return Err(ProxyError::InvalidProtocol);
+            }
             if line.ends_with(b"\n") {
                 break;
             }

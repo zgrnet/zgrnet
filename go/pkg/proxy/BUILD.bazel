@@ -4,6 +4,7 @@ go_library(
     name = "proxy",
     srcs = [
         "handler.go",
+        "policy.go",
         "socks5.go",
     ],
     importpath = "github.com/vibing/zgrnet/pkg/proxy",

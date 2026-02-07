@@ -144,7 +144,7 @@ func runHandler(config *Config, myInfo *HostInfo, myKey *noise.KeyPair) {
 
 	// 5. Handle TCP_PROXY: decode address → dial echo server → relay
 	bs := &proxy.BlockingStream{S: stream}
-	if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil); err != nil {
+	if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil); err != nil {
 		log.Printf("[handler] HandleTCPProxy finished: %v", err)
 	}
 

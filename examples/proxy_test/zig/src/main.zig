@@ -58,15 +58,22 @@ pub fn main() !void {
     defer parsed.deinit();
     const config = parsed.value;
 
-    // Find my host and peer
-    var my_host: ?HostInfo = null;
-    var peer_host: ?HostInfo = null;
-    for (config.hosts) |h| {
-        if (std.mem.eql(u8, h.name, name)) my_host = h;
-        if (!std.mem.eql(u8, h.name, name)) peer_host = h;
-    }
-    const host = my_host orelse return error.HostNotFound;
-    const peer = peer_host orelse return error.PeerNotFound;
+    // Find my host by name
+    const host = blk: {
+        for (config.hosts) |h| {
+            if (std.mem.eql(u8, h.name, name)) break :blk h;
+        }
+        return error.HostNotFound;
+    };
+
+    // Find peer by role (handler↔proxy)
+    const peer_role: []const u8 = if (std.mem.eql(u8, host.role, "handler")) "proxy" else "handler";
+    const peer = blk: {
+        for (config.hosts) |h| {
+            if (std.mem.eql(u8, h.role, peer_role)) break :blk h;
+        }
+        return error.PeerNotFound;
+    };
 
     // Parse keys
     var priv_key: [32]u8 = undefined;

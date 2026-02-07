@@ -78,14 +78,21 @@ type NewUDPRelayFunc func() (UDPRelay, error)
 // Server is a SOCKS5 proxy server.
 type Server struct {
 	listenAddr string
-	dial       DialFunc     // For TCP CONNECT
+	dial       DialFunc        // For TCP CONNECT
 	newRelay   NewUDPRelayFunc // For UDP ASSOCIATE (nil = not supported)
+	policy     Policy          // nil = allow all
 
 	mu       sync.Mutex
 	listener net.Listener
 
 	closed atomic.Bool
 	wg     sync.WaitGroup
+}
+
+// SetPolicy sets the policy for target address validation.
+// If nil (default), all addresses are allowed.
+func (s *Server) SetPolicy(p Policy) {
+	s.policy = p
 }
 
 // NewServer creates a new proxy server.
@@ -252,6 +259,11 @@ func (s *Server) handleSOCKS5(conn net.Conn) {
 
 // handleConnect handles the SOCKS5 CONNECT command.
 func (s *Server) handleConnect(conn net.Conn, addr *noise.Address) {
+	if !checkPolicy(s.policy, addr) {
+		sendReply(conn, RepNotAllowed, nil)
+		return
+	}
+
 	// Dial the target through the tunnel
 	remote, err := s.dial(addr)
 	if err != nil {
@@ -378,7 +390,11 @@ func (s *Server) handleUDPAssociate(conn net.Conn, addr *noise.Address) {
 // Format: "CONNECT host:port HTTP/1.x\r\n" + headers + "\r\n"
 // The first byte 'C' has already been consumed by handleConn.
 func (s *Server) handleHTTPConnect(conn net.Conn) {
-	reader := bufio.NewReader(conn)
+	// Use a small bufio.Reader for header parsing.
+	// The 4KB default buffer limits how much data can accumulate
+	// before a newline, preventing unbounded memory growth from
+	// malicious clients sending very long header lines.
+	reader := bufio.NewReaderSize(conn, 4096)
 
 	// Read the rest of the first line (we already consumed 'C')
 	restOfLine, err := reader.ReadString('\n')
@@ -436,6 +452,12 @@ func (s *Server) handleHTTPConnect(conn net.Conn) {
 
 	// Clear deadline for relay phase
 	conn.SetDeadline(time.Time{})
+
+	// Policy check
+	if !checkPolicy(s.policy, addr) {
+		conn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+		return
+	}
 
 	// Dial the target
 	remote, err := s.dial(addr)

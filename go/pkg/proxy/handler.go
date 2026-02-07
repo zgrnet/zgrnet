@@ -14,18 +14,23 @@ import (
 // HandleTCPProxy handles an incoming TCP_PROXY (proto=69) KCP stream.
 //
 // It decodes the target address from the stream's metadata (SYN frame),
-// dials the real TCP target using the provided DialFunc, and relays data
+// checks the policy, dials the real TCP target, and relays data
 // bidirectionally between the stream and the target connection.
 //
 // The stream should have blocking Read semantics. For kcp.Stream, wrap
 // with BlockingStream before calling this function.
 //
-// If dial is nil, DefaultDial is used (direct TCP connection).
-func HandleTCPProxy(stream io.ReadWriteCloser, metadata []byte, dial DialFunc) error {
+// If dial is nil, DefaultDial is used. If policy is nil, all addresses allowed.
+func HandleTCPProxy(stream io.ReadWriteCloser, metadata []byte, dial DialFunc, policy Policy) error {
 	addr, _, err := noise.DecodeAddress(metadata)
 	if err != nil {
 		stream.Close()
 		return err
+	}
+
+	if !checkPolicy(policy, addr) {
+		stream.Close()
+		return ErrPolicyDenied
 	}
 
 	if dial == nil {
@@ -57,8 +62,9 @@ func DefaultDial(addr *noise.Address) (io.ReadWriteCloser, error) {
 //
 // Wire format (both directions): addr.Encode() + data
 type UDPProxyHandler struct {
-	conn   *net.UDPConn           // local socket for forwarding to targets
+	conn   *net.UDPConn                // local socket for forwarding to targets
 	send   func(response []byte) error // send response back through tunnel
+	policy Policy                      // nil = allow all
 	closed atomic.Bool
 	wg     sync.WaitGroup
 }
@@ -66,15 +72,17 @@ type UDPProxyHandler struct {
 // NewUDPProxyHandler creates a handler and starts a response receive loop.
 // send is called with the encoded response (addr + data) for each reply
 // received from a real UDP target.
-func NewUDPProxyHandler(send func(response []byte) error) (*UDPProxyHandler, error) {
+// If policy is nil, all target addresses are allowed.
+func NewUDPProxyHandler(send func(response []byte) error, policy Policy) (*UDPProxyHandler, error) {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero})
 	if err != nil {
 		return nil, err
 	}
 
 	h := &UDPProxyHandler{
-		conn: conn,
-		send: send,
+		conn:   conn,
+		send:   send,
+		policy: policy,
 	}
 
 	// Start response receive loop
@@ -95,6 +103,11 @@ func (h *UDPProxyHandler) HandlePacket(payload []byte) error {
 	if err != nil {
 		return err
 	}
+
+	if !checkPolicy(h.policy, addr) {
+		return ErrPolicyDenied
+	}
+
 	data := payload[consumed:]
 
 	target, err := net.ResolveUDPAddr("udp",

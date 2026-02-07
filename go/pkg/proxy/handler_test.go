@@ -33,7 +33,7 @@ func TestHandleTCPProxy_Echo(t *testing.T) {
 	// Handle the stream in a goroutine (uses default dial)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- HandleTCPProxy(streamEnd, metadata, nil)
+		errCh <- HandleTCPProxy(streamEnd, metadata, nil, nil)
 	}()
 
 	// Send data through the "stream" side
@@ -78,7 +78,7 @@ func TestHandleTCPProxy_CustomDial(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- HandleTCPProxy(streamEnd, metadata, customDial)
+		errCh <- HandleTCPProxy(streamEnd, metadata, customDial, nil)
 	}()
 
 	testData := []byte("custom dial proxy test")
@@ -98,7 +98,7 @@ func TestHandleTCPProxy_CustomDial(t *testing.T) {
 
 func TestHandleTCPProxy_InvalidMetadata(t *testing.T) {
 	_, streamEnd := net.Pipe()
-	err := HandleTCPProxy(streamEnd, []byte{0xFF}, nil) // invalid address type
+	err := HandleTCPProxy(streamEnd, []byte{0xFF}, nil, nil) // invalid address type
 	if err == nil {
 		t.Fatal("expected error for invalid metadata")
 	}
@@ -117,7 +117,7 @@ func TestHandleTCPProxy_DialError(t *testing.T) {
 	}
 
 	_, streamEnd := net.Pipe()
-	err := HandleTCPProxy(streamEnd, metadata, failDial)
+	err := HandleTCPProxy(streamEnd, metadata, failDial, nil)
 	if err == nil {
 		t.Fatal("expected error for dial failure")
 	}
@@ -137,7 +137,7 @@ func TestHandleTCPProxy_LargePayload(t *testing.T) {
 	clientEnd, streamEnd := net.Pipe()
 	defer clientEnd.Close()
 
-	go HandleTCPProxy(streamEnd, addr.Encode(), nil)
+	go HandleTCPProxy(streamEnd, addr.Encode(), nil, nil)
 
 	// Send a large payload (64KB)
 	testData := make([]byte, 64*1024)
@@ -218,7 +218,7 @@ func TestUDPProxyHandler_Echo(t *testing.T) {
 		responses = append(responses, cp)
 		mu.Unlock()
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestUDPProxyHandler_MultiplePackets(t *testing.T) {
 		responses = append(responses, cp)
 		mu.Unlock()
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +338,7 @@ func TestUDPProxyHandler_MultiplePackets(t *testing.T) {
 func TestUDPProxyHandler_InvalidPayload(t *testing.T) {
 	handler, err := NewUDPProxyHandler(func(response []byte) error {
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,10 +351,75 @@ func TestUDPProxyHandler_InvalidPayload(t *testing.T) {
 	}
 }
 
+func TestHandleTCPProxy_PolicyDenied(t *testing.T) {
+	addr := &noise.Address{
+		Type: noise.AddressTypeIPv4,
+		Host: "127.0.0.1",
+		Port: 80,
+	}
+	metadata := addr.Encode()
+
+	_, streamEnd := net.Pipe()
+	// DenyPrivatePolicy blocks loopback
+	err := HandleTCPProxy(streamEnd, metadata, nil, &DenyPrivatePolicy{})
+	if err != ErrPolicyDenied {
+		t.Fatalf("expected ErrPolicyDenied, got %v", err)
+	}
+}
+
+func TestUDPProxyHandler_PolicyDenied(t *testing.T) {
+	handler, err := NewUDPProxyHandler(func(response []byte) error {
+		return nil
+	}, &DenyPrivatePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.Close()
+
+	// Build payload targeting 10.0.0.1 (private)
+	addr := &noise.Address{Type: noise.AddressTypeIPv4, Host: "10.0.0.1", Port: 53}
+	encoded := addr.Encode()
+	payload := append(encoded, []byte("test")...)
+
+	err = handler.HandlePacket(payload)
+	if err != ErrPolicyDenied {
+		t.Fatalf("expected ErrPolicyDenied, got %v", err)
+	}
+}
+
+func TestDenyPrivatePolicy(t *testing.T) {
+	p := &DenyPrivatePolicy{}
+
+	tests := []struct {
+		name  string
+		addr  *noise.Address
+		allow bool
+	}{
+		{"public IPv4", &noise.Address{Type: noise.AddressTypeIPv4, Host: "8.8.8.8", Port: 53}, true},
+		{"loopback", &noise.Address{Type: noise.AddressTypeIPv4, Host: "127.0.0.1", Port: 80}, false},
+		{"private 10.x", &noise.Address{Type: noise.AddressTypeIPv4, Host: "10.0.0.1", Port: 80}, false},
+		{"private 192.168.x", &noise.Address{Type: noise.AddressTypeIPv4, Host: "192.168.1.1", Port: 80}, false},
+		{"link-local", &noise.Address{Type: noise.AddressTypeIPv4, Host: "169.254.169.254", Port: 80}, false},
+		{"unspecified", &noise.Address{Type: noise.AddressTypeIPv4, Host: "0.0.0.0", Port: 80}, false},
+		{"domain allowed", &noise.Address{Type: noise.AddressTypeDomain, Host: "example.com", Port: 443}, true},
+		{"ipv6 loopback", &noise.Address{Type: noise.AddressTypeIPv6, Host: "::1", Port: 80}, false},
+		{"ipv6 public", &noise.Address{Type: noise.AddressTypeIPv6, Host: "2001:db8::1", Port: 80}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := p.Allow(tt.addr)
+			if got != tt.allow {
+				t.Errorf("Allow(%s:%d) = %v, want %v", tt.addr.Host, tt.addr.Port, got, tt.allow)
+			}
+		})
+	}
+}
+
 func TestUDPProxyHandler_Close(t *testing.T) {
 	handler, err := NewUDPProxyHandler(func(response []byte) error {
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
