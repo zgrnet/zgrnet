@@ -57,10 +57,26 @@ var (
 // For KCP streams (which have non-blocking Read), wrap with BlockingStream.
 type DialFunc func(addr *noise.Address) (io.ReadWriteCloser, error)
 
+// UDPRelay handles UDP data exchange through the tunnel.
+type UDPRelay interface {
+	// WriteTo sends UDP data to the target address through the tunnel.
+	WriteTo(addr *noise.Address, data []byte) error
+	// ReadFrom reads a UDP response from the tunnel.
+	// Returns source address, number of data bytes copied to buf, and error.
+	ReadFrom(buf []byte) (addr *noise.Address, n int, err error)
+	// Close closes the relay.
+	Close() error
+}
+
+// NewUDPRelayFunc creates a new UDPRelay for a UDP association.
+// Each UDP ASSOCIATE connection gets its own relay instance.
+type NewUDPRelayFunc func() (UDPRelay, error)
+
 // Server is a SOCKS5 proxy server.
 type Server struct {
 	listenAddr string
-	dial       DialFunc
+	dial       DialFunc     // For TCP CONNECT
+	newRelay   NewUDPRelayFunc // For UDP ASSOCIATE (nil = not supported)
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -247,9 +263,109 @@ func (s *Server) handleConnect(conn net.Conn, addr *noise.Address) {
 }
 
 // handleUDPAssociate handles the SOCKS5 UDP ASSOCIATE command.
-// This is a placeholder — full implementation in step 2.
+//
+// The server binds a local UDP port, returns it to the client, then relays
+// UDP datagrams between the client (SOCKS5 UDP format) and the tunnel
+// (UDPRelay). The TCP connection serves as a control channel — when it
+// closes, the association ends.
 func (s *Server) handleUDPAssociate(conn net.Conn, addr *noise.Address) {
-	sendReply(conn, RepCmdNotSupported, nil)
+	if s.newRelay == nil {
+		sendReply(conn, RepCmdNotSupported, nil)
+		return
+	}
+
+	// Create a relay for this association
+	relay, err := s.newRelay()
+	if err != nil {
+		sendReply(conn, RepGeneralFailure, nil)
+		return
+	}
+
+	// Determine bind IP from TCP listener (matches the SOCKS5 listen address)
+	var bindIP net.IP
+	s.mu.Lock()
+	if s.listener != nil {
+		if tcpAddr, ok := s.listener.Addr().(*net.TCPAddr); ok {
+			bindIP = tcpAddr.IP
+		}
+	}
+	s.mu.Unlock()
+	if bindIP == nil {
+		bindIP = net.IPv4(127, 0, 0, 1)
+	}
+
+	// Bind a local UDP socket for the client
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bindIP})
+	if err != nil {
+		relay.Close()
+		sendReply(conn, RepGeneralFailure, nil)
+		return
+	}
+
+	// Send bound address to client
+	boundAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	replyAddr := &noise.Address{
+		Type: noise.AddressTypeIPv4,
+		Host: boundAddr.IP.String(),
+		Port: uint16(boundAddr.Port),
+	}
+	sendReply(conn, RepSuccess, replyAddr)
+
+	// Track the client's UDP address (set on first packet received)
+	var clientAddr atomic.Pointer[net.UDPAddr]
+
+	var wg sync.WaitGroup
+
+	// Outbound: client UDP → tunnel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 65535)
+		for {
+			n, from, err := udpConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			clientAddr.Store(from)
+
+			targetAddr, data, err := ParseSOCKS5UDP(buf[:n])
+			if err != nil {
+				continue
+			}
+			relay.WriteTo(targetAddr, data)
+		}
+	}()
+
+	// Inbound: tunnel → client UDP
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 65535)
+		for {
+			srcAddr, n, err := relay.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+
+			ca := clientAddr.Load()
+			if ca == nil {
+				continue // No client connected yet
+			}
+
+			pkt := BuildSOCKS5UDP(srcAddr, buf[:n])
+			if pkt != nil {
+				udpConn.WriteToUDP(pkt, ca)
+			}
+		}
+	}()
+
+	// Wait for TCP control connection to close (signals end of association)
+	io.Copy(io.Discard, conn)
+
+	// Cleanup: close sockets to unblock goroutines, then wait
+	udpConn.Close()
+	relay.Close()
+	wg.Wait()
 }
 
 // sendReply sends a SOCKS5 reply to the client.
@@ -347,6 +463,42 @@ func Relay(a, b io.ReadWriteCloser) {
 	}()
 
 	wg.Wait()
+}
+
+// ParseSOCKS5UDP parses a SOCKS5 UDP datagram.
+// Format: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR(var) + DST.PORT(2) + DATA(var)
+// Returns the target address and the data payload.
+func ParseSOCKS5UDP(data []byte) (addr *noise.Address, payload []byte, err error) {
+	if len(data) < 4 {
+		return nil, nil, errors.New("proxy: UDP datagram too short")
+	}
+	if data[0] != 0 || data[1] != 0 {
+		return nil, nil, errors.New("proxy: invalid RSV in UDP datagram")
+	}
+	if data[2] != 0 {
+		return nil, nil, errors.New("proxy: fragmented UDP not supported")
+	}
+	// Decode address starting at byte 3 (atyp + addr + port)
+	addr, consumed, err := noise.DecodeAddress(data[3:])
+	if err != nil {
+		return nil, nil, err
+	}
+	payload = data[3+consumed:]
+	return addr, payload, nil
+}
+
+// BuildSOCKS5UDP builds a SOCKS5 UDP datagram.
+// Format: RSV(2) + FRAG(1) + ATYP(1) + SRC.ADDR(var) + SRC.PORT(2) + DATA(var)
+func BuildSOCKS5UDP(addr *noise.Address, data []byte) []byte {
+	encoded := addr.Encode()
+	if encoded == nil {
+		return nil
+	}
+	pkt := make([]byte, 3+len(encoded)+len(data))
+	// RSV(2) + FRAG(1) = 0x00 0x00 0x00
+	copy(pkt[3:], encoded)
+	copy(pkt[3+len(encoded):], data)
+	return pkt
 }
 
 // BlockingStream wraps a non-blocking reader (like kcp.Stream) with

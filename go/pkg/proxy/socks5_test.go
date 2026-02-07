@@ -6,8 +6,10 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vibing/zgrnet/pkg/noise"
 )
@@ -606,5 +608,363 @@ func TestServer_Close(t *testing.T) {
 	// Double close should be no-op
 	if err := srv.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// === UDP ASSOCIATE tests ===
+
+// directUDPRelay forwards UDP packets directly (no tunnel).
+// Used for testing the SOCKS5 UDP protocol without zgrnet.
+type directUDPRelay struct {
+	conn *net.UDPConn
+}
+
+func newDirectUDPRelay() (UDPRelay, error) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, err
+	}
+	return &directUDPRelay{conn: conn}, nil
+}
+
+func (r *directUDPRelay) WriteTo(addr *noise.Address, data []byte) error {
+	target, err := net.ResolveUDPAddr("udp", net.JoinHostPort(addr.Host, strconv.Itoa(int(addr.Port))))
+	if err != nil {
+		return err
+	}
+	_, err = r.conn.WriteToUDP(data, target)
+	return err
+}
+
+func (r *directUDPRelay) ReadFrom(buf []byte) (*noise.Address, int, error) {
+	n, from, err := r.conn.ReadFromUDP(buf)
+	if err != nil {
+		return nil, 0, err
+	}
+	addr := &noise.Address{
+		Type: noise.AddressTypeIPv4,
+		Host: from.IP.String(),
+		Port: uint16(from.Port),
+	}
+	return addr, n, nil
+}
+
+func (r *directUDPRelay) Close() error {
+	return r.conn.Close()
+}
+
+// udpEchoServer starts a UDP echo server.
+func udpEchoServer(t *testing.T) (string, func()) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, from, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			conn.WriteToUDP(buf[:n], from)
+		}
+	}()
+	return conn.LocalAddr().String(), func() { conn.Close() }
+}
+
+// startServerWithUDP creates a proxy server with UDP relay support.
+func startServerWithUDP(t *testing.T, dial DialFunc, newRelay NewUDPRelayFunc) (*Server, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	srv := NewServer("", dial)
+	srv.newRelay = newRelay
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+	return srv, addr
+}
+
+// readSOCKS5ReplyWithAddr reads a SOCKS5 reply and returns the reply code
+// and the bound address.
+func readSOCKS5ReplyWithAddr(t *testing.T, conn net.Conn) (byte, *noise.Address) {
+	t.Helper()
+	var header [4]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		t.Fatal(err)
+	}
+	addr, err := ReadAddress(conn, header[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return header[1], addr
+}
+
+func TestSOCKS5_UDPAssociate(t *testing.T) {
+	echoAddr, cleanup := udpEchoServer(t)
+	defer cleanup()
+
+	_, srvAddr := startServerWithUDP(t, nil, newDirectUDPRelay)
+
+	// Connect TCP control channel
+	conn, err := net.Dial("tcp", srvAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	socks5Handshake(t, conn)
+
+	// Send UDP ASSOCIATE request (client addr 0.0.0.0:0)
+	conn.Write([]byte{
+		0x05, CmdUDPAssociate, 0x00, noise.AddressTypeIPv4,
+		0, 0, 0, 0,
+		0, 0,
+	})
+
+	// Read reply: should contain the bound UDP address
+	rep, boundAddr := readSOCKS5ReplyWithAddr(t, conn)
+	if rep != RepSuccess {
+		t.Fatalf("expected RepSuccess, got 0x%02x", rep)
+	}
+	if boundAddr.Port == 0 {
+		t.Fatal("expected non-zero bound port")
+	}
+
+	// Parse echo server address
+	echoHost, echoPortStr, _ := net.SplitHostPort(echoAddr)
+	echoPort, _ := strconv.Atoi(echoPortStr)
+
+	// Create client UDP socket
+	clientUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientUDP.Close()
+
+	// Build SOCKS5 UDP packet targeting the echo server
+	targetAddr := &noise.Address{
+		Type: noise.AddressTypeIPv4,
+		Host: echoHost,
+		Port: uint16(echoPort),
+	}
+	testData := []byte("hello udp associate")
+	pkt := BuildSOCKS5UDP(targetAddr, testData)
+	if pkt == nil {
+		t.Fatal("failed to build SOCKS5 UDP packet")
+	}
+
+	// Send to proxy's bound UDP port
+	proxyUDPAddr, err := net.ResolveUDPAddr("udp",
+		net.JoinHostPort(boundAddr.Host, strconv.Itoa(int(boundAddr.Port))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientUDP.WriteToUDP(pkt, proxyUDPAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read response with timeout
+	clientUDP.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 65535)
+	n, _, err := clientUDP.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Parse SOCKS5 UDP response
+	respAddr, respData, err := ParseSOCKS5UDP(buf[:n])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(respData, testData) {
+		t.Fatalf("expected %q, got %q", testData, respData)
+	}
+	if respAddr.Host != echoHost {
+		t.Errorf("response addr host: got %q, want %q", respAddr.Host, echoHost)
+	}
+	if respAddr.Port != uint16(echoPort) {
+		t.Errorf("response addr port: got %d, want %d", respAddr.Port, echoPort)
+	}
+}
+
+func TestSOCKS5_UDPAssociate_NoRelay(t *testing.T) {
+	// Server without UDP relay should return CmdNotSupported
+	_, addr := startServer(t, nil)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	socks5Handshake(t, conn)
+
+	conn.Write([]byte{
+		0x05, CmdUDPAssociate, 0x00, noise.AddressTypeIPv4,
+		0, 0, 0, 0,
+		0, 0,
+	})
+
+	rep := readSOCKS5Reply(t, conn)
+	if rep != RepCmdNotSupported {
+		t.Fatalf("expected RepCmdNotSupported, got 0x%02x", rep)
+	}
+}
+
+func TestSOCKS5_UDPAssociate_MultiplePackets(t *testing.T) {
+	echoAddr, cleanup := udpEchoServer(t)
+	defer cleanup()
+
+	_, srvAddr := startServerWithUDP(t, nil, newDirectUDPRelay)
+
+	conn, err := net.Dial("tcp", srvAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	socks5Handshake(t, conn)
+
+	conn.Write([]byte{
+		0x05, CmdUDPAssociate, 0x00, noise.AddressTypeIPv4,
+		0, 0, 0, 0, 0, 0,
+	})
+
+	rep, boundAddr := readSOCKS5ReplyWithAddr(t, conn)
+	if rep != RepSuccess {
+		t.Fatalf("expected RepSuccess, got 0x%02x", rep)
+	}
+
+	echoHost, echoPortStr, _ := net.SplitHostPort(echoAddr)
+	echoPort, _ := strconv.Atoi(echoPortStr)
+
+	clientUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientUDP.Close()
+
+	proxyUDPAddr, _ := net.ResolveUDPAddr("udp",
+		net.JoinHostPort(boundAddr.Host, strconv.Itoa(int(boundAddr.Port))))
+
+	targetAddr := &noise.Address{
+		Type: noise.AddressTypeIPv4,
+		Host: echoHost,
+		Port: uint16(echoPort),
+	}
+
+	// Send multiple packets and verify each echo
+	for i := 0; i < 5; i++ {
+		testData := []byte("packet-" + strconv.Itoa(i))
+		pkt := BuildSOCKS5UDP(targetAddr, testData)
+		clientUDP.WriteToUDP(pkt, proxyUDPAddr)
+
+		clientUDP.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 65535)
+		n, _, err := clientUDP.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatalf("packet %d: %v", i, err)
+		}
+		_, respData, err := ParseSOCKS5UDP(buf[:n])
+		if err != nil {
+			t.Fatalf("packet %d: %v", i, err)
+		}
+		if !bytes.Equal(respData, testData) {
+			t.Fatalf("packet %d: expected %q, got %q", i, testData, respData)
+		}
+	}
+}
+
+// --- ParseSOCKS5UDP / BuildSOCKS5UDP unit tests ---
+
+func TestParseSOCKS5UDP(t *testing.T) {
+	// Build a valid packet: RSV(00 00) + FRAG(00) + address(IPv4 127.0.0.1:80) + data
+	addr := &noise.Address{Type: noise.AddressTypeIPv4, Host: "127.0.0.1", Port: 80}
+	encoded := addr.Encode()
+	pkt := make([]byte, 3+len(encoded)+5)
+	copy(pkt[3:], encoded)
+	copy(pkt[3+len(encoded):], []byte("hello"))
+
+	gotAddr, gotData, err := ParseSOCKS5UDP(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAddr.Host != "127.0.0.1" || gotAddr.Port != 80 {
+		t.Errorf("addr: got %s:%d, want 127.0.0.1:80", gotAddr.Host, gotAddr.Port)
+	}
+	if !bytes.Equal(gotData, []byte("hello")) {
+		t.Errorf("data: got %q, want %q", gotData, "hello")
+	}
+}
+
+func TestParseSOCKS5UDP_TooShort(t *testing.T) {
+	_, _, err := ParseSOCKS5UDP([]byte{0, 0})
+	if err == nil {
+		t.Fatal("expected error for short packet")
+	}
+}
+
+func TestParseSOCKS5UDP_InvalidRSV(t *testing.T) {
+	_, _, err := ParseSOCKS5UDP([]byte{0xFF, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	if err == nil {
+		t.Fatal("expected error for invalid RSV")
+	}
+}
+
+func TestParseSOCKS5UDP_Fragment(t *testing.T) {
+	_, _, err := ParseSOCKS5UDP([]byte{0x00, 0x00, 0x01, 0x01, 0, 0, 0, 0, 0, 0})
+	if err == nil {
+		t.Fatal("expected error for fragmented packet")
+	}
+}
+
+func TestBuildSOCKS5UDP(t *testing.T) {
+	addr := &noise.Address{Type: noise.AddressTypeIPv4, Host: "10.0.0.1", Port: 53}
+	data := []byte("dns query")
+	pkt := BuildSOCKS5UDP(addr, data)
+	if pkt == nil {
+		t.Fatal("expected non-nil packet")
+	}
+
+	// Verify header
+	if pkt[0] != 0 || pkt[1] != 0 || pkt[2] != 0 {
+		t.Errorf("expected RSV+FRAG=0, got %v", pkt[:3])
+	}
+
+	// Roundtrip
+	gotAddr, gotData, err := ParseSOCKS5UDP(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAddr.Host != "10.0.0.1" || gotAddr.Port != 53 {
+		t.Errorf("addr roundtrip: got %s:%d", gotAddr.Host, gotAddr.Port)
+	}
+	if !bytes.Equal(gotData, data) {
+		t.Errorf("data roundtrip: got %q", gotData)
+	}
+}
+
+func TestBuildSOCKS5UDP_Domain(t *testing.T) {
+	addr := &noise.Address{Type: noise.AddressTypeDomain, Host: "example.com", Port: 53}
+	data := []byte("query")
+	pkt := BuildSOCKS5UDP(addr, data)
+	if pkt == nil {
+		t.Fatal("expected non-nil packet")
+	}
+
+	gotAddr, gotData, err := ParseSOCKS5UDP(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAddr.Host != "example.com" || gotAddr.Port != 53 {
+		t.Errorf("addr: got %s:%d", gotAddr.Host, gotAddr.Port)
+	}
+	if !bytes.Equal(gotData, data) {
+		t.Errorf("data: got %q", gotData)
 	}
 }
