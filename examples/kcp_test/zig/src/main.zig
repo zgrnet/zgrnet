@@ -178,7 +178,7 @@ fn runOpenerTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key, p
 
     // Encode test Address as metadata: IPv4 127.0.0.1:8080
     const test_addr = noise.Address.ipv4("127.0.0.1", 8080);
-    var meta_buf: [64]u8 = undefined;
+    var meta_buf: [260]u8 = undefined;
     const metadata = test_addr.encode(&meta_buf) catch |e| {
         std.debug.print("[opener] Failed to encode test address: {}\n", .{e});
         return e;

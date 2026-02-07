@@ -581,14 +581,15 @@ pub fn Mux(comptime TimerServiceT: type) type {
             };
 
             // Send SYN with proto + metadata as payload
-            var syn_payload_buf: [256]u8 = undefined;
             const syn_payload = if (proto != 0 or metadata.len > 0) blk: {
-                syn_payload_buf[0] = proto;
+                const buf = self.allocator.alloc(u8, 1 + metadata.len) catch return MuxError.OutOfMemory;
+                buf[0] = proto;
                 if (metadata.len > 0) {
-                    @memcpy(syn_payload_buf[1 .. 1 + metadata.len], metadata);
+                    @memcpy(buf[1..], metadata);
                 }
-                break :blk syn_payload_buf[0 .. 1 + metadata.len];
+                break :blk buf;
             } else &[_]u8{};
+            defer if (proto != 0 or metadata.len > 0) self.allocator.free(syn_payload);
 
             self.sendFrameInternal(.syn, id, syn_payload) catch {
                 _ = self.streams.remove(id);
