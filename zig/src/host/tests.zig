@@ -242,9 +242,11 @@ test "Host: create and close" {
         std.debug.print("Host init failed: {}\n", .{err});
         return error.SkipZigTest;
     };
-    defer h.deinit();
 
-    try std.testing.expectEqual(@as(u16, 0), 0); // host created ok
+    // Start then immediately stop — verifies init/run/close lifecycle
+    h.run();
+    h.close();
+    h.deinit();
 }
 
 test "Host: ICMP forwarding A->B" {
