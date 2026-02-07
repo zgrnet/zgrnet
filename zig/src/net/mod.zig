@@ -52,7 +52,7 @@ pub const UdpError = udp.UdpError;
 pub const UdpOptions = udp.UdpOptions;
 pub const Packet = udp.Packet;
 pub const PacketPool = udp.PacketPool;
-pub const ReadResult = udp.UDP.ReadResult;
+pub const ReadResult = udp.ReadResult;
 
 // KCP types (accessed via UDP)
 pub const KcpMux = udp.KcpMux;

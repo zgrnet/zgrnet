@@ -10,6 +10,7 @@
 //! - `registerWrite(self: *T, fd: fd_t, callback: ReadyCallback) void`
 //! - `unregister(self: *T, fd: fd_t) void`
 //! - `poll(self: *T, timeout_ms: i32) usize`
+//! - `wake(self: *T) void` — interrupt a blocking poll()
 //!
 //! ## Usage Example
 //!
@@ -89,6 +90,7 @@ pub const IOService = struct {
         register_write: *const fn (ptr: *anyopaque, fd: posix.fd_t, callback: ReadyCallback) void,
         unregister: *const fn (ptr: *anyopaque, fd: posix.fd_t) void,
         poll: *const fn (ptr: *anyopaque, timeout_ms: i32) usize,
+        wake: *const fn (ptr: *anyopaque) void,
     };
 
     pub fn registerRead(self: IOService, fd: posix.fd_t, callback: ReadyCallback) void {
@@ -105,6 +107,11 @@ pub const IOService = struct {
 
     pub fn poll(self: IOService, timeout_ms: i32) usize {
         return self.vtable.poll(self.ptr, timeout_ms);
+    }
+
+    /// Interrupt a blocking poll() call from another thread.
+    pub fn wake(self: IOService) void {
+        self.vtable.wake(self.ptr);
     }
 };
 
