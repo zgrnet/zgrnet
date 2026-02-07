@@ -90,7 +90,7 @@ jobs:
           for t in $TARGETS; do
             case "$t" in
               *tun_test*) echo "Skipping TUN test: $t (requires root)" ;;
-              *interop_test*) echo "Skipping interop test: $t (Zig KCP timeout)" ;;
+              *kcp_test*interop*) echo "Skipping KCP interop test: $t (Zig KCP timeout on Linux)" ;;
               *) FILTERED="$FILTERED $t" ;;
             esac
           done
@@ -109,7 +109,7 @@ jobs:
           for t in $TARGETS; do
             case "$t" in
               *tun_test*) echo "Skipping TUN test: $t (requires root)" ;;
-              *interop_test*) echo "Skipping interop test: $t (Zig KCP timeout)" ;;
+              *kcp_test*interop*) echo "Skipping KCP interop test: $t (Zig KCP timeout on Linux)" ;;
               *) FILTERED="$FILTERED $t" ;;
             esac
           done
