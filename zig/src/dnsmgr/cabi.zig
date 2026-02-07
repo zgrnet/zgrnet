@@ -1,0 +1,128 @@
+//! C ABI exports for the DNS Manager module.
+//!
+//! Provides C-compatible function exports that can be called
+//! from Rust, Go, or any other language that supports C FFI.
+
+const std = @import("std");
+const mod = @import("mod.zig");
+const DnsMgr = mod.DnsMgr;
+const DnsMgrConfig = mod.DnsMgrConfig;
+const DnsMgrError = mod.DnsMgrError;
+
+// Error code mapping
+const DNSMGR_OK: c_int = 0;
+const DNSMGR_ERR_SET_FAILED: c_int = -1;
+const DNSMGR_ERR_CREATE_FAILED: c_int = -2;
+const DNSMGR_ERR_REMOVE_FAILED: c_int = -3;
+const DNSMGR_ERR_PERMISSION_DENIED: c_int = -4;
+const DNSMGR_ERR_NOT_SUPPORTED: c_int = -5;
+const DNSMGR_ERR_INVALID_ARGUMENT: c_int = -6;
+const DNSMGR_ERR_FLUSH_FAILED: c_int = -7;
+const DNSMGR_ERR_DETECT_FAILED: c_int = -8;
+const DNSMGR_ERR_UPSTREAM_FAILED: c_int = -9;
+
+fn errorToCode(err: DnsMgrError) c_int {
+    return switch (err) {
+        DnsMgrError.SetFailed => DNSMGR_ERR_SET_FAILED,
+        DnsMgrError.CreateFailed => DNSMGR_ERR_CREATE_FAILED,
+        DnsMgrError.RemoveFailed => DNSMGR_ERR_REMOVE_FAILED,
+        DnsMgrError.PermissionDenied => DNSMGR_ERR_PERMISSION_DENIED,
+        DnsMgrError.NotSupported => DNSMGR_ERR_NOT_SUPPORTED,
+        DnsMgrError.InvalidArgument => DNSMGR_ERR_INVALID_ARGUMENT,
+        DnsMgrError.FlushFailed => DNSMGR_ERR_FLUSH_FAILED,
+        DnsMgrError.DetectFailed => DNSMGR_ERR_DETECT_FAILED,
+        DnsMgrError.UpstreamFailed => DNSMGR_ERR_UPSTREAM_FAILED,
+    };
+}
+
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const allocator = gpa.allocator();
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+/// Create a new DNS manager.
+export fn dnsmgr_create(iface_name: ?[*:0]const u8) ?*DnsMgr {
+    const name_slice: ?[]const u8 = if (iface_name) |n| blk: {
+        const len = std.mem.len(n);
+        break :blk n[0..len];
+    } else null;
+
+    const mgr = allocator.create(DnsMgr) catch return null;
+    mgr.* = DnsMgr.init(.{
+        .iface_name = name_slice,
+    });
+    return mgr;
+}
+
+/// Close and destroy a DNS manager.
+/// Restores original DNS configuration.
+export fn dnsmgr_close(mgr: ?*DnsMgr) void {
+    if (mgr) |m| {
+        m.close();
+        allocator.destroy(m);
+    }
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/// Set DNS configuration.
+/// `nameserver`: IP address string (e.g., "100.64.0.1")
+/// `domains`: comma-separated domain suffixes (e.g., "zigor.net")
+export fn dnsmgr_set(mgr: ?*DnsMgr, nameserver: ?[*:0]const u8, domains_csv: ?[*:0]const u8) c_int {
+    const m = mgr orelse return DNSMGR_ERR_INVALID_ARGUMENT;
+    const ns = if (nameserver) |n| n[0..std.mem.len(n)] else return DNSMGR_ERR_INVALID_ARGUMENT;
+    const csv = if (domains_csv) |d| d[0..std.mem.len(d)] else return DNSMGR_ERR_INVALID_ARGUMENT;
+
+    // Parse comma-separated domains
+    var domain_ptrs: [16][]const u8 = undefined;
+    var count: usize = 0;
+    var start: usize = 0;
+    for (csv, 0..) |c, i| {
+        if (c == ',') {
+            if (i > start and count < domain_ptrs.len) {
+                domain_ptrs[count] = csv[start..i];
+                count += 1;
+            }
+            start = i + 1;
+        }
+    }
+    if (start < csv.len and count < domain_ptrs.len) {
+        domain_ptrs[count] = csv[start..];
+        count += 1;
+    }
+
+    m.setDNS(ns, domain_ptrs[0..count]) catch |err| {
+        return errorToCode(err);
+    };
+    return DNSMGR_OK;
+}
+
+/// Check if platform supports split DNS.
+export fn dnsmgr_supports_split_dns(mgr: ?*DnsMgr) c_int {
+    const m = mgr orelse return 0;
+    return if (m.supportsSplitDNS()) 1 else 0;
+}
+
+/// Flush OS DNS cache.
+export fn dnsmgr_flush_cache() c_int {
+    var dummy = DnsMgr.init(.{});
+    dummy.flushCache() catch |err| {
+        return errorToCode(err);
+    };
+    return DNSMGR_OK;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "errorToCode mapping" {
+    try std.testing.expectEqual(DNSMGR_ERR_SET_FAILED, errorToCode(DnsMgrError.SetFailed));
+    try std.testing.expectEqual(DNSMGR_ERR_PERMISSION_DENIED, errorToCode(DnsMgrError.PermissionDenied));
+    try std.testing.expectEqual(DNSMGR_ERR_NOT_SUPPORTED, errorToCode(DnsMgrError.NotSupported));
+    try std.testing.expect(DNSMGR_ERR_SET_FAILED < 0);
+}

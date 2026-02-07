@@ -15,6 +15,7 @@ pub const relay_mod = @import("relay/mod.zig");
 pub const host = @import("host/mod.zig");
 pub const proxy_mod = @import("proxy/mod.zig");
 pub const dns_mod = @import("dns/mod.zig");
+pub const dnsmgr_mod = @import("dnsmgr/mod.zig");
 
 // KCP multiplexing (re-export submodules)
 pub const kcp = kcp_mod.kcp;
@@ -119,4 +120,5 @@ test {
     _ = host;
     _ = proxy_mod;
     _ = dns_mod;
+    _ = dnsmgr_mod;
 }
