@@ -65,7 +65,7 @@ jobs:
           
           # Detect TUN-specific changes (requires root privileges to test)
           # Includes host package since its integration test uses real TUN devices
-          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build and test affected targets with Bazel
   bazel:
@@ -286,6 +286,15 @@ jobs:
           # Build Host integration test binary (uses real TUN devices)
           bazel build //go/examples/host_test
           sudo bazel-bin/go/examples/host_test/host_test_/host_test
+
+      - name: Test Rust Host (TUN integration)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Build Rust Host integration test (uses real TUN devices)
+          # Uses zgrnet_tun library variant with TUN feature enabled
+          bazel build //rust:host_test
+          sudo bazel-bin/rust/host_test
 
   # Format check
   format:

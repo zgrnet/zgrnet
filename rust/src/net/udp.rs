@@ -329,8 +329,16 @@ impl UDP {
             .collect()
     }
 
-    /// Sends encrypted data to a peer.
+    /// Sends encrypted data to a peer using the default CHAT protocol byte.
     pub fn write_to(&self, pk: &Key, data: &[u8]) -> Result<()> {
+        self.write_to_protocol(pk, message::protocol::CHAT, data)
+    }
+
+    /// Sends encrypted data to a peer with a specific protocol byte.
+    ///
+    /// The protocol byte is prepended to the data before encryption,
+    /// matching the wire format: `protocol(1) + payload`.
+    pub fn write_to_protocol(&self, pk: &Key, protocol: u8, data: &[u8]) -> Result<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(UdpError::Closed);
         }
@@ -342,9 +350,12 @@ impl UDP {
         let endpoint = p.endpoint.ok_or(UdpError::NoEndpoint)?;
         let session = p.session.as_mut().ok_or(UdpError::NoSession)?;
 
+        // Encode payload with protocol byte
+        let payload = encode_payload(protocol, data);
+
         // Encrypt the data
         let (ciphertext, nonce) = session
-            .encrypt(data)
+            .encrypt(&payload)
             .map_err(|e| UdpError::Session(e.to_string()))?;
 
         // Build transport message
@@ -429,6 +440,14 @@ impl UDP {
     /// Handles handshakes internally and only returns transport data.
     /// Returns (sender_pk, bytes_read).
     pub fn read_from(&self, buf: &mut [u8]) -> Result<(Key, usize)> {
+        let (pk, _proto, n) = self.read_packet(buf)?;
+        Ok((pk, n))
+    }
+
+    /// Reads the next decrypted message from any peer, including the protocol byte.
+    /// Unlike read_from, this also returns the protocol byte from the encrypted payload.
+    /// Returns (sender_pk, protocol_byte, bytes_read).
+    pub fn read_packet(&self, buf: &mut [u8]) -> Result<(Key, u8, usize)> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(UdpError::Closed);
         }
@@ -475,7 +494,7 @@ impl UDP {
                 }
                 message::message_type::TRANSPORT => {
                     match self.handle_transport(&recv_buf[..nr], from, buf) {
-                        Ok((pk, n)) => return Ok((pk, n)),
+                        Ok((pk, proto, n)) => return Ok((pk, proto, n)),
                         Err(_) => continue,
                     }
                 }
@@ -895,12 +914,13 @@ impl UDP {
     }
 
     // Internal: handle incoming transport message
+    // Returns (sender_pk, protocol_byte, bytes_copied_to_out_buf)
     fn handle_transport(
         &self,
         data: &[u8],
         from: SocketAddr,
         out_buf: &mut [u8],
-    ) -> Result<(Key, usize)> {
+    ) -> Result<(Key, u8, usize)> {
         let msg = parse_transport_message(data).map_err(|_| UdpError::NoSession)?;
 
         // Find peer by receiver index
@@ -938,7 +958,7 @@ impl UDP {
         // Decode protocol and payload
         if plaintext.is_empty() {
             // Keepalive message
-            return Ok((peer_pk, 0));
+            return Ok((peer_pk, 0, 0));
         }
 
         let (protocol, payload) = decode_payload(&plaintext)
@@ -954,7 +974,7 @@ impl UDP {
                     }
                 }
                 // Return 0 bytes - KCP data is handled internally
-                Ok((peer_pk, 0))
+                Ok((peer_pk, protocol, 0))
             }
 
             message::protocol::RELAY_0 => {
@@ -1012,7 +1032,7 @@ impl UDP {
                 // Non-KCP protocol, copy to output buffer
                 let n = payload.len().min(out_buf.len());
                 out_buf[..n].copy_from_slice(&payload[..n]);
-                Ok((peer_pk, n))
+                Ok((peer_pk, protocol, n))
             }
         }
     }
