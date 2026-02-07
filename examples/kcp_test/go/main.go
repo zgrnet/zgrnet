@@ -163,15 +163,23 @@ func main() {
 }
 
 func runOpenerTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, testCfg TestConfig) {
-	log.Printf("[opener] Opening stream to %s...", peerName)
+	log.Printf("[opener] Opening stream to %s with proto=TCP_PROXY(69)...", peerName)
 
-	stream, err := udp.OpenStream(peerKey, 0, nil)
+	// Encode test Address as metadata: IPv4 127.0.0.1:8080
+	testAddr := &noise.Address{Type: noise.AddressTypeIPv4, Host: "127.0.0.1", Port: 8080}
+	metadata := testAddr.Encode()
+	if metadata == nil {
+		log.Fatalf("[opener] Failed to encode test address")
+	}
+	log.Printf("[opener] Metadata: %x (Address IPv4 127.0.0.1:8080)", metadata)
+
+	stream, err := udp.OpenStream(peerKey, noise.ProtocolTCPProxy, metadata)
 	if err != nil {
 		log.Fatalf("[opener] Failed to open stream: %v", err)
 	}
 	defer stream.Close()
 
-	log.Printf("[opener] Opened stream %d", stream.ID())
+	log.Printf("[opener] Opened stream %d (proto=%d, metadata=%x)", stream.ID(), stream.Proto(), stream.Metadata())
 
 	// Echo test
 	log.Printf("[opener] Running echo test...")
@@ -222,7 +230,20 @@ func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, te
 	}
 	defer stream.Close()
 
-	log.Printf("[accepter] Accepted stream %d", stream.ID())
+	log.Printf("[accepter] Accepted stream %d (proto=%d, metadata=%x)", stream.ID(), stream.Proto(), stream.Metadata())
+
+	// Verify stream type: must be TCP_PROXY(69) with Address metadata
+	if stream.Proto() != noise.ProtocolTCPProxy {
+		log.Fatalf("[accepter] FAIL: expected proto=%d (TCP_PROXY), got %d", noise.ProtocolTCPProxy, stream.Proto())
+	}
+	addr, _, err := noise.DecodeAddress(stream.Metadata())
+	if err != nil {
+		log.Fatalf("[accepter] FAIL: failed to decode metadata as Address: %v", err)
+	}
+	if addr.Type != noise.AddressTypeIPv4 || addr.Host != "127.0.0.1" || addr.Port != 8080 {
+		log.Fatalf("[accepter] FAIL: expected Address{IPv4, 127.0.0.1, 8080}, got {%d, %s, %d}", addr.Type, addr.Host, addr.Port)
+	}
+	log.Printf("[accepter] PASS: stream type verified (proto=TCP_PROXY, addr=127.0.0.1:8080)")
 
 	// Echo test - receive and echo back
 	buf := make([]byte, 1024)

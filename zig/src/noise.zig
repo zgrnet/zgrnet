@@ -41,6 +41,9 @@ pub const Transport = noise.Transport;
 pub const Addr = noise.Addr;
 pub const MockTransport = noise.MockTransport;
 pub const MockAddr = noise.MockAddr;
+pub const Address = noise.Address;
+pub const AddressError = noise.AddressError;
+pub const address = noise.address;
 pub const tag_size = noise.tag_size;
 pub const hash_size = noise.hash_size;
 

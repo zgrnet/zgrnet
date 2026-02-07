@@ -174,14 +174,25 @@ pub fn main() !void {
 }
 
 fn runOpenerTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key, peer_name: []const u8, test_cfg: *const TestConfig, my_name: []const u8) !void {
-    std.debug.print("[opener] Opening stream to {s}...\n", .{peer_name});
+    std.debug.print("[opener] Opening stream to {s} with proto=TCP_PROXY(69)...\n", .{peer_name});
 
-    const stream = udp.openStream(peer_pk, 0, &[_]u8{}) catch |e| {
+    // Encode test Address as metadata: IPv4 127.0.0.1:8080
+    const test_addr = noise.Address.ipv4("127.0.0.1", 8080);
+    var meta_buf: [64]u8 = undefined;
+    const metadata = test_addr.encode(&meta_buf) catch |e| {
+        std.debug.print("[opener] Failed to encode test address: {}\n", .{e});
+        return e;
+    };
+    std.debug.print("[opener] Metadata ({} bytes): ", .{metadata.len});
+    for (metadata) |b| std.debug.print("{x:0>2}", .{b});
+    std.debug.print(" (Address IPv4 127.0.0.1:8080)\n", .{});
+
+    const stream = udp.openStream(peer_pk, @intFromEnum(noise.Protocol.tcp_proxy), metadata) catch |e| {
         std.debug.print("[opener] Failed to open stream: {}\n", .{e});
         return e;
     };
 
-    std.debug.print("[opener] Opened stream {}\n", .{stream.getId()});
+    std.debug.print("[opener] Opened stream {} (proto={}, metadata_len={})\n", .{ stream.getId(), stream.getProto(), stream.getMetadata().len });
 
     // Echo test
     std.debug.print("[opener] Running echo test...\n", .{});
@@ -229,7 +240,25 @@ fn runAccepterTest(allocator: std.mem.Allocator, udp: *UDP, peer_pk: *const Key,
     }
 
     const s = stream.?;
-    std.debug.print("[accepter] Accepted stream {}\n", .{s.getId()});
+    std.debug.print("[accepter] Accepted stream {} (proto={}, metadata_len={})\n", .{ s.getId(), s.getProto(), s.getMetadata().len });
+
+    // Verify stream type: must be TCP_PROXY(69) with Address metadata
+    const expected_proto = @intFromEnum(noise.Protocol.tcp_proxy);
+    if (s.getProto() != expected_proto) {
+        std.debug.print("[accepter] FAIL: expected proto={} (TCP_PROXY), got {}\n", .{ expected_proto, s.getProto() });
+        return error.StreamTypeVerifyFailed;
+    }
+    var host_buf: [64]u8 = undefined;
+    const decode_result = noise.Address.decode(s.getMetadata(), &host_buf) catch |e| {
+        std.debug.print("[accepter] FAIL: failed to decode metadata as Address: {}\n", .{e});
+        return e;
+    };
+    const addr = decode_result.addr;
+    if (addr.atyp != noise.address.ATYP_IPV4 or !std.mem.eql(u8, addr.host, "127.0.0.1") or addr.port != 8080) {
+        std.debug.print("[accepter] FAIL: expected Address{{IPv4, 127.0.0.1, 8080}}, got {{{}, {s}, {}}}\n", .{ addr.atyp, addr.host, addr.port });
+        return error.StreamTypeVerifyFailed;
+    }
+    std.debug.print("[accepter] PASS: stream type verified (proto=TCP_PROXY, addr=127.0.0.1:8080)\n", .{});
 
     // Echo test - receive and echo back (use blocking read)
     var recv_buf: [1024]u8 = undefined;
