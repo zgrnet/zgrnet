@@ -362,7 +362,10 @@ impl UDP {
 
     /// Opens a new KCP stream to the specified peer.
     /// The peer must be in established state with mux initialized.
-    pub fn open_stream(&self, pk: &Key) -> Result<Arc<KcpStream>> {
+    /// proto specifies the stream protocol type (e.g., protocol::TCP_PROXY).
+    /// metadata contains additional data sent with the SYN frame (e.g., encoded Address).
+    /// Use proto=0 and metadata=&[] for untyped streams.
+    pub fn open_stream(&self, pk: &Key, proto: u8, metadata: &[u8]) -> Result<Arc<KcpStream>> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(UdpError::Closed);
         }
@@ -381,7 +384,7 @@ impl UDP {
             p.mux.as_ref().ok_or(UdpError::NoSession)?.clone()
         };
 
-        mux.open_stream().map_err(|_| UdpError::NoSession)
+        mux.open_stream(proto, metadata).map_err(|_| UdpError::NoSession)
     }
 
     /// Accepts an incoming KCP stream from the specified peer.
@@ -1228,7 +1231,7 @@ mod tests {
         });
 
         // Client opens stream
-        let client_stream = client.open_stream(&server_key.public).expect("Failed to open stream");
+        let client_stream = client.open_stream(&server_key.public, 0, &[]).expect("Failed to open stream");
         // Stream ID is assigned based on public key comparison (smaller key uses odd IDs)
         // The first stream ID depends on which peer opens first and their key order
 
@@ -1259,7 +1262,7 @@ mod tests {
         });
 
         // Client opens stream
-        let client_stream = client.open_stream(&server_key.public).unwrap();
+        let client_stream = client.open_stream(&server_key.public, 0, &[]).unwrap();
         let server_stream = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
 
         // Client sends
@@ -1298,7 +1301,7 @@ mod tests {
             let _ = tx.send(stream);
         });
 
-        let client_stream = client.open_stream(&server_key.public).unwrap();
+        let client_stream = client.open_stream(&server_key.public, 0, &[]).unwrap();
         let server_stream = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
 
         // Send 100KB of data
@@ -1360,7 +1363,7 @@ mod tests {
 
         // Open multiple streams and send/receive
         for i in 0..num_streams {
-            let client_stream = client.open_stream(&server_key.public).unwrap();
+            let client_stream = client.open_stream(&server_key.public, 0, &[]).unwrap();
             let server_stream = accept_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
             // Exchange data

@@ -46,6 +46,8 @@ impl From<io::Error> for StreamError {
 /// Stream represents a multiplexed stream over KCP.
 pub struct Stream {
     id: u32,
+    proto: u8,           // Stream protocol type (from SYN payload)
+    metadata: Vec<u8>,   // Stream metadata (from SYN payload)
     kcp: Mutex<Kcp>,
     state: RwLock<StreamState>,
     recv_buf: Mutex<VecDeque<u8>>, // O(1) head removal
@@ -54,9 +56,11 @@ pub struct Stream {
 }
 
 impl Stream {
-    /// Create a new stream.
+    /// Create a new stream with protocol type and metadata.
     pub(crate) fn new(
         id: u32,
+        proto: u8,
+        metadata: Vec<u8>,
         output: super::kcp::OutputFn,
         fin_sender: Option<Box<dyn Fn() + Send + Sync>>,
         output_error: Arc<std::sync::atomic::AtomicBool>,
@@ -66,6 +70,8 @@ impl Stream {
 
         Stream {
             id,
+            proto,
+            metadata,
             kcp: Mutex::new(kcp),
             state: RwLock::new(StreamState::Open),
             recv_buf: Mutex::new(VecDeque::new()),
@@ -77,6 +83,18 @@ impl Stream {
     /// Get stream ID.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Get stream protocol type (from SYN payload).
+    /// Returns 0 (RAW) if no protocol was specified.
+    pub fn proto(&self) -> u8 {
+        self.proto
+    }
+
+    /// Get stream metadata (from SYN payload).
+    /// Returns empty slice if no metadata was specified.
+    pub fn metadata(&self) -> &[u8] {
+        &self.metadata
     }
 
     /// Get stream state.
@@ -362,8 +380,8 @@ impl Mux {
         }
     }
 
-    /// Create a stream with given ID (helper to reduce duplication).
-    fn create_stream(&self, id: u32) -> Arc<Stream> {
+    /// Create a stream with given ID, protocol type, and metadata (helper to reduce duplication).
+    fn create_stream(&self, id: u32, proto: u8, metadata: Vec<u8>) -> Arc<Stream> {
         let output = self.output.clone();
         let fin_output = self.output.clone();
         let output_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -372,6 +390,8 @@ impl Mux {
 
         Arc::new(Stream::new(
             id,
+            proto,
+            metadata,
             Box::new(move |data| {
                 // Use encode_with_payload to avoid intermediate allocations
                 let encoded = Frame::encode_with_payload(Cmd::Psh, id, data);
@@ -392,8 +412,11 @@ impl Mux {
         ))
     }
 
-    /// Open a new stream.
-    pub fn open_stream(&self) -> Result<Arc<Stream>, MuxError> {
+    /// Open a new stream with protocol type and metadata.
+    /// The proto and metadata are sent in the SYN frame payload so the remote
+    /// side can identify the stream type upon acceptance.
+    /// Use proto=0 (RAW) and metadata=&[] for untyped streams.
+    pub fn open_stream(&self, proto: u8, metadata: &[u8]) -> Result<Arc<Stream>, MuxError> {
         if self.is_closed() {
             return Err(MuxError::MuxClosed);
         }
@@ -405,11 +428,11 @@ impl Mux {
             id
         };
 
-        let stream = self.create_stream(id);
+        let stream = self.create_stream(id, proto, metadata.to_vec());
         self.streams.write().unwrap().insert(id, stream.clone());
 
-        // Send SYN - remove from map on failure to avoid resource leak
-        if let Err(e) = self.send_syn(id) {
+        // Send SYN with proto + metadata - remove from map on failure
+        if let Err(e) = self.send_syn(id, proto, metadata) {
             self.streams.write().unwrap().remove(&id);
             return Err(e);
         }
@@ -441,7 +464,7 @@ impl Mux {
         let frame = Frame::decode(data).map_err(|_| MuxError::InvalidFrame)?;
 
         match frame.cmd {
-            Cmd::Syn => self.handle_syn(frame.stream_id)?,
+            Cmd::Syn => self.handle_syn(frame.stream_id, &frame.payload)?,
             Cmd::Fin => self.handle_fin(frame.stream_id),
             Cmd::Psh => self.handle_psh(frame.stream_id, &frame.payload),
             Cmd::Nop => {} // Keepalive
@@ -450,12 +473,19 @@ impl Mux {
         Ok(())
     }
 
-    fn handle_syn(&self, id: u32) -> Result<(), MuxError> {
+    fn handle_syn(&self, id: u32, payload: &[u8]) -> Result<(), MuxError> {
         if self.streams.read().unwrap().contains_key(&id) {
             return Ok(()); // Duplicate SYN
         }
 
-        let stream = self.create_stream(id);
+        // Parse proto + metadata from SYN payload
+        let (proto, metadata) = if !payload.is_empty() {
+            (payload[0], payload[1..].to_vec())
+        } else {
+            (0, Vec::new()) // Default: RAW, no metadata
+        };
+
+        let stream = self.create_stream(id, proto, metadata);
         self.streams.write().unwrap().insert(id, stream.clone());
 
         // Notify via callback
@@ -480,8 +510,16 @@ impl Mux {
         }
     }
 
-    fn send_syn(&self, id: u32) -> Result<(), MuxError> {
-        self.send_frame(Frame::new(Cmd::Syn, id, vec![]))
+    fn send_syn(&self, id: u32, proto: u8, metadata: &[u8]) -> Result<(), MuxError> {
+        let payload = if proto != 0 || !metadata.is_empty() {
+            let mut p = Vec::with_capacity(1 + metadata.len());
+            p.push(proto);
+            p.extend_from_slice(metadata);
+            p
+        } else {
+            vec![]
+        };
+        self.send_frame(Frame::new(Cmd::Syn, id, payload))
     }
 
     pub fn send_fin(&self, id: u32) -> Result<(), MuxError> {
@@ -580,7 +618,7 @@ mod tests {
             Box::new(|_| {}),
         );
 
-        let stream = mux.open_stream().unwrap();
+        let stream = mux.open_stream(0, &[]).unwrap();
         assert_eq!(stream.id(), 1); // Client uses odd IDs
         assert_eq!(mux.num_streams(), 1);
         assert!(output_count.load(Ordering::SeqCst) > 0); // SYN was sent
@@ -596,7 +634,7 @@ mod tests {
             Box::new(|_| {}),
         );
 
-        let stream = mux.open_stream().unwrap();
+        let stream = mux.open_stream(0, &[]).unwrap();
         assert_eq!(stream.state(), StreamState::Open);
 
         stream.shutdown();

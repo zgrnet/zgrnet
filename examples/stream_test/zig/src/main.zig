@@ -178,7 +178,7 @@ fn runKcpTests(
 ) !void {
     // Open stream from client
     std.debug.print("[client] Opening stream...\n", .{});
-    const client_stream = client.openStream(&server_key.public) catch |e| {
+    const client_stream = client.openStream(&server_key.public, 0, &[_]u8{}) catch |e| {
         std.debug.print("[client] Failed to open stream: {}\n", .{e});
         return e;
     };

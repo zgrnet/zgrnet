@@ -21,6 +21,8 @@ pub mod message_type {
 /// Protocol field values (inside encrypted payload).
 pub mod protocol {
     // Transport layer protocols (0-63, matching IP protocol numbers)
+    /// Raw data (default)
+    pub const RAW: u8 = 0;
     /// ICMP in ZigNet (no IP header)
     pub const ICMP: u8 = 1;
     /// IP in ZigNet (complete IP packet)

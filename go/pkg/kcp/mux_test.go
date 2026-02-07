@@ -137,7 +137,7 @@ func TestMuxOpenAccept(t *testing.T) {
 	defer pair.server.Close()
 
 	// Client opens a stream
-	clientStream, err := pair.client.OpenStream()
+	clientStream, err := pair.client.OpenStream(0, nil)
 	if err != nil {
 		t.Fatalf("OpenStream() error = %v", err)
 	}
@@ -165,7 +165,7 @@ func TestMuxStreamReadWrite(t *testing.T) {
 	defer pair.server.Close()
 
 	// Client opens stream
-	clientStream, err := pair.client.OpenStream()
+	clientStream, err := pair.client.OpenStream(0, nil)
 	if err != nil {
 		t.Fatalf("OpenStream() error = %v", err)
 	}
@@ -198,7 +198,7 @@ func TestMuxBidirectional(t *testing.T) {
 	defer pair.client.Close()
 	defer pair.server.Close()
 
-	clientStream, _ := pair.client.OpenStream()
+	clientStream, _ := pair.client.OpenStream(0, nil)
 	serverStream := <-pair.clientStreams
 
 	// Exchange messages
@@ -257,7 +257,7 @@ func TestMuxMultipleStreams(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 
-			clientStream, err := pair.client.OpenStream()
+			clientStream, err := pair.client.OpenStream(0, nil)
 			if err != nil {
 				t.Errorf("Stream %d: OpenStream() error = %v", idx, err)
 				return
@@ -319,7 +319,7 @@ func TestMuxStreamClose(t *testing.T) {
 	defer pair.client.Close()
 	defer pair.server.Close()
 
-	clientStream, _ := pair.client.OpenStream()
+	clientStream, _ := pair.client.OpenStream(0, nil)
 	serverStream := <-pair.clientStreams
 
 	// Client closes
@@ -341,7 +341,7 @@ func TestMuxLargeData(t *testing.T) {
 	defer pair.client.Close()
 	defer pair.server.Close()
 
-	clientStream, _ := pair.client.OpenStream()
+	clientStream, _ := pair.client.OpenStream(0, nil)
 	serverStream := <-pair.clientStreams
 
 	// Send 100KB
@@ -413,10 +413,10 @@ func TestMuxNumStreams(t *testing.T) {
 	}
 
 	// Open streams
-	stream1, _ := pair.client.OpenStream()
+	stream1, _ := pair.client.OpenStream(0, nil)
 	<-pair.clientStreams
 
-	stream2, _ := pair.client.OpenStream()
+	stream2, _ := pair.client.OpenStream(0, nil)
 	<-pair.clientStreams
 
 	if n := pair.client.NumStreams(); n != 2 {
@@ -496,7 +496,7 @@ func TestMuxPacketLoss(t *testing.T) {
 		}
 	}()
 
-	clientStream, _ := clientMux.OpenStream()
+	clientStream, _ := clientMux.OpenStream(0, nil)
 	serverStream := <-newStreams
 
 	// Send larger data - KCP should handle retransmission
@@ -610,7 +610,7 @@ func BenchmarkMuxOpenClose(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		stream, err := clientMux.OpenStream()
+		stream, err := clientMux.OpenStream(0, nil)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -668,7 +668,7 @@ func BenchmarkMuxThroughput(b *testing.B) {
 		}
 	}()
 
-	clientStream, _ := clientMux.OpenStream()
+	clientStream, _ := clientMux.OpenStream(0, nil)
 	serverStream := <-newStreams
 
 	data := bytes.Repeat([]byte("X"), 1024)

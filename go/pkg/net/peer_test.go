@@ -72,7 +72,7 @@ func TestPeerOpenStreamAcceptStream(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Open stream from client
-	clientStream, err := client.OpenStream(serverKey.Public)
+	clientStream, err := client.OpenStream(serverKey.Public, 0, nil)
 	if err != nil {
 		t.Fatalf("Failed to open stream: %v", err)
 	}

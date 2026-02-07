@@ -159,7 +159,7 @@ fn run_kcp_benchmark(
 
     // Client opens stream
     println!("[client] Opening stream...");
-    let client_stream = client.open_stream(&server_key_pub)
+    let client_stream = client.open_stream(&server_key_pub, 0, &[])
         .expect("Failed to open stream");
     println!("[client] Opened stream {}", client_stream.id());
 

@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use zgrnet::{Key, KeyPair, Stream};
 use zgrnet::{UDP, UdpOptions};
+use zgrnet::noise::address::Address;
+use zgrnet::noise::message::protocol;
 
 #[derive(serde::Deserialize)]
 struct Config {
@@ -140,12 +142,17 @@ fn main() {
 }
 
 fn run_opener_test(udp: &Arc<UDP>, peer_pk: &Key, peer_name: &str, test_cfg: &TestConfig) {
-    println!("[opener] Opening stream to {}...", peer_name);
+    println!("[opener] Opening stream to {} with proto=TCP_PROXY(69)...", peer_name);
 
-    let stream = udp.open_stream(peer_pk)
+    // Encode test Address as metadata: IPv4 127.0.0.1:8080
+    let test_addr = Address::ipv4("127.0.0.1", 8080);
+    let metadata = test_addr.encode().expect("Failed to encode test address");
+    println!("[opener] Metadata: {:02x?} (Address IPv4 127.0.0.1:8080)", metadata);
+
+    let stream = udp.open_stream(peer_pk, protocol::TCP_PROXY, &metadata)
         .unwrap_or_else(|e| panic!("Failed to open stream: {}", e));
 
-    println!("[opener] Opened stream {}", stream.id());
+    println!("[opener] Opened stream {} (proto={}, metadata={:02x?})", stream.id(), stream.proto(), stream.metadata());
 
     // Echo test
     println!("[opener] Running echo test...");
@@ -190,7 +197,16 @@ fn run_accepter_test(udp: &Arc<UDP>, peer_pk: &Key, peer_name: &str, test_cfg: &
     let stream = udp.accept_stream(peer_pk)
         .unwrap_or_else(|e| panic!("Failed to accept stream: {}", e));
 
-    println!("[accepter] Accepted stream {}", stream.id());
+    println!("[accepter] Accepted stream {} (proto={}, metadata={:02x?})", stream.id(), stream.proto(), stream.metadata());
+
+    // Verify stream type: must be TCP_PROXY(69) with Address metadata
+    assert_eq!(stream.proto(), protocol::TCP_PROXY,
+        "FAIL: expected proto={} (TCP_PROXY), got {}", protocol::TCP_PROXY, stream.proto());
+    let (addr, _consumed) = Address::decode(stream.metadata())
+        .unwrap_or_else(|e| panic!("FAIL: failed to decode metadata as Address: {}", e));
+    assert_eq!(addr.host, "127.0.0.1", "FAIL: expected host 127.0.0.1, got {}", addr.host);
+    assert_eq!(addr.port, 8080, "FAIL: expected port 8080, got {}", addr.port);
+    println!("[accepter] PASS: stream type verified (proto=TCP_PROXY, addr=127.0.0.1:8080)");
 
     // Echo test - receive and echo back
     let received = read_with_timeout(&stream, Duration::from_secs(5))

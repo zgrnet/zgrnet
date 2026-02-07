@@ -98,8 +98,11 @@ func NewMux(config *Config, isClient bool, output OutputFunc, onStreamData OnStr
 	return m
 }
 
-// OpenStream opens a new stream.
-func (m *Mux) OpenStream() (*Stream, error) {
+// OpenStream opens a new stream with the given protocol type and metadata.
+// The proto and metadata are sent in the SYN frame payload so the remote
+// side can identify the stream type upon acceptance.
+// Use proto=0 (RAW) and metadata=nil for untyped streams.
+func (m *Mux) OpenStream(proto byte, metadata []byte) (*Stream, error) {
 	if m.IsClosed() {
 		return nil, ErrMuxClosed
 	}
@@ -111,15 +114,15 @@ func (m *Mux) OpenStream() (*Stream, error) {
 	m.nextIDMu.Unlock()
 
 	// Create stream
-	stream := newStream(id, m)
+	stream := newStream(id, m, proto, metadata)
 
 	// Register stream
 	m.streamsMu.Lock()
 	m.streams[id] = stream
 	m.streamsMu.Unlock()
 
-	// Send SYN
-	if err := m.sendSYN(id); err != nil {
+	// Send SYN with proto + metadata as payload
+	if err := m.sendSYN(id, proto, metadata); err != nil {
 		m.streamsMu.Lock()
 		delete(m.streams, id)
 		m.streamsMu.Unlock()
@@ -179,7 +182,7 @@ func (m *Mux) Input(data []byte) error {
 
 	switch frame.Cmd {
 	case CmdSYN:
-		return m.handleSYN(frame.StreamID)
+		return m.handleSYN(frame.StreamID, frame.Payload)
 	case CmdFIN:
 		return m.handleFIN(frame.StreamID)
 	case CmdPSH:
@@ -193,7 +196,8 @@ func (m *Mux) Input(data []byte) error {
 }
 
 // handleSYN handles a SYN frame (stream open request).
-func (m *Mux) handleSYN(id uint32) error {
+// The payload contains proto(1B) + metadata(var). Empty payload = proto=0 (RAW).
+func (m *Mux) handleSYN(id uint32, payload []byte) error {
 	m.streamsMu.Lock()
 
 	// Check if stream already exists
@@ -202,8 +206,19 @@ func (m *Mux) handleSYN(id uint32) error {
 		return nil // Duplicate SYN, ignore
 	}
 
-	// Create new stream
-	stream := newStream(id, m)
+	// Parse proto + metadata from SYN payload
+	var proto byte
+	var metadata []byte
+	if len(payload) >= 1 {
+		proto = payload[0]
+		if len(payload) > 1 {
+			metadata = make([]byte, len(payload)-1)
+			copy(metadata, payload[1:])
+		}
+	}
+
+	// Create new stream with proto and metadata
+	stream := newStream(id, m, proto, metadata)
 	m.streams[id] = stream
 	m.streamsMu.Unlock()
 
@@ -256,11 +271,18 @@ func (m *Mux) sendFrame(f *Frame) error {
 	return m.output(f.Encode())
 }
 
-// sendSYN sends a SYN frame.
-func (m *Mux) sendSYN(id uint32) error {
+// sendSYN sends a SYN frame with proto + metadata as payload.
+func (m *Mux) sendSYN(id uint32, proto byte, metadata []byte) error {
+	var payload []byte
+	if proto != 0 || len(metadata) > 0 {
+		payload = make([]byte, 1+len(metadata))
+		payload[0] = proto
+		copy(payload[1:], metadata)
+	}
 	return m.sendFrame(&Frame{
 		Cmd:      CmdSYN,
 		StreamID: id,
+		Payload:  payload,
 	})
 }
 
