@@ -77,35 +77,16 @@ pub const KqueueIO = struct {
 
     /// Register a file descriptor for read readiness.
     pub fn registerRead(self: *Self, fd: posix.fd_t, callback: ReadyCallback) void {
-        const result = self.registrations.getOrPut(fd) catch return;
-        if (!result.found_existing) {
-            result.value_ptr.* = .{
-                .fd = fd,
-                .read_cb = ReadyCallback.noop,
-                .write_cb = ReadyCallback.noop,
-                .read_registered = false,
-                .write_registered = false,
-            };
-        }
-
-        result.value_ptr.read_cb = callback;
-
-        if (!result.value_ptr.read_registered) {
-            const changelist = [_]posix.system.Kevent{.{
-                .ident = @intCast(fd),
-                .filter = posix.system.EVFILT.READ,
-                .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
-                .fflags = 0,
-                .data = 0,
-                .udata = 0,
-            }};
-            _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch return;
-            result.value_ptr.read_registered = true;
-        }
+        self.registerFilter(fd, posix.system.EVFILT.READ, callback);
     }
 
     /// Register a file descriptor for write readiness.
     pub fn registerWrite(self: *Self, fd: posix.fd_t, callback: ReadyCallback) void {
+        self.registerFilter(fd, posix.system.EVFILT.WRITE, callback);
+    }
+
+    /// Shared implementation for registering a filter on a file descriptor.
+    fn registerFilter(self: *Self, fd: posix.fd_t, filter: i8, callback: ReadyCallback) void {
         const result = self.registrations.getOrPut(fd) catch return;
         if (!result.found_existing) {
             result.value_ptr.* = .{
@@ -117,19 +98,29 @@ pub const KqueueIO = struct {
             };
         }
 
-        result.value_ptr.write_cb = callback;
+        const is_read = (filter == posix.system.EVFILT.READ);
+        if (is_read) {
+            result.value_ptr.read_cb = callback;
+        } else {
+            result.value_ptr.write_cb = callback;
+        }
 
-        if (!result.value_ptr.write_registered) {
+        const already_registered = if (is_read) result.value_ptr.read_registered else result.value_ptr.write_registered;
+        if (!already_registered) {
             const changelist = [_]posix.system.Kevent{.{
                 .ident = @intCast(fd),
-                .filter = posix.system.EVFILT.WRITE,
+                .filter = filter,
                 .flags = posix.system.EV.ADD | posix.system.EV.CLEAR,
                 .fflags = 0,
                 .data = 0,
                 .udata = 0,
             }};
             _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch return;
-            result.value_ptr.write_registered = true;
+            if (is_read) {
+                result.value_ptr.read_registered = true;
+            } else {
+                result.value_ptr.write_registered = true;
+            }
         }
     }
 
@@ -164,7 +155,9 @@ pub const KqueueIO = struct {
             }
 
             if (count > 0) {
-                _ = posix.kevent(self.kq, changelist[0..count], &[_]posix.system.Kevent{}, null) catch {};
+                _ = posix.kevent(self.kq, changelist[0..count], &[_]posix.system.Kevent{}, null) catch |err| {
+                    std.log.err("KqueueIO: failed to unregister fd {d}: {s}", .{ fd, @errorName(err) });
+                };
             }
         }
     }
@@ -219,7 +212,9 @@ pub const KqueueIO = struct {
             .data = 0,
             .udata = 0,
         }};
-        _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch {};
+        _ = posix.kevent(self.kq, &changelist, &[_]posix.system.Kevent{}, null) catch |err| {
+            std.log.err("KqueueIO: failed to wake: {s}", .{@errorName(err)});
+        };
     }
 
     /// Create an IOService interface from this KqueueIO.

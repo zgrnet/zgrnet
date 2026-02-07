@@ -919,9 +919,9 @@ pub const UDP = struct {
         while (!self.closed.load(.acquire)) {
             // Acquire packet from pool
             const pkt = self.packet_pool.acquire() orelse {
-                // Pool exhausted, yield and retry
-                std.Thread.yield() catch {};
-                continue;
+                // Pool exhausted — stop draining and wait for next event.
+                // Packets will be released by consumers, making pool available again.
+                break;
             };
 
             // Read from socket (non-blocking)
@@ -963,8 +963,13 @@ pub const UDP = struct {
             }
 
             // Send to output channel (non-blocking)
-            // If full, packet is still in decrypt queue, just won't be delivered to readFrom
-            _ = self.output_chan.trySend(pkt);
+            if (!self.output_chan.trySend(pkt)) {
+                // output_chan full — remove from decrypt_chan to avoid leak.
+                // This ensures the packet is either in both channels or neither.
+                _ = self.decrypt_chan.tryRecv();
+                self.packet_pool.release(pkt);
+                continue;
+            }
         }
     }
 
