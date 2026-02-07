@@ -3,19 +3,17 @@
 // Requires root/sudo to create TUN devices.
 //
 // Usage:
-//   bazel build //go/examples/host_test
-//   sudo bazel-bin/go/examples/host_test/host_test_/host_test
-//
-// Then in another terminal:
-//   ping 100.64.0.2
+//   cd zig && zig build -Doptimize=ReleaseFast
+//   cd go && go build -o /tmp/host_test ./examples/host_test/
+//   sudo /tmp/host_test
 package main
 
 import (
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
-	"syscall"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/vibing/zgrnet/pkg/host"
@@ -29,173 +27,171 @@ func main() {
 
 	if os.Getuid() != 0 {
 		fmt.Println("ERROR: This test requires root privileges.")
-		fmt.Println("  sudo ./host_test")
+		fmt.Println("  sudo /tmp/host_test")
 		os.Exit(1)
 	}
 
 	// Generate keypairs
-	keyA, err := noise.GenerateKeyPair()
-	if err != nil {
-		fatal("generate key A: %v", err)
-	}
-	keyB, err := noise.GenerateKeyPair()
-	if err != nil {
-		fatal("generate key B: %v", err)
-	}
-
+	keyA, _ := noise.GenerateKeyPair()
+	keyB, _ := noise.GenerateKeyPair()
 	fmt.Printf("Host A pubkey: %s\n", keyA.Public.ShortString())
 	fmt.Printf("Host B pubkey: %s\n", keyB.Public.ShortString())
 	fmt.Println()
 
-	// Create TUN devices
-	fmt.Println("Creating TUN devices...")
+	// --- Create and configure TUN devices ---
+	fmt.Println("[1/5] Creating TUN devices...")
 	tunA, err := tun.Create("")
 	if err != nil {
 		fatal("create TUN A: %v", err)
 	}
+	defer tunA.Close()
+
 	tunB, err := tun.Create("")
 	if err != nil {
-		tunA.Close()
 		fatal("create TUN B: %v", err)
 	}
+	defer tunB.Close()
 
 	fmt.Printf("  TUN A: %s\n", tunA.Name())
 	fmt.Printf("  TUN B: %s\n", tunB.Name())
 
 	// Configure TUN A: 100.64.0.1/24
-	if err := tunA.SetMTU(1400); err != nil {
-		cleanup(tunA, tunB)
-		fatal("set MTU A: %v", err)
-	}
-	if err := tunA.SetIPv4(net.IPv4(100, 64, 0, 1), net.CIDRMask(24, 32)); err != nil {
-		cleanup(tunA, tunB)
-		fatal("set IPv4 A: %v", err)
-	}
-	if err := tunA.Up(); err != nil {
-		cleanup(tunA, tunB)
-		fatal("up A: %v", err)
-	}
+	must(tunA.SetMTU(1400), "set MTU A")
+	must(tunA.SetIPv4(net.IPv4(100, 64, 0, 1), net.CIDRMask(24, 32)), "set IPv4 A")
+	must(tunA.Up(), "up A")
 	fmt.Println("  TUN A: 100.64.0.1/24 UP")
 
 	// Configure TUN B: 100.64.1.1/24
-	if err := tunB.SetMTU(1400); err != nil {
-		cleanup(tunA, tunB)
-		fatal("set MTU B: %v", err)
-	}
-	if err := tunB.SetIPv4(net.IPv4(100, 64, 1, 1), net.CIDRMask(24, 32)); err != nil {
-		cleanup(tunA, tunB)
-		fatal("set IPv4 B: %v", err)
-	}
-	if err := tunB.Up(); err != nil {
-		cleanup(tunA, tunB)
-		fatal("up B: %v", err)
-	}
+	must(tunB.SetMTU(1400), "set MTU B")
+	must(tunB.SetIPv4(net.IPv4(100, 64, 1, 1), net.CIDRMask(24, 32)), "set IPv4 B")
+	must(tunB.Up(), "up B")
 	fmt.Println("  TUN B: 100.64.1.1/24 UP")
 	fmt.Println()
 
-	// Create Host A
+	// --- Create Hosts ---
+	fmt.Println("[2/5] Creating Hosts...")
 	hostA, err := host.New(host.Config{
 		PrivateKey: keyA,
 		TunIPv4:    net.IPv4(100, 64, 0, 1),
 		MTU:        1400,
 	}, tunA)
 	if err != nil {
-		cleanup(tunA, tunB)
 		fatal("create Host A: %v", err)
 	}
+	defer hostA.Close()
 
-	// Create Host B
 	hostB, err := host.New(host.Config{
 		PrivateKey: keyB,
 		TunIPv4:    net.IPv4(100, 64, 1, 1),
 		MTU:        1400,
 	}, tunB)
 	if err != nil {
-		hostA.Close()
 		fatal("create Host B: %v", err)
 	}
+	defer hostB.Close()
 
-	// Get actual UDP ports
 	portA := hostA.LocalAddr().(*net.UDPAddr).Port
 	portB := hostB.LocalAddr().(*net.UDPAddr).Port
-	fmt.Printf("Host A listening on UDP port %d\n", portA)
-	fmt.Printf("Host B listening on UDP port %d\n", portB)
+	fmt.Printf("  Host A: UDP :%d\n", portA)
+	fmt.Printf("  Host B: UDP :%d\n", portB)
 
-	// Add peers with static IP assignments
-	// Host A: peer B gets 100.64.0.2
-	err = hostA.AddPeerWithIP(keyB.Public, fmt.Sprintf("127.0.0.1:%d", portB), net.IPv4(100, 64, 0, 2))
-	if err != nil {
-		hostA.Close()
-		hostB.Close()
-		fatal("Host A add peer B: %v", err)
-	}
+	// Add peers with static IPs
+	must(hostA.AddPeerWithIP(keyB.Public, fmt.Sprintf("127.0.0.1:%d", portB), net.IPv4(100, 64, 0, 2)), "add peer B on A")
+	must(hostB.AddPeerWithIP(keyA.Public, fmt.Sprintf("127.0.0.1:%d", portA), net.IPv4(100, 64, 1, 2)), "add peer A on B")
 
-	// Host B: peer A gets 100.64.1.2
-	err = hostB.AddPeerWithIP(keyA.Public, fmt.Sprintf("127.0.0.1:%d", portA), net.IPv4(100, 64, 1, 2))
-	if err != nil {
-		hostA.Close()
-		hostB.Close()
-		fatal("Host B add peer A: %v", err)
-	}
-
-	fmt.Println()
-	fmt.Println("IP allocations:")
-	fmt.Println("  Host A: TUN=100.64.0.1, peer B=100.64.0.2")
-	fmt.Println("  Host B: TUN=100.64.1.1, peer A=100.64.1.2")
+	fmt.Println("  Host A: peer B = 100.64.0.2")
+	fmt.Println("  Host B: peer A = 100.64.1.2")
 	fmt.Println()
 
-	// Start forwarding loops
+	// --- Start forwarding ---
+	fmt.Println("[3/5] Starting forwarding loops...")
 	go hostA.Run()
 	go hostB.Run()
+	fmt.Println("  OK")
+	fmt.Println()
 
-	// Perform handshake
-	fmt.Println("Performing Noise IK handshake (A -> B)...")
+	// --- Handshake ---
+	fmt.Println("[4/5] Noise IK handshake (A -> B)...")
 	if err := hostA.Connect(keyB.Public); err != nil {
-		hostA.Close()
-		hostB.Close()
 		fatal("handshake: %v", err)
 	}
-	fmt.Println("Handshake complete!")
+	fmt.Println("  Handshake complete!")
 	fmt.Println()
 
-	// Print routing info
-	fmt.Println("=== Routing ===")
-	fmt.Printf("  %s: 100.64.0.0/24 -> TUN A -> Host A -> encrypt -> UDP :%d\n", tunA.Name(), portA)
-	fmt.Printf("  %s: 100.64.1.0/24 -> TUN B -> Host B -> encrypt -> UDP :%d\n", tunB.Name(), portB)
+	// Small delay for routes to settle
+	time.Sleep(200 * time.Millisecond)
+
+	// --- Run tests ---
+	fmt.Println("[5/5] Running tests...")
 	fmt.Println()
-	fmt.Println("=== Test Commands (run in another terminal) ===")
-	fmt.Println("  ping 100.64.0.2    # A's view of B, routes through TUN A -> TUN B")
-	fmt.Println("  ping 100.64.1.2    # B's view of A, routes through TUN B -> TUN A")
-	fmt.Println()
-	fmt.Println("Press Ctrl+C to exit.")
 
-	// Wait for signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	passed := 0
+	failed := 0
 
-	// Print periodic status
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-sigCh:
-			fmt.Println("\nShutting down...")
-			hostA.Close()
-			hostB.Close()
-			fmt.Println("Done.")
-			return
-		case <-ticker.C:
-			// Still running
-		}
+	// Test 1: ping from A side to B (100.64.0.2)
+	if runPingTest("A->B", "100.64.0.2") {
+		passed++
+	} else {
+		failed++
 	}
+
+	// Test 2: ping from B side to A (100.64.1.2)
+	if runPingTest("B->A", "100.64.1.2") {
+		passed++
+	} else {
+		failed++
+	}
+
+	// Cleanup
+	hostA.Close()
+	hostB.Close()
+
+	// Summary
+	fmt.Println()
+	fmt.Println("=== Results ===")
+	fmt.Printf("  Passed: %d\n", passed)
+	fmt.Printf("  Failed: %d\n", failed)
+	fmt.Println()
+
+	if failed > 0 {
+		fmt.Println("SOME TESTS FAILED")
+		os.Exit(1)
+	}
+	fmt.Println("All tests passed!")
+	os.Exit(0)
 }
 
-func cleanup(devs ...*tun.Device) {
-	for _, d := range devs {
-		if d != nil {
-			d.Close()
-		}
+// runPingTest runs `ping -c 3 -W 2 <target>` and checks if it succeeds.
+func runPingTest(name, target string) bool {
+	fmt.Printf("--- Test: %s (ping %s) ---\n", name, target)
+
+	cmd := exec.Command("ping", "-c", "3", "-W", "2", target)
+	output, err := cmd.CombinedOutput()
+	out := string(output)
+
+	// Print indented output
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fmt.Printf("  %s\n", line)
+	}
+
+	if err != nil {
+		fmt.Printf("  RESULT: FAIL (%v)\n", err)
+		return false
+	}
+
+	// Check for "0.0% packet loss" or "0% packet loss"
+	if strings.Contains(out, "0.0% packet loss") || strings.Contains(out, " 0% packet loss") {
+		fmt.Println("  RESULT: PASS")
+		return true
+	}
+
+	fmt.Println("  RESULT: FAIL (packet loss)")
+	return false
+}
+
+func must(err error, msg string) {
+	if err != nil {
+		fatal("%s: %v", msg, err)
 	}
 }
 
