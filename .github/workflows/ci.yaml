@@ -128,7 +128,7 @@ jobs:
     if: needs.affected.outputs.has_go == 'true'
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -139,6 +139,7 @@ jobs:
           cache-dependency-path: go/go.sum
 
       - name: Prepare KCP source
+        shell: bash
         run: |
           # Download KCP 1.7 and apply patches for native Go build
           curl -sL https://github.com/skywind3000/kcp/archive/refs/tags/1.7.tar.gz | tar xz
@@ -151,6 +152,7 @@ jobs:
           cp ikcp.c ikcp.h ../go/pkg/kcp/
 
       - name: Test (excluding TUN)
+        shell: bash
         working-directory: go
         run: |
           # Run tests excluding the tun package (requires root)
@@ -169,7 +171,7 @@ jobs:
     if: needs.affected.outputs.has_rust == 'true'
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -199,7 +201,7 @@ jobs:
     if: needs.affected.outputs.has_zig == 'true'
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
