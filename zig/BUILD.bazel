@@ -86,21 +86,25 @@ zig_run(
 )
 
 # KCP test binary (source in examples/kcp_test/zig/)
+# Requires kqueue (macOS/BSD) — UDP examples use KqueueIO backend.
 # Usage: bazel build //zig:kcp_test
 zig_binary(
     name = "kcp_test",
     srcs = [":srcs"],
     binary_name = "kcp_test",
     zig_root = "zig",
+    target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
 )
 
 # Stream test binary (source in examples/stream_test/zig/)
+# Requires kqueue (macOS/BSD) — UDP examples use KqueueIO backend.
 # Usage: bazel build //zig:stream_test
 zig_binary(
     name = "stream_test",
     srcs = [":srcs"],
     binary_name = "stream_test",
     zig_root = "zig",
+    target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
 )
