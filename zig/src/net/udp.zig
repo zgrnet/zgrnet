@@ -1147,17 +1147,8 @@ pub fn UDP(comptime IOBackend: type) type {
 
         if (protocol == @intFromEnum(message.Protocol.relay_2)) {
             if (relay_mod.handleRelay2(payload)) |result| {
-                // Inner payload is an end-to-end encrypted message.
-                // Copy to pkt.out_buf and set packet fields for upper layer.
-                pkt.pk = Key{ .data = result.src_key };
                 if (result.payload.len > 0) {
-                    // Copy payload into the packet's out_buf for safe mutable reference
-                    const copy_len = @min(result.payload.len, pkt.out_buf.len);
-                    @memcpy(pkt.out_buf[0..copy_len], result.payload[0..copy_len]);
-                    pkt.protocol = pkt.out_buf[0];
-                    pkt.payload = pkt.out_buf[0..copy_len];
-                    pkt.payload_len = copy_len;
-                    pkt.err = null;
+                    self.processRelayedPacket(pkt, &result.src_key, result.payload);
                 } else {
                     pkt.err = UdpError.NoData;
                 }
@@ -1202,6 +1193,81 @@ pub fn UDP(comptime IOBackend: type) type {
 
         const peer = peer_opt orelse return;
         self.sendToPeer(peer, action.protocol, action.data()) catch {};
+    }
+
+    /// Process a RELAY_2 inner payload: parse Type 4, find session, decrypt.
+    /// The inner_payload points into pkt.out_buf, so we copy ciphertext to
+    /// pkt.data (already consumed) before decrypting back into pkt.out_buf.
+    fn processRelayedPacket(self: *Self, pkt: *Packet, src_key: *const [32]u8, inner_payload: []const u8) void {
+        // Parse the inner Type 4 transport message
+        const inner_msg = message.parseTransportMessage(inner_payload) catch {
+            pkt.err = UdpError.NoData;
+            return;
+        };
+
+        // Find the session by receiver index (our local index for the A-C session)
+        const inner_pk = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.by_index.get(inner_msg.receiver_index) orelse {
+                pkt.err = UdpError.PeerNotFound;
+                return;
+            };
+        };
+
+        const inner_peer = blk: {
+            self.peers_mutex.lock();
+            defer self.peers_mutex.unlock();
+            break :blk self.peers.get(inner_pk.data) orelse {
+                pkt.err = UdpError.PeerNotFound;
+                return;
+            };
+        };
+
+        const inner_session = inner_peer.session orelse {
+            pkt.err = UdpError.NoData;
+            return;
+        };
+
+        // Copy inner ciphertext to pkt.data (temp buffer).
+        // inner_msg.ciphertext points into pkt.out_buf which we'll overwrite.
+        const ct_len = inner_msg.ciphertext.len;
+        if (ct_len > pkt.data.len) {
+            pkt.err = UdpError.NoData;
+            return;
+        }
+        @memcpy(pkt.data[0..ct_len], inner_msg.ciphertext);
+
+        // Decrypt into pkt.out_buf
+        const inner_pt_len = inner_session.decrypt(pkt.data[0..ct_len], inner_msg.counter, &pkt.out_buf) catch {
+            pkt.err = UdpError.DecryptFailed;
+            return;
+        };
+
+        if (inner_pt_len < 1) {
+            pkt.err = UdpError.NoData;
+            return;
+        }
+
+        // Decode inner protocol + payload
+        const inner_protocol = pkt.out_buf[0];
+        const inner_data = pkt.out_buf[1..inner_pt_len];
+
+        // Fill packet fields
+        pkt.pk = Key{ .data = src_key.* };
+        pkt.protocol = inner_protocol;
+        pkt.payload = inner_data;
+        pkt.payload_len = inner_pt_len - 1;
+        pkt.err = null;
+
+        // Route KCP internally
+        if (inner_protocol == @intFromEnum(message.Protocol.kcp)) {
+            if (inner_peer.mux) |mux| {
+                mux.input(inner_data) catch {};
+            }
+            pkt.err = UdpError.NoData;
+            return;
+        }
     }
 
     // ========================================================================
