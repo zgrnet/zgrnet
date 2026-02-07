@@ -1352,76 +1352,82 @@ test "PacketPool basic" {
 }
 
 test "UDP end-to-end: handshake + send/recv" {
-    const KqueueIO = async_mod.KqueueIO;
-    const UDPImpl = UDP(KqueueIO);
+    const builtin = @import("builtin");
+    const has_kqueue = comptime (builtin.os.tag == .macos or builtin.os.tag == .freebsd or
+        builtin.os.tag == .netbsd or builtin.os.tag == .openbsd);
 
-    const allocator = std.testing.allocator;
+    if (comptime has_kqueue) {
+        const KqueueIO = async_mod.KqueueIO;
+        const UDPImpl = UDP(KqueueIO);
 
-    // Create two keypairs
-    var priv1: [32]u8 = undefined;
-    var priv2: [32]u8 = undefined;
-    @memset(&priv1, 0);
-    @memset(&priv2, 0);
-    priv1[31] = 1;
-    priv2[31] = 2;
-    const kp1 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv1));
-    const kp2 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv2));
+        const allocator = std.testing.allocator;
 
-    // Create two UDP instances on random ports
-    const udp1 = try UDPImpl.init(allocator, &kp1, .{
-        .bind_addr = "127.0.0.1:0",
-        .allow_unknown = true,
-        .decrypt_workers = 1,
-    });
-    defer udp1.deinit();
+        // Create two keypairs
+        var priv1: [32]u8 = undefined;
+        var priv2: [32]u8 = undefined;
+        @memset(&priv1, 0);
+        @memset(&priv2, 0);
+        priv1[31] = 1;
+        priv2[31] = 2;
+        const kp1 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv1));
+        const kp2 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv2));
 
-    const udp2 = try UDPImpl.init(allocator, &kp2, .{
-        .bind_addr = "127.0.0.1:0",
-        .allow_unknown = true,
-        .decrypt_workers = 1,
-    });
-    defer udp2.deinit();
+        // Create two UDP instances on random ports
+        const udp1 = try UDPImpl.init(allocator, &kp1, .{
+            .bind_addr = "127.0.0.1:0",
+            .allow_unknown = true,
+            .decrypt_workers = 1,
+        });
+        defer udp1.deinit();
 
-    const port1 = udp1.getLocalPort();
-    const port2 = udp2.getLocalPort();
+        const udp2 = try UDPImpl.init(allocator, &kp2, .{
+            .bind_addr = "127.0.0.1:0",
+            .allow_unknown = true,
+            .decrypt_workers = 1,
+        });
+        defer udp2.deinit();
 
-    // Set peer endpoints
-    var ep1: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = mem.nativeToBig(u16, port1),
-        .addr = mem.nativeToBig(u32, 0x7F000001),
-    };
-    var ep2: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = mem.nativeToBig(u16, port2),
-        .addr = mem.nativeToBig(u32, 0x7F000001),
-    };
+        const port1 = udp1.getLocalPort();
+        const port2 = udp2.getLocalPort();
 
-    udp1.setPeerEndpoint(kp2.public, @as(*posix.sockaddr, @ptrCast(&ep2)).*, @sizeOf(posix.sockaddr.in));
-    udp2.setPeerEndpoint(kp1.public, @as(*posix.sockaddr, @ptrCast(&ep1)).*, @sizeOf(posix.sockaddr.in));
+        // Set peer endpoints
+        var ep1: posix.sockaddr.in = .{
+            .family = posix.AF.INET,
+            .port = mem.nativeToBig(u16, port1),
+            .addr = mem.nativeToBig(u32, 0x7F000001),
+        };
+        var ep2: posix.sockaddr.in = .{
+            .family = posix.AF.INET,
+            .port = mem.nativeToBig(u16, port2),
+            .addr = mem.nativeToBig(u32, 0x7F000001),
+        };
 
-    // Handshake: udp1 connects to udp2
-    try udp1.connect(&kp2.public);
+        udp1.setPeerEndpoint(kp2.public, @as(*posix.sockaddr, @ptrCast(&ep2)).*, @sizeOf(posix.sockaddr.in));
+        udp2.setPeerEndpoint(kp1.public, @as(*posix.sockaddr, @ptrCast(&ep1)).*, @sizeOf(posix.sockaddr.in));
 
-    // Send a message from udp1 to udp2
-    const msg = "hello from udp1";
-    try udp1.writeTo(&kp2.public, msg);
+        // Handshake: udp1 connects to udp2
+        try udp1.connect(&kp2.public);
 
-    // Read on udp2
-    var buf: [256]u8 = undefined;
-    const result = try udp2.readFrom(&buf);
-    try std.testing.expectEqual(msg.len, result.n);
-    try std.testing.expectEqualSlices(u8, msg, buf[0..result.n]);
-    try std.testing.expectEqualSlices(u8, &kp1.public.data, &result.pk.data);
+        // Send a message from udp1 to udp2
+        const msg = "hello from udp1";
+        try udp1.writeTo(&kp2.public, msg);
 
-    // Send reply from udp2 to udp1
-    const reply = "hello back from udp2";
-    try udp2.writeTo(&kp1.public, reply);
+        // Read on udp2
+        var buf: [256]u8 = undefined;
+        const result = try udp2.readFrom(&buf);
+        try std.testing.expectEqual(msg.len, result.n);
+        try std.testing.expectEqualSlices(u8, msg, buf[0..result.n]);
+        try std.testing.expectEqualSlices(u8, &kp1.public.data, &result.pk.data);
 
-    // Read on udp1
-    const result2 = try udp1.readFrom(&buf);
-    try std.testing.expectEqual(reply.len, result2.n);
-    try std.testing.expectEqualSlices(u8, reply, buf[0..result2.n]);
+        // Send reply from udp2 to udp1
+        const reply = "hello back from udp2";
+        try udp2.writeTo(&kp1.public, reply);
+
+        // Read on udp1
+        const result2 = try udp1.readFrom(&buf);
+        try std.testing.expectEqual(reply.len, result2.n);
+        try std.testing.expectEqualSlices(u8, reply, buf[0..result2.n]);
+    }
 }
 
 test "Channel with Packet pointers" {
