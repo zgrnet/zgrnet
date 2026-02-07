@@ -1,0 +1,29 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "host",
+    srcs = [
+        "host.go",
+        "ipalloc.go",
+        "packet.go",
+    ],
+    importpath = "github.com/vibing/zgrnet/pkg/host",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go:noise",
+        "//go/pkg/net",
+    ],
+)
+
+go_test(
+    name = "host_test",
+    srcs = [
+        "host_test.go",
+        "ipalloc_test.go",
+        "packet_test.go",
+    ],
+    embed = [":host"],
+    deps = [
+        "//go:noise",
+    ],
+)

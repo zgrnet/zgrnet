@@ -545,9 +545,17 @@ func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 // It handles handshakes internally and only returns transport data.
 // Returns the sender's public key, number of bytes, and any error.
 func (u *UDP) ReadFrom(buf []byte) (pk noise.PublicKey, n int, err error) {
+	pk, _, n, err = u.ReadPacket(buf)
+	return
+}
+
+// ReadPacket reads the next decrypted message from any peer, including the protocol byte.
+// Unlike ReadFrom, this also returns the protocol byte from the encrypted payload.
+// Returns the sender's public key, protocol byte, number of bytes, and any error.
+func (u *UDP) ReadPacket(buf []byte) (pk noise.PublicKey, proto byte, n int, err error) {
 	for {
 		if u.closed.Load() {
-			return pk, 0, ErrClosed
+			return pk, 0, 0, ErrClosed
 		}
 
 		// Get next packet from output queue
@@ -555,11 +563,11 @@ func (u *UDP) ReadFrom(buf []byte) (pk noise.PublicKey, n int, err error) {
 		select {
 		case p, ok := <-u.outputChan:
 			if !ok {
-				return pk, 0, ErrClosed
+				return pk, 0, 0, ErrClosed
 			}
 			pkt = p
 		case <-u.closeChan:
-			return pk, 0, ErrClosed
+			return pk, 0, 0, ErrClosed
 		}
 
 		// Wait for decryption to complete
@@ -570,7 +578,7 @@ func (u *UDP) ReadFrom(buf []byte) (pk noise.PublicKey, n int, err error) {
 			// Still need to wait for decryption to complete before releasing
 			<-pkt.ready
 			releasePacket(pkt)
-			return pk, 0, ErrClosed
+			return pk, 0, 0, ErrClosed
 		}
 
 		// Check for errors (handshake, KCP routed internally, etc.)
@@ -582,8 +590,9 @@ func (u *UDP) ReadFrom(buf []byte) (pk noise.PublicKey, n int, err error) {
 		// Copy decrypted data to caller's buffer
 		n = copy(buf, pkt.payload[:pkt.payloadN])
 		pk = pkt.pk
+		proto = pkt.protocol
 		releasePacket(pkt)
-		return pk, n, nil
+		return pk, proto, n, nil
 	}
 }
 
