@@ -10,7 +10,8 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 # =============================================================================
 
 # KCP patched C sources (platform-independent)
-_KCP_C_SRCS = ["//third_party/kcp:srcs"]
+# ikcp.h is vendored at src/kcp/ for @cImport resolution (same as upstream, unpatched)
+_KCP_C_SRCS = ["//third_party/kcp:srcs", "src/kcp/ikcp.h"]
 
 # ChaCha20-Poly1305 ASM backend (platform-specific)
 _CHACHA20_C_SRCS = select({
@@ -21,10 +22,14 @@ _CHACHA20_C_SRCS = select({
     "//conditions:default": [],
 })
 
+# Only use the no-CFI version (Zig's linker doesn't support CFI directives)
 _CHACHA20_ASM_SRCS = select({
-    "@platforms//cpu:aarch64": glob(["src/noise/chacha20_poly1305/aarch64/*.S"]),
+    "@platforms//cpu:aarch64": ["src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"],
     "//conditions:default": [],
 })
+
+# Include paths for @cImport: KCP header + ChaCha20 headers
+_KCP_C_INCLUDES = ["src/kcp"]
 
 _CHACHA20_C_INCLUDES = select({
     "@platforms//cpu:aarch64": ["src/noise/chacha20_poly1305/aarch64"],
@@ -80,7 +85,7 @@ zig_library(
     deps = [":build_options"],
     c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
     asm_srcs = _CHACHA20_ASM_SRCS,
-    c_includes = _CHACHA20_C_INCLUDES,
+    c_includes = _KCP_C_INCLUDES + _CHACHA20_C_INCLUDES,
     c_flags = _C_FLAGS,
     link_libc = True,
     visibility = ["//visibility:public"],
@@ -95,7 +100,7 @@ zig_test(
     deps = [":build_options"],
     c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
     asm_srcs = _CHACHA20_ASM_SRCS,
-    c_includes = _CHACHA20_C_INCLUDES,
+    c_includes = _KCP_C_INCLUDES + _CHACHA20_C_INCLUDES,
     c_flags = _C_FLAGS,
     link_libc = True,
 )
@@ -150,47 +155,12 @@ cc_library(
 # Example binaries (macOS only — use KqueueIO backend)
 # =============================================================================
 
-# KCP interop test binary (source in examples/kcp_test/zig/)
-zig_binary(
-    name = "kcp_test",
-    main = "//examples/kcp_test/zig:src/main.zig",
-    srcs = ["//examples/kcp_test/zig:src/main.zig"],
-    deps = [":noise"],
-    c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
-    asm_srcs = _CHACHA20_ASM_SRCS,
-    c_includes = _CHACHA20_C_INCLUDES,
-    c_flags = _C_FLAGS,
-    link_libc = True,
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)
-
-# Stream throughput test binary (source in examples/stream_test/zig/)
-zig_binary(
-    name = "stream_test",
-    main = "//examples/stream_test/zig:src/main.zig",
-    srcs = ["//examples/stream_test/zig:src/main.zig"],
-    deps = [":noise"],
-    c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
-    asm_srcs = _CHACHA20_ASM_SRCS,
-    c_includes = _CHACHA20_C_INCLUDES,
-    c_flags = _C_FLAGS,
-    link_libc = True,
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)
-
-# Proxy interop test binary (source in examples/proxy_test/zig/)
-zig_binary(
-    name = "proxy_test",
-    main = "//examples/proxy_test/zig:src/main.zig",
-    srcs = ["//examples/proxy_test/zig:src/main.zig"],
-    deps = [":noise"],
-    c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
-    asm_srcs = _CHACHA20_ASM_SRCS,
-    c_includes = _CHACHA20_C_INCLUDES,
-    c_flags = _C_FLAGS,
-    link_libc = True,
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)
+# =============================================================================
+# Example binaries
+#
+# TODO: Zig's multi-module CLI scopes @cImport include paths per-module.
+# The noise dep uses @cImport("ikcp.h") which needs -I, but -I flags don't
+# propagate to dep modules in zig build-exe. Once embed-zig supports
+# per-module include paths in zig_binary, these can use deps=[":noise"].
+# For now, use `zig build` from zig/ directory for example binaries.
+# =============================================================================

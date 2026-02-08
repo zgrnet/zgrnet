@@ -41,7 +41,7 @@ use_repo(
 bazel_dep(name = "embed_zig", version = "0.1.0")
 local_path_override(
     module_name = "embed_zig",
-    path = "../embed-zig/main",
+    path = "../../embed-zig/main",
 )
 
 # KCP library (skywind3000/kcp)
