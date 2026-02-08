@@ -1,9 +1,10 @@
-# Zig source files for KCP interop test
-exports_files(glob(["src/**/*.zig"]))
+load("@embed_zig//bazel/zig:defs.bzl", "zig_binary")
 
-# KCP interop test binary (built from //zig with all C/ASM deps)
-alias(
+zig_binary(
     name = "kcp_test",
-    actual = "//zig:kcp_test",
+    main = "src/main.zig",
+    srcs = ["src/main.zig"],
+    deps = ["//zig:noise"],
+    target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
 )

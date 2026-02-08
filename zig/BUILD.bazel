@@ -151,36 +151,3 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# =============================================================================
-# Example binaries (macOS only — use KqueueIO backend)
-# =============================================================================
-
-# KCP interop test binary (source in examples/kcp_test/zig/)
-zig_binary(
-    name = "kcp_test",
-    main = "//examples/kcp_test/zig:src/main.zig",
-    srcs = ["//examples/kcp_test/zig:src/main.zig"],
-    deps = [":noise"],
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)
-
-# Stream throughput test binary (source in examples/stream_test/zig/)
-zig_binary(
-    name = "stream_test",
-    main = "//examples/stream_test/zig:src/main.zig",
-    srcs = ["//examples/stream_test/zig:src/main.zig"],
-    deps = [":noise"],
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)
-
-# Proxy interop test binary (source in examples/proxy_test/zig/)
-zig_binary(
-    name = "proxy_test",
-    main = "//examples/proxy_test/zig:src/main.zig",
-    srcs = ["//examples/proxy_test/zig:src/main.zig"],
-    deps = [":noise"],
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)
