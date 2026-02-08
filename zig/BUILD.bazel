@@ -1,12 +1,8 @@
-load("@embed_zig//bazel/zig:defs.bzl", "zig_binary", "zig_library", "zig_static_library", "zig_test")
+load("@embed_zig//bazel/zig:defs.bzl", "zig_library", "zig_package", "zig_static_library")
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 # =============================================================================
-# Common C/ASM configuration
-#
-# Shared between noise library and example binaries. Binaries need C/ASM too
-# because zig build-exe must see all compilation inputs for linking (extern fn
-# symbols from C objects are resolved at link time).
+# C/ASM configuration for noise library
 # =============================================================================
 
 # KCP patched C sources (platform-independent)
@@ -77,26 +73,10 @@ zig_library(
 # Main noise library + tests
 # =============================================================================
 
-zig_library(
+# Creates :noise (zig_library) + :noise_test (zig_test)
+zig_package(
     name = "noise",
     main = "src/noise.zig",
-    srcs = glob(["src/**/*.zig"]),
-    module_name = "noise",
-    deps = [":build_options"],
-    c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
-    asm_srcs = _CHACHA20_ASM_SRCS,
-    c_includes = _KCP_C_INCLUDES + _CHACHA20_C_INCLUDES,
-    c_flags = _C_FLAGS,
-    link_libc = True,
-    visibility = ["//visibility:public"],
-)
-
-# Noise library unit tests — real Bazel test target (replaces zig_run + "test")
-zig_test(
-    name = "noise_test",
-    main = "src/noise.zig",
-    srcs = glob(["src/**/*.zig"]),
-    module_name = "noise",
     deps = [":build_options"],
     c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
     asm_srcs = _CHACHA20_ASM_SRCS,
