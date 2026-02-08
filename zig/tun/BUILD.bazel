@@ -21,6 +21,7 @@ zig_library(
 zig_static_library(
     name = "static_lib",
     lib = ":zig",
+    pic = True,  # Required for linking into Go CGo / Rust on Linux
     visibility = ["//visibility:public"],
 )
 
