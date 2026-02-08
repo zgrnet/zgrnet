@@ -22,14 +22,14 @@ import (
 //
 // If dial is nil, DefaultDial is used. If policy is nil, all addresses allowed.
 func HandleTCPProxy(stream io.ReadWriteCloser, metadata []byte, dial DialFunc, policy Policy) error {
+	defer stream.Close()
+
 	addr, _, err := noise.DecodeAddress(metadata)
 	if err != nil {
-		stream.Close()
 		return err
 	}
 
 	if !checkPolicy(policy, addr) {
-		stream.Close()
 		return ErrPolicyDenied
 	}
 
@@ -39,7 +39,6 @@ func HandleTCPProxy(stream io.ReadWriteCloser, metadata []byte, dial DialFunc, p
 
 	remote, err := dial(addr)
 	if err != nil {
-		stream.Close()
 		return err
 	}
 	defer remote.Close()
