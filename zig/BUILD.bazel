@@ -155,12 +155,32 @@ cc_library(
 # Example binaries (macOS only — use KqueueIO backend)
 # =============================================================================
 
-# =============================================================================
-# Example binaries
-#
-# TODO: Zig's multi-module CLI scopes @cImport include paths per-module.
-# The noise dep uses @cImport("ikcp.h") which needs -I, but -I flags don't
-# propagate to dep modules in zig build-exe. Once embed-zig supports
-# per-module include paths in zig_binary, these can use deps=[":noise"].
-# For now, use `zig build` from zig/ directory for example binaries.
-# =============================================================================
+# KCP interop test binary (source in examples/kcp_test/zig/)
+zig_binary(
+    name = "kcp_test",
+    main = "//examples/kcp_test/zig:src/main.zig",
+    srcs = ["//examples/kcp_test/zig:src/main.zig"],
+    deps = [":noise"],
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//visibility:public"],
+)
+
+# Stream throughput test binary (source in examples/stream_test/zig/)
+zig_binary(
+    name = "stream_test",
+    main = "//examples/stream_test/zig:src/main.zig",
+    srcs = ["//examples/stream_test/zig:src/main.zig"],
+    deps = [":noise"],
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//visibility:public"],
+)
+
+# Proxy interop test binary (source in examples/proxy_test/zig/)
+zig_binary(
+    name = "proxy_test",
+    main = "//examples/proxy_test/zig:src/main.zig",
+    srcs = ["//examples/proxy_test/zig:src/main.zig"],
+    deps = [":noise"],
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//visibility:public"],
+)
