@@ -39,10 +39,15 @@ use_repo(
 
 # embed-zig: Bazel-native Zig build rules + Zig toolchain
 bazel_dep(name = "embed_zig", version = "0.1.0")
-local_path_override(
+git_override(
     module_name = "embed_zig",
-    path = "../../embed-zig/main",
+    remote = "git@github.com:haivivi/embed-zig.git",
+    commit = "e988a88",
 )
+
+# Zig toolchain (provided by embed-zig, needed by //third_party/kcp for zig cc)
+zig_toolchain = use_extension("@embed_zig//:extensions.bzl", "zig_toolchain")
+use_repo(zig_toolchain, "zig_toolchain")
 
 # KCP library (skywind3000/kcp)
 kcp_lib = use_extension("//:extensions.bzl", "kcp_lib")

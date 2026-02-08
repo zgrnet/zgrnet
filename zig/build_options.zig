@@ -22,12 +22,13 @@ pub const Backend = enum {
 
 /// Auto-detected backend based on target architecture.
 /// - ARM64: BoringSSL assembly
-/// - x86_64 Linux: AVX2/SSE4.1 assembly
 /// - Other: Pure Zig std.crypto
+///
+/// Note: x86_64 ASM backend exists but is not yet wired into Bazel's
+/// select() for C/ASM sources. When added, change the x86_64 linux
+/// case below from native_zig to x86_64_asm.
 pub const backend: Backend = if (builtin.cpu.arch == .aarch64)
     .aarch64_asm
-else if (builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux)
-    .x86_64_asm
 else
     .native_zig;
 

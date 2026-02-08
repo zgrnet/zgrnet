@@ -245,7 +245,7 @@
     "@@embed_zig+//:extensions.bzl%zig_toolchain": {
       "general": {
         "bzlTransitiveDigest": "am/6RpXT6UCmEHOyA7ql7eLPWpPFqwNiq6bJVoPstPs=",
-        "usagesDigest": "fSY/EgT3zxTsZoxdWd7jCVmtZ0mk/YMmQYq7KpSNtQU=",
+        "usagesDigest": "gBsBFgUU5pR1rUVOK+35HpNZpHL3VDdKmmo5NYDKUwU=",
         "recordedInputs": [],
         "generatedRepoSpecs": {
           "zig_toolchain": {
