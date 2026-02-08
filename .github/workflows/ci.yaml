@@ -302,6 +302,7 @@ jobs:
 
   # DNS integration test (requires elevated privileges)
   # Tests Magic DNS server + OS resolver integration
+  # Pure Go — no dig dependency, works on all platforms
   dns-test:
     needs: affected
     if: needs.affected.outputs.has_dns == 'true'
@@ -310,6 +311,7 @@ jobs:
         include:
           - os: ubuntu-latest
           - os: macos-latest
+          - os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -319,16 +321,19 @@ jobs:
           go-version: '1.23'
           cache-dependency-path: go/go.sum
 
-      - name: Install dig (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y dnsutils
-
       - name: Build DNS test
+        shell: bash
         working-directory: go
         run: go build -o ../dns_test ../examples/dns_test/go/main.go
 
-      - name: Run DNS test
+      - name: Run DNS test (Unix)
+        if: runner.os != 'Windows'
         run: sudo ./dns_test
+
+      - name: Run DNS test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: ./dns_test.exe
 
   # Format check
   format:
