@@ -195,7 +195,12 @@ pub const FakeIPPool = struct {
     fn touchLRU(self: *Self, domain: []const u8) void {
         if (self.domain_gen.getPtr(domain)) |gen_ptr| {
             gen_ptr.* += 1;
-            self.lru_queue.pushBack(.{ .domain = domain, .gen = gen_ptr.* }) catch {};
+            self.lru_queue.pushBack(.{ .domain = domain, .gen = gen_ptr.* }) catch {
+                // Rollback gen increment on OOM. Without the queue entry,
+                // all existing entries become stale and evictLRU would skip
+                // this domain forever, causing pool to exceed max_size.
+                gen_ptr.* -= 1;
+            };
         }
     }
 
