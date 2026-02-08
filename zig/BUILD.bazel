@@ -1,5 +1,5 @@
-load("@embed_zig//bazel/zig:defs.bzl", "zig_library", "zig_package", "zig_static_library")
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@embed_zig//bazel/zig:defs.bzl", "zig_library", "zig_package")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
 
 # =============================================================================
 # C/ASM configuration for noise library
@@ -86,48 +86,11 @@ zig_package(
 )
 
 # =============================================================================
-# TUN static library (for Go CGo and Rust FFI)
+# TUN sources exported for //zig/tun package
 # =============================================================================
 
-filegroup(
-    name = "tun_header",
-    srcs = ["include/tun.h"],
-    visibility = ["//visibility:public"],
-)
-
-# TUN Zig library (compiled from cabi.zig, separate from noise)
-zig_library(
-    name = "tun_zig",
-    main = "src/tun/cabi.zig",
-    srcs = glob(["src/tun/**/*.zig"]),
-    module_name = "tun_cabi",
-    deps = [":tun_build_options"],
-)
-
-# TUN static library (.a) for Go/Rust FFI
-zig_static_library(
-    name = "tun_static",
-    lib = ":tun_zig",
-    visibility = ["//visibility:public"],
-)
-
-# TUN cc_library with headers and linkopts for Go CGo and Rust FFI
-cc_library(
-    name = "tun_lib",
-    srcs = [":tun_static"],
-    hdrs = ["include/tun.h"],
-    includes = ["include"],
-    linkopts = select({
-        "@platforms//os:macos": [
-            "-framework CoreFoundation",
-            "-framework SystemConfiguration",
-        ],
-        "@platforms//os:linux": [],
-        "@platforms//os:windows": [
-            "-lws2_32",
-            "-liphlpapi",
-        ],
-    }),
-    visibility = ["//visibility:public"],
+exports_files(
+    glob(["src/tun/**/*.zig"]) + ["include/tun.h"],
+    visibility = ["//zig/tun:__pkg__"],
 )
 
