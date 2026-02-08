@@ -324,7 +324,12 @@ jobs:
       - name: Build DNS test
         shell: bash
         working-directory: go
-        run: go build -o ../dns_test ../examples/dns_test/go/main.go
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            go build -o ../dns_test.exe ../examples/dns_test/go/main.go
+          else
+            go build -o ../dns_test ../examples/dns_test/go/main.go
+          fi
 
       - name: Run DNS test (Unix)
         if: runner.os != 'Windows'
@@ -332,7 +337,6 @@ jobs:
 
       - name: Run DNS test (Windows)
         if: runner.os == 'Windows'
-        shell: bash
         run: ./dns_test.exe
 
   # Format check
