@@ -1,13 +1,6 @@
 # Zig throughput test
-# Usage: bazel run //examples/throughput/zig:run
-
-load("//bazel/zig:defs.bzl", "zig_run")
+# Note: Previously used zig_run (build.zig based). Now just exports the source
+# file for the //zig:noise library's build.zig to reference in local dev.
+# For Bazel, a proper zig_binary target can be added here when needed.
 
 exports_files(["main.zig"])
-
-zig_run(
-    name = "run",
-    srcs = glob(["**/*"]) + ["//zig:srcs"],
-    build_args = ["throughput", "-Doptimize=ReleaseFast"],
-    zig_root = "zig",
-)

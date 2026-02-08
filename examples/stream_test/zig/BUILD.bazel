@@ -1,17 +1,10 @@
-# Zig source files for this example
-filegroup(
-    name = "srcs",
-    srcs = glob([
-        "src/**/*.zig",
-    ]),
-    visibility = ["//visibility:public"],
-)
+load("@embed_zig//bazel/zig:defs.bzl", "zig_binary")
 
-# Stream throughput test binary
-# Built from main zig/ directory (due to C dependency complexity)
-# Usage: bazel build //examples/stream_test/zig:stream_test
-alias(
+zig_binary(
     name = "stream_test",
-    actual = "//zig:stream_test",
+    main = "src/main.zig",
+    srcs = ["src/main.zig"],
+    deps = ["//zig:noise"],
+    target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
 )

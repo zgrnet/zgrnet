@@ -1,3 +1,10 @@
+// build.zig — For local development only (zig build / zig build test).
+//
+// Bazel builds use BUILD.bazel with embed-zig's Bazel-native rules
+// (@embed_zig//bazel/zig:defs.bzl) and do NOT depend on this file.
+// Build options are provided by build_options.zig and tun_build_options.zig
+// as separate zig_library modules.
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {

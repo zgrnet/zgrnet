@@ -1,1 +1,2 @@
-exports_files(["defs.bzl"])
+# Zig build rules are now provided by embed-zig (@embed_zig//bazel/zig:defs.bzl).
+# This directory is kept for organizational purposes only.

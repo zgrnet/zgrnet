@@ -1,17 +1,10 @@
-# Zig source files for this example
-filegroup(
-    name = "srcs",
-    srcs = glob([
-        "src/**/*.zig",
-    ]),
-    visibility = ["//visibility:public"],
-)
+load("@embed_zig//bazel/zig:defs.bzl", "zig_binary")
 
-# KCP interop test binary
-# Built from main zig/ directory (due to C dependency complexity)
-# Usage: bazel build //examples/kcp_test/zig:kcp_test
-alias(
+zig_binary(
     name = "kcp_test",
-    actual = "//zig:kcp_test",
+    main = "src/main.zig",
+    srcs = ["src/main.zig"],
+    deps = ["//zig:noise"],
+    target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
 )

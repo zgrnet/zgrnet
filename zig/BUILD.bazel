@@ -1,123 +1,96 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
-load("//bazel/zig:defs.bzl", "zig_binary", "zig_library", "zig_run")
+load("@embed_zig//bazel/zig:defs.bzl", "zig_library", "zig_package")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
 
-# BoringSSL benchmark (C)
+# =============================================================================
+# C/ASM configuration for noise library
+# =============================================================================
+
+# KCP patched C sources (platform-independent)
+# ikcp.h is vendored at src/kcp/ for @cImport resolution (same as upstream, unpatched)
+_KCP_C_SRCS = ["//third_party/kcp:srcs", "src/kcp/ikcp.h"]
+
+# ChaCha20-Poly1305 ASM backend (platform-specific)
+_CHACHA20_C_SRCS = select({
+    "@platforms//cpu:aarch64": glob([
+        "src/noise/chacha20_poly1305/aarch64/*.c",
+        "src/noise/chacha20_poly1305/aarch64/*.h",
+    ]),
+    "//conditions:default": [],
+})
+
+# Only use the no-CFI version (Zig's linker doesn't support CFI directives)
+_CHACHA20_ASM_SRCS = select({
+    "@platforms//cpu:aarch64": ["src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"],
+    "//conditions:default": [],
+})
+
+# Include paths for @cImport: KCP header + ChaCha20 headers
+_KCP_C_INCLUDES = ["src/kcp"]
+
+_CHACHA20_C_INCLUDES = select({
+    "@platforms//cpu:aarch64": ["src/noise/chacha20_poly1305/aarch64"],
+    "//conditions:default": [],
+})
+
+# Shared C flags: -O3 for performance, -fno-sanitize=undefined for KCP
+# (KCP uses ((TYPE*)0)->member offsetof which triggers zig cc's UB sanitizer)
+_C_FLAGS = ["-O3", "-DNDEBUG", "-fno-sanitize=undefined"]
+
+# =============================================================================
+# BoringSSL benchmark (C, unchanged)
+# =============================================================================
+
 cc_binary(
     name = "bench_boringssl_c",
     srcs = ["bench_boringssl.c"],
-    deps = ["@boringssl//:crypto"],
     copts = ["-O3"],
+    deps = ["@boringssl//:crypto"],
 )
 
-# Zig library source files (for examples to depend on)
-filegroup(
-    name = "srcs",
-    srcs = glob([
-        "src/**/*.zig",
-        "src/**/*.S",
-        "src/**/*.c",
-        "src/**/*.h",
-        "include/**/*.h",  # C headers for TUN library
-        "examples/**/*.zig",  # host_test.zig remains
-    ]) + [
-        "build.zig",
-        "build.zig.zon",
-        "//examples/throughput/zig:main.zig",
-        "//examples/kcp_test/zig:srcs",
-        "//examples/stream_test/zig:srcs",
-        "//examples/proxy_test/zig:srcs",
-    ],
-    visibility = ["//visibility:public"],
-)
+# =============================================================================
+# Build options modules (replace build.zig addOptions)
+# =============================================================================
 
-# TUN C header for Go/Rust bindings
-filegroup(
-    name = "tun_header",
-    srcs = ["include/tun.h"],
-    visibility = ["//visibility:public"],
-)
-
-# TUN static library (built hermetically via zig_library rule)
-# This builds libtun.a/tun.lib from Zig source within Bazel
+# Cipher backend auto-detection (provides @import("build_options"))
 zig_library(
-    name = "tun_static",
-    srcs = [":srcs"],
-    lib_name = "tun",
-    zig_root = "zig",
+    name = "build_options",
+    main = "build_options.zig",
+    srcs = ["build_options.zig"],
+    module_name = "build_options",
     visibility = ["//visibility:public"],
 )
 
-# TUN library with headers and linkopts for Go CGo and Rust FFI
-cc_library(
-    name = "tun_lib",
-    srcs = [":tun_static"],
-    hdrs = ["include/tun.h"],
-    includes = ["include"],
-    linkopts = select({
-        "@platforms//os:macos": [
-            "-framework CoreFoundation",
-            "-framework SystemConfiguration",
-        ],
-        "@platforms//os:linux": [],
-        "@platforms//os:windows": [
-            "-lws2_32",
-            "-liphlpapi",
-        ],
-    }),
+# TUN build options (provides @import("tun_build_options"))
+zig_library(
+    name = "tun_build_options",
+    main = "tun_build_options.zig",
+    srcs = ["tun_build_options.zig"],
+    module_name = "tun_build_options",
     visibility = ["//visibility:public"],
 )
 
-# Zig test
-# Usage: bazel run //zig:test
-zig_run(
-    name = "test",
-    srcs = [":srcs"],
-    build_args = ["test"],
-    zig_root = "zig",
+# =============================================================================
+# Main noise library + tests
+# =============================================================================
+
+# Creates :noise (zig_library) + :noise_test (zig_test)
+zig_package(
+    name = "noise",
+    main = "src/noise.zig",
+    deps = [":build_options"],
+    c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
+    asm_srcs = _CHACHA20_ASM_SRCS,
+    c_includes = _KCP_C_INCLUDES + _CHACHA20_C_INCLUDES,
+    c_flags = _C_FLAGS,
+    link_libc = True,
 )
 
-# TUN test (requires root/admin privileges)
-# Usage: sudo bazel run //zig:tun_test
-zig_run(
-    name = "tun_test",
-    srcs = [":srcs"],
-    build_args = ["test-tun"],
-    zig_root = "zig",
-    tags = ["requires-root"],
+# =============================================================================
+# TUN sources exported for //zig/tun package
+# =============================================================================
+
+exports_files(
+    glob(["src/tun/**/*.zig"]) + ["include/tun.h"],
+    visibility = ["//zig/tun:__pkg__"],
 )
 
-# KCP test binary (source in examples/kcp_test/zig/)
-# Requires kqueue (macOS/BSD) — UDP examples use KqueueIO backend.
-# Usage: bazel build //zig:kcp_test
-zig_binary(
-    name = "kcp_test",
-    srcs = [":srcs"],
-    binary_name = "kcp_test",
-    zig_root = "zig",
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)
-
-# Stream test binary (source in examples/stream_test/zig/)
-# Requires kqueue (macOS/BSD) — UDP examples use KqueueIO backend.
-# Usage: bazel build //zig:stream_test
-zig_binary(
-    name = "stream_test",
-    srcs = [":srcs"],
-    binary_name = "stream_test",
-    zig_root = "zig",
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)
-
-# Proxy test binary (source in examples/proxy_test/zig/)
-# Requires kqueue (macOS/BSD) — UDP examples use KqueueIO backend.
-# Usage: bazel build //zig:proxy_test
-zig_binary(
-    name = "proxy_test",
-    srcs = [":srcs"],
-    binary_name = "proxy_test",
-    zig_root = "zig",
-    target_compatible_with = ["@platforms//os:macos"],
-    visibility = ["//visibility:public"],
-)

@@ -26,14 +26,14 @@ rust_library(
     edition = "2021",
     crate_features = ["tun"],
     visibility = ["//visibility:public"],
-    deps = all_crate_deps() + ["//third_party/kcp", "//zig:tun_lib"],
+    deps = all_crate_deps() + ["//third_party/kcp", "//zig/tun:lib"],
 )
 
 # TUN-specific tests (requires root/admin privileges)
 rust_test(
     name = "tun_test",
     crate = ":zgrnet_tun",
-    deps = all_crate_deps(normal_dev = True) + ["//third_party/kcp", "//zig:tun_lib"],
+    deps = all_crate_deps(normal_dev = True) + ["//third_party/kcp", "//zig/tun:lib"],
     env = {"RUST_TEST_THREADS": "1"},
     args = ["tun::"],
     tags = ["requires-root"],

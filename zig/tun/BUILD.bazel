@@ -1,0 +1,46 @@
+load("@embed_zig//bazel/zig:defs.bzl", "zig_library", "zig_static_library")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# TUN Zig library (compiled from cabi.zig)
+zig_library(
+    name = "zig",
+    main = "//zig:src/tun/cabi.zig",
+    srcs = [
+        "//zig:src/tun/cabi.zig",
+        "//zig:src/tun/darwin.zig",
+        "//zig:src/tun/linux.zig",
+        "//zig:src/tun/mod.zig",
+        "//zig:src/tun/testing.zig",
+        "//zig:src/tun/windows.zig",
+    ],
+    module_name = "tun_cabi",
+    deps = ["//zig:tun_build_options"],
+)
+
+# TUN static library (.a) for Go/Rust FFI
+zig_static_library(
+    name = "static_lib",
+    lib = ":zig",
+    pic = True,  # Required for linking into Go CGo / Rust on Linux
+    visibility = ["//visibility:public"],
+)
+
+# TUN cc_library with headers and linkopts for Go CGo and Rust FFI
+cc_library(
+    name = "lib",
+    srcs = [":static_lib"],
+    hdrs = ["//zig:include/tun.h"],
+    includes = ["../include"],
+    linkopts = select({
+        "@platforms//os:macos": [
+            "-framework CoreFoundation",
+            "-framework SystemConfiguration",
+        ],
+        "@platforms//os:linux": [],
+        "@platforms//os:windows": [
+            "-lws2_32",
+            "-liphlpapi",
+        ],
+    }),
+    visibility = ["//visibility:public"],
+)
