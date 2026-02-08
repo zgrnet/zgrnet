@@ -322,6 +322,29 @@ pub fn build(b: *std.Build) void {
         }
         const kcp_interop_step = b.step("kcp_test", "Run KCP interop test");
         kcp_interop_step.dependOn(&run_kcp_interop.step);
+
+        // Proxy Interop test (source in examples/proxy_test/zig/)
+        const proxy_test_module = b.createModule(.{
+            .root_source_file = b.path("../examples/proxy_test/zig/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        proxy_test_module.addOptions("build_options", options);
+        proxy_test_module.addImport("noise", lib_module);
+
+        const proxy_test_exe = b.addExecutable(.{
+            .name = "proxy_test",
+            .root_module = proxy_test_module,
+        });
+        proxy_test_exe.linkLibrary(lib);
+        b.installArtifact(proxy_test_exe);
+
+        const run_proxy_test = b.addRunArtifact(proxy_test_exe);
+        if (b.args) |args| {
+            run_proxy_test.addArgs(args);
+        }
+        const proxy_test_step = b.step("proxy_test", "Run proxy interop test");
+        proxy_test_step.dependOn(&run_proxy_test.step);
     }
 
     // ========================================================================

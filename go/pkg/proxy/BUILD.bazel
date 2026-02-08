@@ -1,0 +1,27 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "proxy",
+    srcs = [
+        "handler.go",
+        "policy.go",
+        "socks5.go",
+    ],
+    importpath = "github.com/vibing/zgrnet/pkg/proxy",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go:noise",
+    ],
+)
+
+go_test(
+    name = "proxy_test",
+    srcs = [
+        "handler_test.go",
+        "socks5_test.go",
+    ],
+    embed = [":proxy"],
+    deps = [
+        "//go:noise",
+    ],
+)

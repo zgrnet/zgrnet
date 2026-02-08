@@ -13,6 +13,7 @@ pub const async_mod = @import("async/mod.zig");
 pub const kcp_mod = @import("kcp/mod.zig");
 pub const relay_mod = @import("relay/mod.zig");
 pub const host = @import("host/mod.zig");
+pub const proxy_mod = @import("proxy/mod.zig");
 
 // KCP multiplexing (re-export submodules)
 pub const kcp = kcp_mod.kcp;
@@ -115,4 +116,5 @@ test {
     _ = kcp_mod;
     _ = relay_mod;
     _ = host;
+    _ = proxy_mod;
 }
