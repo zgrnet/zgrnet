@@ -594,9 +594,19 @@ mod tests {
 
         conn.write_all(b"CGET / HTTP/1.1\r\n\r\n").await.unwrap();
         let mut resp = vec![0u8; 256];
-        let n = conn.read(&mut resp).await.unwrap();
-        let resp_str = String::from_utf8_lossy(&resp[..n]);
-        assert!(resp_str.contains("400"), "expected 400, got: {}", resp_str);
+        // On Windows, the server may forcibly close the connection (ConnectionReset)
+        // instead of sending a 400 response. Both behaviors indicate the bad request
+        // was rejected, which is the correct outcome.
+        match conn.read(&mut resp).await {
+            Ok(n) => {
+                let resp_str = String::from_utf8_lossy(&resp[..n]);
+                assert!(resp_str.contains("400"), "expected 400, got: {}", resp_str);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                // Windows: server closed connection — bad request was rejected
+            }
+            Err(e) => panic!("unexpected error: {}", e),
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,22 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "dns",
+    srcs = [
+        "dns.go",
+        "fakeip.go",
+        "server.go",
+    ],
+    importpath = "github.com/vibing/zgrnet/pkg/dns",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "dns_test",
+    srcs = [
+        "dns_test.go",
+        "fakeip_test.go",
+        "server_test.go",
+    ],
+    embed = [":dns"],
+)

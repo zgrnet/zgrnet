@@ -24,6 +24,7 @@ jobs:
       has_rust: ${{ steps.affected.outputs.has_rust }}
       has_zig: ${{ steps.affected.outputs.has_zig }}
       has_tun: ${{ steps.affected.outputs.has_tun }}
+      has_dns: ${{ steps.affected.outputs.has_dns }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +67,7 @@ jobs:
           # Detect TUN-specific changes (requires root privileges to test)
           # Includes host package since its integration test uses real TUN devices
           echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_dns=$(echo "$changed" | grep -qE '^(go/pkg/dns/|rust/src/dns/|zig/src/dns/|zig/src/dnsmgr/|go/pkg/dnsmgr/|rust/src/dnsmgr/|examples/dns_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build and test affected targets with Bazel
   bazel:
@@ -128,7 +130,7 @@ jobs:
     if: needs.affected.outputs.has_go == 'true'
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -139,6 +141,7 @@ jobs:
           cache-dependency-path: go/go.sum
 
       - name: Prepare KCP source
+        shell: bash
         run: |
           # Download KCP 1.7 and apply patches for native Go build
           curl -sL https://github.com/skywind3000/kcp/archive/refs/tags/1.7.tar.gz | tar xz
@@ -151,6 +154,7 @@ jobs:
           cp ikcp.c ikcp.h ../go/pkg/kcp/
 
       - name: Test (excluding TUN)
+        shell: bash
         working-directory: go
         run: |
           # Run tests excluding the tun package (requires root)
@@ -169,7 +173,7 @@ jobs:
     if: needs.affected.outputs.has_rust == 'true'
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -295,6 +299,45 @@ jobs:
           # Uses zgrnet_tun library variant with TUN feature enabled
           bazel build //rust:host_test
           sudo bazel-bin/rust/host_test
+
+  # DNS integration test (requires elevated privileges)
+  # Tests Magic DNS server + OS resolver integration
+  # Pure Go — no dig dependency, works on all platforms
+  dns-test:
+    needs: affected
+    if: needs.affected.outputs.has_dns == 'true'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go/go.sum
+
+      - name: Build DNS test
+        shell: bash
+        working-directory: go
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            go build -o ../dns_test.exe ../examples/dns_test/go/main.go
+          else
+            go build -o ../dns_test ../examples/dns_test/go/main.go
+          fi
+
+      - name: Run DNS test (Unix)
+        if: runner.os != 'Windows'
+        run: sudo ./dns_test
+
+      - name: Run DNS test (Windows)
+        if: runner.os == 'Windows'
+        run: ./dns_test.exe
 
   # Format check
   format:

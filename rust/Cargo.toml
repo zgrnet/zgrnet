@@ -8,7 +8,8 @@ build = "build.rs"
 
 [features]
 default = []
-tun = []  # Enable TUN device support (requires libtun.a from Zig build)
+tun = []     # Enable TUN device support (requires libtun.a from Zig build)
+dnsmgr = []  # Enable DNS manager support (requires libdnsmgr.a from Zig build)
 
 [build-dependencies]
 cc = "1.2"
