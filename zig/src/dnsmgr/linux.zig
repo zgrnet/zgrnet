@@ -42,8 +42,10 @@ fn detectMode() LinuxMode {
         std.heap.page_allocator,
     );
     const term = child.spawnAndWait() catch return .direct;
-    if (term.Exited == 0) return .systemd_resolved;
-    return .direct;
+    return switch (term) {
+        .Exited => |code| if (code == 0) .systemd_resolved else .direct,
+        else => .direct,
+    };
 }
 
 /// Check if platform supports split DNS.
@@ -97,7 +99,10 @@ fn setResolvedDNS(
         std.heap.page_allocator,
     );
     const dns_term = dns_child.spawnAndWait() catch return DnsMgrError.SetFailed;
-    if (dns_term.Exited != 0) return DnsMgrError.SetFailed;
+    switch (dns_term) {
+        .Exited => |code| if (code != 0) return DnsMgrError.SetFailed,
+        else => return DnsMgrError.SetFailed,
+    }
 
     // resolvectl domain <iface> ~domain1 ~domain2 ...
     // Build args: resolvectl domain <iface> ~zigor.net
@@ -124,7 +129,10 @@ fn setResolvedDNS(
         std.heap.page_allocator,
     );
     const domain_term = domain_child.spawnAndWait() catch return DnsMgrError.SetFailed;
-    if (domain_term.Exited != 0) return DnsMgrError.SetFailed;
+    switch (domain_term) {
+        .Exited => |code| if (code != 0) return DnsMgrError.SetFailed,
+        else => return DnsMgrError.SetFailed,
+    }
 }
 
 /// Configure DNS by directly editing /etc/resolv.conf.

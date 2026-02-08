@@ -48,12 +48,11 @@ type ServerConfig struct {
 
 // Server is a Magic DNS server.
 type Server struct {
-	config       ServerConfig
-	conn         *net.UDPConn
-	upstreamConn *net.UDPConn // persistent upstream connection
-	mu           sync.RWMutex
-	closed       bool
-	wg           sync.WaitGroup
+	config ServerConfig
+	conn   *net.UDPConn
+	mu     sync.RWMutex
+	closed bool
+	wg     sync.WaitGroup
 }
 
 // NewServer creates a new DNS server with the given configuration.
@@ -61,28 +60,11 @@ func NewServer(config ServerConfig) *Server {
 	if config.Upstream == "" {
 		config.Upstream = DefaultUpstream
 	}
-	s := &Server{config: config}
-	// Eagerly initialize upstream connection for performance.
-	// Avoids creating a new UDP socket per forwarded query.
-	s.initUpstream()
-	return s
+	return &Server{config: config}
 }
 
 // upstreamTimeout is the maximum time to wait for an upstream DNS response.
 const upstreamTimeout = 5 * time.Second
-
-// initUpstream creates the persistent upstream UDP connection.
-func (s *Server) initUpstream() {
-	upstreamAddr, err := net.ResolveUDPAddr("udp", s.config.Upstream)
-	if err != nil {
-		return // will fall back to per-query connection
-	}
-	conn, err := net.DialUDP("udp", nil, upstreamAddr)
-	if err != nil {
-		return
-	}
-	s.upstreamConn = conn
-}
 
 // ListenAndServe starts the DNS server. Blocks until closed.
 func (s *Server) ListenAndServe() error {
@@ -134,15 +116,10 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	s.closed = true
 	conn := s.conn
-	upConn := s.upstreamConn
-	s.upstreamConn = nil
 	s.mu.Unlock()
 
 	if conn != nil {
 		conn.Close()
-	}
-	if upConn != nil {
-		upConn.Close()
 	}
 	s.wg.Wait()
 	return nil
@@ -284,43 +261,9 @@ func (s *Server) resolveFakeIP(query *Message, name string, qtype uint16) ([]byt
 }
 
 // forwardUpstream forwards a DNS query to the upstream resolver.
-// Uses a persistent UDP connection for performance. Falls back to
-// a per-query connection if the persistent one is unavailable.
+// Each query gets its own UDP socket to avoid response mismatch under
+// concurrency (goroutine A reading goroutine B's response on a shared socket).
 func (s *Server) forwardUpstream(queryData []byte) ([]byte, error) {
-	s.mu.RLock()
-	conn := s.upstreamConn
-	s.mu.RUnlock()
-
-	if conn != nil {
-		return s.forwardVia(conn, queryData)
-	}
-
-	// Fallback: create a one-off connection
-	return s.forwardOnce(queryData)
-}
-
-// forwardVia sends a query through the given connection.
-func (s *Server) forwardVia(conn *net.UDPConn, queryData []byte) ([]byte, error) {
-	// Set read deadline to avoid hanging forever (especially on Windows
-	// where UDP to unreachable ports doesn't fail fast).
-	conn.SetReadDeadline(time.Now().Add(upstreamTimeout))
-
-	_, err := conn.Write(queryData)
-	if err != nil {
-		return nil, fmt.Errorf("dns: write upstream: %w", err)
-	}
-
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, fmt.Errorf("dns: read upstream: %w", err)
-	}
-
-	return buf[:n], nil
-}
-
-// forwardOnce creates a temporary connection for a single query.
-func (s *Server) forwardOnce(queryData []byte) ([]byte, error) {
 	upstreamAddr, err := net.ResolveUDPAddr("udp", s.config.Upstream)
 	if err != nil {
 		return nil, fmt.Errorf("dns: resolve upstream: %w", err)
@@ -332,7 +275,22 @@ func (s *Server) forwardOnce(queryData []byte) ([]byte, error) {
 	}
 	defer conn.Close()
 
-	return s.forwardVia(conn, queryData)
+	// Set read deadline to avoid hanging forever (especially on Windows
+	// where UDP to unreachable ports doesn't fail fast).
+	conn.SetReadDeadline(time.Now().Add(upstreamTimeout))
+
+	_, err = conn.Write(queryData)
+	if err != nil {
+		return nil, fmt.Errorf("dns: write upstream: %w", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("dns: read upstream: %w", err)
+	}
+
+	return buf[:n], nil
 }
 
 // matchesDomain checks if the query name matches any of the configured match domains.

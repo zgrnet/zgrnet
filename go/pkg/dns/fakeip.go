@@ -111,12 +111,25 @@ func (p *FakeIPPool) Size() int {
 }
 
 // allocIP returns the next available IP and advances the offset.
-// Wraps around if the range is exhausted.
+// Wraps around if the range is exhausted. If the next IP is already
+// held by an active domain (due to wrap-around), evict it first to
+// prevent two domains mapping to the same IP.
 func (p *FakeIPPool) allocIP() net.IP {
 	ipVal := p.baseIP + p.nextOff
 	p.nextOff++
 	if p.nextOff > p.maxOff {
 		p.nextOff = 1 // Wrap around
+	}
+
+	// Check for IP collision from wrap-around
+	if oldDomain, ok := p.ipToDomain[ipVal]; ok {
+		// Evict the old domain holding this IP
+		delete(p.ipToDomain, ipVal)
+		delete(p.domainToIP, oldDomain)
+		if elem, ok := p.lruElement[oldDomain]; ok {
+			p.lruList.Remove(elem)
+			delete(p.lruElement, oldDomain)
+		}
 	}
 
 	ip := make(net.IP, 4)

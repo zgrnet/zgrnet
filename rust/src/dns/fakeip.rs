@@ -86,6 +86,14 @@ impl FakeIPPool {
         if self.next_off > self.max_off {
             self.next_off = 1;
         }
+
+        // Check for IP collision from wrap-around: if this IP is still held
+        // by an active domain, evict it first.
+        if let Some(old_domain) = self.ip_to_domain.remove(&ip_val) {
+            self.domain_to_ip.remove(&old_domain);
+            self.domain_gen.remove(&old_domain);
+        }
+
         Ipv4Addr::from(ip_val)
     }
 

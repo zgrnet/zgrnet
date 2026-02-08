@@ -47,21 +47,12 @@ impl Default for ServerConfig {
 /// Magic DNS server.
 pub struct Server {
     config: ServerConfig,
-    /// Persistent upstream UDP socket for connection reuse.
-    upstream_socket: Option<UdpSocket>,
 }
 
 impl Server {
     /// Create a new DNS server.
     pub fn new(config: ServerConfig) -> Self {
-        // Eagerly initialize upstream connection for performance.
-        let upstream_socket = config.upstream.parse::<SocketAddr>().ok().and_then(|addr| {
-            let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-            socket.connect(addr).ok()?;
-            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
-            Some(socket)
-        });
-        Server { config, upstream_socket }
+        Server { config }
     }
 
     /// Handle a DNS query and return the response bytes.
@@ -209,21 +200,12 @@ impl Server {
     }
 
     /// Forward a DNS query to the upstream resolver.
-    /// Uses a persistent UDP socket for performance. Falls back to
-    /// a per-query socket if the persistent one is unavailable.
+    /// Each query gets its own UDP socket to avoid response mismatch
+    /// under concurrency (thread A reading thread B's response).
     fn forward_upstream(
         &self,
         query_data: &[u8],
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        if let Some(ref socket) = self.upstream_socket {
-            socket.send(query_data)?;
-            let mut buf = vec![0u8; 4096];
-            let n = socket.recv(&mut buf)?;
-            buf.truncate(n);
-            return Ok(buf);
-        }
-
-        // Fallback: one-off connection
         let upstream: SocketAddr = self.config.upstream.parse()?;
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
