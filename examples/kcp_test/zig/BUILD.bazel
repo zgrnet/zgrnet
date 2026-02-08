@@ -1,15 +1,7 @@
-# Zig source files for this example
-filegroup(
-    name = "srcs",
-    srcs = glob([
-        "src/**/*.zig",
-    ]),
-    visibility = ["//visibility:public"],
-)
+# Zig source files for KCP interop test
+exports_files(glob(["src/**/*.zig"]))
 
-# KCP interop test binary
-# Built from main zig/ directory (due to C dependency complexity)
-# Usage: bazel build //examples/kcp_test/zig:kcp_test
+# KCP interop test binary (built from //zig with all C/ASM deps)
 alias(
     name = "kcp_test",
     actual = "//zig:kcp_test",

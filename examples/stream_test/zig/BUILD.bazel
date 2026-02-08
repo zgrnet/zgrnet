@@ -1,15 +1,7 @@
-# Zig source files for this example
-filegroup(
-    name = "srcs",
-    srcs = glob([
-        "src/**/*.zig",
-    ]),
-    visibility = ["//visibility:public"],
-)
+# Zig source files for stream throughput test
+exports_files(glob(["src/**/*.zig"]))
 
-# Stream throughput test binary
-# Built from main zig/ directory (due to C dependency complexity)
-# Usage: bazel build //examples/stream_test/zig:stream_test
+# Stream test binary (built from //zig with all C/ASM deps)
 alias(
     name = "stream_test",
     actual = "//zig:stream_test",
