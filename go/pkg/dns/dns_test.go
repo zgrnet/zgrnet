@@ -32,11 +32,7 @@ func TestEncodeName(t *testing.T) {
 }
 
 func TestEncodeNameErrors(t *testing.T) {
-	// Label too long (64 chars)
-	longLabel := string(make([]byte, 64))
-	for i := range longLabel {
-		_ = i
-	}
+	// Label too long (66 chars > 63 max)
 	_, err := encodeName("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com")
 	if err != ErrLabelTooLong {
 		t.Errorf("expected ErrLabelTooLong, got %v", err)

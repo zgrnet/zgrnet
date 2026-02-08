@@ -51,6 +51,18 @@ pub fn supportsSplitDNS() bool {
     return detectMode() == .systemd_resolved;
 }
 
+/// Validate nameserver: only IP address characters, no newlines/metacharacters.
+/// Prevents CRLF injection into /etc/resolv.conf.
+fn validateNameserver(ns: []const u8) bool {
+    if (ns.len == 0) return false;
+    for (ns) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != ':' and c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Set DNS configuration.
 pub fn setDNS(
     state: *LinuxState,
@@ -58,6 +70,7 @@ pub fn setDNS(
     domains: []const []const u8,
     iface_name: ?[]const u8,
 ) DnsMgrError!void {
+    if (!validateNameserver(nameserver)) return DnsMgrError.InvalidArgument;
     if (state.mode == .unknown) {
         state.mode = detectMode();
     }

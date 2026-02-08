@@ -68,7 +68,9 @@ struct ManagerInner {
     closed: bool,
 }
 
-// Safety: The Zig library uses its own synchronization internally.
+// Safety: The raw `handle` pointer is not inherently thread-safe.
+// Thread safety is provided by the `RwLock<ManagerInner>` in `Manager`,
+// which ensures all access to the handle is properly synchronized.
 unsafe impl Send for ManagerInner {}
 unsafe impl Sync for ManagerInner {}
 

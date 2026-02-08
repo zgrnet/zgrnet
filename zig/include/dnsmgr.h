@@ -98,7 +98,8 @@ void dnsmgr_close(dnsmgr_t* mgr);
  *
  * @param mgr DNS manager handle
  * @param nameserver IP address of the DNS server (e.g., "100.64.0.1")
- * @param domains Comma-separated domain suffixes (e.g., "zigor.net")
+ * @param domains Comma-separated domain suffixes (e.g., "zigor.net,example.com").
+ *                No limit on the number of domains.
  *
  * @return DNSMGR_OK on success, or a negative error code
  */

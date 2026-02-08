@@ -134,15 +134,12 @@ pub const Server = struct {
             return resp.encode(buf) catch return error.EncodeFailed;
         };
 
-        // Decode hex pubkey
+        // Decode hex pubkey using std library
         var pubkey: [32]u8 = undefined;
-        var i: usize = 0;
-        while (i < 32) : (i += 1) {
-            pubkey[i] = hexByte(hex_pubkey[i * 2], hex_pubkey[i * 2 + 1]) orelse {
-                var resp = Message.newResponse(query, protocol.RCODE_NXDOMAIN, alloc) catch return error.EncodeFailed;
-                return resp.encode(buf) catch return error.EncodeFailed;
-            };
-        }
+        _ = std.fmt.hexToBytes(&pubkey, hex_pubkey) catch {
+            var resp = Message.newResponse(query, protocol.RCODE_NXDOMAIN, alloc) catch return error.EncodeFailed;
+            return resp.encode(buf) catch return error.EncodeFailed;
+        };
 
         const ip = ip_alloc.lookupByPubkey(&pubkey) orelse {
             var resp = Message.newResponse(query, protocol.RCODE_NXDOMAIN, alloc) catch return error.EncodeFailed;
@@ -174,6 +171,10 @@ pub const Server = struct {
         return resp.encode(buf) catch return error.EncodeFailed;
     }
 
+    // TODO: Implement upstream DNS forwarding for Zig.
+    // Zig's std networking is async (io_uring/kqueue based), so a synchronous
+    // UDP sendto/recvfrom needs posix syscalls directly. Deferring to when
+    // the Zig DNS server is integrated with the async event loop.
     fn forwardUpstream(self: *const Self, query_data: []const u8, buf: []u8) ![]u8 {
         _ = self;
         _ = query_data;
@@ -202,18 +203,6 @@ fn isHexString(s: []const u8) bool {
     return true;
 }
 
-fn hexByte(hi: u8, lo: u8) ?u8 {
-    const h = hexDigit(hi) orelse return null;
-    const l = hexDigit(lo) orelse return null;
-    return (h << 4) | l;
-}
-
-fn hexDigit(c: u8) ?u8 {
-    if (c >= '0' and c <= '9') return c - '0';
-    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
-    return null;
-}
 
 // =============================================================================
 // Tests
@@ -412,10 +401,3 @@ test "endsWith" {
     try testing.expect(!endsWith("net", ".zigor.net"));
 }
 
-test "hexByte" {
-    try testing.expectEqual(@as(?u8, 0xAB), hexByte('a', 'b'));
-    try testing.expectEqual(@as(?u8, 0x00), hexByte('0', '0'));
-    try testing.expectEqual(@as(?u8, 0xFF), hexByte('f', 'f'));
-    try testing.expectEqual(@as(?u8, null), hexByte('g', '0'));
-    try testing.expectEqual(@as(?u8, null), hexByte('0', 'z'));
-}

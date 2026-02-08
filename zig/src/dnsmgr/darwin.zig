@@ -44,8 +44,22 @@ fn validateDomain(domain: []const u8) bool {
     return true;
 }
 
+/// Validate nameserver string: only IP address characters allowed.
+/// Rejects newlines and shell metacharacters to prevent CRLF injection
+/// into /etc/resolver/ files.
+fn validateNameserver(ns: []const u8) bool {
+    if (ns.len == 0) return false;
+    for (ns) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '.' and c != ':' and c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Set DNS configuration by writing /etc/resolver/ files.
 pub fn setDNS(state: *DarwinState, nameserver: []const u8, domains: []const []const u8) DnsMgrError!void {
+    if (!validateNameserver(nameserver)) return DnsMgrError.InvalidArgument;
     for (domains) |domain| {
         if (!validateDomain(domain)) return DnsMgrError.InvalidArgument;
     }

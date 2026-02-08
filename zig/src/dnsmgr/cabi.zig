@@ -81,26 +81,34 @@ export fn dnsmgr_close(mgr: ?*DnsMgr) void {
 
 /// Set DNS configuration.
 /// `nameserver`: IP address string (e.g., "100.64.0.1")
-/// `domains`: comma-separated domain suffixes (e.g., "zigor.net")
+/// `domains`: comma-separated domain suffixes (e.g., "zigor.net,example.com")
 export fn dnsmgr_set(mgr: ?*DnsMgr, nameserver: ?[*:0]const u8, domains_csv: ?[*:0]const u8) c_int {
     const m = mgr orelse return DNSMGR_ERR_INVALID_ARGUMENT;
     const ns = if (nameserver) |n| n[0..std.mem.len(n)] else return DNSMGR_ERR_INVALID_ARGUMENT;
     const csv = if (domains_csv) |d| d[0..std.mem.len(d)] else return DNSMGR_ERR_INVALID_ARGUMENT;
 
-    // Parse comma-separated domains
-    var domain_ptrs: [16][]const u8 = undefined;
+    // Count commas to determine number of domains
+    var num_domains: usize = 1;
+    for (csv) |c| {
+        if (c == ',') num_domains += 1;
+    }
+
+    // Dynamically allocate domain slice array
+    const domain_ptrs = allocator.alloc([]const u8, num_domains) catch return DNSMGR_ERR_SET_FAILED;
+    defer allocator.free(domain_ptrs);
+
     var count: usize = 0;
     var start: usize = 0;
     for (csv, 0..) |c, i| {
         if (c == ',') {
-            if (i > start and count < domain_ptrs.len) {
+            if (i > start) {
                 domain_ptrs[count] = csv[start..i];
                 count += 1;
             }
             start = i + 1;
         }
     }
-    if (start < csv.len and count < domain_ptrs.len) {
+    if (start < csv.len) {
         domain_ptrs[count] = csv[start..];
         count += 1;
     }
@@ -117,12 +125,15 @@ export fn dnsmgr_supports_split_dns(mgr: ?*DnsMgr) c_int {
     return if (m.supportsSplitDNS()) 1 else 0;
 }
 
-/// Flush OS DNS cache.
+/// Flush OS DNS cache (standalone, no DnsMgr instance needed).
 export fn dnsmgr_flush_cache() c_int {
-    var dummy = DnsMgr.init(.{});
-    dummy.flushCache() catch |err| {
-        return errorToCode(err);
-    };
+    const builtin = @import("builtin");
+    switch (builtin.os.tag) {
+        .macos => mod.darwin.flushCache() catch |err| return errorToCode(err),
+        .linux => mod.linux.flushCache() catch |err| return errorToCode(err),
+        .windows => mod.windows.flushCache() catch |err| return errorToCode(err),
+        else => return DNSMGR_ERR_NOT_SUPPORTED,
+    }
     return DNSMGR_OK;
 }
 
