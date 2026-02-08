@@ -24,6 +24,7 @@ jobs:
       has_rust: ${{ steps.affected.outputs.has_rust }}
       has_zig: ${{ steps.affected.outputs.has_zig }}
       has_tun: ${{ steps.affected.outputs.has_tun }}
+      has_dns: ${{ steps.affected.outputs.has_dns }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +67,7 @@ jobs:
           # Detect TUN-specific changes (requires root privileges to test)
           # Includes host package since its integration test uses real TUN devices
           echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_dns=$(echo "$changed" | grep -qE '^(go/pkg/dns/|rust/src/dns/|zig/src/dns/|zig/src/dnsmgr/|go/pkg/dnsmgr/|rust/src/dnsmgr/|examples/dns_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build and test affected targets with Bazel
   bazel:
@@ -297,6 +299,36 @@ jobs:
           # Uses zgrnet_tun library variant with TUN feature enabled
           bazel build //rust:host_test
           sudo bazel-bin/rust/host_test
+
+  # DNS integration test (requires elevated privileges)
+  # Tests Magic DNS server + OS resolver integration
+  dns-test:
+    needs: affected
+    if: needs.affected.outputs.has_dns == 'true'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go/go.sum
+
+      - name: Install dig (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y dnsutils
+
+      - name: Build DNS test
+        working-directory: go
+        run: go build -o ../dns_test ../examples/dns_test/go/main.go
+
+      - name: Run DNS test
+        run: sudo ./dns_test
 
   # Format check
   format:
