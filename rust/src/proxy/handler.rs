@@ -113,6 +113,7 @@ impl UdpProxyHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     async fn echo_server() -> std::net::SocketAddr {
