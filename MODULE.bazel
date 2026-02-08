@@ -41,7 +41,7 @@ use_repo(
 bazel_dep(name = "embed_zig", version = "0.1.0")
 git_override(
     module_name = "embed_zig",
-    remote = "git@github.com:haivivi/embed-zig.git",
+    remote = "https://github.com/haivivi/embed-zig.git",
     commit = "e988a88",
 )
 
