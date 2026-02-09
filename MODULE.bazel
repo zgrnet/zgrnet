@@ -43,7 +43,9 @@ bazel_dep(name = "embed_zig", version = "0.1.0")
 git_override(
     module_name = "embed_zig",
     remote = "https://github.com/haivivi/embed-zig.git",
-    commit = "6bbbcb883c3f52533df6aeac0a135f0ab911711c",
+    commit = "79ccb3d510437e9bfca6c8d277e543b8e9d2feab",
+    patches = ["//bazel/patches:embed-zig-opus-var-const.patch"],
+    patch_strip = 1,
 )
 
 # Zig toolchain (provided by embed-zig, needed by //third_party/kcp for zig cc)

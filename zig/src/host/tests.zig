@@ -27,7 +27,7 @@ const net_udp = @import("../net/udp.zig");
 
 // IOService resolves to kqueue (macOS/BSD) or epoll (Linux), void otherwise.
 const IOService = std_impl.IOService;
-const has_io_backend = comptime (IOService != void);
+const has_io_backend = (IOService != void);
 
 const UDPType = if (has_io_backend) net_udp.UDP(IOService) else void;
 const HostType = if (has_io_backend) host_mod.Host(UDPType) else void;
