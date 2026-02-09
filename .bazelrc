@@ -3,6 +3,9 @@
 # Use C++17 for any C++ code
 build --cxxopt=-std=c++17
 
+# Go proxy: bypass proxy.golang.org (unreachable in some networks)
+build --repo_env=GOPROXY=direct
+
 # Rust options (edition set in MODULE.bazel)
 
 # Platform configurations
