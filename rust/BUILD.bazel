@@ -60,6 +60,17 @@ rust_binary(
     visibility = ["//visibility:public"],
 )
 
+# Full-stack smoke test (requires root/admin privileges)
+rust_binary(
+    name = "smoketest",
+    srcs = ["examples/smoketest.rs"],
+    edition = "2021",
+    crate_features = ["tun"],
+    deps = [":zgrnet_tun"] + all_crate_deps(),
+    tags = ["requires-root"],
+    visibility = ["//visibility:public"],
+)
+
 # Host TUN integration test (requires root/admin privileges)
 rust_binary(
     name = "host_test",

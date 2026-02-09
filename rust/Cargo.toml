@@ -46,6 +46,10 @@ name = "zgrnet"
 path = "src/lib.rs"
 
 [[example]]
+name = "smoketest"
+path = "examples/smoketest.rs"
+
+[[example]]
 name = "host_test"
 path = "examples/host_test.rs"
 
