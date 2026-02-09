@@ -35,6 +35,7 @@ go_deps.from_file(go_mod = "//go:go.mod")
 use_repo(
     go_deps,
     "org_golang_x_crypto",
+    "in_gopkg_yaml_v3",
 )
 
 # embed-zig: Bazel-native Zig build rules + Zig toolchain
