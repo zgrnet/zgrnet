@@ -16,6 +16,7 @@ build:linux --platforms=@rules_rust//rust/platform:linux
 
 # Test options
 test --test_output=errors
+test --test_arg=-test.short
 
 # Debug build
 build:debug --compilation_mode=dbg

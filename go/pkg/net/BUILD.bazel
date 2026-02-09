@@ -34,6 +34,8 @@ go_test(
         "peer_test.go",
         "rekey_test.go",
         "synctest_test.go",
+        "throughput_proxy_test.go",
+        "throughput_test.go",
         "tick_test.go",
         "transport_mock_test.go",
         "udp_test.go",
@@ -42,6 +44,7 @@ go_test(
     deps = [
         "//go:noise",
         "//go/pkg/kcp",
+        "//go/pkg/proxy",
         "//go/pkg/relay",
     ],
 )

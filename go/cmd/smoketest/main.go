@@ -609,17 +609,21 @@ func testThroughput(proxyAddr string, size int) bool {
 		return false
 	}
 
-	// Read all data and measure time
+	// Read all data and measure time.
+	// Stop as soon as we've received the expected amount (don't wait for EOF,
+	// which would block for 30s because the proxy relay doesn't half-close KCP).
 	start := time.Now()
 	buf := make([]byte, 256*1024)
 	totalRead := 0
 
-	// Read until EOF
 	for {
 		proxyConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := proxyConn.Read(buf)
 		totalRead += n
 		if err != nil {
+			break
+		}
+		if totalRead >= size {
 			break
 		}
 	}
