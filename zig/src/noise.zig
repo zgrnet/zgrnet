@@ -16,6 +16,7 @@ pub const host = @import("host/mod.zig");
 pub const proxy_mod = @import("proxy/mod.zig");
 pub const dns_mod = @import("dns/mod.zig");
 pub const dnsmgr_mod = @import("dnsmgr/mod.zig");
+pub const config_mod = @import("config/mod.zig");
 
 // KCP multiplexing (re-export submodules)
 pub const kcp = kcp_mod.kcp;
@@ -111,6 +112,9 @@ pub fn backendName() []const u8 {
     return noise.backendName();
 }
 
+// Config types
+pub const config = config_mod;
+
 test {
     std.testing.refAllDecls(@This());
     _ = noise;
@@ -121,4 +125,5 @@ test {
     _ = proxy_mod;
     _ = dns_mod;
     _ = dnsmgr_mod;
+    _ = config_mod;
 }
