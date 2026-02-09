@@ -1,17 +1,10 @@
-# NOTE: dnsmgr requires libdnsmgr.a from the Zig build.
-# The zig_library target for dnsmgr needs to be added to zig/BUILD.bazel
-# before this can be built with Bazel.
-#
-# For now, build with native Go + CGo:
-#   cd go && CGO_ENABLED=1 go build ./pkg/dnsmgr/
-#
-# load("@rules_go//go:def.bzl", "go_library")
-#
-# go_library(
-#     name = "dnsmgr",
-#     srcs = ["dnsmgr.go"],
-#     cgo = True,
-#     cdeps = ["//zig:dnsmgr_lib"],
-#     importpath = "github.com/vibing/zgrnet/pkg/dnsmgr",
-#     visibility = ["//visibility:public"],
-# )
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "dnsmgr",
+    srcs = ["dnsmgr.go"],
+    cgo = True,
+    cdeps = ["//zig/dnsmgr:lib"],
+    importpath = "github.com/vibing/zgrnet/pkg/dnsmgr",
+    visibility = ["//visibility:public"],
+)

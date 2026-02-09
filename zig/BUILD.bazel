@@ -94,3 +94,8 @@ exports_files(
     visibility = ["//zig/tun:__pkg__"],
 )
 
+exports_files(
+    glob(["src/dnsmgr/**/*.zig"]) + ["include/dnsmgr.h"],
+    visibility = ["//zig/dnsmgr:__pkg__"],
+)
+
