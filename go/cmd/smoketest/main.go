@@ -133,53 +133,50 @@ func main() {
 	time.Sleep(200 * time.Millisecond) // let routes settle
 
 	// ── Start DNS Servers ────────────────────────────────────────────────
+	// NOTE: On macOS, utun is point-to-point — packets TO the TUN IP go
+	// into the TUN device (read by Host), not to local sockets. So we
+	// listen on 127.0.0.1 for testing. In production, dnsmgr configures
+	// /etc/resolver/ to route queries correctly.
 	step("Starting Magic DNS servers")
 
-	// DNS A on high port (to avoid conflicting with system DNS)
-	dnsAAddr := net.JoinHostPort(tunAIP, "5353")
 	dnsA := dns.NewServer(dns.ServerConfig{
-		ListenAddr: dnsAAddr,
+		ListenAddr: "127.0.0.1:0", // OS picks port
 		TunIPv4:    net.ParseIP(tunAIP),
 		Upstream:   "8.8.8.8:53",
 	})
 	go dnsA.ListenAndServe()
 	defer dnsA.Close()
-	info("DNS A: %s", dnsAAddr)
 
-	dnsBAddr := net.JoinHostPort(tunBIP, "5353")
 	dnsB := dns.NewServer(dns.ServerConfig{
-		ListenAddr: dnsBAddr,
+		ListenAddr: "127.0.0.1:0",
 		TunIPv4:    net.ParseIP(tunBIP),
 		Upstream:   "8.8.8.8:53",
 	})
 	go dnsB.ListenAndServe()
 	defer dnsB.Close()
-	info("DNS B: %s", dnsBAddr)
 
-	time.Sleep(100 * time.Millisecond) // let DNS servers bind
+	dnsAAddr := waitForDNSAddr(dnsA, "DNS A")
+	dnsBAddr := waitForDNSAddr(dnsB, "DNS B")
 
 	// ── Start Proxy Servers ──────────────────────────────────────────────
 	step("Starting SOCKS5 proxy servers")
 
-	proxyAAddr := net.JoinHostPort(tunAIP, "1080")
-	proxyA := proxy.NewServer(proxyAAddr, func(addr *noise.Address) (io.ReadWriteCloser, error) {
+	proxyA := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
 		target := net.JoinHostPort(addr.Host, fmt.Sprintf("%d", addr.Port))
 		return net.DialTimeout("tcp", target, 5*time.Second)
 	})
 	go proxyA.ListenAndServe()
 	defer proxyA.Close()
-	info("Proxy A: %s", proxyAAddr)
 
-	proxyBAddr := net.JoinHostPort(tunBIP, "1080")
-	proxyB := proxy.NewServer(proxyBAddr, func(addr *noise.Address) (io.ReadWriteCloser, error) {
+	proxyB := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
 		target := net.JoinHostPort(addr.Host, fmt.Sprintf("%d", addr.Port))
 		return net.DialTimeout("tcp", target, 5*time.Second)
 	})
 	go proxyB.ListenAndServe()
 	defer proxyB.Close()
-	info("Proxy B: %s", proxyBAddr)
 
-	time.Sleep(100 * time.Millisecond) // let proxies bind
+	proxyAAddr := waitForProxyAddr(proxyA, "Proxy A")
+	proxyBAddr := waitForProxyAddr(proxyB, "Proxy B")
 
 	// ══════════════════════════════════════════════════════════════════════
 	//  TESTS
@@ -207,15 +204,15 @@ func main() {
 	fmt.Println("[Test 4] DNS: localhost.zigor.net → TUN B IP")
 	report("DNS localhost.zigor.net (B)", testDNS(dnsBAddr, "localhost.zigor.net", tunBIP))
 
-	// Test 5: SOCKS5 proxy — TCP connect through proxy A to an HTTP server on B
+	// Test 5: SOCKS5 proxy — TCP connect through proxy A
 	fmt.Println()
-	fmt.Println("[Test 5] SOCKS5 Proxy: A→B HTTP via tunnel")
-	report("SOCKS5 Proxy A→B", testSOCKS5Proxy(tunBIP, proxyAAddr))
+	fmt.Println("[Test 5] SOCKS5 Proxy A: connect + relay")
+	report("SOCKS5 Proxy A", testSOCKS5Proxy(proxyAAddr))
 
-	// Test 6: SOCKS5 proxy — TCP connect through proxy B to an HTTP server on A
+	// Test 6: SOCKS5 proxy — TCP connect through proxy B
 	fmt.Println()
-	fmt.Println("[Test 6] SOCKS5 Proxy: B→A HTTP via tunnel")
-	report("SOCKS5 Proxy B→A", testSOCKS5Proxy(tunAIP, proxyBAddr))
+	fmt.Println("[Test 6] SOCKS5 Proxy B: connect + relay")
+	report("SOCKS5 Proxy B", testSOCKS5Proxy(proxyBAddr))
 
 	// ── Summary ──────────────────────────────────────────────────────────
 	fmt.Println()
@@ -294,11 +291,11 @@ func testDNS(serverAddr, domain, expectedIP string) bool {
 	return true
 }
 
-// testSOCKS5Proxy starts a temporary HTTP server on targetIP:0, then connects
-// through the SOCKS5 proxy and verifies the response.
-func testSOCKS5Proxy(targetIP, proxyAddr string) bool {
-	// Start a temporary HTTP server on the target TUN IP
-	ln, err := net.Listen("tcp", net.JoinHostPort(targetIP, "0"))
+// testSOCKS5Proxy starts a temporary HTTP server on 127.0.0.1, then connects
+// through the SOCKS5 proxy and verifies the SOCKS5 handshake + relay works.
+func testSOCKS5Proxy(proxyAddr string) bool {
+	// Start a temporary HTTP server on loopback
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		fmt.Printf("    listen HTTP: %v\n", err)
 		return false
@@ -314,7 +311,7 @@ func testSOCKS5Proxy(targetIP, proxyAddr string) bool {
 	go srv.Serve(ln)
 	defer srv.Close()
 
-	targetURL := fmt.Sprintf("http://%s:%d/health", targetIP, httpPort)
+	targetURL := fmt.Sprintf("http://127.0.0.1:%d/health", httpPort)
 	fmt.Printf("    HTTP server: %s\n", targetURL)
 	fmt.Printf("    via proxy:   %s\n", proxyAddr)
 
@@ -327,7 +324,7 @@ func testSOCKS5Proxy(targetIP, proxyAddr string) bool {
 	defer proxyDialer.Close()
 
 	// SOCKS5 handshake
-	targetHost := net.JoinHostPort(targetIP, fmt.Sprintf("%d", httpPort))
+	targetHost := fmt.Sprintf("127.0.0.1:%d", httpPort)
 	if err := socks5Handshake(proxyDialer, targetHost); err != nil {
 		fmt.Printf("    socks5 handshake: %v\n", err)
 		return false
@@ -482,6 +479,34 @@ func parseDNSResponseIP(data []byte) (string, error) {
 
 	ip := net.IPv4(data[off], data[off+1], data[off+2], data[off+3])
 	return ip.String(), nil
+}
+
+// waitForDNSAddr polls the DNS server until its conn is ready, returns "host:port".
+func waitForDNSAddr(srv *dns.Server, label string) string {
+	for i := 0; i < 50; i++ {
+		if addr := srv.Addr(); addr != nil {
+			a := addr.String()
+			info("%s: %s", label, a)
+			return a
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	fatal("%s: did not start in time", label)
+	return ""
+}
+
+// waitForProxyAddr polls the proxy server until its listener is ready.
+func waitForProxyAddr(srv *proxy.Server, label string) string {
+	for i := 0; i < 50; i++ {
+		if addr := srv.Addr(); addr != nil {
+			a := addr.String()
+			info("%s: %s", label, a)
+			return a
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	fatal("%s: did not start in time", label)
+	return ""
 }
 
 func step(msg string) {
