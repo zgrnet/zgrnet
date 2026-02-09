@@ -196,7 +196,7 @@ jobs:
         working-directory: rust
         run: cargo clippy -- -D warnings
 
-  # Zig tests (native) - no root required
+  # Zig tests via Bazel - no root required
   # Excludes TUN tests which require elevated privileges
   zig-test:
     needs: affected
@@ -208,16 +208,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
       - name: Test (excluding TUN)
-        working-directory: zig
-        run: |
-          # Run tests excluding TUN module (requires root)
-          # The main test target excludes tun_test by default
-          zig build test
+        run: bazel test //zig:noise_test --test_output=errors
 
   # TUN tests (requires elevated privileges)
   # Only runs when TUN-related files are changed
