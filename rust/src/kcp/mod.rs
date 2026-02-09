@@ -14,4 +14,4 @@ mod stream;
 pub use kcp::{Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
 
 // Re-export from stream module
-pub use stream::{Stream, StreamState, StreamError, Mux, MuxConfig, MuxError, OutputFn, OnStreamDataFn, OnNewStreamFn};
+pub use stream::{Stream, StreamIo, StreamState, StreamError, Mux, MuxConfig, MuxError, OutputFn, OnStreamDataFn, OnNewStreamFn};

@@ -54,6 +54,10 @@ name = "throughput_rust"
 path = "../examples/throughput/rust/main.rs"
 
 [[bin]]
+name = "zgrnetd"
+path = "src/bin/zgrnetd.rs"
+
+[[bin]]
 name = "async_bench"
 path = "../zig/src/async/benchmark/rust/main.rs"
 

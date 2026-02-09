@@ -39,6 +39,27 @@ rust_test(
     tags = ["requires-root"],
 )
 
+# Library with TUN + dnsmgr (for zgrnetd binary)
+rust_library(
+    name = "zgrnet_full",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "zgrnet",
+    edition = "2021",
+    crate_features = ["tun", "dnsmgr"],
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps() + ["//third_party/kcp", "//zig/tun:lib", "//zig/dnsmgr:lib"],
+)
+
+# zgrnetd daemon
+rust_binary(
+    name = "zgrnetd",
+    srcs = ["src/bin/zgrnetd.rs"],
+    edition = "2021",
+    crate_features = ["tun", "dnsmgr"],
+    deps = [":zgrnet_full"] + all_crate_deps(),
+    visibility = ["//visibility:public"],
+)
+
 # Host TUN integration test (requires root/admin privileges)
 rust_binary(
     name = "host_test",
