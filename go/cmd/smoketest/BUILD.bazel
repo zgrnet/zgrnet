@@ -8,6 +8,7 @@ go_binary(
     deps = [
         "//go/pkg/dns",
         "//go/pkg/host",
+        "//go/pkg/net",
         "//go:noise",
         "//go/pkg/proxy",
         "//go/pkg/tun",

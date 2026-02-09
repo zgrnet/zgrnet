@@ -25,11 +25,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/vibing/zgrnet/pkg/config"
 	"github.com/vibing/zgrnet/pkg/dns"
 	"github.com/vibing/zgrnet/pkg/dnsmgr"
 	"github.com/vibing/zgrnet/pkg/host"
+	znet "github.com/vibing/zgrnet/pkg/net"
 	"github.com/vibing/zgrnet/pkg/noise"
 	"github.com/vibing/zgrnet/pkg/proxy"
 	"github.com/vibing/zgrnet/pkg/tun"
@@ -169,23 +171,70 @@ func run(cfgPath string) error {
 		}
 	}
 
-	// ── 9. Start SOCKS5 Proxy ────────────────────────────────────────────
+	// ── 9. Build peer alias → pubkey lookup for route matching ──────────
+	aliasToPubkey := make(map[string]noise.PublicKey)
+	for domain, peerCfg := range cfg.Peers {
+		hexPK, _ := config.PubkeyFromDomain(domain)
+		pk, _ := noise.KeyFromHex(hexPK)
+		if peerCfg.Alias != "" {
+			aliasToPubkey[peerCfg.Alias] = pk
+		}
+		aliasToPubkey[domain] = pk
+	}
+
+	// ── 10. Start SOCKS5 Proxy (dials through KCP tunnel) ───────────────
 	proxyAddr := net.JoinHostPort(tunIP.String(), "1080")
+	udpTransport := h.UDP()
+
+	// The proxy's DialFunc opens a KCP stream to the first available peer.
+	// TODO: route matching — pick peer based on config route rules + domain.
 	proxyDial := func(addr *noise.Address) (io.ReadWriteCloser, error) {
-		target := net.JoinHostPort(addr.Host, fmt.Sprintf("%d", addr.Port))
-		return net.DialTimeout("tcp", target, proxyDialTimeout)
+		// Find an established peer to tunnel through
+		var targetPK noise.PublicKey
+		found := false
+		for peer := range udpTransport.Peers() {
+			if peer.Info.State.String() == "established" {
+				targetPK = peer.Info.PublicKey
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Fallback: direct TCP if no tunnel peer available
+			target := net.JoinHostPort(addr.Host, fmt.Sprintf("%d", addr.Port))
+			log.Printf("proxy: no tunnel peer, direct dial %s", target)
+			return net.DialTimeout("tcp", target, 10*time.Second)
+		}
+
+		// Open KCP stream with TCP_PROXY proto + target address as metadata
+		metadata := addr.Encode()
+		stream, err := udpTransport.OpenStream(targetPK, noise.ProtocolTCPProxy, metadata)
+		if err != nil {
+			return nil, fmt.Errorf("open stream to %s: %w", targetPK.ShortString(), err)
+		}
+		log.Printf("proxy: tunnel %s via %s", addr, targetPK.ShortString())
+		return &proxy.BlockingStream{S: stream}, nil
 	}
 	proxySrv := proxy.NewServer(proxyAddr, proxyDial)
 
 	go func() {
-		log.Printf("proxy listening on %s (SOCKS5 + HTTP CONNECT)", proxyAddr)
+		log.Printf("proxy listening on %s (SOCKS5 + HTTP CONNECT → tunnel)", proxyAddr)
 		if err := proxySrv.ListenAndServe(); err != nil {
 			log.Printf("proxy error: %v", err)
 		}
 	}()
 	defer proxySrv.Close()
 
-	// ── 10. Start Host forwarding + wait for signal ──────────────────────
+	// ── 11. Accept incoming TCP_PROXY streams (exit node) ────────────────
+	// For each peer, accept KCP streams with proto=69 and handle them
+	// by dialing the real TCP target and relaying.
+	for domain := range cfg.Peers {
+		hexPK, _ := config.PubkeyFromDomain(domain)
+		pk, _ := noise.KeyFromHex(hexPK)
+		go acceptTCPProxyStreams(udpTransport, pk)
+	}
+
+	// ── 12. Start Host forwarding + wait for signal ──────────────────────
 	go func() {
 		if err := h.Run(); err != nil {
 			log.Printf("host error: %v", err)
@@ -210,8 +259,27 @@ func run(cfgPath string) error {
 	return nil
 }
 
-// proxyDialTimeout is the TCP dial timeout for the SOCKS5 proxy.
-const proxyDialTimeout = 10 * 1e9 // 10 seconds (time.Duration)
+// acceptTCPProxyStreams accepts incoming KCP streams from a peer and handles
+// TCP_PROXY (proto=69) by dialing the real target and relaying traffic.
+// This makes this node an "exit node" for the peer's proxy traffic.
+func acceptTCPProxyStreams(udp *znet.UDP, pk noise.PublicKey) {
+	for {
+		stream, err := udp.AcceptStream(pk)
+		if err != nil {
+			return // peer gone or UDP closed
+		}
+		if stream.Proto() != noise.ProtocolTCPProxy {
+			stream.Close()
+			continue
+		}
+		go func() {
+			bs := &proxy.BlockingStream{S: stream}
+			if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil); err != nil {
+				log.Printf("tcp_proxy from %s: %v", pk.ShortString(), err)
+			}
+		}()
+	}
+}
 
 // loadOrGenerateKey reads a Noise private key from file, or generates one
 // if the file doesn't exist. The key is stored as 64 hex characters.

@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -158,25 +159,79 @@ func main() {
 	dnsAAddr := waitForDNSAddr(dnsA, "DNS A")
 	dnsBAddr := waitForDNSAddr(dnsB, "DNS B")
 
-	// ── Start Proxy Servers ──────────────────────────────────────────────
-	step("Starting SOCKS5 proxy servers")
+	// ── Start Proxy Servers (tunnel mode) ────────────────────────────────
+	// Proxy A dials through KCP tunnel to B; B accepts and does real TCP dial.
+	step("Starting SOCKS5 proxy + TCP_PROXY accept loops")
 
+	udpA := hostA.UDP()
+	udpB := hostB.UDP()
+
+	// Proxy A: SOCKS5 → KCP stream (proto=69) → B
 	proxyA := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
-		target := net.JoinHostPort(addr.Host, fmt.Sprintf("%d", addr.Port))
-		return net.DialTimeout("tcp", target, 5*time.Second)
+		metadata := addr.Encode()
+		stream, err := udpA.OpenStream(keyB.Public, noise.ProtocolTCPProxy, metadata)
+		if err != nil {
+			return nil, fmt.Errorf("open stream: %w", err)
+		}
+		return &proxy.BlockingStream{S: stream}, nil
 	})
 	go proxyA.ListenAndServe()
 	defer proxyA.Close()
 
+	// B accepts TCP_PROXY streams and dials real targets
+	go func() {
+		for {
+			stream, err := udpB.AcceptStream(keyA.Public)
+			if err != nil {
+				return
+			}
+			if stream.Proto() != noise.ProtocolTCPProxy {
+				stream.Close()
+				continue
+			}
+			go func() {
+				bs := &proxy.BlockingStream{S: stream}
+				if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil); err != nil {
+					log.Printf("tcp_proxy: %v", err)
+				}
+			}()
+		}
+	}()
+
+	// Proxy B: SOCKS5 → KCP stream (proto=69) → A
 	proxyB := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
-		target := net.JoinHostPort(addr.Host, fmt.Sprintf("%d", addr.Port))
-		return net.DialTimeout("tcp", target, 5*time.Second)
+		metadata := addr.Encode()
+		stream, err := udpB.OpenStream(keyA.Public, noise.ProtocolTCPProxy, metadata)
+		if err != nil {
+			return nil, fmt.Errorf("open stream: %w", err)
+		}
+		return &proxy.BlockingStream{S: stream}, nil
 	})
 	go proxyB.ListenAndServe()
 	defer proxyB.Close()
 
-	proxyAAddr := waitForProxyAddr(proxyA, "Proxy A")
-	proxyBAddr := waitForProxyAddr(proxyB, "Proxy B")
+	// A accepts TCP_PROXY streams and dials real targets
+	go func() {
+		for {
+			stream, err := udpA.AcceptStream(keyB.Public)
+			if err != nil {
+				return
+			}
+			if stream.Proto() != noise.ProtocolTCPProxy {
+				stream.Close()
+				continue
+			}
+			go func() {
+				bs := &proxy.BlockingStream{S: stream}
+				if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil); err != nil {
+					log.Printf("tcp_proxy: %v", err)
+				}
+			}()
+		}
+	}()
+
+	proxyAAddr := waitForProxyAddr(proxyA, "Proxy A (→ tunnel → B)")
+	proxyBAddr := waitForProxyAddr(proxyB, "Proxy B (→ tunnel → A)")
 
 	// ══════════════════════════════════════════════════════════════════════
 	//  TESTS
@@ -204,15 +259,15 @@ func main() {
 	fmt.Println("[Test 4] DNS: localhost.zigor.net → TUN B IP")
 	report("DNS localhost.zigor.net (B)", testDNS(dnsBAddr, "localhost.zigor.net", tunBIP))
 
-	// Test 5: SOCKS5 proxy — TCP connect through proxy A
+	// Test 5: SOCKS5 proxy — A → tunnel → B → TCP target
 	fmt.Println()
-	fmt.Println("[Test 5] SOCKS5 Proxy A: connect + relay")
-	report("SOCKS5 Proxy A", testSOCKS5Proxy(proxyAAddr))
+	fmt.Println("[Test 5] SOCKS5 Proxy: curl → A → KCP tunnel → B → HTTP target")
+	report("Proxy A→tunnel→B", testSOCKS5Proxy(proxyAAddr))
 
-	// Test 6: SOCKS5 proxy — TCP connect through proxy B
+	// Test 6: SOCKS5 proxy — B → tunnel → A → TCP target
 	fmt.Println()
-	fmt.Println("[Test 6] SOCKS5 Proxy B: connect + relay")
-	report("SOCKS5 Proxy B", testSOCKS5Proxy(proxyBAddr))
+	fmt.Println("[Test 6] SOCKS5 Proxy: curl → B → KCP tunnel → A → HTTP target")
+	report("Proxy B→tunnel→A", testSOCKS5Proxy(proxyBAddr))
 
 	// ── Summary ──────────────────────────────────────────────────────────
 	fmt.Println()
