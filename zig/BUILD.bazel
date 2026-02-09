@@ -1,4 +1,4 @@
-load("@embed_zig//bazel/zig:defs.bzl", "zig_library", "zig_package")
+load("@embed_zig//bazel/zig:defs.bzl", "zig_binary", "zig_library", "zig_package")
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 
 # =============================================================================
@@ -91,11 +91,41 @@ zig_package(
 
 exports_files(
     glob(["src/tun/**/*.zig"]) + ["include/tun.h"],
-    visibility = ["//zig/tun:__pkg__"],
+    visibility = ["//zig/tun:__pkg__", "//zig/cmd:__pkg__"],
 )
 
 exports_files(
     glob(["src/dnsmgr/**/*.zig"]) + ["include/dnsmgr.h"],
     visibility = ["//zig/dnsmgr:__pkg__"],
+)
+
+# =============================================================================
+# TUN module for native Zig binaries (not C ABI export)
+# =============================================================================
+
+zig_library(
+    name = "tun_zig",
+    main = "src/tun/mod.zig",
+    srcs = glob(["src/tun/**/*.zig"]),
+    module_name = "tun",
+    deps = [":tun_build_options"],
+    link_libc = True,
+)
+
+# =============================================================================
+# zgrnetd daemon
+# =============================================================================
+
+zig_binary(
+    name = "zgrnetd",
+    main = "cmd_zgrnetd.zig",
+    srcs = ["cmd_zgrnetd.zig"],
+    deps = [":noise", ":tun_zig"],
+    c_srcs = _KCP_C_SRCS,
+    c_includes = _KCP_C_INCLUDES,
+    c_flags = _C_FLAGS,
+    link_libc = True,
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//visibility:public"],
 )
 
