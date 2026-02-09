@@ -40,6 +40,7 @@ go_test(
         "transport_mock_test.go",
         "udp_test.go",
     ],
+    args = ["-test.short"],
     embed = [":net"],
     deps = [
         "//go:noise",

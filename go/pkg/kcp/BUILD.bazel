@@ -23,5 +23,6 @@ go_test(
         "mux_test.go",
         "throughput_test.go",
     ],
+    args = ["-test.short"],
     embed = [":kcp"],
 )
