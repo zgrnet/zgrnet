@@ -327,9 +327,9 @@ fn handle_socks5(mut conn: TcpStream, udp: &Arc<zgrnet::net::UDP>, target_pk: &K
     let kcp_stream = sio.0.clone();
     let t = thread::spawn(move || {
         let mut kcp_w = StreamIo(kcp_stream);
-        let _ = io::copy(&mut conn2, &mut kcp_w);
+        let _ = copy_32k(&mut conn2, &mut kcp_w);
     });
-    let _ = io::copy(&mut sio, &mut conn);
+    let _ = copy_32k(&mut sio, &mut conn);
     let _ = t.join();
 }
 
@@ -361,9 +361,9 @@ fn tcp_proxy_accept_loop(udp: Arc<zgrnet::net::UDP>, peer_pk: Key) {
                     let kcp = sio.0.clone();
                     let t = thread::spawn(move || {
                         let mut kcp_w = StreamIo(kcp);
-                        let _ = io::copy(&mut remote2, &mut kcp_w);
+                        let _ = copy_32k(&mut remote2, &mut kcp_w);
                     });
-                    let _ = io::copy(&mut sio, &mut remote);
+                    let _ = copy_32k(&mut sio, &mut remote);
                     let _ = t.join();
                 }
             }
@@ -577,6 +577,21 @@ fn parse_dns_response_ip(data: &[u8]) -> Option<String> {
     if off + rdlen > data.len() || rdlen != 4 { return None; }
 
     Some(format!("{}.{}.{}.{}", data[off], data[off + 1], data[off + 2], data[off + 3]))
+}
+
+/// Copy with 32KB buffer (matching Go's io.Copy buffer size).
+fn copy_32k(reader: &mut dyn Read, writer: &mut dyn Write) -> io::Result<u64> {
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
+        };
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+    }
 }
 
 fn step(msg: &str) { println!("\n── {} ──", msg); }
