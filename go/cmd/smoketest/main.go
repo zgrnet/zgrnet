@@ -269,6 +269,16 @@ func main() {
 	fmt.Println("[Test 6] SOCKS5 Proxy: curl → B → KCP tunnel → A → HTTP target")
 	report("Proxy B→tunnel→A", testSOCKS5Proxy(proxyBAddr))
 
+	// Test 7: Throughput benchmark — download through tunnel
+	fmt.Println()
+	fmt.Println("[Test 7] Throughput: HTTP download through KCP tunnel (A → B)")
+	report("Throughput A→B", testThroughput(proxyAAddr, 32*1024*1024)) // 32 MB
+
+	// Test 8: Throughput benchmark — download through tunnel (reverse)
+	fmt.Println()
+	fmt.Println("[Test 8] Throughput: HTTP download through KCP tunnel (B → A)")
+	report("Throughput B→A", testThroughput(proxyBAddr, 32*1024*1024)) // 32 MB
+
 	// ── Summary ──────────────────────────────────────────────────────────
 	fmt.Println()
 	fmt.Println("══════════════════════════════════════════════════════════")
@@ -534,6 +544,103 @@ func parseDNSResponseIP(data []byte) (string, error) {
 
 	ip := net.IPv4(data[off], data[off+1], data[off+2], data[off+3])
 	return ip.String(), nil
+}
+
+// testThroughput starts an HTTP server that streams `size` bytes of data,
+// then downloads it through the SOCKS5 proxy (which goes through the KCP tunnel).
+// Prints throughput in MB/s. Returns true if download completed successfully.
+func testThroughput(proxyAddr string, size int) bool {
+	// Start HTTP server that streams `size` bytes
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Printf("    listen: %v\n", err)
+		return false
+	}
+	defer ln.Close()
+
+	httpPort := ln.Addr().(*net.TCPAddr).Port
+	mux := http.NewServeMux()
+	mux.HandleFunc("/data", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+		// Write in 64KB chunks
+		chunk := make([]byte, 64*1024)
+		for i := range chunk {
+			chunk[i] = byte(i & 0xFF)
+		}
+		remaining := size
+		for remaining > 0 {
+			n := len(chunk)
+			if n > remaining {
+				n = remaining
+			}
+			written, err := w.Write(chunk[:n])
+			if err != nil {
+				return
+			}
+			remaining -= written
+		}
+	})
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	targetURL := fmt.Sprintf("http://127.0.0.1:%d/data", httpPort)
+	fmt.Printf("    server: %s (%d MB)\n", targetURL, size/(1024*1024))
+	fmt.Printf("    proxy:  %s\n", proxyAddr)
+
+	// Connect through SOCKS5
+	proxyConn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		fmt.Printf("    connect proxy: %v\n", err)
+		return false
+	}
+	defer proxyConn.Close()
+
+	targetHost := fmt.Sprintf("127.0.0.1:%d", httpPort)
+	if err := socks5Handshake(proxyConn, targetHost); err != nil {
+		fmt.Printf("    socks5: %v\n", err)
+		return false
+	}
+
+	// Send HTTP GET
+	httpReq := fmt.Sprintf("GET /data HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetHost)
+	if _, err := proxyConn.Write([]byte(httpReq)); err != nil {
+		fmt.Printf("    write: %v\n", err)
+		return false
+	}
+
+	// Read all data and measure time
+	start := time.Now()
+	buf := make([]byte, 256*1024)
+	totalRead := 0
+
+	// Read until EOF
+	for {
+		proxyConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := proxyConn.Read(buf)
+		totalRead += n
+		if err != nil {
+			break
+		}
+	}
+	elapsed := time.Since(start)
+
+	// Subtract approximate HTTP header size (~200 bytes)
+	dataBytes := totalRead
+	if dataBytes > 200 {
+		dataBytes -= 200
+	}
+
+	mbps := float64(dataBytes) / elapsed.Seconds() / (1024 * 1024)
+	fmt.Printf("    downloaded: %d bytes in %s\n", totalRead, elapsed.Round(time.Millisecond))
+	fmt.Printf("    throughput: %.1f MB/s\n", mbps)
+
+	// Pass if we got at least 90% of the data
+	if dataBytes >= size*9/10 {
+		return true
+	}
+	fmt.Printf("    expected at least %d bytes\n", size*9/10)
+	return false
 }
 
 // waitForDNSAddr polls the DNS server until its conn is ready, returns "host:port".
