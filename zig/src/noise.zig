@@ -17,7 +17,6 @@ pub const dns_mod = @import("dns/mod.zig");
 pub const dnsmgr_mod = @import("dnsmgr/mod.zig");
 pub const config_mod = @import("config/mod.zig");
 pub const json_config = @import("config.zig");
-pub const timer_impl = @import("timer_impl.zig");
 
 // KCP multiplexing (re-export submodules)
 pub const kcp = kcp_mod.kcp;
@@ -81,9 +80,6 @@ pub const ReadPacketResult = net.ReadPacketResult;
 pub const Packet = net.Packet;
 pub const PacketPool = net.PacketPool;
 
-// Timer implementation (for UDP/KCP)
-pub const SimpleTimerService = timer_impl.SimpleTimerService;
-
 // KCP types
 pub const Kcp = kcp.Kcp;
 pub const Frame = kcp.Frame;
@@ -126,5 +122,4 @@ test {
     _ = dns_mod;
     _ = dnsmgr_mod;
     _ = config_mod;
-    _ = timer_impl;
 }

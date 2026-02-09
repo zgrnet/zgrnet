@@ -30,9 +30,9 @@ const Atomic = std.atomic.Value;
 const noise = @import("../noise/mod.zig");
 const relay_mod = @import("../relay/mod.zig");
 const kcp_mod = @import("../kcp/mod.zig");
-const timer_impl = @import("../timer_impl.zig");
 const trait = @import("trait");
 const channel_pkg = @import("channel");
+const timer_pkg = @import("timer");
 const std_impl = @import("std_impl");
 
 /// Runtime type for embed-zig channel/signal primitives.
@@ -42,8 +42,8 @@ const StdRt = std_impl.runtime;
 const ChannelT = channel_pkg.Channel;
 const SignalT = channel_pkg.Signal;
 
-pub const SimpleTimerService = timer_impl.SimpleTimerService;
-pub const KcpMux = kcp_mod.Mux(StdRt, SimpleTimerService);
+pub const TimerService = timer_pkg.TimerService(StdRt);
+pub const KcpMux = kcp_mod.Mux(StdRt, TimerService);
 pub const KcpStream = kcp_mod.Stream;
 
 const Key = noise.Key;
@@ -409,7 +409,7 @@ pub fn UDP(comptime IOBackend: type) type {
     io_backend: *IOBackend,
 
     // Timer service for KCP updates
-    timer_service: SimpleTimerService,
+    timer_service: TimerService,
 
     // Close signaling
     closed: Atomic(bool),
@@ -507,7 +507,7 @@ pub fn UDP(comptime IOBackend: type) type {
             .workers = workers,
             .num_workers = num_workers,
             .io_backend = io_backend,
-            .timer_service = SimpleTimerService.init(allocator),
+            .timer_service = TimerService.init(allocator),
             .closed = Atomic(bool).init(false),
             .close_signal = CloseSignal.init(),
             .total_tx = Atomic(u64).init(0),
@@ -1582,13 +1582,11 @@ test "PacketPool basic" {
 }
 
 test "UDP end-to-end: handshake + send/recv" {
-    const builtin = @import("builtin");
-    const has_kqueue = comptime (builtin.os.tag == .macos or builtin.os.tag == .freebsd or
-        builtin.os.tag == .netbsd or builtin.os.tag == .openbsd);
+    const IOService = std_impl.IOService;
+    const has_io_backend = comptime (IOService != void);
 
-    if (comptime has_kqueue) {
-        const KqueueIO = std_impl.kqueue_io.KqueueIO;
-        const UDPImpl = UDP(KqueueIO);
+    if (comptime has_io_backend) {
+        const UDPImpl = UDP(IOService);
 
         const allocator = std.testing.allocator;
 

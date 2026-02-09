@@ -19,10 +19,10 @@ const kcp_mod = @import("kcp.zig");
 const ring_buffer = @import("ring_buffer.zig");
 const trait = @import("trait");
 const channel_pkg = @import("channel");
+const timer_pkg = @import("timer");
 
 const kcp = kcp_mod;
-const Task = trait.task.Task;
-const TimerHandle = trait.task.TimerHandle;
+const TimerHandle = timer_pkg.TimerHandle;
 
 /// Re-export RingBuffer for convenience
 pub const RingBuffer = ring_buffer.RingBuffer;
@@ -396,9 +396,10 @@ pub const Stream = struct {
 /// - `Rt`: Runtime type providing Mutex/Condition (for Channel)
 /// - `TimerServiceT`: Timer service with schedule/cancel (for KCP updates)
 pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
-    // Compile-time validation via embed-zig traits
+    // Compile-time check for TimerService interface
     comptime {
-        trait.timer.from(TimerServiceT);
+        if (!@hasDecl(TimerServiceT, "schedule")) @compileError("TimerService missing schedule()");
+        if (!@hasDecl(TimerServiceT, "cancel")) @compileError("TimerService missing cancel()");
     }
 
     const AcceptChan = channel_pkg.Channel(*Stream, 16, Rt);
@@ -465,8 +466,15 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
 
             self.update_handle = self.timer_service.schedule(
                 self.config.update_interval_ms,
-                Task.init(Self, self, doUpdate),
+                onUpdateTimer,
+                @ptrCast(self),
             );
+        }
+
+        /// Timer callback wrapper — dispatches to doUpdate.
+        fn onUpdateTimer(ctx: ?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.doUpdate();
         }
 
         /// KCP update task (called by timer).
@@ -731,8 +739,8 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
 test "Mux comptime check" {
     // Verify the type compiles with a minimal Rt and TimerService
     const TestRt = @import("std_impl").runtime;
-    const timer_impl = @import("../timer_impl.zig");
-    const MuxType = Mux(TestRt, timer_impl.SimpleTimerService);
+    const TimerSvc = timer_pkg.TimerService(TestRt);
+    const MuxType = Mux(TestRt, TimerSvc);
     _ = MuxType;
 }
 
