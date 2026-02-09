@@ -213,7 +213,7 @@ func run(cfgPath string) error {
 			return nil, fmt.Errorf("open stream to %s: %w", targetPK.ShortString(), err)
 		}
 		log.Printf("proxy: tunnel %s via %s", addr, targetPK.ShortString())
-		return &proxy.BlockingStream{S: stream}, nil
+		return stream, nil
 	}
 	proxySrv := proxy.NewServer(proxyAddr, proxyDial)
 
@@ -273,8 +273,7 @@ func acceptTCPProxyStreams(udp *znet.UDP, pk noise.PublicKey) {
 			continue
 		}
 		go func() {
-			bs := &proxy.BlockingStream{S: stream}
-			if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil); err != nil {
+			if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
 				log.Printf("tcp_proxy from %s: %v", pk.ShortString(), err)
 			}
 		}()

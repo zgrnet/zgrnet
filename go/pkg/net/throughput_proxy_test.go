@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +13,7 @@ import (
 )
 
 // TestProxyThroughput measures throughput through the full proxy stack:
-// SOCKS5 client → proxy.Server → BlockingStream(KCP stream) → exit peer → TCP target
+// SOCKS5 client → proxy.Server → KCP stream → exit peer → TCP target
 func TestProxyThroughput(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping throughput test in short mode")
@@ -95,7 +94,7 @@ func TestProxyThroughput(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		return &proxy.BlockingStream{S: stream}, nil
+		return stream, nil
 	})
 	go proxySrv.ListenAndServe()
 	defer proxySrv.Close()
@@ -108,8 +107,7 @@ func TestProxyThroughput(t *testing.T) {
 				return
 			}
 			go func() {
-				bs := &proxy.BlockingStream{S: stream}
-				proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil)
+				proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil)
 			}()
 		}
 	}()
@@ -148,7 +146,6 @@ func TestProxyThroughput(t *testing.T) {
 		if err != nil {
 			break
 		}
-		// HTTP headers + body — once we have enough data, stop timing
 		if totalRead >= totalSize {
 			break
 		}
@@ -157,124 +154,13 @@ func TestProxyThroughput(t *testing.T) {
 
 	dataBytes := totalRead - 200 // subtract HTTP headers
 	mbps := float64(dataBytes) / elapsed.Seconds() / (1024 * 1024)
-	t.Logf("Layer 3 (SOCKS5 + BlockingStream + KCP + Noise): %d bytes in %s = %.1f MB/s",
+	t.Logf("Layer 3 (SOCKS5 + KCP + Noise): %d bytes in %s = %.1f MB/s",
 		totalRead, elapsed.Round(time.Millisecond), mbps)
 	fmt.Printf("THROUGHPUT_PROXY=%.1f\n", mbps)
 }
 
-// TestBlockingStreamThroughput isolates BlockingStream overhead by wrapping
-// the same KCP stream with BlockingStream and measuring throughput.
-func TestBlockingStreamThroughput(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping throughput test in short mode")
-	}
-	const totalSize = 32 * 1024 * 1024 // 32 MB
-	const chunkSize = 8 * 1024
-
-	clientKey, _ := noise.GenerateKeyPair()
-	serverKey, _ := noise.GenerateKeyPair()
-
-	client, err := NewUDP(clientKey, WithBindAddr("127.0.0.1:0"), WithAllowUnknown(true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	server, err := NewUDP(serverKey, WithBindAddr("127.0.0.1:0"), WithAllowUnknown(true))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
-
-	client.SetPeerEndpoint(serverKey.Public, server.HostInfo().Addr)
-	server.SetPeerEndpoint(clientKey.Public, client.HostInfo().Addr)
-
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			if _, _, err := client.ReadFrom(buf); err != nil {
-				return
-			}
-		}
-	}()
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			if _, _, err := server.ReadFrom(buf); err != nil {
-				return
-			}
-		}
-	}()
-
-	if err := client.Connect(serverKey.Public); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(100 * time.Millisecond)
-
-	clientStream, err := client.OpenStream(serverKey.Public, 0, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	serverStream, err := server.AcceptStream(clientKey.Public)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Wrap with BlockingStream (same as proxy uses)
-	bsWrite := &proxy.BlockingStream{S: clientStream}
-	bsRead := &proxy.BlockingStream{S: serverStream}
-
-	chunk := make([]byte, chunkSize)
-	var wg sync.WaitGroup
-	var readBytes int
-
-	// Reader via BlockingStream
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 64*1024)
-		for readBytes < totalSize {
-			n, err := bsRead.Read(buf)
-			if err != nil {
-				t.Errorf("read error: %v", err)
-				return
-			}
-			readBytes += n
-		}
-	}()
-
-	// Writer via BlockingStream
-	start := time.Now()
-	written := 0
-	for written < totalSize {
-		n, err := bsWrite.Write(chunk)
-		if err != nil {
-			t.Fatalf("write error at %d: %v", written, err)
-		}
-		written += n
-	}
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(60 * time.Second):
-		t.Fatalf("timeout: wrote %d, read %d", written, readBytes)
-	}
-
-	elapsed := time.Since(start)
-	mbps := float64(readBytes) / elapsed.Seconds() / (1024 * 1024)
-	t.Logf("Layer 2.5 (BlockingStream + UDP + Noise): %d bytes in %s = %.1f MB/s",
-		readBytes, elapsed.Round(time.Millisecond), mbps)
-	fmt.Printf("THROUGHPUT_BLOCKING=%.1f\n", mbps)
-}
-
 // TestRelayThroughput isolates the io.Copy relay pattern over KCP.
-// No SOCKS5, no HandleTCPProxy — just io.Copy bidirectional relay
+// No SOCKS5, no HandleTCPProxy — just io.Copy unidirectional relay
 // between a TCP pipe and a KCP stream, like proxy.Relay does.
 func TestRelayThroughput(t *testing.T) {
 	if testing.Short() {
@@ -331,9 +217,6 @@ func TestRelayThroughput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bsClient := &proxy.BlockingStream{S: clientStream}
-	bsServer := &proxy.BlockingStream{S: serverStream}
-
 	// Create a TCP pipe (simulates what the proxy does: TCP ↔ Relay ↔ KCP)
 	tcpLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	defer tcpLn.Close()
@@ -352,14 +235,14 @@ func TestRelayThroughput(t *testing.T) {
 	tcpReaderServer, _ := tcpLn2.Accept()
 	defer tcpReaderServer.Close()
 
-	// Exit side relay: TCP → KCP (simulates exit node doing io.Copy from target to tunnel)
+	// Exit side relay: TCP → KCP
 	go func() {
-		io.Copy(bsServer, tcpWriterServer) // read TCP, write KCP
+		io.Copy(serverStream, tcpWriterServer)
 	}()
 
-	// Client side relay: KCP → TCP (simulates client proxy doing io.Copy from tunnel to app)
+	// Client side relay: KCP → TCP
 	go func() {
-		io.Copy(tcpReaderServer, bsClient) // read KCP, write TCP
+		io.Copy(tcpReaderServer, clientStream)
 	}()
 
 	// Write data to the TCP writer
@@ -374,7 +257,7 @@ func TestRelayThroughput(t *testing.T) {
 			}
 			written += n
 		}
-		tcpWriter.Close() // signal EOF
+		tcpWriter.Close()
 	}()
 
 	// Read data from the TCP reader

@@ -173,7 +173,7 @@ func main() {
 		if err != nil {
 			return nil, fmt.Errorf("open stream: %w", err)
 		}
-		return &proxy.BlockingStream{S: stream}, nil
+		return stream, nil
 	})
 	go proxyA.ListenAndServe()
 	defer proxyA.Close()
@@ -190,8 +190,7 @@ func main() {
 				continue
 			}
 			go func() {
-				bs := &proxy.BlockingStream{S: stream}
-				if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil); err != nil {
+				if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
 					log.Printf("tcp_proxy: %v", err)
 				}
 			}()
@@ -205,7 +204,7 @@ func main() {
 		if err != nil {
 			return nil, fmt.Errorf("open stream: %w", err)
 		}
-		return &proxy.BlockingStream{S: stream}, nil
+		return stream, nil
 	})
 	go proxyB.ListenAndServe()
 	defer proxyB.Close()
@@ -222,8 +221,7 @@ func main() {
 				continue
 			}
 			go func() {
-				bs := &proxy.BlockingStream{S: stream}
-				if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil); err != nil {
+				if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
 					log.Printf("tcp_proxy: %v", err)
 				}
 			}()

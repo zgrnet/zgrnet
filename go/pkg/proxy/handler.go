@@ -17,8 +17,7 @@ import (
 // checks the policy, dials the real TCP target, and relays data
 // bidirectionally between the stream and the target connection.
 //
-// The stream should have blocking Read semantics. For kcp.Stream, wrap
-// with BlockingStream before calling this function.
+// The stream must have blocking Read semantics (kcp.Stream does).
 //
 // If dial is nil, DefaultDial is used. If policy is nil, all addresses allowed.
 func HandleTCPProxy(stream io.ReadWriteCloser, metadata []byte, dial DialFunc, policy Policy) error {
