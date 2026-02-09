@@ -1,0 +1,64 @@
+{
+  "net": {
+    "private_key": "/etc/zgrnet/private.key",
+    "tun_ipv4": "100.64.0.1",
+    "tun_mtu": 1400,
+    "listen_port": 51820
+  },
+  "lans": [
+    {
+      "domain": "company.zigor.net",
+      "pubkey": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "endpoint": "1.2.3.4:51820"
+    }
+  ],
+  "peers": {
+    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567aa.zigor.net": {
+      "alias": "peer_us",
+      "direct": ["us.example.com:51820", "1.2.3.4:51820"]
+    },
+    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567bb.zigor.net": {
+      "alias": "peer_jp",
+      "relay": ["abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567aa.zigor.net"]
+    }
+  },
+  "inbound_policy": {
+    "default": "deny",
+    "revalidate_interval": "5m",
+    "rules": [
+      {
+        "name": "trusted-users",
+        "match": {
+          "pubkey": {
+            "type": "any"
+          }
+        },
+        "services": [
+          {"proto": "*", "port": "*"}
+        ],
+        "action": "allow"
+      },
+      {
+        "name": "web-only",
+        "match": {
+          "pubkey": {
+            "type": "zgrlan",
+            "peer": "company.zigor.net"
+          }
+        },
+        "services": [
+          {"proto": "tcp", "port": "80,443"}
+        ],
+        "action": "allow"
+      }
+    ]
+  },
+  "route": {
+    "rules": [
+      {"domain": "*.google.com", "peer": "peer_us"},
+      {"domain": "*.youtube.com", "peer": "peer_us"},
+      {"domain": "*.nicovideo.jp", "peer": "peer_jp"},
+      {"domain": "example.com", "peer": "peer_us"}
+    ]
+  }
+}

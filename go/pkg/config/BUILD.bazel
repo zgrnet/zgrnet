@@ -21,9 +21,14 @@ go_test(
     srcs = [
         "config_test.go",
         "diff_test.go",
+        "interop_test.go",
         "manager_test.go",
         "policy_test.go",
         "route_test.go",
+    ],
+    data = [
+        "//tests/vectors:config_full.yaml",
+        "//tests/vectors:config_full.json",
     ],
     embed = [":config"],
 )
