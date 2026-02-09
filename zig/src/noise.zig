@@ -9,7 +9,6 @@ const std = @import("std");
 // Submodules
 pub const noise = @import("noise/mod.zig");
 pub const net = @import("net/mod.zig");
-pub const async_mod = @import("async/mod.zig");
 pub const kcp_mod = @import("kcp/mod.zig");
 pub const relay_mod = @import("relay/mod.zig");
 pub const host = @import("host/mod.zig");
@@ -18,6 +17,7 @@ pub const dns_mod = @import("dns/mod.zig");
 pub const dnsmgr_mod = @import("dnsmgr/mod.zig");
 pub const config_mod = @import("config/mod.zig");
 pub const json_config = @import("config.zig");
+pub const timer_impl = @import("timer_impl.zig");
 
 // KCP multiplexing (re-export submodules)
 pub const kcp = kcp_mod.kcp;
@@ -81,9 +81,8 @@ pub const ReadPacketResult = net.ReadPacketResult;
 pub const Packet = net.Packet;
 pub const PacketPool = net.PacketPool;
 
-// IO backend types (for UDP generic parameter)
-pub const IOService = async_mod.IOService;
-pub const KqueueIO = async_mod.KqueueIO;
+// Timer implementation (for UDP/KCP)
+pub const SimpleTimerService = timer_impl.SimpleTimerService;
 
 // KCP types
 pub const Kcp = kcp.Kcp;
@@ -127,4 +126,5 @@ test {
     _ = dns_mod;
     _ = dnsmgr_mod;
     _ = config_mod;
+    _ = timer_impl;
 }
