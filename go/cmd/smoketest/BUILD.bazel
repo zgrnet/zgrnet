@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "smoketest",
+    srcs = ["main.go"],
+    importpath = "github.com/vibing/zgrnet/cmd/smoketest",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go/pkg/dns",
+        "//go/pkg/host",
+        "//go:noise",
+        "//go/pkg/proxy",
+        "//go/pkg/tun",
+    ],
+)
