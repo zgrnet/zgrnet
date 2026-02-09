@@ -3,8 +3,10 @@
 # Use C++17 for any C++ code
 build --cxxopt=-std=c++17
 
-# Go proxy: bypass proxy.golang.org (unreachable in some networks)
-build --repo_env=GOPROXY=direct
+# Go proxy: use goproxy.cn as fallback (proxy.golang.org may be unreachable)
+build --repo_env=GOPROXY=https://goproxy.cn,direct
+build --repo_env=GONOSUMDB=*
+build --repo_env=GONOSUMCHECK=*
 
 # Rust options (edition set in MODULE.bazel)
 
