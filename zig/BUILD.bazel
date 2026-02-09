@@ -77,7 +77,12 @@ zig_library(
 zig_package(
     name = "noise",
     main = "src/noise.zig",
-    deps = [":build_options"],
+    deps = [
+        ":build_options",
+        "@embed_zig//lib/trait",
+        "@embed_zig//lib/pkg/channel",
+        "@embed_zig//lib/platform/std",
+    ],
     c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
     asm_srcs = _CHACHA20_ASM_SRCS,
     c_includes = _KCP_C_INCLUDES + _CHACHA20_C_INCLUDES,

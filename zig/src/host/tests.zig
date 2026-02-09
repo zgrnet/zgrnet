@@ -12,7 +12,7 @@ const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
 
 const noise_mod = @import("../noise/mod.zig");
-const async_mod = @import("../async/mod.zig");
+const std_impl = @import("std_impl");
 const Key = noise_mod.Key;
 const KeyPair = noise_mod.KeyPair;
 
@@ -31,7 +31,8 @@ const has_io_backend = builtin.os.tag == .macos or
     builtin.os.tag == .netbsd or
     builtin.os.tag == .openbsd;
 
-const UDPType = if (has_io_backend) net_udp.UDP(async_mod.KqueueIO) else void;
+const KqueueIO = if (has_io_backend) std_impl.kqueue_io.KqueueIO else void;
+const UDPType = if (has_io_backend) net_udp.UDP(KqueueIO) else void;
 const HostType = if (has_io_backend) host_mod.Host(UDPType) else void;
 
 // ============================================================================
