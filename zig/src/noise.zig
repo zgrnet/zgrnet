@@ -17,6 +17,7 @@ pub const proxy_mod = @import("proxy/mod.zig");
 pub const dns_mod = @import("dns/mod.zig");
 pub const dnsmgr_mod = @import("dnsmgr/mod.zig");
 pub const config_mod = @import("config/mod.zig");
+pub const config = @import("config.zig");
 
 // KCP multiplexing (re-export submodules)
 pub const kcp = kcp_mod.kcp;
