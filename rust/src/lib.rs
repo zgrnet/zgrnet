@@ -30,6 +30,7 @@ pub mod relay;
 pub mod host;
 pub mod proxy;
 pub mod dns;
+pub mod config;
 
 #[cfg(feature = "tun")]
 pub mod tun;
