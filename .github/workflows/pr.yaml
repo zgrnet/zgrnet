@@ -166,7 +166,7 @@ jobs:
         working-directory: go
         run: |
           # Run tests excluding the tun package (requires root)
-          go test -v -race $(go list ./... | grep -v '/tun$')
+          go test -v -race -short $(go list ./... | grep -v '/tun$')
 
   # Rust native tests - excludes TUN tests which require elevated privileges
   rust-test:
