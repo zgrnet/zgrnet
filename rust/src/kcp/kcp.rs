@@ -110,7 +110,7 @@ impl Kcp {
 
     /// Apply default fast mode configuration.
     pub fn set_default_config(&mut self) {
-        self.set_nodelay(1, 1, 2, 1);  // Fast mode with 1ms interval (same as Go)
+        self.set_nodelay(2, 1, 2, 1);  // nodelay=2: fixed RTO increment (no multiplicative backoff)
         self.set_wndsize(4096, 4096);  // Large window for high throughput (same as Go)
         self.set_mtu(1400);
     }
@@ -639,5 +639,125 @@ mod tests {
         let us_per_op = elapsed.as_micros() as f64 / iterations as f64;
         let throughput_mbps = (data_size as f64 * 8.0 * iterations as f64) / elapsed.as_secs_f64() / 1e6;
         println!("\nRust KCP send/recv: {:.2} us/op, {:.1} Mbps ({} bytes/msg)", us_per_op, throughput_mbps, data_size);
+    }
+
+    /// Simple LCG PRNG for deterministic packet drop simulation.
+    struct Lcg {
+        state: u64,
+    }
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg { state: seed }
+        }
+
+        fn next_f64(&mut self) -> f64 {
+            self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.state >> 33) & 0x7FFFFFFF) as f64 / 0x7FFFFFFF as f64
+        }
+
+        fn should_drop(&mut self, rate: f64) -> bool {
+            if rate <= 0.0 { return false; }
+            self.next_f64() < rate
+        }
+    }
+
+    fn run_kcp_loss_test(data_size: usize, block_size: usize, loss_rate: f64, timeout_ms: u64) -> (usize, u64) {
+        let mut rng = Lcg::new(42);
+
+        let packets_a = Arc::new(Mutex::new(Vec::new()));
+        let packets_b = Arc::new(Mutex::new(Vec::new()));
+        let packets_a_clone = packets_a.clone();
+        let packets_b_clone = packets_b.clone();
+
+        let mut kcp_a = Kcp::new(1, Box::new(move |data| {
+            packets_a_clone.lock().unwrap().push(data.to_vec());
+        }));
+        let mut kcp_b = Kcp::new(1, Box::new(move |data| {
+            packets_b_clone.lock().unwrap().push(data.to_vec());
+        }));
+
+        kcp_a.set_default_config();
+        kcp_b.set_default_config();
+
+        // Send all data
+        let data = vec![0xABu8; data_size];
+        let mut offset = 0;
+        while offset < data_size {
+            let end = std::cmp::min(offset + block_size, data_size);
+            kcp_a.send(&data[offset..end]);
+            offset = end;
+        }
+
+        // Run exchange loop
+        let mut received = 0usize;
+        let mut buf = [0u8; 65536];
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let mut current = 0u32;
+
+        while start.elapsed() < timeout && received < data_size {
+            kcp_a.update(current);
+            kcp_a.flush();
+
+            // A→B with loss
+            let pkts_a: Vec<Vec<u8>> = packets_a.lock().unwrap().drain(..).collect();
+            for pkt in pkts_a {
+                if !rng.should_drop(loss_rate) {
+                    kcp_b.input(&pkt);
+                }
+            }
+
+            kcp_b.update(current);
+
+            // B→A (ACKs) with loss
+            let pkts_b: Vec<Vec<u8>> = packets_b.lock().unwrap().drain(..).collect();
+            for pkt in pkts_b {
+                if !rng.should_drop(loss_rate) {
+                    kcp_a.input(&pkt);
+                }
+            }
+
+            // Receive
+            loop {
+                let n = kcp_b.recv(&mut buf);
+                if n <= 0 { break; }
+                received += n as usize;
+            }
+
+            current += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        (received, elapsed_ms)
+    }
+
+    #[test]
+    fn test_kcp_packet_loss() {
+        let loss_rates = [0.0, 0.01, 0.03, 0.05, 0.10];
+        let data_size = 64 * 1024; // 64KB
+        let block_size = 1024;     // 1KB per send
+        let timeout_ms = 5000;     // 5s
+
+        println!("\n{:<12} {:<14} {:<14} {:<14}", "Loss Rate", "Delivered", "Throughput", "Time");
+        println!("{:<12} {:<14} {:<14} {:<14}", "----------", "----------", "----------", "----------");
+
+        for &loss_rate in &loss_rates {
+            let (delivered, elapsed_ms) = run_kcp_loss_test(data_size, block_size, loss_rate, timeout_ms);
+
+            let throughput = if elapsed_ms > 0 && delivered > 0 {
+                format!("{:.0} KB/s", delivered as f64 / (elapsed_ms as f64 / 1000.0) / 1024.0)
+            } else {
+                "0 KB/s".to_string()
+            };
+
+            println!("{:<12} {:<14} {:<14} {:<14}",
+                format!("{}%", (loss_rate * 100.0) as u32),
+                format!("{}/{} KB", delivered / 1024, data_size / 1024),
+                throughput,
+                format!("{}ms", elapsed_ms),
+            );
+        }
     }
 }

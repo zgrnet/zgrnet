@@ -22,10 +22,10 @@
 //=====================================================================
 // KCP BASIC
 //=====================================================================
-const IUINT32 IKCP_RTO_NDL = 30;		// no delay min rto
-const IUINT32 IKCP_RTO_MIN = 100;		// normal min rto
-const IUINT32 IKCP_RTO_DEF = 200;
-const IUINT32 IKCP_RTO_MAX = 60000;
+const IUINT32 IKCP_RTO_NDL = 10;		// no delay min rto (30→10)
+const IUINT32 IKCP_RTO_MIN = 50;		// normal min rto (100→50)
+const IUINT32 IKCP_RTO_DEF = 100;		// default rto (200→100)
+const IUINT32 IKCP_RTO_MAX = 5000;		// max rto (60000→5000)
 const IUINT32 IKCP_CMD_PUSH = 81;		// cmd: push data
 const IUINT32 IKCP_CMD_ACK  = 82;		// cmd: ack
 const IUINT32 IKCP_CMD_WASK = 83;		// cmd: window probe (ask)
