@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -63,21 +64,29 @@ func run(cfgPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("validate config: %w", err)
+
+	// Apply defaults for optional fields
+	if cfg.Net.TunMTU == 0 {
+		cfg.Net.TunMTU = 1400
+	}
+	if cfg.Net.ListenPort == 0 {
+		cfg.Net.ListenPort = 51820
+	}
+	if cfg.Net.PrivateKeyPath == "" {
+		cfg.Net.PrivateKeyPath = "private.key"
 	}
 
 	// ── 2. Load or generate private key ──────────────────────────────────
-	keyPair, err := loadOrGenerateKey(cfg.Net.PrivateKey)
+	keyPair, err := loadOrGenerateKey(cfg.Net.PrivateKeyPath)
 	if err != nil {
 		return fmt.Errorf("private key: %w", err)
 	}
 	log.Printf("public key: %s", keyPair.Public)
 
 	// ── 3. Create data directory ─────────────────────────────────────────
-	if err := os.MkdirAll(cfg.Net.DataDir, 0700); err != nil {
-		return fmt.Errorf("create data dir %s: %w", cfg.Net.DataDir, err)
+	dataDir := filepath.Join(filepath.Dir(string(cfgPath)), "data")
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return fmt.Errorf("create data dir %s: %w", dataDir, err)
 	}
 
 	// ── 4. Create and configure TUN device ───────────────────────────────
@@ -121,7 +130,7 @@ func run(cfgPath string) error {
 
 	// ── 7. Add peers from config ─────────────────────────────────────────
 	for domain, peerCfg := range cfg.Peers {
-		hexPubkey, err := config.PubkeyFromDomain(domain)
+		hexPubkey, err := pubkeyFromDomain(domain)
 		if err != nil {
 			return fmt.Errorf("peer %s: %w", domain, err)
 		}
@@ -174,7 +183,7 @@ func run(cfgPath string) error {
 	// ── 9. Build peer alias → pubkey lookup for route matching ──────────
 	aliasToPubkey := make(map[string]noise.PublicKey)
 	for domain, peerCfg := range cfg.Peers {
-		hexPK, _ := config.PubkeyFromDomain(domain)
+		hexPK, _ := pubkeyFromDomain(domain)
 		pk, _ := noise.KeyFromHex(hexPK)
 		if peerCfg.Alias != "" {
 			aliasToPubkey[peerCfg.Alias] = pk
@@ -229,7 +238,7 @@ func run(cfgPath string) error {
 	// For each peer, accept KCP streams with proto=69 and handle them
 	// by dialing the real TCP target and relaying.
 	for domain := range cfg.Peers {
-		hexPK, _ := config.PubkeyFromDomain(domain)
+		hexPK, _ := pubkeyFromDomain(domain)
 		pk, _ := noise.KeyFromHex(hexPK)
 		go acceptTCPProxyStreams(udpTransport, pk)
 	}
@@ -326,6 +335,27 @@ func loadOrGenerateKey(path string) (*noise.KeyPair, error) {
 	}
 
 	return kp, nil
+}
+
+// pubkeyFromDomain extracts hex pubkey from "{first32}.{last32}.zigor.net" or plain 64-char hex.
+func pubkeyFromDomain(domain string) (string, error) {
+	domain = strings.ToLower(domain)
+	subdomain := strings.TrimSuffix(domain, ".zigor.net")
+	if parts := strings.SplitN(subdomain, ".", 2); len(parts) == 2 {
+		combined := parts[0] + parts[1]
+		if len(combined) == 64 && isHexString(combined) {
+			return combined, nil
+		}
+	}
+	if len(subdomain) == 64 && isHexString(subdomain) {
+		return subdomain, nil
+	}
+	return "", fmt.Errorf("invalid peer domain %q", domain)
+}
+
+func isHexString(s string) bool {
+	_, err := hex.DecodeString(s)
+	return err == nil && len(s)%2 == 0
 }
 
 // trimKey removes whitespace and newlines from a key string.

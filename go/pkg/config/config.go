@@ -1,24 +1,10 @@
-// Package config handles zgrnetd configuration file parsing and validation.
+// Package config provides configuration management for zgrnet.
 //
-// The configuration is a YAML file with the following top-level sections:
-//   - net: Global settings (private key, TUN IP, MTU, listen port)
-//   - peers: Manually configured direct peers
-//   - inbound_policy: Inbound access control rules
-//   - route: Outbound routing rules (domain -> peer)
+// It handles parsing, validation, diffing, and hot-reloading of configuration
+// files. The config describes the "desired state" of the system; consumers
+// receive incremental diffs and reconcile accordingly.
 //
-// Example:
-//
-//	net:
-//	  private_key: "private.key"
-//	  tun_ipv4: "100.64.0.1"
-//	  tun_mtu: 1400
-//	  listen_port: 51820
-//	  data_dir: "./data"
-//	peers:
-//	  "abc123...zigor.net":
-//	    alias: peer_us
-//	    direct:
-//	      - "us.example.com:51820"
+// Go and Rust use YAML format; Zig uses JSON. The data structures are identical.
 package config
 
 import (
@@ -26,313 +12,340 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the top-level configuration for zgrnetd.
+// Config is the top-level configuration structure.
 type Config struct {
-	Net           NetConfig             `yaml:"net"`
-	Peers         map[string]PeerConfig `yaml:"peers"`
-	InboundPolicy InboundPolicy         `yaml:"inbound_policy"`
-	Route         RouteConfig           `yaml:"route"`
+	Net           NetConfig             `yaml:"net" json:"net"`
+	Lans          []LanConfig           `yaml:"lans" json:"lans"`
+	Peers         map[string]PeerConfig `yaml:"peers" json:"peers"`
+	InboundPolicy InboundPolicy         `yaml:"inbound_policy" json:"inbound_policy"`
+	Route         RouteConfig           `yaml:"route" json:"route"`
 }
 
-// NetConfig holds global network settings.
+// NetConfig holds global network settings. Changes require a restart.
 type NetConfig struct {
-	// PrivateKey is the path to the Noise private key file.
-	// Relative paths are resolved against the config file's directory.
-	PrivateKey string `yaml:"private_key"`
+	// PrivateKeyPath is the path to the Noise Protocol private key file.
+	PrivateKeyPath string `yaml:"private_key" json:"private_key"`
 
-	// TunIPv4 is the local IPv4 address for the TUN device.
+	// TunIPv4 is the local TUN device IPv4 address.
 	// Must be in the CGNAT range (100.64.0.0/10).
-	TunIPv4 string `yaml:"tun_ipv4"`
+	TunIPv4 string `yaml:"tun_ipv4" json:"tun_ipv4"`
 
-	// TunMTU is the Maximum Transmission Unit. Default: 1400.
-	TunMTU int `yaml:"tun_mtu"`
+	// TunMTU is the TUN device MTU. Default: 1400.
+	TunMTU int `yaml:"tun_mtu" json:"tun_mtu"`
 
-	// ListenPort is the UDP port to listen on. Default: 51820.
-	ListenPort int `yaml:"listen_port"`
-
-	// DataDir is the directory for runtime data (state, cache).
-	// Relative paths are resolved against the config file's directory.
-	// Default: "./data"
-	DataDir string `yaml:"data_dir"`
+	// ListenPort is the UDP listen port. 0 for random.
+	ListenPort int `yaml:"listen_port" json:"listen_port"`
 }
 
-// PeerConfig holds configuration for a single peer.
+// LanConfig holds the configuration for a zgrlan node.
+type LanConfig struct {
+	Domain   string `yaml:"domain" json:"domain"`
+	Pubkey   string `yaml:"pubkey" json:"pubkey"`
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+}
+
+// PeerConfig holds the configuration for a manually configured peer.
 type PeerConfig struct {
-	// Alias is a short name for the peer (used in route rules).
-	Alias string `yaml:"alias"`
-
-	// Direct is a list of direct endpoint addresses ("host:port").
-	Direct []string `yaml:"direct"`
-
-	// Relay is a list of relay peer domains to use for this peer.
-	Relay []string `yaml:"relay"`
+	Alias  string   `yaml:"alias" json:"alias"`
+	Direct []string `yaml:"direct" json:"direct"`
+	Relay  []string `yaml:"relay" json:"relay"`
 }
 
-// InboundPolicy controls which peers can connect and what services they can access.
+// InboundPolicy controls who can connect and what services they can access.
 type InboundPolicy struct {
-	// Default is the default action: "allow" or "deny".
-	Default string `yaml:"default"`
+	// Default action when no rule matches: "allow" or "deny".
+	Default string `yaml:"default" json:"default"`
 
-	// Rules is an ordered list of inbound rules.
-	Rules []InboundRule `yaml:"rules"`
+	// RevalidateInterval is how often existing connections are re-checked.
+	// Format: Go duration string (e.g., "5m", "1h").
+	RevalidateInterval string `yaml:"revalidate_interval" json:"revalidate_interval"`
+
+	// Rules are evaluated in order; first match wins.
+	Rules []InboundRule `yaml:"rules" json:"rules"`
 }
 
-// InboundRule is a single inbound access control rule.
+// InboundRule is a single inbound policy rule.
 type InboundRule struct {
-	Name     string          `yaml:"name"`
-	Match    MatchConfig     `yaml:"match"`
-	Services []ServiceConfig `yaml:"services"`
-	Action   string          `yaml:"action"`
+	Name     string          `yaml:"name" json:"name"`
+	Match    MatchConfig     `yaml:"match" json:"match"`
+	Services []ServiceConfig `yaml:"services" json:"services"`
+	Action   string          `yaml:"action" json:"action"`
 }
 
-// MatchConfig defines how to match a peer for an inbound rule.
+// MatchConfig defines how to match a peer's identity.
 type MatchConfig struct {
-	Pubkey PubkeyMatch `yaml:"pubkey"`
+	Pubkey PubkeyMatch `yaml:"pubkey" json:"pubkey"`
 }
 
-// PubkeyMatch specifies how to match peer public keys.
+// PubkeyMatch defines the pubkey matching strategy.
 type PubkeyMatch struct {
-	// Type is the match type: "whitelist" or "zgrlan".
-	Type string `yaml:"type"`
+	// Type is the matching strategy.
+	// Supported: "whitelist", "zgrlan", "any".
+	// Future: "solana", "database", "http".
+	Type string `yaml:"type" json:"type"`
 
-	// Path is the path to a file containing allowed pubkeys (for "whitelist" type).
-	// Relative paths are resolved against the config file's directory.
-	Path string `yaml:"path"`
+	// Path is the file path for whitelist type (one pubkey per line).
+	Path string `yaml:"path,omitempty" json:"path,omitempty"`
 
-	// Peer is the zgrlan peer domain (for "zgrlan" type).
-	Peer string `yaml:"peer"`
+	// Peer is the zgrlan peer domain for zgrlan type.
+	Peer string `yaml:"peer,omitempty" json:"peer,omitempty"`
 }
 
-// ServiceConfig defines a service (protocol + port) for inbound rules.
+// ServiceConfig defines which network services are accessible.
 type ServiceConfig struct {
-	Proto string `yaml:"proto"`
-	Port  string `yaml:"port"`
+	// Proto is the protocol: "*", "tcp", "udp", "icmp".
+	Proto string `yaml:"proto" json:"proto"`
+
+	// Port is the port specification: "*", "80", "80,443", "8000-9000".
+	Port string `yaml:"port" json:"port"`
 }
 
 // RouteConfig holds outbound routing rules.
 type RouteConfig struct {
-	Rules []RouteRule `yaml:"rules"`
+	Rules []RouteRule `yaml:"rules" json:"rules"`
 }
 
-// RouteRule matches domains to a target peer for outbound routing.
+// RouteRule defines how traffic for specific domains is routed.
 type RouteRule struct {
-	// Domain is a glob pattern (e.g., "*.google.com").
-	Domain string `yaml:"domain"`
+	// Domain is a glob pattern: "*.google.com", "google.com".
+	Domain string `yaml:"domain,omitempty" json:"domain,omitempty"`
 
-	// DomainList is a path to a file with one domain per line.
-	// Relative paths are resolved against the config file's directory.
-	DomainList string `yaml:"domain_list"`
+	// DomainList is a file path containing one domain per line.
+	DomainList string `yaml:"domain_list,omitempty" json:"domain_list,omitempty"`
 
 	// Peer is the target peer alias or domain.
-	Peer string `yaml:"peer"`
+	Peer string `yaml:"peer" json:"peer"`
 }
 
-// Load reads and parses a YAML config file.
-// Relative paths in the config are resolved against the config file's directory.
+// Load reads and parses a YAML config file from the given path.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("config: read %s: %w", path, err)
+		return nil, fmt.Errorf("config: read file %q: %w", path, err)
 	}
-
-	cfg, err := Parse(data)
-	if err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
-	}
-
-	// Resolve relative paths against config directory.
-	dir := filepath.Dir(path)
-	if absDir, err := filepath.Abs(dir); err == nil {
-		dir = absDir
-	}
-	cfg.ResolveRelativePaths(dir)
-
-	return cfg, nil
+	return LoadFromBytes(data)
 }
 
-// Parse parses a YAML config from raw bytes.
-func Parse(data []byte) (*Config, error) {
+// LoadFromBytes parses a YAML config from raw bytes.
+func LoadFromBytes(data []byte) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("yaml: %w", err)
+		return nil, fmt.Errorf("config: parse yaml: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 	return &cfg, nil
 }
 
-// ResolveRelativePaths resolves relative file paths in the config
-// against the given context directory (typically the config file's directory).
-func (c *Config) ResolveRelativePaths(contextDir string) {
-	resolve := func(p string) string {
-		if p == "" || filepath.IsAbs(p) {
-			return p
-		}
-		return filepath.Join(contextDir, p)
-	}
+// CGNAT is the Carrier-Grade NAT range: 100.64.0.0/10.
+var cgnatNet = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("100.64.0.0/10")
+	return n
+}()
 
-	c.Net.PrivateKey = resolve(c.Net.PrivateKey)
-	c.Net.DataDir = resolve(c.Net.DataDir)
-
-	for i := range c.InboundPolicy.Rules {
-		r := &c.InboundPolicy.Rules[i]
-		r.Match.Pubkey.Path = resolve(r.Match.Pubkey.Path)
-	}
-
-	for i := range c.Route.Rules {
-		r := &c.Route.Rules[i]
-		r.DomainList = resolve(r.DomainList)
-	}
-}
-
-// ApplyDefaults fills in default values for unset fields.
-func (c *Config) ApplyDefaults() {
-	if c.Net.TunMTU == 0 {
-		c.Net.TunMTU = 1400
-	}
-	if c.Net.ListenPort == 0 {
-		c.Net.ListenPort = 51820
-	}
-	if c.Net.DataDir == "" {
-		c.Net.DataDir = "./data"
-	}
-	if c.Net.PrivateKey == "" {
-		c.Net.PrivateKey = "private.key"
-	}
-	if c.InboundPolicy.Default == "" {
-		c.InboundPolicy.Default = "deny"
-	}
-}
-
-// Validate checks the configuration for errors.
-// Call ApplyDefaults before Validate if you want defaults to be set.
+// Validate checks the configuration for correctness.
 func (c *Config) Validate() error {
-	// net.private_key must be set
-	if c.Net.PrivateKey == "" {
-		return fmt.Errorf("config: net.private_key is required")
+	if err := c.Net.validate(); err != nil {
+		return fmt.Errorf("config: net: %w", err)
 	}
-
-	// net.tun_ipv4 must be a valid CGNAT address
-	if c.Net.TunIPv4 == "" {
-		return fmt.Errorf("config: net.tun_ipv4 is required")
+	for i, lan := range c.Lans {
+		if err := lan.validate(); err != nil {
+			return fmt.Errorf("config: lans[%d]: %w", i, err)
+		}
 	}
-	if err := validateCGNATAddress(c.Net.TunIPv4); err != nil {
-		return fmt.Errorf("config: net.tun_ipv4: %w", err)
-	}
-
-	// net.tun_mtu range
-	if c.Net.TunMTU < 576 || c.Net.TunMTU > 65535 {
-		return fmt.Errorf("config: net.tun_mtu must be between 576 and 65535, got %d", c.Net.TunMTU)
-	}
-
-	// net.listen_port range
-	if c.Net.ListenPort < 0 || c.Net.ListenPort > 65535 {
-		return fmt.Errorf("config: net.listen_port must be between 0 and 65535, got %d", c.Net.ListenPort)
-	}
-
-	// Validate peers
-	for domain, p := range c.Peers {
+	for domain, peer := range c.Peers {
 		if err := validatePeerDomain(domain); err != nil {
 			return fmt.Errorf("config: peers[%q]: %w", domain, err)
 		}
-		for _, ep := range p.Direct {
-			if _, _, err := net.SplitHostPort(ep); err != nil {
-				return fmt.Errorf("config: peers[%q].direct: invalid endpoint %q: %w", domain, ep, err)
-			}
+		if err := peer.validate(); err != nil {
+			return fmt.Errorf("config: peers[%q]: %w", domain, err)
 		}
 	}
-
-	// Validate inbound_policy
-	switch c.InboundPolicy.Default {
-	case "allow", "deny":
-		// ok
-	default:
-		return fmt.Errorf("config: inbound_policy.default must be \"allow\" or \"deny\", got %q", c.InboundPolicy.Default)
+	if err := c.InboundPolicy.validate(); err != nil {
+		return fmt.Errorf("config: inbound_policy: %w", err)
 	}
-
-	for i, r := range c.InboundPolicy.Rules {
-		if r.Name == "" {
-			return fmt.Errorf("config: inbound_policy.rules[%d]: name is required", i)
-		}
-		switch r.Action {
-		case "allow", "deny":
-			// ok
-		default:
-			return fmt.Errorf("config: inbound_policy.rules[%d] (%s): action must be \"allow\" or \"deny\"", i, r.Name)
-		}
+	if err := c.Route.validate(); err != nil {
+		return fmt.Errorf("config: route: %w", err)
 	}
-
-	// Validate route rules
-	for i, r := range c.Route.Rules {
-		if r.Domain == "" && r.DomainList == "" {
-			return fmt.Errorf("config: route.rules[%d]: domain or domain_list is required", i)
-		}
-		if r.Peer == "" {
-			return fmt.Errorf("config: route.rules[%d]: peer is required", i)
-		}
-	}
-
 	return nil
 }
 
-// PubkeyFromDomain extracts the hex-encoded public key from a peer domain.
-// Format: "{first32hex}.{last32hex}.zigor.net" or plain 64-char hex.
-func PubkeyFromDomain(domain string) (string, error) {
-	domain = strings.ToLower(domain)
-
-	// Strip .zigor.net suffix if present
-	const suffix = ".zigor.net"
-	subdomain := domain
-	if strings.HasSuffix(domain, suffix) {
-		subdomain = strings.TrimSuffix(domain, suffix)
+func (n *NetConfig) validate() error {
+	if n.PrivateKeyPath == "" {
+		return fmt.Errorf("private_key is required")
 	}
-
-	// Try "first32.last32" format
-	if parts := strings.SplitN(subdomain, ".", 2); len(parts) == 2 {
-		combined := parts[0] + parts[1]
-		if len(combined) == 64 && isHexString(combined) {
-			return combined, nil
-		}
+	if n.TunIPv4 == "" {
+		return fmt.Errorf("tun_ipv4 is required")
 	}
-
-	// Try plain 64-char hex
-	if len(subdomain) == 64 && isHexString(subdomain) {
-		return subdomain, nil
-	}
-
-	return "", fmt.Errorf("config: invalid peer domain %q: expected hex pubkey", domain)
-}
-
-// validateCGNATAddress checks that the IP is in the CGNAT range (100.64.0.0/10).
-func validateCGNATAddress(addr string) error {
-	ip := net.ParseIP(addr)
+	ip := net.ParseIP(n.TunIPv4)
 	if ip == nil {
-		return fmt.Errorf("invalid IP address: %s", addr)
+		return fmt.Errorf("tun_ipv4 %q is not a valid IP address", n.TunIPv4)
 	}
 	ip4 := ip.To4()
 	if ip4 == nil {
-		return fmt.Errorf("IPv6 not supported for TUN IP: %s", addr)
+		return fmt.Errorf("tun_ipv4 %q is not an IPv4 address", n.TunIPv4)
 	}
-	// CGNAT range: 100.64.0.0/10 → first byte 100, second byte 64-127
-	if ip4[0] != 100 || ip4[1] < 64 || ip4[1] > 127 {
-		return fmt.Errorf("%s is not in CGNAT range (100.64.0.0/10)", addr)
+	if !cgnatNet.Contains(ip4) {
+		return fmt.Errorf("tun_ipv4 %q is not in CGNAT range (100.64.0.0/10)", n.TunIPv4)
+	}
+	if n.TunMTU < 0 || n.TunMTU > 65535 {
+		return fmt.Errorf("tun_mtu %d is out of range [0, 65535]", n.TunMTU)
+	}
+	if n.ListenPort < 0 || n.ListenPort > 65535 {
+		return fmt.Errorf("listen_port %d is out of range [0, 65535]", n.ListenPort)
 	}
 	return nil
 }
 
-// validatePeerDomain validates a peer domain key in the peers map.
-// Accepts "{hex}.zigor.net" or plain 64-char hex pubkey strings.
-func validatePeerDomain(domain string) error {
-	_, err := PubkeyFromDomain(domain)
-	return err
+func (l *LanConfig) validate() error {
+	if l.Domain == "" {
+		return fmt.Errorf("domain is required")
+	}
+	if l.Pubkey == "" {
+		return fmt.Errorf("pubkey is required")
+	}
+	if err := validatePubkeyHex(l.Pubkey); err != nil {
+		return err
+	}
+	if l.Endpoint == "" {
+		return fmt.Errorf("endpoint is required")
+	}
+	return nil
 }
 
-// isHexString returns true if s contains only hex characters.
-func isHexString(s string) bool {
-	_, err := hex.DecodeString(s)
-	return err == nil && len(s)%2 == 0
+func (p *PeerConfig) validate() error {
+	if len(p.Direct) == 0 && len(p.Relay) == 0 {
+		return fmt.Errorf("at least one of direct or relay is required")
+	}
+	return nil
+}
+
+func (ip *InboundPolicy) validate() error {
+	if ip.Default != "" && ip.Default != "allow" && ip.Default != "deny" {
+		return fmt.Errorf("default must be \"allow\" or \"deny\", got %q", ip.Default)
+	}
+	for i, rule := range ip.Rules {
+		if err := rule.validate(); err != nil {
+			return fmt.Errorf("rules[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (r *InboundRule) validate() error {
+	if r.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if err := r.Match.validate(); err != nil {
+		return fmt.Errorf("match: %w", err)
+	}
+	if r.Action != "allow" && r.Action != "deny" {
+		return fmt.Errorf("action must be \"allow\" or \"deny\", got %q", r.Action)
+	}
+	for i, svc := range r.Services {
+		if err := svc.validate(); err != nil {
+			return fmt.Errorf("services[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (m *MatchConfig) validate() error {
+	return m.Pubkey.validate()
+}
+
+var validMatchTypes = map[string]bool{
+	"whitelist": true,
+	"zgrlan":    true,
+	"any":       true,
+	// Future types:
+	"solana":   true,
+	"database": true,
+	"http":     true,
+}
+
+func (p *PubkeyMatch) validate() error {
+	if p.Type == "" {
+		return fmt.Errorf("pubkey.type is required")
+	}
+	if !validMatchTypes[p.Type] {
+		return fmt.Errorf("pubkey.type %q is not supported", p.Type)
+	}
+	switch p.Type {
+	case "whitelist":
+		if p.Path == "" {
+			return fmt.Errorf("pubkey.path is required for type \"whitelist\"")
+		}
+	case "zgrlan":
+		if p.Peer == "" {
+			return fmt.Errorf("pubkey.peer is required for type \"zgrlan\"")
+		}
+	}
+	return nil
+}
+
+func (s *ServiceConfig) validate() error {
+	validProtos := map[string]bool{"*": true, "tcp": true, "udp": true, "icmp": true}
+	if !validProtos[s.Proto] {
+		return fmt.Errorf("proto must be one of *, tcp, udp, icmp; got %q", s.Proto)
+	}
+	if s.Port == "" {
+		return fmt.Errorf("port is required")
+	}
+	return nil
+}
+
+func (r *RouteConfig) validate() error {
+	for i, rule := range r.Rules {
+		if err := rule.validate(); err != nil {
+			return fmt.Errorf("rules[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (r *RouteRule) validate() error {
+	if r.Domain == "" && r.DomainList == "" {
+		return fmt.Errorf("at least one of domain or domain_list is required")
+	}
+	if r.Peer == "" {
+		return fmt.Errorf("peer is required")
+	}
+	return nil
+}
+
+// validatePeerDomain checks that a peer key looks like "{hex}.zigor.net".
+func validatePeerDomain(domain string) error {
+	if !strings.HasSuffix(domain, ".zigor.net") {
+		return fmt.Errorf("peer domain must end with .zigor.net")
+	}
+	prefix := strings.TrimSuffix(domain, ".zigor.net")
+	if prefix == "" {
+		return fmt.Errorf("peer domain must have a pubkey prefix")
+	}
+	// The prefix should be hex-encoded (up to 64 chars for a 32-byte key).
+	if _, err := hex.DecodeString(prefix); err != nil {
+		return fmt.Errorf("peer domain prefix %q is not valid hex: %w", prefix, err)
+	}
+	if len(prefix) > 64 {
+		return fmt.Errorf("peer domain prefix is too long (%d > 64)", len(prefix))
+	}
+	return nil
+}
+
+// validatePubkeyHex checks that a string is valid hex-encoded 32-byte public key.
+func validatePubkeyHex(s string) error {
+	if len(s) != 64 {
+		return fmt.Errorf("pubkey must be 64 hex characters, got %d", len(s))
+	}
+	if _, err := hex.DecodeString(s); err != nil {
+		return fmt.Errorf("pubkey is not valid hex: %w", err)
+	}
+	return nil
 }
