@@ -45,7 +45,7 @@ func (s StreamState) String() string {
 }
 
 // Stream represents a multiplexed stream over KCP.
-// It implements io.ReadWriteCloser.
+// It implements io.ReadWriteCloser with blocking Read semantics.
 type Stream struct {
 	id       uint32
 	mux      *Mux
@@ -53,9 +53,10 @@ type Stream struct {
 	proto    byte   // Stream protocol type (from SYN payload)
 	metadata []byte // Stream metadata (from SYN payload)
 
-	// Receive buffer
-	recvBuf []byte
-	recvMu  sync.Mutex
+	// Receive buffer (protected by recvMu, which also backs recvCond)
+	recvBuf  []byte
+	recvMu   sync.Mutex
+	recvCond *sync.Cond // signaled when data arrives or stream closes
 
 	// State
 	state     atomic.Uint32
@@ -76,6 +77,7 @@ func newStream(id uint32, mux *Mux, proto byte, metadata []byte) *Stream {
 		metadata: metadata,
 		closeCh:  make(chan struct{}),
 	}
+	s.recvCond = sync.NewCond(&s.recvMu)
 
 	// Create KCP instance
 	s.kcp = NewKCP(id, func(data []byte) {
@@ -112,9 +114,9 @@ func (s *Stream) State() StreamState {
 	return StreamState(s.state.Load())
 }
 
-// Read reads data from the stream (non-blocking).
-// Returns 0, nil if no data is available.
-// Returns 0, io.EOF if the stream is closed.
+// Read reads data from the stream. Blocks until data is available,
+// the stream is closed, or the read deadline expires.
+// Returns 0, io.EOF when the stream is closed.
 func (s *Stream) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -123,19 +125,41 @@ func (s *Stream) Read(b []byte) (int, error) {
 	s.recvMu.Lock()
 	defer s.recvMu.Unlock()
 
-	if len(s.recvBuf) == 0 {
+	for len(s.recvBuf) == 0 {
+		// Check terminal states
 		state := s.State()
 		if state == StreamStateClosed || state == StreamStateRemoteClose {
 			return 0, io.EOF
 		}
-
 		select {
 		case <-s.closeCh:
 			return 0, io.EOF
 		default:
 		}
 
-		return 0, nil // No data available
+		// Check read deadline
+		if deadline, ok := s.readDeadline.Load().(time.Time); ok && !deadline.IsZero() {
+			if time.Now().After(deadline) {
+				return 0, ErrTimeout
+			}
+			// Use timed wait: spawn a goroutine to signal after timeout
+			done := make(chan struct{})
+			go func() {
+				timer := time.NewTimer(time.Until(deadline))
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					s.recvCond.Broadcast()
+				case <-done:
+				}
+			}()
+			s.recvCond.Wait()
+			close(done)
+			continue
+		}
+
+		// Block until data arrives or stream closes
+		s.recvCond.Wait()
 	}
 
 	// Copy data
@@ -214,8 +238,9 @@ func (s *Stream) doClose(removeFromMux bool) error {
 		err = s.mux.sendFIN(s.id)
 	}
 
-	// Signal close
+	// Signal close — wake blocked readers
 	close(s.closeCh)
+	s.recvCond.Broadcast()
 
 	// Release KCP
 	s.kcp.Release()
@@ -258,6 +283,7 @@ func (s *Stream) kcpInput(data []byte) {
 
 // kcpRecv tries to receive data from KCP and buffer it.
 // Returns true if any data was received.
+// Signals recvCond to wake any blocked Read calls.
 func (s *Stream) kcpRecv() bool {
 	bufPtr := bufferPool.Get().(*[]byte)
 	buf := *bufPtr
@@ -280,6 +306,9 @@ func (s *Stream) kcpRecv() bool {
 		s.recvMu.Unlock()
 		received = true
 	}
+	if received {
+		s.recvCond.Broadcast()
+	}
 	return received
 }
 
@@ -300,6 +329,8 @@ func (s *Stream) fin() {
 	} else if state == StreamStateOpen {
 		s.state.Store(uint32(StreamStateRemoteClose))
 	}
+	// Wake blocked readers so they see EOF
+	s.recvCond.Broadcast()
 }
 
 // Stream errors.

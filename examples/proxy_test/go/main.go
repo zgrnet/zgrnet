@@ -143,8 +143,7 @@ func runHandler(config *Config, myInfo *HostInfo, myKey *noise.KeyPair) {
 	}
 
 	// 5. Handle TCP_PROXY: decode address → dial echo server → relay
-	bs := &proxy.BlockingStream{S: stream}
-	if err := proxy.HandleTCPProxy(bs, stream.Metadata(), nil, nil); err != nil {
+	if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
 		log.Printf("[handler] HandleTCPProxy finished: %v", err)
 	}
 
@@ -205,15 +204,13 @@ func runProxy(config *Config, myInfo *HostInfo, myKey *noise.KeyPair) {
 
 	// 4. Send test data and verify echo
 	testMsg := config.Test.Message
-	bs := &proxy.BlockingStream{S: stream}
-
 	log.Printf("[proxy] Sending: %q", testMsg)
-	if _, err := bs.Write([]byte(testMsg)); err != nil {
+	if _, err := stream.Write([]byte(testMsg)); err != nil {
 		log.Fatalf("[proxy] Write failed: %v", err)
 	}
 
 	buf := make([]byte, len(testMsg))
-	if _, err := io.ReadFull(bs, buf); err != nil {
+	if _, err := io.ReadFull(stream, buf); err != nil {
 		log.Fatalf("[proxy] ReadFull failed: %v", err)
 	}
 

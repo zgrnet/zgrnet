@@ -57,7 +57,6 @@ var (
 
 // DialFunc opens a connection to the target address.
 // The returned io.ReadWriteCloser must have blocking Read semantics.
-// For KCP streams (which have non-blocking Read), wrap with BlockingStream.
 type DialFunc func(addr *noise.Address) (io.ReadWriteCloser, error)
 
 // UDPRelay handles UDP data exchange through the tunnel.
@@ -625,28 +624,4 @@ func BuildSOCKS5UDP(addr *noise.Address, data []byte) []byte {
 	copy(pkt[3:], encoded)
 	copy(pkt[3+len(encoded):], data)
 	return pkt
-}
-
-// BlockingStream wraps a non-blocking reader (like kcp.Stream) with
-// blocking Read semantics by polling with a short sleep interval.
-type BlockingStream struct {
-	S io.ReadWriteCloser
-}
-
-func (b *BlockingStream) Read(p []byte) (int, error) {
-	for {
-		n, err := b.S.Read(p)
-		if n > 0 || err != nil {
-			return n, err
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-func (b *BlockingStream) Write(p []byte) (int, error) {
-	return b.S.Write(p)
-}
-
-func (b *BlockingStream) Close() error {
-	return b.S.Close()
 }

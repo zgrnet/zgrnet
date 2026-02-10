@@ -111,6 +111,16 @@ func (s *Server) ListenAndServe() error {
 	}
 }
 
+// Addr returns the server's listener address, or nil if not listening.
+func (s *Server) Addr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.conn == nil {
+		return nil
+	}
+	return s.conn.LocalAddr()
+}
+
 // Close shuts down the DNS server.
 func (s *Server) Close() error {
 	s.mu.Lock()

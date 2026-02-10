@@ -223,6 +223,17 @@ func (h *Host) PublicKey() noise.PublicKey {
 	return h.udp.HostInfo().PublicKey
 }
 
+// UDP returns the underlying UDP transport.
+// Use this to open/accept KCP streams for proxy and other protocols.
+func (h *Host) UDP() *znet.UDP {
+	return h.udp
+}
+
+// IPAlloc returns the host's IP allocator (pubkey ↔ IP mapping).
+func (h *Host) IPAlloc() *IPAllocator {
+	return h.ipAlloc
+}
+
 // outboundLoop reads IP packets from the TUN device and forwards them to peers.
 //
 // Flow: TUN.Read -> parse dst IP -> lookup peer pubkey -> strip IP header -> UDP.Write

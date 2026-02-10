@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use super::kcp::{Cmd, Frame, Kcp, FRAME_HEADER_SIZE};
 
@@ -51,6 +51,7 @@ pub struct Stream {
     kcp: Mutex<Kcp>,
     state: RwLock<StreamState>,
     recv_buf: Mutex<VecDeque<u8>>, // O(1) head removal
+    recv_cond: Condvar,            // Signaled when data arrives or stream closes
     fin_sender: Option<Box<dyn Fn() + Send + Sync>>, // Callback to send FIN frame
     output_error: Arc<std::sync::atomic::AtomicBool>, // Set on transport output error
 }
@@ -75,6 +76,7 @@ impl Stream {
             kcp: Mutex::new(kcp),
             state: RwLock::new(StreamState::Open),
             recv_buf: Mutex::new(VecDeque::new()),
+            recv_cond: Condvar::new(),
             fin_sender,
             output_error,
         }
@@ -145,6 +147,22 @@ impl Stream {
         Ok(Self::drain_recv_buf(&mut recv_buf, buf))
     }
 
+    /// Read data from the stream (blocking).
+    /// Blocks until data is available or the stream is closed/EOF.
+    pub fn read_blocking(&self, buf: &mut [u8]) -> Result<usize, StreamError> {
+        let mut recv_buf = self.recv_buf.lock().unwrap();
+        loop {
+            if !recv_buf.is_empty() {
+                return Ok(Self::drain_recv_buf(&mut recv_buf, buf));
+            }
+            let state = self.state();
+            if state == StreamState::Closed || state == StreamState::RemoteClose {
+                return Ok(0); // EOF
+            }
+            recv_buf = self.recv_cond.wait(recv_buf).unwrap();
+        }
+    }
+
     /// Helper: drain data from recv_buf into user buffer (DRY).
     /// Returns number of bytes copied.
     #[inline]
@@ -183,12 +201,17 @@ impl Stream {
             *state = StreamState::Closed;
         }
 
+        drop(state);
+
         // Send FIN frame to notify remote peer (only once)
         if should_send_fin {
             if let Some(ref fin_sender) = self.fin_sender {
                 fin_sender();
             }
         }
+
+        // Wake blocked readers
+        self.recv_cond.notify_all();
     }
 
     /// Input data from KCP.
@@ -238,6 +261,11 @@ impl Stream {
 
             recv_buf.extend(&buf[..n as usize]);
             received_data = true;
+        }
+
+        // Wake blocked readers
+        if received_data {
+            self.recv_cond.notify_all();
         }
 
         received_data
@@ -309,6 +337,9 @@ impl Stream {
         } else if *state == StreamState::Open {
             *state = StreamState::RemoteClose;
         }
+        drop(state);
+        // Wake blocked readers so they see EOF
+        self.recv_cond.notify_all();
     }
 }
 
@@ -582,6 +613,30 @@ impl std::fmt::Display for MuxError {
 }
 
 impl std::error::Error for MuxError {}
+
+/// Wrapper providing std::io::Read + Write for a KCP Stream.
+/// Uses blocking read semantics (waits via Condvar for data).
+pub struct StreamIo(pub Arc<Stream>);
+
+impl io::Read for StreamIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0
+            .read_blocking(buf)
+            .map_err(|e| io::Error::other(format!("{}", e)))
+    }
+}
+
+impl io::Write for StreamIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .write_data(buf)
+            .map_err(|e| io::Error::other(format!("{}", e)))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

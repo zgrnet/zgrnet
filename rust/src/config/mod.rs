@@ -359,6 +359,29 @@ fn validate_pubkey_hex(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Extract hex-encoded public key from a peer domain.
+/// Format: "{first32hex}.{last32hex}.zigor.net" or plain 64-char hex.
+pub fn pubkey_from_domain(domain: &str) -> Result<String, ConfigError> {
+    let domain = domain.to_lowercase();
+    let subdomain = domain.strip_suffix(".zigor.net").unwrap_or(&domain);
+
+    // Try "first32.last32" format
+    if let Some((a, b)) = subdomain.split_once('.') {
+        let combined = format!("{}{}", a, b);
+        if combined.len() == 64 && combined.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(combined);
+        }
+    }
+
+    // Try plain 64-char hex
+    if subdomain.len() == 64 && subdomain.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(subdomain.to_string());
+    }
+
+    Err(ConfigError::Validation(
+        format!("invalid peer domain {:?}: expected hex pubkey", domain)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

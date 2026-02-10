@@ -1,0 +1,43 @@
+load("@embed_zig//bazel/zig:defs.bzl", "zig_library", "zig_static_library")
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# DNS Manager Zig library (compiled from cabi.zig)
+zig_library(
+    name = "zig",
+    main = "//zig:src/dnsmgr/cabi.zig",
+    srcs = [
+        "//zig:src/dnsmgr/cabi.zig",
+        "//zig:src/dnsmgr/darwin.zig",
+        "//zig:src/dnsmgr/linux.zig",
+        "//zig:src/dnsmgr/mod.zig",
+        "//zig:src/dnsmgr/windows.zig",
+    ],
+    module_name = "dnsmgr_cabi",
+)
+
+# DNS Manager static library (.a) for Go/Rust FFI
+zig_static_library(
+    name = "static_lib",
+    lib = ":zig",
+    pic = True,  # Required for linking into Go CGo / Rust on Linux
+    visibility = ["//visibility:public"],
+)
+
+# DNS Manager cc_library with headers and linkopts for Go CGo and Rust FFI
+cc_library(
+    name = "lib",
+    srcs = [":static_lib"],
+    hdrs = ["//zig:include/dnsmgr.h"],
+    includes = ["../include"],
+    linkopts = select({
+        "@platforms//os:macos": [
+            "-framework CoreFoundation",
+            "-framework SystemConfiguration",
+        ],
+        "@platforms//os:linux": [],
+        "@platforms//os:windows": [
+            "-ladvapi32",
+        ],
+    }),
+    visibility = ["//visibility:public"],
+)

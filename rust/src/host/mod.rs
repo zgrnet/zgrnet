@@ -244,6 +244,17 @@ impl Host {
         self.udp.host_info().public_key
     }
 
+    /// Returns the underlying UDP transport.
+    /// Use this to open/accept KCP streams for proxy and other protocols.
+    pub fn udp(&self) -> &Arc<UDP> {
+        &self.udp
+    }
+
+    /// Returns the host's IP allocator (pubkey <-> IP mapping).
+    pub fn ip_alloc(&self) -> &Arc<IPAllocator> {
+        &self.ip_alloc
+    }
+
     // ========================================================================
     // Outbound: TUN -> Peer
     // ========================================================================
