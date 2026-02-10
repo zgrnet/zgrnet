@@ -622,7 +622,7 @@ impl io::Read for StreamIo {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0
             .read_blocking(buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{}", e)))
+            .map_err(|e| io::Error::other(format!("{}", e)))
     }
 }
 
@@ -630,7 +630,7 @@ impl io::Write for StreamIo {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0
             .write_data(buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{}", e)))
+            .map_err(|e| io::Error::other(format!("{}", e)))
     }
 
     fn flush(&mut self) -> io::Result<()> {

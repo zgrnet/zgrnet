@@ -39,33 +39,36 @@ rust_test(
     tags = ["requires-root"],
 )
 
-# Library with TUN + dnsmgr (for zgrnetd binary)
+# Library with TUN + dnsmgr (for zgrnetd binary, macOS only)
 rust_library(
     name = "zgrnet_full",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
     crate_name = "zgrnet",
     edition = "2021",
     crate_features = ["tun", "dnsmgr"],
+    target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
     deps = all_crate_deps() + ["//third_party/kcp", "//zig/tun:lib", "//zig/dnsmgr:lib"],
 )
 
-# zgrnetd daemon
+# zgrnetd daemon (macOS only — requires TUN device support)
 rust_binary(
     name = "zgrnetd",
     srcs = ["src/bin/zgrnetd.rs"],
     edition = "2021",
     crate_features = ["tun", "dnsmgr"],
+    target_compatible_with = ["@platforms//os:macos"],
     deps = [":zgrnet_full"] + all_crate_deps(),
     visibility = ["//visibility:public"],
 )
 
-# Full-stack smoke test (requires root/admin privileges)
+# Smoke test (macOS only)
 rust_binary(
     name = "smoketest",
     srcs = ["examples/smoketest.rs"],
     edition = "2021",
     crate_features = ["tun"],
+    target_compatible_with = ["@platforms//os:macos"],
     deps = [":zgrnet_tun"] + all_crate_deps(),
     tags = ["requires-root"],
     visibility = ["//visibility:public"],
