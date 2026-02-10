@@ -2,6 +2,7 @@ package kcp
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -301,6 +302,146 @@ func TestGetConv(t *testing.T) {
 	if conv != 12345 {
 		t.Errorf("GetConv() = %d, want 12345", conv)
 	}
+}
+
+// TestKCPPacketLoss measures KCP throughput under simulated packet loss.
+// It sends 64KB of data through a KCP pair, randomly dropping packets at
+// various loss rates, and reports how much data is delivered within a timeout.
+func TestKCPPacketLoss(t *testing.T) {
+	lossRates := []float64{0.0, 0.01, 0.03, 0.05, 0.10}
+	dataSize := 64 * 1024     // 64KB total
+	blockSize := 1024         // 1KB per send
+	timeout := 5 * time.Second
+	interval := time.Millisecond // 1ms update interval
+
+	t.Logf("\n%-12s %-14s %-14s %-14s", "Loss Rate", "Delivered", "Throughput", "Time")
+	t.Logf("%-12s %-14s %-14s %-14s", "----------", "----------", "----------", "----------")
+
+	for _, lossRate := range lossRates {
+		delivered, elapsed := runKCPLossTest(dataSize, blockSize, lossRate, timeout, interval)
+
+		var throughput string
+		if elapsed > 0 && delivered > 0 {
+			kbps := float64(delivered) / elapsed.Seconds() / 1024.0
+			throughput = fmt.Sprintf("%.0f KB/s", kbps)
+		} else {
+			throughput = "0 KB/s"
+		}
+
+		t.Logf("%-12s %-14s %-14s %-14s",
+			fmt.Sprintf("%.0f%%", lossRate*100),
+			fmt.Sprintf("%d/%d KB", delivered/1024, dataSize/1024),
+			throughput,
+			fmt.Sprintf("%dms", elapsed.Milliseconds()),
+		)
+	}
+}
+
+func runKCPLossTest(dataSize, blockSize int, lossRate float64, timeout, interval time.Duration) (int, time.Duration) {
+	// Deterministic PRNG for reproducibility
+	rng := newLCG(42)
+
+	var aOutput, bOutput [][]byte
+	var muA, muB sync.Mutex
+
+	kcpA := NewKCP(1, func(data []byte) {
+		muA.Lock()
+		aOutput = append(aOutput, append([]byte(nil), data...))
+		muA.Unlock()
+	})
+	defer kcpA.Release()
+
+	kcpB := NewKCP(1, func(data []byte) {
+		muB.Lock()
+		bOutput = append(bOutput, append([]byte(nil), data...))
+		muB.Unlock()
+	})
+	defer kcpB.Release()
+
+	kcpA.DefaultConfig()
+	kcpB.DefaultConfig()
+
+	// Send all data
+	data := bytes.Repeat([]byte{0xAB}, dataSize)
+	for offset := 0; offset < dataSize; offset += blockSize {
+		end := offset + blockSize
+		if end > dataSize {
+			end = dataSize
+		}
+		kcpA.Send(data[offset:end])
+	}
+
+	// Run exchange loop with packet loss
+	received := 0
+	buf := make([]byte, 64*1024)
+	start := time.Now()
+	current := uint32(0)
+
+	for time.Since(start) < timeout && received < dataSize {
+		// Update A
+		kcpA.Update(current)
+		kcpA.Flush()
+
+		// Feed A→B with loss
+		muA.Lock()
+		pktsA := aOutput
+		aOutput = nil
+		muA.Unlock()
+		for _, pkt := range pktsA {
+			if !rng.shouldDrop(lossRate) {
+				kcpB.Input(pkt)
+			}
+		}
+
+		// Update B
+		kcpB.Update(current)
+
+		// Feed B→A (ACKs) with loss
+		muB.Lock()
+		pktsB := bOutput
+		bOutput = nil
+		muB.Unlock()
+		for _, pkt := range pktsB {
+			if !rng.shouldDrop(lossRate) {
+				kcpA.Input(pkt)
+			}
+		}
+
+		// Try to receive
+		for {
+			n := kcpB.Recv(buf)
+			if n <= 0 {
+				break
+			}
+			received += n
+		}
+
+		current++
+		time.Sleep(interval)
+	}
+
+	return received, time.Since(start)
+}
+
+// lcg is a simple linear congruential generator for deterministic "random" drops.
+type lcg struct {
+	state uint64
+}
+
+func newLCG(seed uint64) *lcg {
+	return &lcg{state: seed}
+}
+
+func (l *lcg) next() float64 {
+	l.state = l.state*6364136223846793005 + 1442695040888963407
+	return float64((l.state>>33)&0x7FFFFFFF) / float64(0x7FFFFFFF)
+}
+
+func (l *lcg) shouldDrop(rate float64) bool {
+	if rate <= 0 {
+		return false
+	}
+	return l.next() < rate
 }
 
 func BenchmarkKCPSendRecv(b *testing.B) {
