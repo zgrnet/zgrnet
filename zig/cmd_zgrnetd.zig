@@ -15,7 +15,7 @@ const posix = std.posix;
 const mem = std.mem;
 const noise = @import("noise");
 const tun_mod = @import("tun");
-const config_mod = noise.config;
+const config_mod = noise.json_config;
 
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;

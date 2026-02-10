@@ -36,7 +36,6 @@ use_repo(
     go_deps,
     "in_gopkg_yaml_v3",
     "org_golang_x_crypto",
-    "in_gopkg_yaml_v3",
 )
 
 # embed-zig: Bazel-native Zig build rules + Zig toolchain
