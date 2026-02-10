@@ -309,8 +309,8 @@ func TestGetConv(t *testing.T) {
 // various loss rates, and reports how much data is delivered within a timeout.
 func TestKCPPacketLoss(t *testing.T) {
 	lossRates := []float64{0.0, 0.01, 0.03, 0.05, 0.10}
-	dataSize := 64 * 1024     // 64KB total
-	blockSize := 1024         // 1KB per send
+	dataSize := 64 * 1024 // 64KB total
+	blockSize := 1024     // 1KB per send
 	timeout := 5 * time.Second
 	interval := time.Millisecond // 1ms update interval
 
