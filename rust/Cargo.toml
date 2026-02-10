@@ -60,6 +60,7 @@ path = "../examples/throughput/rust/main.rs"
 [[bin]]
 name = "zgrnetd"
 path = "src/bin/zgrnetd.rs"
+required-features = ["tun", "dnsmgr"]
 
 [[bin]]
 name = "async_bench"

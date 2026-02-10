@@ -212,7 +212,7 @@ func run(cfgPath string) error {
 		if err != nil {
 			return nil, fmt.Errorf("open stream to %s: %w", targetPK.ShortString(), err)
 		}
-		log.Printf("proxy: tunnel %s via %s", addr, targetPK.ShortString())
+		log.Printf("proxy: tunnel %s:%d via %s", addr.Host, addr.Port, targetPK.ShortString())
 		return stream, nil
 	}
 	proxySrv := proxy.NewServer(proxyAddr, proxyDial)

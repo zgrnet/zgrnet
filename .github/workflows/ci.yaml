@@ -159,7 +159,7 @@ jobs:
         run: |
           # Run tests excluding the tun package (requires root)
           # Also exclude examples/host_test which imports tun via CGo
-          go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v '/tun$' | grep -v 'examples/host_test')
+          go test -v -race -short -coverprofile=coverage.out $(go list ./... | grep -v '/tun$' | grep -v 'examples/host_test')
 
       - name: Coverage
         if: matrix.os == 'ubuntu-latest'

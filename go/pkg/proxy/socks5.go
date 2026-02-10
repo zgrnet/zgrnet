@@ -625,4 +625,3 @@ func BuildSOCKS5UDP(addr *noise.Address, data []byte) []byte {
 	copy(pkt[3+len(encoded):], data)
 	return pkt
 }
-
