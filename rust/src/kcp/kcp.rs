@@ -110,7 +110,7 @@ impl Kcp {
 
     /// Apply default fast mode configuration.
     pub fn set_default_config(&mut self) {
-        self.set_nodelay(1, 1, 2, 1);  // Fast mode with 1ms interval (same as Go)
+        self.set_nodelay(2, 1, 2, 1);  // nodelay=2: fixed RTO increment (no multiplicative backoff)
         self.set_wndsize(4096, 4096);  // Large window for high throughput (same as Go)
         self.set_mtu(1400);
     }
