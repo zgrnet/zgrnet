@@ -1,0 +1,34 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "config",
+    srcs = [
+        "config.go",
+        "diff.go",
+        "manager.go",
+        "policy.go",
+        "route.go",
+    ],
+    importpath = "github.com/vibing/zgrnet/pkg/config",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@in_gopkg_yaml_v3//:yaml_v3",
+    ],
+)
+
+go_test(
+    name = "config_test",
+    srcs = [
+        "config_test.go",
+        "diff_test.go",
+        "interop_test.go",
+        "manager_test.go",
+        "policy_test.go",
+        "route_test.go",
+    ],
+    data = [
+        "//tests/vectors:config_full.yaml",
+        "//tests/vectors:config_full.json",
+    ],
+    embed = [":config"],
+)

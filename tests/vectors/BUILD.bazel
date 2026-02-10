@@ -1,0 +1,7 @@
+exports_files(
+    [
+        "config_full.yaml",
+        "config_full.json",
+    ],
+    visibility = ["//visibility:public"],
+)
