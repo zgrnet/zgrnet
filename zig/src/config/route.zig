@@ -70,7 +70,10 @@ pub const RouteMatcher = struct {
                     self.allocator.free(r.pattern);
                 }
             }
-            if (r.domains) |*d| d.deinit(self.allocator);
+            if (r.domains) |*d| {
+                freeStringKeys(self.allocator, d);
+                d.deinit(self.allocator);
+            }
         }
         self.rules.deinit(self.allocator);
     }
@@ -117,12 +120,23 @@ pub const RouteMatcher = struct {
     pub fn reload(self: *RouteMatcher) !void {
         for (self.rules.items) |*r| {
             if (r.list_path.len > 0) {
-                if (r.domains) |*d| d.deinit(self.allocator);
+                if (r.domains) |*d| {
+                    freeStringKeys(self.allocator, d);
+                    d.deinit(self.allocator);
+                }
                 r.domains = try loadDomainList(self.allocator, r.list_path);
             }
         }
     }
 };
+
+/// Free all allocated key strings in a StringHashMap before deiniting it.
+fn freeStringKeys(allocator: Allocator, map: *std.StringHashMapUnmanaged(void)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+    }
+}
 
 fn matchDomainList(domain: []const u8, domains: *const std.StringHashMapUnmanaged(void)) bool {
     if (domains.get(domain) != null) return true;

@@ -180,16 +180,24 @@ fn validateInbound(policy: *const InboundPolicy) error{ValidationFailed}!void {
 
 fn validateInboundRule(rule: *const InboundRule) error{ValidationFailed}!void {
     if (rule.name.len == 0) return error.ValidationFailed;
-    if (rule.@"match".pubkey.@"type".len == 0) return error.ValidationFailed;
+    const match_type = rule.@"match".pubkey.@"type";
+    if (match_type.len == 0) return error.ValidationFailed;
     const valid_types = [_][]const u8{ "whitelist", "zgrlan", "any", "solana", "database", "http" };
     var found = false;
     for (&valid_types) |t| {
-        if (mem.eql(u8, rule.@"match".pubkey.@"type", t)) {
+        if (mem.eql(u8, match_type, t)) {
             found = true;
             break;
         }
     }
     if (!found) return error.ValidationFailed;
+    // Type-specific validation (must match Go and Rust)
+    if (mem.eql(u8, match_type, "whitelist")) {
+        if (rule.@"match".pubkey.path.len == 0) return error.ValidationFailed;
+    }
+    if (mem.eql(u8, match_type, "zgrlan")) {
+        if (rule.@"match".pubkey.peer.len == 0) return error.ValidationFailed;
+    }
     if (!mem.eql(u8, rule.action, "allow") and !mem.eql(u8, rule.action, "deny")) {
         return error.ValidationFailed;
     }

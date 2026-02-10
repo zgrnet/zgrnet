@@ -85,12 +85,18 @@ func (m *Manager) Current() *Config {
 
 // MatchRoute checks if a domain matches any outbound route rule.
 func (m *Manager) MatchRoute(domain string) (RouteResult, bool) {
-	return m.route.Match(domain)
+	m.mu.RLock()
+	route := m.route
+	m.mu.RUnlock()
+	return route.Match(domain)
 }
 
 // CheckInbound evaluates inbound policy for a peer's public key.
 func (m *Manager) CheckInbound(pubkey [32]byte) *PolicyResult {
-	return m.policy.Check(pubkey)
+	m.mu.RLock()
+	policy := m.policy
+	m.mu.RUnlock()
+	return policy.Check(pubkey)
 }
 
 // Watch registers a watcher to receive change notifications.
@@ -136,13 +142,6 @@ func (m *Manager) Reload() (*ConfigDiff, error) {
 	// Also check if external files changed
 	extChanged := m.checkExternalFilesChanged()
 	if extChanged {
-		// Reload external file data in route/policy
-		if err := m.route.Reload(); err != nil {
-			log.Printf("config: route reload error: %v", err)
-		}
-		if err := m.policy.Reload(); err != nil {
-			log.Printf("config: policy reload error: %v", err)
-		}
 		// Mark these sections as changed so watchers get notified
 		diff.RouteChanged = true
 		diff.InboundChanged = true
@@ -152,27 +151,36 @@ func (m *Manager) Reload() (*ConfigDiff, error) {
 		return nil, nil
 	}
 
-	// Rebuild route/policy if the config sections changed
+	// Build new route/policy BEFORE acquiring the lock (avoid holding lock during I/O).
+	// Build first, swap later — if init fails, old state is preserved.
+	var newRoute *RouteMatcher
+	var newPolicy *PolicyEngine
 	if diff.RouteChanged {
-		newRoute, err := NewRouteMatcher(&newCfg.Route)
+		r, err := NewRouteMatcher(&newCfg.Route)
 		if err != nil {
 			return nil, fmt.Errorf("config: rebuild route matcher: %w", err)
 		}
-		m.route = newRoute
+		newRoute = r
 	}
 	if diff.InboundChanged {
-		newPolicy, err := NewPolicyEngine(&newCfg.InboundPolicy)
+		p, err := NewPolicyEngine(&newCfg.InboundPolicy)
 		if err != nil {
 			return nil, fmt.Errorf("config: rebuild policy engine: %w", err)
 		}
-		m.policy = newPolicy
+		newPolicy = p
 	}
 
-	// Update current config
+	// Swap everything under the lock
 	m.mu.Lock()
 	m.current = newCfg
 	m.configMtime = fileMtime(m.path)
 	m.trackExternalFiles(newCfg)
+	if newRoute != nil {
+		m.route = newRoute
+	}
+	if newPolicy != nil {
+		m.policy = newPolicy
+	}
 	watchers := make([]Watcher, len(m.watchers))
 	copy(watchers, m.watchers)
 	m.mu.Unlock()

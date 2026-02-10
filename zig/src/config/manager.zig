@@ -100,8 +100,10 @@ pub const Manager = struct {
     /// Manually reload the configuration from disk.
     pub fn reload(self: *Manager) !?ConfigDiff {
         const new_parsed = try types.load(self.allocator, self.path);
+        errdefer new_parsed.deinit();
 
         var d = try diff_mod.diff(self.allocator, &self.current.value, &new_parsed.value);
+        errdefer d.deinit(self.allocator);
 
         if (d.isEmpty()) {
             d.deinit(self.allocator);
@@ -109,14 +111,29 @@ pub const Manager = struct {
             return null;
         }
 
-        // Rebuild route/policy if changed
+        // Build new state BEFORE destroying old — if init fails, old state is preserved.
+        var new_route: ?RouteMatcher = null;
+        var new_policy: ?PolicyEngine = null;
+        errdefer {
+            if (new_route) |*r| r.deinit();
+            if (new_policy) |*p| p.deinit();
+        }
+
         if (d.route_changed) {
-            self.route.deinit();
-            self.route = try RouteMatcher.init(self.allocator, &new_parsed.value.route);
+            new_route = try RouteMatcher.init(self.allocator, &new_parsed.value.route);
         }
         if (d.inbound_changed) {
+            new_policy = try PolicyEngine.init(self.allocator, &new_parsed.value.inbound_policy);
+        }
+
+        // All init succeeded — now swap (no more errors possible below)
+        if (new_route) |_| {
+            self.route.deinit();
+            self.route = new_route.?;
+        }
+        if (new_policy) |_| {
             self.policy.deinit();
-            self.policy = try PolicyEngine.init(self.allocator, &new_parsed.value.inbound_policy);
+            self.policy = new_policy.?;
         }
 
         // Replace current config

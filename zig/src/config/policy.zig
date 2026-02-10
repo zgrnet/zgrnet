@@ -55,7 +55,10 @@ pub const PolicyEngine = struct {
 
     pub fn deinit(self: *PolicyEngine) void {
         for (self.entries.items) |*e| {
-            if (e.whitelist) |*w| w.deinit(self.allocator);
+            if (e.whitelist) |*w| {
+                freeStringKeys(self.allocator, w);
+                w.deinit(self.allocator);
+            }
         }
         self.entries.deinit(self.allocator);
     }
@@ -117,12 +120,23 @@ pub const PolicyEngine = struct {
     pub fn reload(self: *PolicyEngine) !void {
         for (self.entries.items) |*entry| {
             if (entry.list_path.len > 0) {
-                if (entry.whitelist) |*w| w.deinit(self.allocator);
+                if (entry.whitelist) |*w| {
+                    freeStringKeys(self.allocator, w);
+                    w.deinit(self.allocator);
+                }
                 entry.whitelist = try loadPubkeyList(self.allocator, entry.list_path);
             }
         }
     }
 };
+
+/// Free all allocated key strings in a StringHashMap before deiniting it.
+fn freeStringKeys(allocator: Allocator, map: *std.StringHashMapUnmanaged(void)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+    }
+}
 
 fn loadPubkeyList(allocator: Allocator, path: []const u8) !std.StringHashMapUnmanaged(void) {
     var keys = std.StringHashMapUnmanaged(void){};
