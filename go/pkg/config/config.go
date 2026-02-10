@@ -19,11 +19,11 @@ import (
 
 // Config is the top-level configuration structure.
 type Config struct {
-	Net           NetConfig            `yaml:"net" json:"net"`
-	Lans          []LanConfig          `yaml:"lans" json:"lans"`
+	Net           NetConfig             `yaml:"net" json:"net"`
+	Lans          []LanConfig           `yaml:"lans" json:"lans"`
 	Peers         map[string]PeerConfig `yaml:"peers" json:"peers"`
-	InboundPolicy InboundPolicy        `yaml:"inbound_policy" json:"inbound_policy"`
-	Route         RouteConfig          `yaml:"route" json:"route"`
+	InboundPolicy InboundPolicy         `yaml:"inbound_policy" json:"inbound_policy"`
+	Route         RouteConfig           `yaml:"route" json:"route"`
 }
 
 // NetConfig holds global network settings. Changes require a restart.

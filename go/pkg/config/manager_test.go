@@ -103,11 +103,11 @@ func TestManager_ReloadNoChange(t *testing.T) {
 
 // testWatcher records all change notifications for verification.
 type testWatcher struct {
-	mu              sync.Mutex
-	peersChangeCnt  int
-	lansChangeCnt   int
+	mu               sync.Mutex
+	peersChangeCnt   int
+	lansChangeCnt    int
 	inboundChangeCnt int
-	routeChangeCnt  int
+	routeChangeCnt   int
 }
 
 func (w *testWatcher) OnPeersChanged(added map[string]PeerConfig, removed []string, changed map[string]PeerConfig) {

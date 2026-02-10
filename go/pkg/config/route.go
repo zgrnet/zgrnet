@@ -28,7 +28,7 @@ type compiledRouteRule struct {
 	peer string
 
 	// For domain patterns (e.g., "*.google.com" or "google.com")
-	pattern string
+	pattern  string
 	isSuffix bool // true if pattern starts with "*."
 
 	// For domain list files

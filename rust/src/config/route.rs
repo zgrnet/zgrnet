@@ -125,15 +125,10 @@ fn match_domain_list(domain: &str, domains: &HashSet<String>) -> bool {
         return true;
     }
     let mut d = domain;
-    loop {
-        match d.find('.') {
-            Some(idx) => {
-                d = &d[idx + 1..];
-                if domains.contains(d) {
-                    return true;
-                }
-            }
-            None => break,
+    while let Some(idx) = d.find('.') {
+        d = &d[idx + 1..];
+        if domains.contains(d) {
+            return true;
         }
     }
     false

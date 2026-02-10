@@ -45,7 +45,7 @@ func TestRouteMatcher_WildcardMatch(t *testing.T) {
 		{"www.google.com", true},
 		{"mail.google.com", true},
 		{"deep.sub.google.com", true},
-		{"google.com", true},          // *.google.com also matches google.com
+		{"google.com", true},           // *.google.com also matches google.com
 		{"notgoogle.com", false},       // should not match
 		{"google.com.evil.com", false}, // should not match
 	}
@@ -81,7 +81,7 @@ func TestRouteMatcher_DomainList(t *testing.T) {
 		match  bool
 	}{
 		{"google.com", true},
-		{"www.google.com", true},    // parent domain match
+		{"www.google.com", true}, // parent domain match
 		{"youtube.com", true},
 		{"m.youtube.com", true},
 		{"twitter.com", true},
