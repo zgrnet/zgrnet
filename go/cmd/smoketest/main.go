@@ -1,3 +1,5 @@
+//go:build darwin || linux
+
 // Command smoketest runs a full-stack integration test of two zgrnetd instances.
 //
 // It creates two TUN devices, two Hosts, two DNS servers, and two SOCKS5 proxies,

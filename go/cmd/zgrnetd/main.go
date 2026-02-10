@@ -1,3 +1,5 @@
+//go:build darwin || linux
+
 // Command zgrnetd is the zgrnet daemon.
 //
 // It loads a config file and starts:
