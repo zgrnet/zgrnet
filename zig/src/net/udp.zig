@@ -418,7 +418,7 @@ pub fn UDP(comptime IOBackend: type) type {
     // Statistics
     total_tx: Atomic(u64),
     total_rx: Atomic(u64),
-    last_seen: Atomic(i128),
+    last_seen: Atomic(i64),
 
     // Index generator
     next_index: Atomic(u32),
@@ -512,7 +512,7 @@ pub fn UDP(comptime IOBackend: type) type {
             .close_signal = CloseSignal.init(),
             .total_tx = Atomic(u64).init(0),
             .total_rx = Atomic(u64).init(0),
-            .last_seen = Atomic(i128).init(0),
+            .last_seen = Atomic(i64).init(0),
             .next_index = Atomic(u32).init(1),
         };
 
@@ -1077,7 +1077,7 @@ pub fn UDP(comptime IOBackend: type) type {
 
             // Update stats
             _ = self.total_rx.fetchAdd(@intCast(nr), .release);
-            self.last_seen.store(std.time.nanoTimestamp(), .release);
+            self.last_seen.store(@as(i64, @intCast(std.time.nanoTimestamp())), .release);
 
             // Dual-channel send: packet must be in both channels or neither.
             // Send to output_chan FIRST — reader blocks on ready.wait() so it
