@@ -6,9 +6,14 @@
 const std = @import("std");
 const message = @import("message.zig");
 const noise_message = @import("../noise/message.zig");
-const session_mod = @import("../noise/session.zig");
-const keypair_mod = @import("../noise/keypair.zig");
-const crypto_mod = @import("../noise/crypto.zig");
+const noise = @import("../noise/mod.zig");
+const keypair_mod = noise.keypair_mod;
+
+// Concrete types for tests
+const TestCrypto = noise.test_crypto;
+const P = noise.Protocol(TestCrypto);
+const crypto_mod = noise.crypto_mod.CryptoMod(TestCrypto, .ChaChaPoly_BLAKE2s);
+const Session = P.Session;
 
 pub const Strategy = message.Strategy;
 pub const RelayError = message.RelayError;
@@ -444,13 +449,13 @@ test "relay chain with noise session A->B->C" {
     const recv_key = keypair_mod.Key{ .data = recv_key_data };
 
     // Create A-C end-to-end sessions (keys swapped between sides)
-    var session_a = session_mod.Session.init(.{
+    var session_a = Session.init(.{
         .local_index = 1,
         .remote_index = 2,
         .send_key = send_key,
         .recv_key = recv_key,
     });
-    var session_c = session_mod.Session.init(.{
+    var session_c = Session.init(.{
         .local_index = 2,
         .remote_index = 1,
         .send_key = recv_key, // swapped
@@ -467,7 +472,7 @@ test "relay chain with noise session A->B->C" {
 
     var cipher_buf: [1024]u8 = undefined;
     const nonce = try session_a.encrypt(payload_enc, &cipher_buf);
-    const ciphertext_len = payload_enc.len + session_mod.tag_size;
+    const ciphertext_len = payload_enc.len + noise.tag_size;
 
     // Build Type 4 transport message
     const type4msg = try noise_message.buildTransportMessage(
@@ -518,13 +523,13 @@ test "relay multi-hop with noise session A->B->C->D" {
     const send_key = keypair_mod.Key{ .data = send_key_data };
     const recv_key = keypair_mod.Key{ .data = recv_key_data };
 
-    var session_a = session_mod.Session.init(.{
+    var session_a = Session.init(.{
         .local_index = 10,
         .remote_index = 20,
         .send_key = send_key,
         .recv_key = recv_key,
     });
-    var session_d = session_mod.Session.init(.{
+    var session_d = Session.init(.{
         .local_index = 20,
         .remote_index = 10,
         .send_key = recv_key,
@@ -542,7 +547,7 @@ test "relay multi-hop with noise session A->B->C->D" {
 
     var cipher_buf: [1024]u8 = undefined;
     const nonce = try session_a.encrypt(payload_enc, &cipher_buf);
-    const ct_len = payload_enc.len + session_mod.tag_size;
+    const ct_len = payload_enc.len + noise.tag_size;
     const type4msg = try noise_message.buildTransportMessage(
         allocator,
         session_a.remote_index,
