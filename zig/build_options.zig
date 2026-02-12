@@ -20,14 +20,15 @@ pub const Backend = enum {
     native_zig,
 };
 
-/// Auto-detected backend based on target architecture.
-/// - ARM64: BoringSSL assembly
+/// Auto-detected backend based on target architecture and OS.
+/// - macOS ARM64: BoringSSL assembly (Mach-O ASM syntax)
 /// - Other: Pure Zig std.crypto
 ///
-/// Note: x86_64 ASM backend exists but is not yet wired into Bazel's
-/// select() for C/ASM sources. When added, change the x86_64 linux
-/// case below from native_zig to x86_64_asm.
-pub const backend: Backend = if (builtin.cpu.arch == .aarch64)
+/// Note: The aarch64 ASM files use Mach-O syntax (.section __TEXT,
+/// .private_extern) which only works on macOS. Linux aarch64 needs
+/// ELF-syntax ASM (not yet available), so falls back to native Zig.
+/// x86_64 ASM backend also exists but is not yet wired into Bazel.
+pub const backend: Backend = if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .macos)
     .aarch64_asm
 else
     .native_zig;

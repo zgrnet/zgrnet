@@ -2,6 +2,20 @@ load("@embed_zig//bazel/zig:defs.bzl", "zig_binary", "zig_library", "zig_package
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 
 # =============================================================================
+# Platform config settings
+# =============================================================================
+
+# ChaCha20 ASM uses Mach-O syntax (.section __TEXT, .private_extern) —
+# only valid on macOS. Linux aarch64 needs ELF syntax (not yet available).
+config_setting(
+    name = "is_macos_aarch64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+# =============================================================================
 # C/ASM configuration for noise library
 # =============================================================================
 
@@ -9,9 +23,9 @@ load("@rules_cc//cc:defs.bzl", "cc_binary")
 # ikcp.h is vendored at src/kcp/ for @cImport resolution (same as upstream, unpatched)
 _KCP_C_SRCS = ["//third_party/kcp:srcs", "src/kcp/ikcp.h"]
 
-# ChaCha20-Poly1305 ASM backend (platform-specific)
+# ChaCha20-Poly1305 ASM backend (macOS aarch64 only — ASM uses Mach-O syntax)
 _CHACHA20_C_SRCS = select({
-    "@platforms//cpu:aarch64": glob([
+    ":is_macos_aarch64": glob([
         "src/noise/chacha20_poly1305/aarch64/*.c",
         "src/noise/chacha20_poly1305/aarch64/*.h",
     ]),
@@ -20,7 +34,7 @@ _CHACHA20_C_SRCS = select({
 
 # Only use the no-CFI version (Zig's linker doesn't support CFI directives)
 _CHACHA20_ASM_SRCS = select({
-    "@platforms//cpu:aarch64": ["src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"],
+    ":is_macos_aarch64": ["src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"],
     "//conditions:default": [],
 })
 
@@ -28,7 +42,7 @@ _CHACHA20_ASM_SRCS = select({
 _KCP_C_INCLUDES = ["src/kcp"]
 
 _CHACHA20_C_INCLUDES = select({
-    "@platforms//cpu:aarch64": ["src/noise/chacha20_poly1305/aarch64"],
+    ":is_macos_aarch64": ["src/noise/chacha20_poly1305/aarch64"],
     "//conditions:default": [],
 })
 
