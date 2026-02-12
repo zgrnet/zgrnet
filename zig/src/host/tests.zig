@@ -14,7 +14,11 @@ const Atomic = std.atomic.Value;
 const noise_mod = @import("../noise/mod.zig");
 const std_impl = @import("std_impl");
 const Key = noise_mod.Key;
-const KeyPair = noise_mod.KeyPair;
+
+// Concrete Noise Protocol types
+const StdCrypto = noise_mod.test_crypto;
+const P = noise_mod.Protocol(StdCrypto);
+const KeyPair = P.KeyPair;
 
 const host_mod = @import("mod.zig");
 const TunDevice = host_mod.TunDevice;

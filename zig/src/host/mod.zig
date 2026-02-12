@@ -21,7 +21,11 @@ const Atomic = std.atomic.Value;
 const noise = @import("../noise/mod.zig");
 const message = noise.message;
 const Key = noise.Key;
-const KeyPair = noise.KeyPair;
+
+// Concrete Noise Protocol types (instantiated with StdCrypto)
+const StdCrypto = noise.test_crypto;
+const P = noise.Protocol(StdCrypto);
+const KeyPair = P.KeyPair;
 
 pub const ipalloc = @import("ipalloc.zig");
 pub const packet = @import("packet.zig");
