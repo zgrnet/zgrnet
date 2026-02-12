@@ -17,14 +17,12 @@
 const std = @import("std");
 const kcp_mod = @import("kcp.zig");
 const ring_buffer = @import("ring_buffer.zig");
-const async_mod = @import("../async/mod.zig");
-const concepts = async_mod.concepts;
+const trait = @import("trait");
+const channel_pkg = @import("channel");
+const timer_pkg = @import("timer");
 
 const kcp = kcp_mod;
-const Task = async_mod.Task;
-const TimerHandle = async_mod.TimerHandle;
-const Channel = async_mod.Channel;
-const Signal = async_mod.Signal;
+const TimerHandle = timer_pkg.TimerHandle;
 
 /// Re-export RingBuffer for convenience
 pub const RingBuffer = ring_buffer.RingBuffer;
@@ -394,11 +392,17 @@ pub const Stream = struct {
 
 /// Mux multiplexes streams over a single connection.
 /// Uses comptime generics for zero-cost timer scheduling.
-pub fn Mux(comptime TimerServiceT: type) type {
+///
+/// - `Rt`: Runtime type providing Mutex/Condition (for Channel)
+/// - `TimerServiceT`: Timer service with schedule/cancel (for KCP updates)
+pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
     // Compile-time check for TimerService interface
     comptime {
-        concepts.assertTimerService(TimerServiceT);
+        if (!@hasDecl(TimerServiceT, "schedule")) @compileError("TimerService missing schedule()");
+        if (!@hasDecl(TimerServiceT, "cancel")) @compileError("TimerService missing cancel()");
     }
+
+    const AcceptChan = channel_pkg.Channel(*Stream, 16, Rt);
 
     return struct {
         const Self = @This();
@@ -417,8 +421,8 @@ pub fn Mux(comptime TimerServiceT: type) type {
         update_handle: TimerHandle,
         ref_count: std.atomic.Value(u32),
 
-        // Accept channel for incoming streams
-        accept_chan: ?*Channel(*Stream),
+        // Accept channel for incoming streams (comptime-sized, inline)
+        accept_chan: AcceptChan,
 
         /// Initialize a new Mux.
         pub fn init(
@@ -432,11 +436,6 @@ pub fn Mux(comptime TimerServiceT: type) type {
         ) !*Self {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
-
-            // Create accept channel on heap
-            const accept_chan = try allocator.create(Channel(*Stream));
-            errdefer allocator.destroy(accept_chan);
-            accept_chan.* = try Channel(*Stream).init(allocator, 16);
 
             self.* = Self{
                 .config = config,
@@ -452,7 +451,7 @@ pub fn Mux(comptime TimerServiceT: type) type {
                 .mutex = .{},
                 .update_handle = TimerHandle.null_handle,
                 .ref_count = std.atomic.Value(u32).init(1),
-                .accept_chan = accept_chan,
+                .accept_chan = AcceptChan.init(),
             };
 
             // Schedule first KCP update
@@ -467,8 +466,15 @@ pub fn Mux(comptime TimerServiceT: type) type {
 
             self.update_handle = self.timer_service.schedule(
                 self.config.update_interval_ms,
-                Task.init(Self, self, doUpdate),
+                onUpdateTimer,
+                @ptrCast(self),
             );
+        }
+
+        /// Timer callback wrapper — dispatches to doUpdate.
+        fn onUpdateTimer(ctx: ?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            self.doUpdate();
         }
 
         /// KCP update task (called by timer).
@@ -524,11 +530,7 @@ pub fn Mux(comptime TimerServiceT: type) type {
             self.timer_service.cancel(self.update_handle);
 
             // Close accept channel
-            if (self.accept_chan) |ch| {
-                ch.close();
-                ch.deinit();
-                self.allocator.destroy(ch);
-            }
+            self.accept_chan.close();
 
             // Release all streams
             self.mutex.lock();
@@ -544,6 +546,7 @@ pub fn Mux(comptime TimerServiceT: type) type {
         }
 
         fn deinitInternal(self: *Self) void {
+            self.accept_chan.deinit();
             self.allocator.destroy(self);
         }
 
@@ -604,18 +607,12 @@ pub fn Mux(comptime TimerServiceT: type) type {
 
         /// Accept an incoming stream (blocks until available or closed).
         pub fn acceptStream(self: *Self) ?*Stream {
-            if (self.accept_chan) |ch| {
-                return ch.recv();
-            }
-            return null;
+            return self.accept_chan.recv();
         }
 
         /// Try to accept a stream without blocking.
         pub fn tryAcceptStream(self: *Self) ?*Stream {
-            if (self.accept_chan) |ch| {
-                return ch.tryRecv();
-            }
-            return null;
+            return self.accept_chan.tryRecv();
         }
 
         /// Input a frame from the network.
@@ -658,12 +655,10 @@ pub fn Mux(comptime TimerServiceT: type) type {
             };
 
             // Push to accept channel
-            if (self.accept_chan) |ch| {
-                stream.retain(); // Reference for accept channel
-                if (!ch.trySend(stream)) {
-                    _ = stream.release(); // Channel full
-                }
-            }
+            stream.retain(); // Reference for accept channel
+            self.accept_chan.trySend(stream) catch {
+                _ = stream.release(); // Channel full or closed
+            };
 
             // Also call callback
             self.mutex.unlock();
@@ -737,16 +732,15 @@ pub fn Mux(comptime TimerServiceT: type) type {
     };
 }
 
-// Convenience type alias for common timer service
-pub const SimpleMux = Mux(async_mod.SimpleTimerService);
-
 // ============================================================================
 // Tests
 // ============================================================================
 
 test "Mux comptime check" {
-    // Just verify the type compiles
-    const MuxType = Mux(async_mod.SimpleTimerService);
+    // Verify the type compiles with a minimal Rt and TimerService
+    const TestRt = @import("std_impl").runtime;
+    const TimerSvc = timer_pkg.TimerService(TestRt);
+    const MuxType = Mux(TestRt, TimerSvc);
     _ = MuxType;
 }
 

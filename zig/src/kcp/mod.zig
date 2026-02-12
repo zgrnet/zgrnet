@@ -33,11 +33,10 @@ pub const Stream = stream.Stream;
 pub const StreamState = stream.StreamState;
 pub const StreamError = stream.StreamError;
 
-// Mux - comptime generic
+// Mux - comptime generic over Rt (runtime) and TimerServiceT
 pub const Mux = stream.Mux;
 pub const MuxConfig = stream.MuxConfig;
 pub const MuxError = stream.MuxError;
-pub const SimpleMux = stream.SimpleMux;
 
 // Callbacks
 pub const OutputFn = stream.OutputFn;
