@@ -532,30 +532,38 @@ pub fn UDP(comptime IOBackend: type) type {
 
     /// Close the UDP instance.
     pub fn deinit(self: *Self) void {
-        // Signal close
-        self.closed.store(true, .release);
-        self.close_signal.notify();
+        // === Phase 1: Stop the IO loop thread FIRST ===
+        // The ioLoop's onSocketReady callback accesses channels, socket,
+        // and other self fields. We MUST ensure it has fully exited before
+        // closing/freeing anything it touches.
 
-        // Unregister socket from IO backend BEFORE closing it.
-        // This prevents epoll/kqueue from delivering EPOLLHUP/EV_EOF
-        // events after close(), which would fire callbacks on a
-        // partially-destroyed self (race → segfault on Linux).
+        // Signal close — ioLoop checks this flag each iteration
+        self.closed.store(true, .release);
+
+        // Unregister socket from epoll/kqueue so no more events fire
         self.io_backend.unregister(@intCast(self.socket));
 
-        // Wake ioLoop from blocking poll
+        // Wake ioLoop from blocking poll(-1)
         self.io_backend.wake();
 
-        // Close channels to wake blocked threads
-        self.decrypt_chan.close();
-        self.output_chan.close();
-
-        // Close socket (safe now — no more epoll/kqueue events for this fd)
-        posix.close(self.socket);
-
-        // Join threads
+        // Wait for ioLoop thread to fully exit
         if (self.io_thread) |t| {
             t.join();
         }
+
+        // === Phase 2: Now safe to tear down everything else ===
+        // ioLoop is gone — no more callbacks touching channels/socket/peers.
+
+        self.close_signal.notify();
+
+        // Close channels to wake blocked worker/timer threads
+        self.decrypt_chan.close();
+        self.output_chan.close();
+
+        // Close socket
+        posix.close(self.socket);
+
+        // Join remaining threads
         if (self.timer_thread) |t| {
             t.join();
         }
