@@ -19,6 +19,8 @@ Thumbs.db
 
 # Go build artifacts (not source code)
 **/bin/
+# But keep Rust src/bin/ (binary entry points)
+!rust/src/bin/
 # Go module cache (typically in $GOPATH/pkg)
 # Note: go/pkg/ is source code, not ignored
 coverage.out
