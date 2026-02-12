@@ -44,7 +44,7 @@ pub const RecvResult = struct {
 // =============================================================================
 
 // Import UDP types from net module
-const transport_udp = @import("../net/transport_udp.zig");
+const transport_udp = @import("transport_udp.zig");
 pub const UdpAddr = transport_udp.UdpAddr;
 pub const UdpTransport = transport_udp.UdpTransport;
 

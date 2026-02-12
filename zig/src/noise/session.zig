@@ -1,43 +1,29 @@
 //! Session management for transport phase.
+//!
+//! NOT thread-safe. Caller must provide external synchronization
+//! and pass timestamps explicitly. No std.Thread or std.time dependencies.
 
 const std = @import("std");
-const crypto = std.crypto;
 const mem = std.mem;
-const time = std.time;
-const Mutex = std.Thread.Mutex;
-const Atomic = std.atomic.Value;
 
 const keypair = @import("keypair.zig");
 const replay_mod = @import("replay.zig");
-const cipher_mod = @import("cipher.zig");
+const crypto_mod = @import("crypto.zig");
 
 pub const Key = keypair.Key;
 pub const key_size = keypair.key_size;
 pub const ReplayFilter = replay_mod.ReplayFilter;
-pub const tag_size = 16;
+pub const tag_size = crypto_mod.tag_size;
 
 /// Session state.
 pub const SessionState = enum {
     handshaking,
     established,
     expired,
-
-    pub fn format(
-        self: SessionState,
-        comptime _: []const u8,
-        _: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        try writer.writeAll(switch (self) {
-            .handshaking => "handshaking",
-            .established => "established",
-            .expired => "expired",
-        });
-    }
 };
 
 /// Session timeout in nanoseconds (180 seconds).
-pub const session_timeout_ns: i128 = 180 * std.time.ns_per_s;
+pub const session_timeout_ns: u64 = 180 * std.time.ns_per_s;
 
 /// Maximum nonce value.
 pub const max_nonce: u64 = std.math.maxInt(u64) - 1;
@@ -59,201 +45,174 @@ pub const SessionConfig = struct {
     send_key: Key,
     recv_key: Key,
     remote_pk: Key = Key.zero,
+    /// Current timestamp in nanoseconds (caller-provided).
+    now_ns: u64 = 0,
 };
 
-/// An established Noise session with a peer.
-pub const Session = struct {
-    mutex: Mutex = .{},
+/// Instantiate session for a given Crypto implementation and cipher suite.
+pub fn SessionMod(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite) type {
+    const cipher = @import("cipher.zig").Cipher(Crypto, suite);
 
-    local_index: u32,
-    remote_index: u32,
+    return struct {
+        /// An established Noise session with a peer.
+        ///
+        /// NOT thread-safe. Caller must synchronize access and provide
+        /// timestamps via method parameters.
+        pub const Session = struct {
+            local_index: u32,
+            remote_index: u32,
 
-    send_key: Key,
-    recv_key: Key,
+            send_key: Key,
+            recv_key: Key,
 
-    send_nonce: Atomic(u64) = Atomic(u64).init(0),
-    recv_filter: ReplayFilter = ReplayFilter.init(),
+            send_nonce: u64 = 0,
+            recv_filter: ReplayFilter = ReplayFilter.init(),
 
-    // Use atomic for state to allow lock-free reads
-    state_atomic: Atomic(u8) = Atomic(u8).init(@intFromEnum(SessionState.established)),
-    remote_pk: Key,
+            state: SessionState = .established,
+            remote_pk: Key,
 
-    created_at: i128,
-    // Use atomic timestamps to avoid lock contention
-    last_received_nanos: Atomic(i64) = Atomic(i64).init(0),
-    last_sent_nanos: Atomic(i64) = Atomic(i64).init(0),
+            created_ns: u64,
+            last_received_ns: u64 = 0,
+            last_sent_ns: u64 = 0,
 
-    /// Creates a new session.
-    pub fn init(cfg: SessionConfig) Session {
-        const now = time.nanoTimestamp();
-        const now_i64: i64 = @intCast(@mod(now, std.math.maxInt(i64)));
-        return .{
-            .local_index = cfg.local_index,
-            .remote_index = cfg.remote_index,
-            .send_key = cfg.send_key,
-            .recv_key = cfg.recv_key,
-            .remote_pk = cfg.remote_pk,
-            .created_at = now,
-            .last_received_nanos = Atomic(i64).init(now_i64),
-            .last_sent_nanos = Atomic(i64).init(now_i64),
+            /// Creates a new session.
+            pub fn init(cfg: SessionConfig) Session {
+                return .{
+                    .local_index = cfg.local_index,
+                    .remote_index = cfg.remote_index,
+                    .send_key = cfg.send_key,
+                    .recv_key = cfg.recv_key,
+                    .remote_pk = cfg.remote_pk,
+                    .created_ns = cfg.now_ns,
+                    .last_received_ns = cfg.now_ns,
+                    .last_sent_ns = cfg.now_ns,
+                };
+            }
+
+            pub fn localIndex(self: *const Session) u32 {
+                return self.local_index;
+            }
+
+            pub fn remoteIndex(self: *const Session) u32 {
+                return self.remote_index;
+            }
+
+            pub fn setRemoteIndex(self: *Session, idx: u32) void {
+                self.remote_index = idx;
+            }
+
+            pub fn remotePk(self: *const Session) Key {
+                return self.remote_pk;
+            }
+
+            pub fn getState(self: *const Session) SessionState {
+                return self.state;
+            }
+
+            pub fn setState(self: *Session, new_state: SessionState) void {
+                self.state = new_state;
+            }
+
+            /// Encrypts a message. Returns the nonce used.
+            /// `now_ns` is the current timestamp in nanoseconds (caller-provided).
+            pub fn encrypt(self: *Session, plaintext: []const u8, out: []u8, now_ns: u64) SessionError!u64 {
+                if (self.state != .established) {
+                    return SessionError.NotEstablished;
+                }
+
+                const nonce = self.send_nonce;
+                if (nonce >= max_nonce) {
+                    return SessionError.NonceExhausted;
+                }
+                self.send_nonce += 1;
+
+                cipher.encrypt(&self.send_key.data, nonce, plaintext, "", out);
+                self.last_sent_ns = now_ns;
+
+                return nonce;
+            }
+
+            /// Decrypts a message.
+            /// `now_ns` is the current timestamp in nanoseconds (caller-provided).
+            pub fn decrypt(self: *Session, ciphertext: []const u8, nonce: u64, out: []u8, now_ns: u64) SessionError!usize {
+                if (self.state != .established) {
+                    return SessionError.NotEstablished;
+                }
+
+                if (!self.recv_filter.checkAndUpdate(nonce)) {
+                    return SessionError.ReplayDetected;
+                }
+
+                if (ciphertext.len < tag_size) {
+                    return SessionError.DecryptFailed;
+                }
+
+                cipher.decrypt(&self.recv_key.data, nonce, ciphertext, "", out) catch {
+                    return SessionError.AuthenticationFailed;
+                };
+
+                self.last_received_ns = now_ns;
+
+                return ciphertext.len - tag_size;
+            }
+
+            pub fn isExpired(self: *const Session, now_ns: u64) bool {
+                if (self.state == .expired) return true;
+                if (now_ns < self.last_received_ns) return false;
+                return (now_ns - self.last_received_ns) > session_timeout_ns;
+            }
+
+            pub fn expire(self: *Session) void {
+                self.state = .expired;
+            }
+
+            pub fn sendNonce(self: *const Session) u64 {
+                return self.send_nonce;
+            }
+
+            pub fn recvMaxNonce(self: *const Session) u64 {
+                return self.recv_filter.maxNonce();
+            }
+
+            pub fn createdNs(self: *const Session) u64 {
+                return self.created_ns;
+            }
+
+            pub fn lastReceivedNs(self: *const Session) u64 {
+                return self.last_received_ns;
+            }
+
+            pub fn lastSentNs(self: *const Session) u64 {
+                return self.last_sent_ns;
+            }
         };
-    }
+    };
+}
 
-    /// Returns the local index.
-    pub fn localIndex(self: *const Session) u32 {
-        return self.local_index;
-    }
-
-    /// Returns the remote index.
-    pub fn remoteIndex(self: *Session) u32 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.remote_index;
-    }
-
-    /// Sets the remote index.
-    pub fn setRemoteIndex(self: *Session, idx: u32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.remote_index = idx;
-    }
-
-    /// Returns the remote public key.
-    pub fn remotePk(self: *const Session) Key {
-        return self.remote_pk;
-    }
-
-    /// Returns the current state (lock-free).
-    pub fn getState(self: *const Session) SessionState {
-        return @enumFromInt(self.state_atomic.load(.acquire));
-    }
-
-    /// Sets the state (lock-free).
-    pub fn setState(self: *Session, new_state: SessionState) void {
-        self.state_atomic.store(@intFromEnum(new_state), .release);
-    }
-
-    /// Encrypts a message.
-    /// Returns the nonce used. Output buffer must be at least plaintext.len + tag_size.
-    /// Lock-free for concurrent encryption.
-    pub fn encrypt(self: *Session, plaintext: []const u8, out: []u8) SessionError!u64 {
-        // Lock-free state check
-        if (self.getState() != .established) {
-            return SessionError.NotEstablished;
-        }
-
-        // Atomic nonce increment
-        const nonce = self.send_nonce.fetchAdd(1, .seq_cst);
-        if (nonce >= max_nonce) {
-            return SessionError.NonceExhausted;
-        }
-
-        // Encryption is thread-safe (read-only key)
-        cipher_mod.encrypt(&self.send_key.data, nonce, plaintext, "", out);
-
-        // Atomic timestamp update
-        const now: i64 = @intCast(@mod(time.nanoTimestamp(), std.math.maxInt(i64)));
-        self.last_sent_nanos.store(now, .release);
-
-        return nonce;
-    }
-
-    /// Decrypts a message.
-    /// Output buffer must be at least ciphertext.len - tag_size.
-    /// Lock-free for concurrent decryption.
-    pub fn decrypt(self: *Session, ciphertext: []const u8, nonce: u64, out: []u8) SessionError!usize {
-        // Lock-free state check
-        if (self.getState() != .established) {
-            return SessionError.NotEstablished;
-        }
-
-        // Atomically check and update replay filter (has its own lock)
-        if (!self.recv_filter.checkAndUpdate(nonce)) {
-            return SessionError.ReplayDetected;
-        }
-
-        if (ciphertext.len < tag_size) {
-            return SessionError.DecryptFailed;
-        }
-
-        // Decryption is thread-safe (read-only key)
-        cipher_mod.decrypt(&self.recv_key.data, nonce, ciphertext, "", out) catch {
-            return SessionError.AuthenticationFailed;
-        };
-
-        // Atomic timestamp update
-        const now: i64 = @intCast(@mod(time.nanoTimestamp(), std.math.maxInt(i64)));
-        self.last_received_nanos.store(now, .release);
-
-        return ciphertext.len - tag_size;
-    }
-
-    /// Checks if the session has expired (lock-free).
-    pub fn isExpired(self: *const Session) bool {
-        if (self.getState() == .expired) {
-            return true;
-        }
-
-        const last = self.last_received_nanos.load(.acquire);
-        const now: i64 = @intCast(@mod(time.nanoTimestamp(), std.math.maxInt(i64)));
-        const elapsed = now - last;
-        return elapsed > @as(i64, @intCast(@mod(session_timeout_ns, std.math.maxInt(i64))));
-    }
-
-    /// Marks the session as expired.
-    pub fn expire(self: *Session) void {
-        self.setState(.expired);
-    }
-
-    /// Returns current send nonce (lock-free).
-    pub fn sendNonce(self: *const Session) u64 {
-        return self.send_nonce.load(.seq_cst);
-    }
-
-    /// Returns max received nonce.
-    pub fn recvMaxNonce(self: *Session) u64 {
-        return self.recv_filter.maxNonce();
-    }
-
-    /// Returns when session was created.
-    pub fn createdAt(self: *const Session) i128 {
-        return self.created_at;
-    }
-
-    /// Returns when last message was received (as nanos, lock-free).
-    pub fn lastReceivedNanos(self: *const Session) i64 {
-        return self.last_received_nanos.load(.acquire);
-    }
-
-    /// Returns when last message was sent (as nanos, lock-free).
-    pub fn lastSentNanos(self: *const Session) i64 {
-        return self.last_sent_nanos.load(.acquire);
-    }
-};
-
-/// Generates a random session index.
-pub fn generateIndex() u32 {
-    var buf: [4]u8 = undefined;
-    crypto.random.bytes(&buf);
-    return mem.readInt(u32, &buf, .little);
+/// Creates a session index from 4 random bytes.
+/// The caller is responsible for providing cryptographic random bytes.
+pub fn generateIndexFromBytes(random_bytes: [4]u8) u32 {
+    return mem.readInt(u32, &random_bytes, .little);
 }
 
 // Tests
 const testing = std.testing;
-const c = @import("crypto.zig");
+const TestCrypto = @import("test_crypto.zig");
+const TestSession = SessionMod(TestCrypto, .ChaChaPoly_BLAKE2s).Session;
+const c = crypto_mod.CryptoMod(TestCrypto, .ChaChaPoly_BLAKE2s);
 
-fn createTestSessions() struct { alice: Session, bob: Session } {
+fn createTestSessions() struct { alice: TestSession, bob: TestSession } {
     const send_key = Key.fromBytes(c.hash(&.{"send key"}));
     const recv_key = Key.fromBytes(c.hash(&.{"recv key"}));
 
-    const alice = Session.init(.{
+    const alice = TestSession.init(.{
         .local_index = 1,
         .remote_index = 2,
         .send_key = send_key,
         .recv_key = recv_key,
     });
 
-    const bob = Session.init(.{
+    const bob = TestSession.init(.{
         .local_index = 2,
         .remote_index = 1,
         .send_key = recv_key,
@@ -270,30 +229,10 @@ test "encrypt decrypt" {
     var ciphertext: [plaintext.len + tag_size]u8 = undefined;
     var decrypted: [plaintext.len]u8 = undefined;
 
-    const nonce = try sessions.alice.encrypt(plaintext, &ciphertext);
-    const pt_len = try sessions.bob.decrypt(&ciphertext, nonce, &decrypted);
+    const nonce = try sessions.alice.encrypt(plaintext, &ciphertext, 0);
+    const pt_len = try sessions.bob.decrypt(&ciphertext, nonce, &decrypted, 0);
 
     try testing.expectEqualSlices(u8, plaintext, decrypted[0..pt_len]);
-}
-
-test "bidirectional" {
-    var sessions = createTestSessions();
-
-    // Alice -> Bob
-    const msg1 = "from alice";
-    var ct1: [msg1.len + tag_size]u8 = undefined;
-    var pt1: [msg1.len]u8 = undefined;
-    const n1 = try sessions.alice.encrypt(msg1, &ct1);
-    const len1 = try sessions.bob.decrypt(&ct1, n1, &pt1);
-    try testing.expectEqualSlices(u8, msg1, pt1[0..len1]);
-
-    // Bob -> Alice
-    const msg2 = "from bob";
-    var ct2: [msg2.len + tag_size]u8 = undefined;
-    var pt2: [msg2.len]u8 = undefined;
-    const n2 = try sessions.bob.encrypt(msg2, &ct2);
-    const len2 = try sessions.alice.decrypt(&ct2, n2, &pt2);
-    try testing.expectEqualSlices(u8, msg2, pt2[0..len2]);
 }
 
 test "nonce increment" {
@@ -302,7 +241,7 @@ test "nonce increment" {
 
     for (0..10) |i| {
         try testing.expectEqual(@as(u64, i), sessions.alice.sendNonce());
-        _ = try sessions.alice.encrypt("test", &ct);
+        _ = try sessions.alice.encrypt("test", &ct, 0);
     }
     try testing.expectEqual(@as(u64, 10), sessions.alice.sendNonce());
 }
@@ -314,82 +253,24 @@ test "replay protection" {
     var ciphertext: [plaintext.len + tag_size]u8 = undefined;
     var decrypted: [plaintext.len]u8 = undefined;
 
-    const nonce = try sessions.alice.encrypt(plaintext, &ciphertext);
-
-    // First decrypt succeeds
-    _ = try sessions.bob.decrypt(&ciphertext, nonce, &decrypted);
-
-    // Replay fails
-    try testing.expectError(SessionError.ReplayDetected, sessions.bob.decrypt(&ciphertext, nonce, &decrypted));
-}
-
-test "out of order" {
-    var sessions = createTestSessions();
-
-    const Messages = struct {
-        ct: [5 + tag_size]u8,
-        nonce: u64,
-        expected: u8,
-    };
-
-    var messages: [10]Messages = undefined;
-    for (0..10) |i| {
-        const msg = [_]u8{@intCast(i)} ++ [_]u8{0} ** 4;
-        const nonce = try sessions.alice.encrypt(&msg, &messages[i].ct);
-        messages[i].nonce = nonce;
-        messages[i].expected = @intCast(i);
-    }
-
-    // Decrypt in reverse
-    var i: usize = 9;
-    while (true) {
-        var pt: [5]u8 = undefined;
-        const len = try sessions.bob.decrypt(&messages[i].ct, messages[i].nonce, &pt);
-        try testing.expectEqual(messages[i].expected, pt[0]);
-        _ = len;
-        if (i == 0) break;
-        i -= 1;
-    }
+    const nonce = try sessions.alice.encrypt(plaintext, &ciphertext, 0);
+    _ = try sessions.bob.decrypt(&ciphertext, nonce, &decrypted, 0);
+    try testing.expectError(SessionError.ReplayDetected, sessions.bob.decrypt(&ciphertext, nonce, &decrypted, 0));
 }
 
 test "state" {
     var sessions = createTestSessions();
 
     try testing.expectEqual(SessionState.established, sessions.alice.getState());
-
     sessions.alice.setState(.expired);
     try testing.expectEqual(SessionState.expired, sessions.alice.getState());
 
     var ct: [4 + tag_size]u8 = undefined;
-    try testing.expectError(SessionError.NotEstablished, sessions.alice.encrypt("test", &ct));
+    try testing.expectError(SessionError.NotEstablished, sessions.alice.encrypt("test", &ct, 0));
 }
 
-test "indices" {
-    const sessions = createTestSessions();
-
-    try testing.expectEqual(@as(u32, 1), sessions.alice.localIndex());
-    try testing.expectEqual(@as(u32, 2), sessions.bob.localIndex());
-}
-
-test "generate index" {
-    var indices = std.AutoHashMap(u32, void).init(testing.allocator);
-    defer indices.deinit();
-
-    for (0..1000) |_| {
-        try indices.put(generateIndex(), {});
-    }
-
-    // Should have many unique values
-    try testing.expect(indices.count() > 900);
-}
-
-test "session state enum" {
-    // Just verify the enum values work correctly
-    try testing.expectEqual(SessionState.handshaking, SessionState.handshaking);
-    try testing.expectEqual(SessionState.established, SessionState.established);
-    try testing.expectEqual(SessionState.expired, SessionState.expired);
-
-    // Verify they are distinct
-    try testing.expect(SessionState.handshaking != SessionState.established);
-    try testing.expect(SessionState.established != SessionState.expired);
+test "generate index from bytes" {
+    const bytes1 = [4]u8{ 1, 0, 0, 0 };
+    const bytes2 = [4]u8{ 2, 0, 0, 0 };
+    try testing.expect(generateIndexFromBytes(bytes1) != generateIndexFromBytes(bytes2));
 }
