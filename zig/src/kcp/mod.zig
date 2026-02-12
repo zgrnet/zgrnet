@@ -3,22 +3,24 @@
 //! This module provides:
 //! - `Kcp`: KCP reliable transport protocol bindings
 //! - `Frame`: Multiplexing frame encoding/decoding
-//! - `Stream`: Multiplexed reliable stream
-//! - `Mux`: Stream multiplexer (comptime generic for zero-cost async)
+//! - `Stream(Rt)`: Multiplexed reliable stream (generic over Runtime)
+//! - `Mux(Rt)`: Stream multiplexer (generic over Runtime)
 //!
 //! ## Usage
 //!
 //! ```zig
-//! const MuxType = kcp.Mux(MyTimerService);
-//! const mux = try MuxType.init(allocator, timer_service, ...);
+//! const MyMux = kcp.Mux(MyRuntime);
+//! const mux = try MyMux.init(allocator, ...);
 //! defer mux.deinit();
 //!
 //! const stream = try mux.openStream(0, &.{});
 //! defer stream.close();
+//!
+//! const n = try stream.readBlocking(&buf, 5_000_000_000); // 5s timeout
 //! ```
 
 pub const kcp = @import("kcp.zig");
-pub const stream = @import("stream.zig");
+pub const stream_mod = @import("stream.zig");
 pub const ring_buffer = @import("ring_buffer.zig");
 
 // Re-export commonly used types
@@ -28,18 +30,16 @@ pub const Cmd = kcp.Cmd;
 pub const FrameError = kcp.FrameError;
 pub const FrameHeaderSize = kcp.FrameHeaderSize;
 
-// Stream types
-pub const Stream = stream.Stream;
-pub const StreamState = stream.StreamState;
-pub const StreamError = stream.StreamError;
-
-// Mux - comptime generic over Rt (runtime) and TimerServiceT
-pub const Mux = stream.Mux;
-pub const MuxConfig = stream.MuxConfig;
-pub const MuxError = stream.MuxError;
+// Stream/Mux - generic over Runtime
+pub const Stream = stream_mod.Stream;
+pub const Mux = stream_mod.Mux;
+pub const StreamState = stream_mod.StreamState;
+pub const StreamError = stream_mod.StreamError;
+pub const MuxConfig = stream_mod.MuxConfig;
+pub const MuxError = stream_mod.MuxError;
 
 // Callbacks
-pub const OutputFn = stream.OutputFn;
-pub const OnNewStreamFn = stream.OnNewStreamFn;
+pub const OutputFn = stream_mod.OutputFn;
+pub const OnNewStreamFn = stream_mod.OnNewStreamFn;
 
 pub const RingBuffer = ring_buffer.RingBuffer;
