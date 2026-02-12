@@ -471,7 +471,8 @@ test "relay chain with noise session A->B->C" {
     defer allocator.free(payload_enc);
 
     var cipher_buf: [1024]u8 = undefined;
-    const nonce = try session_a.encrypt(payload_enc, &cipher_buf);
+    const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+    const nonce = try session_a.encrypt(payload_enc, &cipher_buf, now_ns);
     const ciphertext_len = payload_enc.len + noise.tag_size;
 
     // Build Type 4 transport message
@@ -506,7 +507,8 @@ test "relay chain with noise session A->B->C" {
     try std.testing.expectEqual(@as(u32, 2), inner_msg.receiver_index);
 
     var decrypt_buf: [1024]u8 = undefined;
-    const pt_len = try session_c.decrypt(inner_msg.ciphertext, inner_msg.counter, &decrypt_buf);
+    const dec_now_ns: u64 = @intCast(std.time.nanoTimestamp());
+    const pt_len = try session_c.decrypt(inner_msg.ciphertext, inner_msg.counter, &decrypt_buf, dec_now_ns);
     const plaintext = decrypt_buf[0..pt_len];
 
     const decoded = try noise_message.decodePayload(plaintext);
@@ -546,7 +548,8 @@ test "relay multi-hop with noise session A->B->C->D" {
     defer allocator.free(payload_enc);
 
     var cipher_buf: [1024]u8 = undefined;
-    const nonce = try session_a.encrypt(payload_enc, &cipher_buf);
+    const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+    const nonce = try session_a.encrypt(payload_enc, &cipher_buf, now_ns);
     const ct_len = payload_enc.len + noise.tag_size;
     const type4msg = try noise_message.buildTransportMessage(
         allocator,
@@ -584,7 +587,8 @@ test "relay multi-hop with noise session A->B->C->D" {
     try std.testing.expectEqual(@as(u32, 20), inner_msg.receiver_index);
 
     var decrypt_buf: [1024]u8 = undefined;
-    const pt_len = try session_d.decrypt(inner_msg.ciphertext, inner_msg.counter, &decrypt_buf);
+    const dec2_now_ns: u64 = @intCast(std.time.nanoTimestamp());
+    const pt_len = try session_d.decrypt(inner_msg.ciphertext, inner_msg.counter, &decrypt_buf, dec2_now_ns);
     const plaintext = decrypt_buf[0..pt_len];
 
     const decoded = try noise_message.decodePayload(plaintext);

@@ -32,13 +32,13 @@ const relay_mod = @import("../relay/mod.zig");
 const kcp_mod = @import("../kcp/mod.zig");
 const std_impl = @import("std_impl");
 const channel_pkg = @import("channel");
+const zgrnet_runtime = @import("../runtime.zig");
 
-/// Runtime type for embed-zig channel/signal primitives.
-/// Uses std library Mutex/Condition via embed-zig platform/std.
-const StdRt = std_impl.runtime;
+/// Runtime type with timedWait, sleepMs, nowMs for KCP and Channel.
+const StdRt = zgrnet_runtime;
 
-const Channel = channel_pkg.Channel;
-const Signal = channel_pkg.Signal;
+const ChannelT = channel_pkg.Channel;
+const SignalT = channel_pkg.Signal;
 
 pub const KcpMux = kcp_mod.Mux(StdRt);
 pub const KcpStream = kcp_mod.Stream(StdRt);
@@ -133,7 +133,7 @@ pub const Packet = struct {
     out_buf: [MaxPacketSize]u8,
 
     // Synchronization
-    ready: Signal, // Signaled when decryption is complete
+    ready: SignalT(StdRt), // Signaled when decryption is complete
 
     pub fn init() Packet {
         return Packet{
@@ -147,7 +147,7 @@ pub const Packet = struct {
             .payload_len = 0,
             .err = null,
             .out_buf = undefined,
-            .ready = Signal.init(),
+            .ready = SignalT(StdRt).init(),
         };
     }
 
@@ -158,7 +158,8 @@ pub const Packet = struct {
         self.payload = &[_]u8{};
         self.payload_len = 0;
         self.err = null;
-        self.ready.reset();
+        // Clear signal state (consume any pending signal)
+        _ = self.ready.tryWait();
     }
 };
 
@@ -284,9 +285,21 @@ const PeerState = struct {
 const PendingHandshake = struct {
     hs: *HandshakeState,
     pk: Key,
-    done: Signal,
+    done: SignalT(StdRt),
     success: bool,
     created_at: i128,
+
+    /// Wait for done signal with timeout. Returns true if signaled, false on timeout.
+    fn waitTimeout(self: *PendingHandshake, timeout_ns: u64) bool {
+        self.done.mutex.lock();
+        defer self.done.mutex.unlock();
+        while (!self.done.signaled) {
+            const result = self.done.cond.timedWait(&self.done.mutex, timeout_ns);
+            if (result == .timed_out) return false;
+        }
+        self.done.signaled = false;
+        return true;
+    }
 };
 
 // ============================================================================
@@ -333,10 +346,12 @@ pub const ReadPacketResult = struct {
 /// (e.g., KqueueIO on macOS/BSD, EpollIO on Linux).
 /// The backend must implement the IOService interface.
 pub fn UDP(comptime IOBackend: type) type {
-    // Compile-time check that IOBackend implements IOService
-    comptime async_mod.assertIOService(IOBackend);
+    // IOBackend must implement the IOService interface (kqueue/epoll).
 
-    const IOService = IOBackend;
+    // Channel types (comptime-sized, using StdRt for sync primitives)
+    const DecryptChan = ChannelT(*Packet, DecryptChanSize, StdRt);
+    const OutputChan = ChannelT(*Packet, OutputChanSize, StdRt);
+    const CloseSignal = SignalT(StdRt);
 
     return struct {
         const Self = @This();
@@ -365,8 +380,8 @@ pub fn UDP(comptime IOBackend: type) type {
 
     // Pipeline channels (Go-style double queue)
     packet_pool: PacketPool,
-    decrypt_chan: Channel(*Packet),
-    output_chan: Channel(*Packet),
+    decrypt_chan: DecryptChan,
+    output_chan: OutputChan,
 
     // Worker threads
     io_thread: ?Thread,
@@ -374,21 +389,17 @@ pub fn UDP(comptime IOBackend: type) type {
     workers: []Thread,
     num_workers: usize,
 
-    // IO service (platform-agnostic)
-    io: IOService,
+    // IO backend (kqueue/epoll)
     io_backend: *IOBackend,
-
-    // Timer service for KCP updates
-    timer_service: SimpleTimerService,
 
     // Close signaling
     closed: Atomic(bool),
-    close_signal: Signal,
+    close_signal: CloseSignal,
 
     // Statistics
     total_tx: Atomic(u64),
     total_rx: Atomic(u64),
-    last_seen: Atomic(i128),
+    last_seen: Atomic(i64),
 
     // Index generator
     next_index: Atomic(u32),
@@ -439,12 +450,12 @@ pub fn UDP(comptime IOBackend: type) type {
         errdefer allocator.destroy(self);
 
         // Initialize packet pool
-        const pool_size = options.decrypt_chan_size + options.output_chan_size;
+        const pool_size = DecryptChanSize + OutputChanSize;
         const packet_pool = PacketPool.init(allocator, pool_size) catch return UdpError.OutOfMemory;
 
         // Initialize channels
-        const decrypt_chan = Channel(*Packet).init(allocator, options.decrypt_chan_size) catch return UdpError.OutOfMemory;
-        const output_chan = Channel(*Packet).init(allocator, options.output_chan_size) catch return UdpError.OutOfMemory;
+        const decrypt_chan = DecryptChan.init();
+        const output_chan = OutputChan.init();
 
         // Allocate worker array
         const workers = allocator.alloc(Thread, num_workers) catch return UdpError.OutOfMemory;
@@ -480,14 +491,12 @@ pub fn UDP(comptime IOBackend: type) type {
             .timer_thread = null,
             .workers = workers,
             .num_workers = num_workers,
-            .io = io_backend.ioService(),
             .io_backend = io_backend,
-            .timer_service = SimpleTimerService.init(allocator),
             .closed = Atomic(bool).init(false),
-            .close_signal = Signal.init(),
+            .close_signal = CloseSignal.init(),
             .total_tx = Atomic(u64).init(0),
             .total_rx = Atomic(u64).init(0),
-            .last_seen = Atomic(i128).init(0),
+            .last_seen = Atomic(i64).init(0),
             .next_index = Atomic(u32).init(1),
         };
 
@@ -509,10 +518,10 @@ pub fn UDP(comptime IOBackend: type) type {
     pub fn deinit(self: *Self) void {
         // Signal close
         self.closed.store(true, .release);
-        self.close_signal.signal();
+        self.close_signal.notify();
 
         // Wake ioLoop from blocking poll
-        self.io.wake();
+        self.io_backend.wake();
 
         // Close channels to wake blocked threads
         self.decrypt_chan.close();
@@ -532,7 +541,7 @@ pub fn UDP(comptime IOBackend: type) type {
             w.join();
         }
 
-        // Free peers first (before timer_service, as mux.deinit() needs to cancel timers)
+        // Free peers first
         var peer_iter = self.peers.valueIterator();
         while (peer_iter.next()) |peer_ptr| {
             const peer = peer_ptr.*;
@@ -566,7 +575,6 @@ pub fn UDP(comptime IOBackend: type) type {
         // Now cleanup internal resources
         self.io_backend.deinit();
         self.allocator.destroy(self.io_backend);
-        self.timer_service.deinit();
         self.decrypt_chan.deinit();
         self.output_chan.deinit();
         self.packet_pool.deinit();
@@ -657,7 +665,7 @@ pub fn UDP(comptime IOBackend: type) type {
         pending.* = PendingHandshake{
             .hs = hs,
             .pk = pk.*,
-            .done = Signal.init(),
+            .done = SignalT(StdRt).init(),
             .success = false,
             .created_at = std.time.nanoTimestamp(),
         };
@@ -696,7 +704,7 @@ pub fn UDP(comptime IOBackend: type) type {
 
         // Wait for response
         const timeout_u64: u64 = @intCast(@max(0, timeout_ns));
-        if (!pending.done.waitTimeout(timeout_u64)) {
+        if (!pending.waitTimeout(timeout_u64)) {
             self.cleanupPending(sender_index);
             return UdpError.HandshakeTimeout;
         }
@@ -745,7 +753,8 @@ pub fn UDP(comptime IOBackend: type) type {
         const ciphertext_len = plaintext_len + noise.tag_size;
 
         // encrypt returns nonce, writes ciphertext to msg_buf[13..]
-        const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..]) catch {
+        const enc_now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..], enc_now_ns) catch {
             return UdpError.SendFailed;
         };
 
@@ -865,7 +874,6 @@ pub fn UDP(comptime IOBackend: type) type {
         // Create Mux
         peer.mux = KcpMux.init(
             self.allocator,
-            &self.timer_service,
             .{},
             is_client,
             MuxOutputCtx.output,
@@ -890,7 +898,7 @@ pub fn UDP(comptime IOBackend: type) type {
     };
 
     /// Callback when a new stream is accepted.
-    fn onNewStream(_: *KcpStream, _: ?*anyopaque) void {
+    fn onNewStream(_: *anyopaque, _: ?*anyopaque) void {
         // Stream is pushed to accept_chan in Mux, nothing extra to do here
     }
 
@@ -909,7 +917,8 @@ pub fn UDP(comptime IOBackend: type) type {
         const plaintext_len = data.len + 1;
         const ciphertext_len = plaintext_len + noise.tag_size;
 
-        const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..]) catch {
+        const enc2_now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..], enc2_now_ns) catch {
             return UdpError.SendFailed;
         };
 
@@ -983,14 +992,14 @@ pub fn UDP(comptime IOBackend: type) type {
 
     fn ioLoop(self: *Self) void {
         // Register socket for read readiness via IOService callback
-        self.io.registerRead(@intCast(self.socket), .{
+        self.io_backend.registerRead(@intCast(self.socket), .{
             .ptr = @ptrCast(self),
             .callback = onSocketReady,
         });
 
         // Poll loop — blocks until events, callbacks fire inside poll()
         while (!self.closed.load(.acquire)) {
-            _ = self.io.poll(-1); // block indefinitely, wake() interrupts
+            _ = self.io_backend.poll(-1); // block indefinitely, wake() interrupts
         }
     }
 
@@ -1039,26 +1048,26 @@ pub fn UDP(comptime IOBackend: type) type {
 
             // Update stats
             _ = self.total_rx.fetchAdd(@intCast(nr), .release);
-            self.last_seen.store(std.time.nanoTimestamp(), .release);
+            self.last_seen.store(@intCast(std.time.nanoTimestamp()), .release);
 
             // Dual-channel send: packet must be in both channels or neither.
             // Send to output_chan FIRST — reader blocks on ready.wait() so it
             // won't touch the packet until decrypt worker signals ready.
-            if (!self.output_chan.trySend(pkt)) {
-                // output_chan full, drop packet (nothing to undo)
+            self.output_chan.trySend(pkt) catch {
+                // output_chan full or closed, drop packet (nothing to undo)
                 self.packet_pool.release(pkt);
                 continue;
-            }
+            };
 
             // Now send to decrypt_chan for worker processing.
-            if (!self.decrypt_chan.trySend(pkt)) {
+            self.decrypt_chan.trySend(pkt) catch {
                 // decrypt_chan full (rare). Packet is already in output_chan
                 // and reader will block on ready.wait(). Signal ready with
                 // error so reader can consume and release it — no leak.
                 pkt.err = UdpError.NoData;
-                pkt.ready.signal();
+                pkt.ready.notify();
                 continue;
-            }
+            };
         }
     }
 
@@ -1073,8 +1082,7 @@ pub fn UDP(comptime IOBackend: type) type {
 
             if (self.closed.load(.acquire)) return;
 
-            // Advance timer and fire due tasks
-            _ = self.timer_service.advance(1);
+            // KCP update is now managed by Mux's own update loop
         }
     }
 
@@ -1093,7 +1101,7 @@ pub fn UDP(comptime IOBackend: type) type {
             self.processPacket(pkt);
 
             // Signal ready
-            pkt.ready.signal();
+            pkt.ready.notify();
         }
     }
 
@@ -1157,7 +1165,8 @@ pub fn UDP(comptime IOBackend: type) type {
         };
 
         // Decrypt - returns plaintext length
-        const plaintext_len = session.decrypt(msg.ciphertext, msg.counter, &pkt.out_buf) catch {
+        const dec_now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        const plaintext_len = session.decrypt(msg.ciphertext, msg.counter, &pkt.out_buf, dec_now_ns) catch {
             pkt.err = UdpError.DecryptFailed;
             return;
         };
@@ -1294,7 +1303,8 @@ pub fn UDP(comptime IOBackend: type) type {
         @memcpy(pkt.data[0..ct_len], inner_msg.ciphertext);
 
         // Decrypt into pkt.out_buf
-        const inner_pt_len = inner_session.decrypt(pkt.data[0..ct_len], inner_msg.counter, &pkt.out_buf) catch {
+        const inner_dec_now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        const inner_pt_len = inner_session.decrypt(pkt.data[0..ct_len], inner_msg.counter, &pkt.out_buf, inner_dec_now_ns) catch {
             pkt.err = UdpError.DecryptFailed;
             return;
         };
@@ -1423,20 +1433,20 @@ pub fn UDP(comptime IOBackend: type) type {
         // Read response
         _ = pending.hs.readMessage(&noise_msg, &[_]u8{}) catch {
             pending.success = false;
-            pending.done.signal();
+            pending.done.notify();
             return;
         };
 
         // Create session from split cipher states
         const send_cipher, const recv_cipher = pending.hs.split() catch {
             pending.success = false;
-            pending.done.signal();
+            pending.done.notify();
             return;
         };
 
         const session = self.allocator.create(Session) catch {
             pending.success = false;
-            pending.done.signal();
+            pending.done.notify();
             return;
         };
 
@@ -1466,7 +1476,7 @@ pub fn UDP(comptime IOBackend: type) type {
         self.initMux(peer);
 
         pending.success = true;
-        pending.done.signal();
+        pending.done.notify();
     }
 
     // ========================================================================
@@ -1567,7 +1577,7 @@ test "UDP end-to-end: handshake + send/recv" {
         builtin.os.tag == .netbsd or builtin.os.tag == .openbsd);
 
     if (comptime has_kqueue) {
-        const KqueueIO = async_mod.KqueueIO;
+        const KqueueIO = std_impl.kqueue_io.KqueueIO;
         const UDPImpl = UDP(KqueueIO);
 
         const allocator = std.testing.allocator;
@@ -1646,8 +1656,8 @@ test "Channel with Packet pointers" {
     var pool = try PacketPool.init(allocator, 4);
     defer pool.deinit();
 
-    var ch = try Channel(*Packet).init(allocator, 4);
-    defer ch.deinit();
+    const TestChan = ChannelT(*Packet, 4, StdRt);
+    var ch = TestChan.init();
 
     // Send packets through channel
     const p1 = pool.acquire().?;

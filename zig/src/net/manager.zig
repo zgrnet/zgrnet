@@ -70,6 +70,7 @@ pub const SessionManager = struct {
             .send_key = send_key,
             .recv_key = recv_key,
             .remote_pk = remote_pk,
+            .now_ns = @intCast(std.time.nanoTimestamp()),
         });
 
         // Remove existing session for this peer
@@ -161,12 +162,13 @@ pub const SessionManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        const now_ns: u64 = @intCast(std.time.nanoTimestamp());
         var expired = std.ArrayListUnmanaged(u32){};
         defer expired.deinit(self.allocator);
 
         var it = self.by_index.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.*.isExpired()) {
+            if (entry.value_ptr.*.isExpired(now_ns)) {
                 expired.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }

@@ -316,7 +316,8 @@ pub const Conn = struct {
             const ciphertext = self.allocator.alloc(u8, plaintext.len + session_mod.tag_size) catch return ConnError.OutOfMemory;
             defer self.allocator.free(ciphertext);
 
-            const counter = session.encrypt(plaintext, ciphertext) catch return ConnError.SessionError;
+            const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+            const counter = session.encrypt(plaintext, ciphertext, now_ns) catch return ConnError.SessionError;
 
             // Build wire message
             break :blk message.buildTransportMessage(self.allocator, session.remoteIndex(), counter, ciphertext) catch return ConnError.OutOfMemory;
@@ -392,7 +393,8 @@ pub const Conn = struct {
             };
             defer self.allocator.free(plaintext);
 
-            _ = session.decrypt(pkt.ciphertext, pkt.counter, plaintext) catch {
+            const dec_now_ns: u64 = @intCast(std.time.nanoTimestamp());
+            _ = session.decrypt(pkt.ciphertext, pkt.counter, plaintext, dec_now_ns) catch {
                 self.mutex.unlock();
                 return ConnError.SessionError;
             };
@@ -442,7 +444,8 @@ pub const Conn = struct {
         const plaintext = self.allocator.alloc(u8, plaintext_len) catch return ConnError.OutOfMemory;
         defer self.allocator.free(plaintext);
 
-        _ = session.decrypt(msg.ciphertext, msg.counter, plaintext) catch return ConnError.SessionError;
+        const dec2_now_ns: u64 = @intCast(std.time.nanoTimestamp());
+        _ = session.decrypt(msg.ciphertext, msg.counter, plaintext, dec2_now_ns) catch return ConnError.SessionError;
 
         // Decode protocol and payload
         const decoded = message.decodePayload(plaintext) catch return ConnError.MessageError;
@@ -606,7 +609,7 @@ pub const Conn = struct {
             has_hs_state = self.hs_state != null;
 
             if (self.current) |*session| {
-                send_nonce = session.send_nonce.load(.acquire);
+                send_nonce = session.sendNonce();
                 recv_nonce = session.recvMaxNonce();
             }
         }
