@@ -536,6 +536,12 @@ pub fn UDP(comptime IOBackend: type) type {
         self.closed.store(true, .release);
         self.close_signal.notify();
 
+        // Unregister socket from IO backend BEFORE closing it.
+        // This prevents epoll/kqueue from delivering EPOLLHUP/EV_EOF
+        // events after close(), which would fire callbacks on a
+        // partially-destroyed self (race → segfault on Linux).
+        self.io_backend.unregister(@intCast(self.socket));
+
         // Wake ioLoop from blocking poll
         self.io_backend.wake();
 
@@ -543,7 +549,7 @@ pub fn UDP(comptime IOBackend: type) type {
         self.decrypt_chan.close();
         self.output_chan.close();
 
-        // Close socket
+        // Close socket (safe now — no more epoll/kqueue events for this fd)
         posix.close(self.socket);
 
         // Join threads
