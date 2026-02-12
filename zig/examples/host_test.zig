@@ -13,7 +13,7 @@ const tun = @import("tun");
 
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
-const UDPType = noise.UDP(noise.KqueueIO);
+const UDPType = noise.UDP;
 const HostType = noise.Host(UDPType);
 const TunDevice = noise.TunDevice;
 

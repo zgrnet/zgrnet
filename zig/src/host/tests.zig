@@ -13,10 +13,12 @@ const Atomic = std.atomic.Value;
 
 const noise_mod = @import("../noise/mod.zig");
 const std_impl = @import("std_impl");
+const zgrnet_runtime = @import("../runtime.zig");
 const Key = noise_mod.Key;
 
 // Concrete Noise Protocol types
 const StdCrypto = noise_mod.test_crypto;
+const StdRt = zgrnet_runtime;
 const P = noise_mod.Protocol(StdCrypto);
 const KeyPair = P.KeyPair;
 
@@ -33,7 +35,7 @@ const net_udp = @import("../net/udp.zig");
 const IOService = std_impl.IOService;
 const has_io_backend = (IOService != void);
 
-const UDPType = if (has_io_backend) net_udp.UDP(IOService) else void;
+const UDPType = if (has_io_backend) net_udp.UDP(StdCrypto, StdRt, IOService) else void;
 const HostType = if (has_io_backend) host_mod.Host(UDPType) else void;
 
 // ============================================================================

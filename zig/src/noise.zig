@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - `noise`: Pure Noise Protocol Framework (generic over Crypto)
-//! - `net`: Network layer with WireGuard-style connection management
+//! - `net`: Network layer with WireGuard-style connection management (generic over Crypto + Rt)
 //!
 //! The noise protocol is parameterized by a Crypto type. For desktop platforms,
 //! we use StdCrypto (std.crypto wrappers conforming to trait.crypto interface).
@@ -23,12 +23,16 @@ pub const config_mod = @import("config/mod.zig");
 pub const json_config = @import("config.zig");
 
 // ============================================================================
-// Concrete Crypto instantiation for desktop platforms
+// Concrete Crypto + Runtime instantiation for desktop platforms
 // ============================================================================
 
 /// StdCrypto — std.crypto wrappers conforming to trait.crypto interface.
 /// Provides Blake2s256, ChaCha20Poly1305, X25519 for Noise Protocol.
 pub const StdCrypto = noise.test_crypto;
+
+/// StdRt — zgrnet runtime extending embed-zig's std runtime with
+/// timedWait, sleepMs, nowMs, nowNs.
+pub const StdRt = @import("runtime.zig");
 
 /// Concrete Noise Protocol instantiation for desktop platforms.
 pub const N = noise.Protocol(StdCrypto);
@@ -79,31 +83,35 @@ const std_impl = @import("std_impl");
 pub const KqueueIO = std_impl.kqueue_io.KqueueIO;
 
 // ============================================================================
-// Net layer types
+// Concrete Net layer types (instantiated with StdCrypto + StdRt)
 // ============================================================================
 
-pub const Conn = net.Conn;
-pub const ConnConfig = net.ConnConfig;
+pub const Conn = net.Conn(StdCrypto, StdRt);
+pub const ConnConfig = Conn.ConnConfig;
 pub const ConnState = net.ConnState;
 pub const ConnError = net.ConnError;
 pub const RecvResult = net.RecvResult;
-pub const SessionManager = net.SessionManager;
+pub const SessionManager = net.SessionManager(StdCrypto, StdRt);
 pub const ManagerError = net.ManagerError;
-pub const dial = net.dial;
-pub const DialOptions = net.DialOptions;
+pub const DialOptions = net.DialOptions(StdCrypto);
 pub const DialError = net.DialError;
-pub const Listener = net.Listener;
-pub const ListenerConfig = net.ListenerConfig;
+pub const Listener = net.Listener(StdCrypto, StdRt);
+pub const ListenerConfig = Listener.Config;
 pub const ListenerError = net.ListenerError;
 pub const UdpTransport = net.UdpTransport;
 pub const UdpAddr = net.UdpAddr;
-pub const UDP = net.UDP;
+pub const UDP = net.UDP(StdCrypto, StdRt, KqueueIO);
 pub const UdpError = net.UdpError;
 pub const UdpOptions = net.UdpOptions;
 pub const ReadResult = net.ReadResult;
 pub const ReadPacketResult = net.ReadPacketResult;
-pub const Packet = net.Packet;
-pub const PacketPool = net.PacketPool;
+pub const Packet = net.Packet(StdRt);
+pub const PacketPool = net.PacketPool(StdRt);
+
+/// Dial function instantiated with StdCrypto + StdRt.
+pub fn dial(opts: DialOptions) DialError!*Conn {
+    return net.dial(StdCrypto, StdRt, opts);
+}
 
 // ============================================================================
 // KCP types
@@ -134,7 +142,7 @@ pub const Host = host.Host;
 pub const TunDevice = host.TunDevice;
 pub const IPAllocator = host.IPAllocator;
 pub const HostError = host.HostError;
-pub const HostConfig = host.Config;
+pub const HostConfig = host.Config(KeyPair);
 pub const PeerConfig = host.PeerConfig;
 
 // ============================================================================

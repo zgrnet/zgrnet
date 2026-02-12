@@ -1,12 +1,12 @@
 //! Network layer for zgrnet.
 //!
 //! This module provides WireGuard-style connection management including:
-//! - `Conn`: A connection to a remote peer
-//! - `Listener`: Server-side connection acceptor
-//! - `dial`: Client-side connection initiator
-//! - `SessionManager`: Multi-peer session management
+//! - `Conn`: A connection to a remote peer (generic over Crypto + Rt)
+//! - `Listener`: Server-side connection acceptor (generic over Crypto + Rt)
+//! - `dial`: Client-side connection initiator (generic over Crypto + Rt)
+//! - `SessionManager`: Multi-peer session management (generic over Crypto + Rt)
 //! - `UdpTransport`: UDP-based transport implementation
-//! - `UDP`: High-level peer management layer with double-queue architecture
+//! - `UDP`: High-level peer management layer with double-queue architecture (generic over Crypto + Rt + IOBackend)
 
 const std = @import("std");
 
@@ -21,12 +21,12 @@ pub const manager = @import("manager.zig");
 pub const transport_udp = @import("transport_udp.zig");
 pub const udp = @import("udp.zig");
 
-// Re-export main types - Connection
+// Re-export generic type constructors
 pub const Conn = conn_impl.Conn;
-pub const ConnConfig = conn_impl.ConnConfig;
 pub const ConnState = conn_impl.ConnState;
 pub const ConnError = conn_impl.ConnError;
 pub const RecvResult = conn_impl.RecvResult;
+pub const InboundPacket = conn_impl.InboundPacket;
 
 // Re-export dial function and options
 pub const dial = dial_mod.dial;
@@ -35,7 +35,6 @@ pub const DialError = dial_mod.DialError;
 
 // Re-export listener types
 pub const Listener = listener_mod.Listener;
-pub const ListenerConfig = listener_mod.ListenerConfig;
 pub const ListenerError = listener_mod.ListenerError;
 
 // Re-export session manager
@@ -55,9 +54,9 @@ pub const PacketPool = udp.PacketPool;
 pub const ReadResult = udp.ReadResult;
 pub const ReadPacketResult = udp.ReadPacketResult;
 
-// KCP types (accessed via UDP)
-pub const KcpMux = udp.KcpMux;
-pub const KcpStream = udp.KcpStream;
+// KCP types (convenience re-exports from udp module, for backward compat)
+pub const KcpMux = udp.StdKcpMux;
+pub const KcpStream = udp.StdKcpStream;
 
 // Channel sizes
 pub const DecryptChanSize = udp.DecryptChanSize;
@@ -76,7 +75,6 @@ pub const rekey_after_messages = consts.rekey_after_messages;
 pub const reject_after_messages = consts.reject_after_messages;
 
 test {
-    std.testing.refAllDecls(@This());
     _ = conn_impl;
     _ = consts;
     _ = dial_mod;

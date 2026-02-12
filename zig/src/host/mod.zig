@@ -22,11 +22,6 @@ const noise = @import("../noise/mod.zig");
 const message = noise.message;
 const Key = noise.Key;
 
-// Concrete Noise Protocol types (instantiated with StdCrypto)
-const StdCrypto = noise.test_crypto;
-const P = noise.Protocol(StdCrypto);
-const KeyPair = P.KeyPair;
-
 pub const ipalloc = @import("ipalloc.zig");
 pub const packet = @import("packet.zig");
 pub const IPAllocator = ipalloc.IPAllocator;
@@ -118,16 +113,19 @@ pub const TunDevice = struct {
 // ============================================================================
 
 /// Configuration for creating a Host.
-pub const Config = struct {
-    /// Local keypair for Noise Protocol handshakes.
-    private_key: *const KeyPair,
-    /// Local IPv4 address assigned to the TUN device (CGNAT range).
-    tun_ipv4: [4]u8,
-    /// Maximum Transmission Unit. Default: 1400.
-    mtu: usize = 1400,
-    /// UDP port to listen on. 0 for random.
-    listen_port: u16 = 0,
-};
+/// Generic over KeyPair type to support different Crypto backends.
+pub fn Config(comptime KeyPair: type) type {
+    return struct {
+        /// Local keypair for Noise Protocol handshakes.
+        private_key: *const KeyPair,
+        /// Local IPv4 address assigned to the TUN device (CGNAT range).
+        tun_ipv4: [4]u8,
+        /// Maximum Transmission Unit. Default: 1400.
+        mtu: usize = 1400,
+        /// UDP port to listen on. 0 for random.
+        listen_port: u16 = 0,
+    };
+}
 
 /// Configuration for a peer.
 pub const PeerConfig = struct {
@@ -151,8 +149,13 @@ pub const HostError = error{
 };
 
 /// Host bridges a TUN virtual network device with encrypted UDP transport.
-/// Generic over `UDPType` to support different IO backends.
+/// Generic over `UDPType` to support different IO backends and Crypto/Runtime.
 pub fn Host(comptime UDPType: type) type {
+    // Extract KeyPair type from UDPType's local_key field
+    const KeyPairPtrType = @TypeOf(@as(UDPType, undefined).local_key);
+    const KeyPair = @typeInfo(KeyPairPtrType).pointer.child;
+    const HostConfig = Config(KeyPair);
+
     return struct {
         const Self = @This();
 
@@ -170,7 +173,7 @@ pub fn Host(comptime UDPType: type) type {
 
         pub fn init(
             allocator: Allocator,
-            cfg: Config,
+            cfg: HostConfig,
             tun_dev: TunDevice,
         ) HostError!*Self {
             // Create UDP transport
@@ -282,9 +285,6 @@ pub fn Host(comptime UDPType: type) type {
             var buf: [1500 + 40]u8 = undefined; // MTU + extra room
 
             while (!self.closed.load(.acquire)) {
-                // TODO(async-tun): Replace blocking read with async I/O
-                // (kqueue/io_uring). Currently TUN read is blocking, so
-                // WouldBlock never triggers. See design/14-async-tun.md.
                 const n = self.tun.read(&buf) catch |err| {
                     if (self.closed.load(.acquire)) return;
                     std.debug.print("host: tun read error: {}\n", .{err});

@@ -49,6 +49,11 @@ pub const Condition = struct {
     }
 };
 
+/// Returns current time in nanoseconds.
+pub fn nowNs() u64 {
+    return @intCast(std.time.nanoTimestamp());
+}
+
 /// Returns current time in milliseconds.
 pub fn nowMs() u64 {
     return @intCast(std.time.milliTimestamp());
