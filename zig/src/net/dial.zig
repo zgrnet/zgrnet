@@ -5,7 +5,7 @@
 //! retry mechanism.
 
 const std = @import("std");
-const noise = @import("../noise/mod.zig");
+const noise = @import("mod.zig");
 const conn_mod = @import("conn.zig");
 const consts = @import("consts.zig");
 

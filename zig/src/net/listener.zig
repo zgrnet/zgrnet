@@ -9,7 +9,7 @@ const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Condition = Thread.Condition;
 
-const noise = @import("../noise/mod.zig");
+const noise = @import("mod.zig");
 const conn_mod = @import("conn.zig");
 const manager_mod = @import("manager.zig");
 

@@ -7,7 +7,7 @@ const std = @import("std");
 const mem = std.mem;
 const Mutex = std.Thread.Mutex;
 
-const noise = @import("../noise/mod.zig");
+const noise = @import("mod.zig");
 
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;

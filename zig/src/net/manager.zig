@@ -4,7 +4,7 @@ const std = @import("std");
 const Mutex = std.Thread.Mutex;
 const Allocator = std.mem.Allocator;
 
-const noise = @import("../noise/mod.zig");
+const noise = @import("mod.zig");
 
 pub const Key = noise.Key;
 pub const Session = noise.Session;
