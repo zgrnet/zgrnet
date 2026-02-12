@@ -9,16 +9,20 @@ const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Condition = Thread.Condition;
 
-const noise = @import("mod.zig");
+const noise = @import("../noise/mod.zig");
 const conn_mod = @import("conn.zig");
 const manager_mod = @import("manager.zig");
 
+// Concrete Noise Protocol types (instantiated with StdCrypto)
+const StdCrypto = noise.test_crypto;
+const P = noise.Protocol(StdCrypto);
+
 const Key = noise.Key;
-const KeyPair = noise.KeyPair;
+const KeyPair = P.KeyPair;
 const key_size = noise.key_size;
 const Transport = noise.Transport;
 const Addr = noise.Addr;
-const Session = noise.Session;
+const Session = P.Session;
 const message = noise.message;
 
 const Conn = conn_mod.Conn;

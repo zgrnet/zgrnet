@@ -4,10 +4,14 @@ const std = @import("std");
 const Mutex = std.Thread.Mutex;
 const Allocator = std.mem.Allocator;
 
-const noise = @import("mod.zig");
+const noise = @import("../noise/mod.zig");
+
+// Concrete Noise Protocol types (instantiated with StdCrypto)
+const StdCrypto = noise.test_crypto;
+const P = noise.Protocol(StdCrypto);
 
 pub const Key = noise.Key;
-pub const Session = noise.Session;
+pub const Session = P.Session;
 pub const SessionConfig = noise.SessionConfig;
 
 /// Manager errors.

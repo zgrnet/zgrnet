@@ -27,50 +27,34 @@ const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 const Atomic = std.atomic.Value;
 
-const noise = @import("mod.zig");
-// const relay_mod = @import("../relay/mod.zig"); // TODO: relay module not yet extracted
-const kcp_pkg = @import("kcp");
-const kcp_mod = kcp_pkg.kcp_mod;
-const KcpMux = kcp_mod.KcpMux;
-const KcpStream = kcp_mod.KcpStream;
+const noise = @import("../noise/mod.zig");
+const relay_mod = @import("../relay/mod.zig");
+const kcp_mod = @import("../kcp/mod.zig");
+const std_impl = @import("std_impl");
+const channel_pkg = @import("channel");
 
-// TODO: Import async primitives from lib/pkg/async
-const Channel = @import("async/channel").Channel;
-const Signal = @import("async/channel").Signal; // Signal is in channel package
-const async_mod = struct {
-    pub const KqueueIO = @import("trait").io.KqueueIO;
-    pub const EpollIO = @import("trait").io.EpollIO;
-    pub fn assertIOService(comptime T: type) void {
-        _ = T;
-    }
-};
+/// Runtime type for embed-zig channel/signal primitives.
+/// Uses std library Mutex/Condition via embed-zig platform/std.
+const StdRt = std_impl.runtime;
 
-// Stub for relay until extracted
-const relay_mod = struct {
-    pub const Router = *anyopaque;
-    pub const NodeMetrics = struct {};
-    pub const Action = struct {};
-    pub fn handleRelay0(_: Router, _: *const [32]u8, _: []const u8) ?*const Action {
-        return null;
-    }
-    pub fn handleRelay1(_: Router, _: []const u8) ?*const Action {
-        return null;
-    }
-    pub fn handleRelay2(_: []const u8) ?struct {} {
-        return null;
-    }
-    pub fn handlePing(_: *const [32]u8, _: []const u8, _: *const NodeMetrics) ?*const Action {
-        return null;
-    }
-};
+const Channel = channel_pkg.Channel;
+const Signal = channel_pkg.Signal;
+
+pub const KcpMux = kcp_mod.Mux(StdRt);
+pub const KcpStream = kcp_mod.Stream(StdRt);
+
+const message = noise.message;
+
+// Concrete Noise Protocol types (instantiated with StdCrypto)
+const StdCrypto = noise.test_crypto;
+const P = noise.Protocol(StdCrypto);
 
 const Key = noise.Key;
-const KeyPair = noise.KeyPair;
-const Session = noise.Session;
+const KeyPair = P.KeyPair;
+const Session = P.Session;
 const SessionConfig = noise.SessionConfig;
 const SessionState = noise.SessionState;
-const HandshakeState = noise.HandshakeState;
-const message = noise.message;
+const HandshakeState = P.HandshakeState;
 
 // ============================================================================
 // Constants
@@ -1595,8 +1579,8 @@ test "UDP end-to-end: handshake + send/recv" {
         @memset(&priv2, 0);
         priv1[31] = 1;
         priv2[31] = 2;
-        const kp1 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv1));
-        const kp2 = noise.KeyPair.fromPrivate(noise.Key.fromBytes(priv2));
+        const kp1 = KeyPair.fromPrivate(noise.Key.fromBytes(priv1));
+        const kp2 = KeyPair.fromPrivate(noise.Key.fromBytes(priv2));
 
         // Create two UDP instances on random ports
         const udp1 = try UDPImpl.init(allocator, &kp1, .{

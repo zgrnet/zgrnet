@@ -195,6 +195,14 @@ pub fn generateIndexFromBytes(random_bytes: [4]u8) u32 {
     return mem.readInt(u32, &random_bytes, .little);
 }
 
+/// Generates a random session index using std.crypto.random.
+/// Not available on freestanding targets — use generateIndexFromBytes instead.
+pub fn generateIndex() u32 {
+    var buf: [4]u8 = undefined;
+    std.crypto.random.bytes(&buf);
+    return generateIndexFromBytes(buf);
+}
+
 // Tests
 const testing = std.testing;
 const TestCrypto = @import("test_crypto.zig");

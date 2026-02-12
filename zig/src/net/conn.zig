@@ -7,22 +7,26 @@ const std = @import("std");
 const mem = std.mem;
 const Mutex = std.Thread.Mutex;
 
-const noise = @import("mod.zig");
+const noise = @import("../noise/mod.zig");
+
+// Concrete Noise Protocol types (instantiated with StdCrypto)
+const StdCrypto = noise.test_crypto;
+const P = noise.Protocol(StdCrypto);
 
 const Key = noise.Key;
-const KeyPair = noise.KeyPair;
+const KeyPair = P.KeyPair;
 const key_size = noise.key_size;
-const HandshakeState = noise.HandshakeState;
+const HandshakeState = P.HandshakeState;
 const Pattern = noise.Pattern;
-const Session = noise.Session;
+const Session = P.Session;
 const SessionConfig = noise.SessionConfig;
 const Transport = noise.Transport;
 const Addr = noise.Addr;
 const HandshakeInit = noise.HandshakeInit;
-const Protocol = noise.Protocol;
+const Protocol = noise.Protocol_msg;
 
 // Internal module access for constants
-const session_mod = noise.session;
+const session_mod = noise.session_mod;
 const message = noise.message;
 const transport_mod = noise.transport;
 

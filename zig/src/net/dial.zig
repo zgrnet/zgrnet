@@ -5,19 +5,23 @@
 //! retry mechanism.
 
 const std = @import("std");
-const noise = @import("mod.zig");
+const noise = @import("../noise/mod.zig");
 const conn_mod = @import("conn.zig");
 const consts = @import("consts.zig");
 
+// Concrete Noise Protocol types (instantiated with StdCrypto)
+const StdCrypto = noise.test_crypto;
+const P = noise.Protocol(StdCrypto);
+
 const Key = noise.Key;
-const KeyPair = noise.KeyPair;
+const KeyPair = P.KeyPair;
 const key_size = noise.key_size;
 const Transport = noise.Transport;
 const TransportError = noise.transport.TransportError;
 const Addr = noise.Addr;
-const HandshakeState = noise.HandshakeState;
+const HandshakeState = P.HandshakeState;
 const Pattern = noise.Pattern;
-const Session = noise.Session;
+const Session = P.Session;
 const SessionConfig = noise.SessionConfig;
 const message = noise.message;
 
