@@ -83,6 +83,13 @@ const std_impl = @import("std_impl");
 pub const KqueueIO = std_impl.kqueue_io.KqueueIO;
 
 // ============================================================================
+// Socket abstraction
+// ============================================================================
+
+pub const Endpoint = net.Endpoint;
+pub const StdUdpSocket = net.StdUdpSocket;
+
+// ============================================================================
 // Concrete Net layer types (instantiated with StdCrypto + StdRt)
 // ============================================================================
 
@@ -100,7 +107,7 @@ pub const ListenerConfig = Listener.Config;
 pub const ListenerError = net.ListenerError;
 pub const UdpTransport = net.UdpTransport;
 pub const UdpAddr = net.UdpAddr;
-pub const UDP = net.UDP(StdCrypto, StdRt, KqueueIO);
+pub const UDP = net.UDP(StdCrypto, StdRt, KqueueIO, StdUdpSocket);
 pub const UdpError = net.UdpError;
 pub const UdpOptions = net.UdpOptions;
 pub const ReadResult = net.ReadResult;
@@ -144,6 +151,7 @@ pub const IPAllocator = host.IPAllocator;
 pub const HostError = host.HostError;
 pub const HostConfig = host.Config(KeyPair);
 pub const PeerConfig = host.PeerConfig;
+pub const HostEndpoint = host.Endpoint;
 
 // ============================================================================
 // Config types

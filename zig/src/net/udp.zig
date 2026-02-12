@@ -16,20 +16,21 @@
 //!
 //! ## Design
 //!
-//! Uses comptime generics for Crypto, Runtime, and IOService injection,
-//! allowing platform-specific optimizations.
+//! Uses comptime generics for Crypto, Runtime, IOService, and SocketImpl injection,
+//! allowing platform-specific optimizations. No direct std.posix or std.Thread usage.
 
 const std = @import("std");
-const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const Thread = std.Thread;
 const Atomic = std.atomic.Value;
 
 const noise = @import("../noise/mod.zig");
 const relay_mod = @import("../relay/mod.zig");
 const kcp_mod = @import("../kcp/mod.zig");
 const channel_pkg = @import("channel");
+
+const endpoint_mod = @import("endpoint.zig");
+pub const Endpoint = endpoint_mod.Endpoint;
 
 const message = noise.message;
 
@@ -137,8 +138,7 @@ pub fn Packet(comptime Rt: type) type {
         // Input (set by ioLoop)
         data: []u8, // Buffer (from pool)
         len: usize, // Actual data length
-        from_addr: posix.sockaddr.in, // Sender address
-        from_len: posix.socklen_t, // Address length
+        from: Endpoint, // Sender endpoint (portable)
 
         // Output (set by decryptWorker)
         pk: Key, // Sender's public key
@@ -157,8 +157,7 @@ pub fn Packet(comptime Rt: type) type {
             return Self{
                 .data = &[_]u8{},
                 .len = 0,
-                .from_addr = undefined,
-                .from_len = 0,
+                .from = Endpoint.zero,
                 .pk = Key.zero,
                 .protocol = 0,
                 .payload = &[_]u8{},
@@ -188,7 +187,6 @@ pub fn Packet(comptime Rt: type) type {
 
 /// Pool of reusable packets to avoid allocation per-packet.
 pub fn PacketPool(comptime Rt: type) type {
-    const Mutex = std.Thread.Mutex;
     const PacketT = Packet(Rt);
 
     return struct {
@@ -198,7 +196,7 @@ pub fn PacketPool(comptime Rt: type) type {
         buffers: []u8, // Contiguous buffer for all packet data
         free_stack: []usize, // Stack of free packet indices
         stack_top: Atomic(usize),
-        mutex: Mutex,
+        mutex: Rt.Mutex,
         allocator: Allocator,
         capacity: usize,
 
@@ -223,7 +221,7 @@ pub fn PacketPool(comptime Rt: type) type {
                 .buffers = buffers,
                 .free_stack = free_stack,
                 .stack_top = Atomic(usize).init(capacity),
-                .mutex = .{},
+                .mutex = Rt.Mutex.init(),
                 .allocator = allocator,
                 .capacity = capacity,
             };
@@ -275,10 +273,12 @@ pub fn PacketPool(comptime Rt: type) type {
 
 /// UDP network layer with Noise Protocol encryption.
 ///
-/// Generic over `Crypto` for Noise Protocol, `Rt` for runtime primitives,
-/// and `IOBackend` for platform-specific I/O backends
-/// (e.g., KqueueIO on macOS/BSD, EpollIO on Linux).
-pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) type {
+/// Generic over:
+/// - `Crypto` for Noise Protocol primitives
+/// - `Rt` for runtime (Mutex, Condition, Thread, time, sleep, spawn)
+/// - `IOBackend` for platform-specific I/O multiplexing (kqueue/epoll)
+/// - `SocketImpl` for platform-specific UDP socket (posix/lwIP)
+pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, comptime SocketImpl: type) type {
     const P = noise.Protocol(Crypto);
     const KeyPair = P.KeyPair;
     const Session = P.Session;
@@ -298,13 +298,10 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
     const OutputChan = ChannelT(*PacketT, OutputChanSize, Rt);
     const CloseSignal = SignalT(Rt);
 
-    const Mutex = std.Thread.Mutex;
-
     // State for a single peer.
     const PeerState = struct {
         pk: Key,
-        endpoint: posix.sockaddr,
-        endpoint_len: posix.socklen_t,
+        endpoint: Endpoint,
         session: ?*Session,
         handshake: ?*HandshakeState,
 
@@ -319,8 +316,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
         pub fn init(pk: Key) @This() {
             return .{
                 .pk = pk,
-                .endpoint = undefined,
-                .endpoint_len = 0,
+                .endpoint = Endpoint.zero,
                 .session = null,
                 .handshake = null,
                 .tx_bytes = Atomic(u64).init(0),
@@ -339,7 +335,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
         success: bool,
         created_at: i128,
 
-        /// Wait for done signal with timeout. Returns true if signaled, false on timeout.
+        // Wait for done signal with timeout. Returns true if signaled, false on timeout.
         fn waitTimeout(self: *@This(), timeout_ns: u64) bool {
             self.done.mutex.lock();
             defer self.done.mutex.unlock();
@@ -362,7 +358,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
         // Core state
         allocator: Allocator,
         local_key: *const KeyPair,
-        socket: posix.socket_t,
+        socket: SocketImpl,
         local_port: u16,
 
         // Options
@@ -373,12 +369,12 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
         local_metrics: relay_mod.NodeMetrics,
 
         // Peer management
-        peers_mutex: Mutex,
+        peers_mutex: Rt.Mutex,
         peers: std.AutoHashMap([32]u8, *PeerState),
         by_index: std.AutoHashMap(u32, Key),
 
         // Pending handshakes
-        pending_mutex: Mutex,
+        pending_mutex: Rt.Mutex,
         pending: std.AutoHashMap(u32, *PendingHandshake),
 
         // Pipeline channels (Go-style double queue)
@@ -386,10 +382,10 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
         decrypt_chan: DecryptChan,
         output_chan: OutputChan,
 
-        // Worker threads
-        io_thread: ?Thread,
-        timer_thread: ?Thread, // For KCP update ticks
-        workers: []Thread,
+        // Worker threads (joinable)
+        io_thread: ?Rt.Thread,
+        timer_thread: ?Rt.Thread,
+        workers: []Rt.Thread,
         num_workers: usize,
 
         // IO backend (kqueue/epoll)
@@ -413,39 +409,26 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             key: *const KeyPair,
             options: UdpOptions,
         ) UdpError!*Self {
-            // Create socket
-            const socket = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return UdpError.BindFailed;
-            errdefer posix.close(socket);
+            // Create socket via trait
+            var socket = SocketImpl.udp() catch return UdpError.BindFailed;
+            errdefer socket.close();
 
-            // Set socket to non-blocking mode for clean shutdown
-            const current_flags = posix.fcntl(socket, posix.F.GETFL, 0) catch 0;
-            var o_flags: posix.O = @bitCast(@as(u32, @intCast(current_flags)));
-            o_flags.NONBLOCK = true;
-            _ = posix.fcntl(socket, posix.F.SETFL, @as(usize, @as(u32, @bitCast(o_flags)))) catch {};
+            // Set socket to non-blocking mode
+            socket.setNonBlocking(true);
 
             // Parse bind address
-            var addr: posix.sockaddr.in = .{
-                .family = posix.AF.INET,
-                .port = 0,
-                .addr = 0,
-            };
-
-            if (parseBindAddr(options.bind_addr)) |parsed| {
-                addr = parsed;
-            }
+            const bind_ep = Endpoint.parse(options.bind_addr) orelse Endpoint.zero;
 
             // Bind socket
-            posix.bind(socket, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) catch return UdpError.BindFailed;
+            socket.bind(bind_ep.addr, bind_ep.port) catch return UdpError.BindFailed;
 
-            // Get bound address
-            var bound_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-            posix.getsockname(socket, @ptrCast(&addr), &bound_addr_len) catch return UdpError.BindFailed;
-            const local_port = mem.bigToNative(u16, addr.port);
+            // Get bound port
+            const local_port = socket.getBoundPort() catch return UdpError.BindFailed;
 
             // Determine worker count
             var num_workers = options.decrypt_workers;
             if (num_workers == 0) {
-                num_workers = @max(1, Thread.getCpuCount() catch 4);
+                num_workers = @max(1, Rt.getCpuCount());
             }
 
             // Allocate self
@@ -461,7 +444,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             const output_chan = OutputChan.init();
 
             // Allocate worker array
-            const workers = allocator.alloc(Thread, num_workers) catch return UdpError.OutOfMemory;
+            const workers = allocator.alloc(Rt.Thread, num_workers) catch return UdpError.OutOfMemory;
 
             // Initialize IO backend
             const io_backend = allocator.create(IOBackend) catch return UdpError.OutOfMemory;
@@ -482,10 +465,10 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 .allow_unknown = options.allow_unknown,
                 .router = null,
                 .local_metrics = .{},
-                .peers_mutex = .{},
+                .peers_mutex = Rt.Mutex.init(),
                 .peers = std.AutoHashMap([32]u8, *PeerState).init(allocator),
                 .by_index = std.AutoHashMap(u32, Key).init(allocator),
-                .pending_mutex = .{},
+                .pending_mutex = Rt.Mutex.init(),
                 .pending = std.AutoHashMap(u32, *PendingHandshake).init(allocator),
                 .packet_pool = packet_pool,
                 .decrypt_chan = decrypt_chan,
@@ -504,14 +487,14 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             };
 
             // Start IO thread
-            self.io_thread = Thread.spawn(.{}, ioLoop, .{self}) catch return UdpError.OutOfMemory;
+            self.io_thread = Rt.Thread.spawnFn(ioLoop, .{self}) catch return UdpError.OutOfMemory;
 
             // Start timer thread for KCP updates
-            self.timer_thread = Thread.spawn(.{}, timerLoop, .{self}) catch return UdpError.OutOfMemory;
+            self.timer_thread = Rt.Thread.spawnFn(timerLoop, .{self}) catch return UdpError.OutOfMemory;
 
             // Start decrypt workers
             for (self.workers) |*w| {
-                w.* = Thread.spawn(.{}, decryptWorker, .{self}) catch return UdpError.OutOfMemory;
+                w.* = Rt.Thread.spawnFn(decryptWorker, .{self}) catch return UdpError.OutOfMemory;
             }
 
             return self;
@@ -531,7 +514,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             self.output_chan.close();
 
             // Close socket
-            posix.close(self.socket);
+            self.socket.close();
 
             // Join threads
             if (self.io_thread) |t| {
@@ -610,14 +593,13 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             self.local_metrics = metrics;
         }
 
-        /// Set peer endpoint.
-        pub fn setPeerEndpoint(self: *Self, pk: Key, endpoint: posix.sockaddr, endpoint_len: posix.socklen_t) void {
+        /// Set peer endpoint using portable Endpoint type.
+        pub fn setPeerEndpoint(self: *Self, pk: Key, ep: Endpoint) void {
             self.peers_mutex.lock();
             defer self.peers_mutex.unlock();
 
             const peer = self.getOrCreatePeerLocked(pk);
-            peer.endpoint = endpoint;
-            peer.endpoint_len = endpoint_len;
+            peer.endpoint = ep;
         }
 
         /// Connect to a peer (initiate handshake).
@@ -697,10 +679,9 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             mem.writeInt(u32, msg_buf[1..5], sender_index, .little);
             @memcpy(msg_buf[5..85], &noise_msg);
 
-            // Send
-            const endpoint = peer.endpoint;
-            const endpoint_len = peer.endpoint_len;
-            _ = posix.sendto(self.socket, &msg_buf, 0, &endpoint, endpoint_len) catch {
+            // Send via socket trait
+            const ep = peer.endpoint;
+            _ = self.socket.sendTo(ep.addr, ep.port, &msg_buf) catch {
                 self.cleanupPending(sender_index);
                 return UdpError.SendFailed;
             };
@@ -768,10 +749,9 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
 
             const msg_len = 13 + ciphertext_len;
 
-            // Send
-            const endpoint = peer.endpoint;
-            const endpoint_len = peer.endpoint_len;
-            const n = posix.sendto(self.socket, msg_buf[0..msg_len], 0, &endpoint, endpoint_len) catch {
+            // Send via socket trait
+            const ep = peer.endpoint;
+            const n = self.socket.sendTo(ep.addr, ep.port, msg_buf[0..msg_len]) catch {
                 return UdpError.SendFailed;
             };
 
@@ -837,10 +817,10 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 const n = @min(buf.len, pkt.payload_len);
                 @memcpy(buf[0..n], pkt.payload[0..n]);
                 const pk = pkt.pk;
-                const protocol = pkt.protocol;
+                const protocol_byte = pkt.protocol;
 
                 self.packet_pool.release(pkt);
-                return ReadPacketResult{ .pk = pk, .protocol = protocol, .n = n };
+                return ReadPacketResult{ .pk = pk, .protocol = protocol_byte, .n = n };
             }
         }
 
@@ -889,7 +869,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             };
         }
 
-        /// Output context for Mux - stored at file scope so we can reference it in cleanup.
+        // Output context for Mux - stored at file scope so we can reference it in cleanup.
         const MuxOutputCtx = struct {
             udp: *Self,
             peer: *PeerState,
@@ -900,12 +880,12 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             }
         };
 
-        /// Callback when a new stream is accepted.
+        // Callback when a new stream is accepted.
         fn onNewStream(_: *anyopaque, _: ?*anyopaque) void {
             // Stream is pushed to accept_chan in Mux, nothing extra to do here
         }
 
-        /// Send data to a peer with protocol byte.
+        // Send data to a peer with protocol byte.
         fn sendToPeer(self: *Self, peer: *PeerState, protocol: u8, data: []const u8) UdpError!void {
             const session = peer.session orelse return UdpError.PeerNotFound;
             if (session.getState() != .established) {
@@ -930,10 +910,9 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             mem.writeInt(u64, msg_buf[5..13], nonce, .little);
 
             const msg_len = 13 + ciphertext_len;
-            const endpoint = peer.endpoint;
-            const endpoint_len = peer.endpoint_len;
+            const ep = peer.endpoint;
 
-            _ = posix.sendto(self.socket, msg_buf[0..msg_len], 0, &endpoint, endpoint_len) catch {
+            _ = self.socket.sendTo(ep.addr, ep.port, msg_buf[0..msg_len]) catch {
                 return UdpError.SendFailed;
             };
         }
@@ -991,7 +970,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
 
         fn ioLoop(self: *Self) void {
             // Register socket for read readiness via IOService callback
-            self.io_backend.registerRead(@intCast(self.socket), .{
+            self.io_backend.registerRead(self.socket.getFd(), .{
                 .ptr = @ptrCast(self),
                 .callback = onSocketReady,
             });
@@ -1002,8 +981,8 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             }
         }
 
-        /// Callback invoked by IOService when socket is readable.
-        fn onSocketReady(ptr: ?*anyopaque, _: posix.fd_t) void {
+        // Callback invoked by IOService when socket is readable.
+        fn onSocketReady(ptr: ?*anyopaque, _: i32) void {
             const self: *Self = @ptrCast(@alignCast(ptr.?));
 
             // Drain all available packets from socket
@@ -1013,17 +992,8 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                     return;
                 };
 
-                // Read from socket (non-blocking)
-                var from_addr: posix.sockaddr.in = undefined;
-                var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-
-                const nr = posix.recvfrom(
-                    self.socket,
-                    pkt.data,
-                    0,
-                    @ptrCast(&from_addr),
-                    &from_len,
-                ) catch |err| {
+                // Read from socket (non-blocking) via trait
+                const recv_result = self.socket.recvFromWithAddr(pkt.data) catch |err| {
                     self.packet_pool.release(pkt);
                     if (err == error.WouldBlock) {
                         break; // No more data, wait for next event
@@ -1031,17 +1001,16 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                     return; // Other errors: exit callback
                 };
 
-                if (nr < 1) {
+                if (recv_result.len < 1) {
                     self.packet_pool.release(pkt);
                     continue;
                 }
 
-                pkt.len = nr;
-                pkt.from_addr = from_addr;
-                pkt.from_len = from_len;
+                pkt.len = recv_result.len;
+                pkt.from = recv_result.src;
 
                 // Update stats
-                _ = self.total_rx.fetchAdd(@intCast(nr), .release);
+                _ = self.total_rx.fetchAdd(@intCast(recv_result.len), .release);
                 self.last_seen.store(@intCast(Rt.nowNs()), .release);
 
                 // Dual-channel send: packet must be in both channels or neither.
@@ -1101,11 +1070,11 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
 
             switch (msg_type) {
                 .handshake_init => {
-                    self.handleHandshakeInit(data, &pkt.from_addr, pkt.from_len);
+                    self.handleHandshakeInit(data, pkt.from);
                     pkt.err = UdpError.NoData; // Not a data packet
                 },
                 .handshake_resp => {
-                    self.handleHandshakeResp(data, &pkt.from_addr, pkt.from_len);
+                    self.handleHandshakeResp(data, pkt.from);
                     pkt.err = UdpError.NoData; // Not a data packet
                 },
                 .transport => {
@@ -1160,11 +1129,11 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 return;
             }
 
-            const protocol = pkt.out_buf[0];
+            const protocol_byte = pkt.out_buf[0];
             const payload = pkt.out_buf[1..plaintext_len];
 
             // Route KCP protocol to Mux
-            if (protocol == @intFromEnum(message.Protocol.kcp)) {
+            if (protocol_byte == @intFromEnum(message.Protocol.kcp)) {
                 if (peer.mux) |mux| {
                     mux.input(payload) catch {};
                 }
@@ -1173,7 +1142,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             }
 
             // Route relay protocols
-            if (protocol == @intFromEnum(message.Protocol.relay_0)) {
+            if (protocol_byte == @intFromEnum(message.Protocol.relay_0)) {
                 if (self.router) |router| {
                     if (relay_mod.handleRelay0(router, &pk.data, payload)) |action| {
                         self.executeRelayAction(&action);
@@ -1183,7 +1152,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 return;
             }
 
-            if (protocol == @intFromEnum(message.Protocol.relay_1)) {
+            if (protocol_byte == @intFromEnum(message.Protocol.relay_1)) {
                 if (self.router) |router| {
                     if (relay_mod.handleRelay1(router, payload)) |action| {
                         self.executeRelayAction(&action);
@@ -1193,7 +1162,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 return;
             }
 
-            if (protocol == @intFromEnum(message.Protocol.relay_2)) {
+            if (protocol_byte == @intFromEnum(message.Protocol.relay_2)) {
                 if (relay_mod.handleRelay2(payload)) |result| {
                     if (result.payload.len > 0) {
                         self.processRelayedPacket(pkt, &result.src_key, result.payload);
@@ -1207,7 +1176,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 return;
             }
 
-            if (protocol == @intFromEnum(message.Protocol.ping)) {
+            if (protocol_byte == @intFromEnum(message.Protocol.ping)) {
                 if (self.router != null) {
                     if (relay_mod.handlePing(&pk.data, payload, &self.local_metrics)) |action| {
                         self.executeRelayAction(&action);
@@ -1219,7 +1188,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
 
             // Extract protocol and payload for other protocols
             pkt.pk = pk;
-            pkt.protocol = protocol;
+            pkt.protocol = protocol_byte;
             pkt.payload = payload;
             pkt.payload_len = plaintext_len - 1;
             pkt.err = null;
@@ -1228,7 +1197,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             _ = peer.rx_bytes.fetchAdd(@intCast(pkt.len), .release);
         }
 
-        /// Execute a relay forwarding action by sending to the target peer.
+        // Execute a relay forwarding action by sending to the target peer.
         fn executeRelayAction(self: *Self, action: *const relay_mod.Action) void {
             const pk = Key{ .data = action.dst };
 
@@ -1240,7 +1209,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             self.sendToPeer(peer, action.protocol, action.data()) catch {};
         }
 
-        /// Process a RELAY_2 inner payload.
+        // Process a RELAY_2 inner payload.
         fn processRelayedPacket(self: *Self, pkt: *PacketT, src_key: *const [32]u8, inner_payload: []const u8) void {
             const inner_msg = message.parseTransportMessage(inner_payload) catch {
                 pkt.err = UdpError.NoData;
@@ -1310,7 +1279,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
         // Internal: Handshake Handling
         // ========================================================================
 
-        fn handleHandshakeInit(self: *Self, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t) void {
+        fn handleHandshakeInit(self: *Self, data: []const u8, from: Endpoint) void {
             const msg = message.parseHandshakeInit(data) catch return;
 
             var hs = HandshakeState.init(.{
@@ -1346,7 +1315,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             @memcpy(resp_buf[9..41], resp_noise[0..32]);
             @memcpy(resp_buf[41..57], resp_noise[32..48]);
 
-            _ = posix.sendto(self.socket, &resp_buf, 0, @ptrCast(from), from_len) catch return;
+            _ = self.socket.sendTo(from.addr, from.port, &resp_buf) catch return;
 
             const send_cipher, const recv_cipher = hs.split() catch return;
             const session = self.allocator.create(Session) catch return;
@@ -1365,8 +1334,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 self.allocator.destroy(old);
             }
             peer.session = session;
-            peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
-            peer.endpoint_len = from_len;
+            peer.endpoint = from;
 
             self.by_index.put(sender_index, remote_pk) catch {};
             self.peers_mutex.unlock();
@@ -1374,7 +1342,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
             self.initMux(peer);
         }
 
-        fn handleHandshakeResp(self: *Self, data: []const u8, from: *const posix.sockaddr.in, from_len: posix.socklen_t) void {
+        fn handleHandshakeResp(self: *Self, data: []const u8, from: Endpoint) void {
             const msg = message.parseHandshakeResp(data) catch return;
 
             const pending = blk: {
@@ -1420,8 +1388,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 self.allocator.destroy(old);
             }
             peer.session = session;
-            peer.endpoint = @as(*const posix.sockaddr, @ptrCast(from)).*;
-            peer.endpoint_len = from_len;
+            peer.endpoint = from;
 
             self.by_index.put(msg.receiver_index, pending.pk) catch {};
             self.peers_mutex.unlock();
@@ -1456,36 +1423,6 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type) t
                 self.allocator.destroy(kv.value);
             }
         }
-
-        fn parseBindAddr(addr: []const u8) ?posix.sockaddr.in {
-            var it = std.mem.splitScalar(u8, addr, ':');
-            const host = it.next() orelse return null;
-            const port_str = it.next() orelse return null;
-
-            const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
-
-            var result: posix.sockaddr.in = .{
-                .family = posix.AF.INET,
-                .port = mem.nativeToBig(u16, port),
-                .addr = 0,
-            };
-
-            if (std.mem.eql(u8, host, "0.0.0.0")) {
-                result.addr = 0;
-            } else if (std.mem.eql(u8, host, "127.0.0.1")) {
-                result.addr = mem.nativeToBig(u32, 0x7F000001);
-            } else {
-                var octets: [4]u8 = undefined;
-                var octet_it = std.mem.splitScalar(u8, host, '.');
-                for (&octets) |*octet| {
-                    const s = octet_it.next() orelse return null;
-                    octet.* = std.fmt.parseInt(u8, s, 10) catch return null;
-                }
-                result.addr = mem.bytesToValue(u32, &octets);
-            }
-
-            return result;
-        }
     };
 }
 
@@ -1497,6 +1434,8 @@ const zgrnet_runtime = @import("../runtime.zig");
 const StdCrypto = noise.test_crypto;
 const StdRt = zgrnet_runtime;
 const std_impl = @import("std_impl");
+const std_socket = @import("std_socket.zig");
+const StdUdpSocket = std_socket.StdUdpSocket;
 
 // Re-export KcpMux/KcpStream for net/mod.zig
 pub const StdKcpMux = kcp_mod.Mux(StdRt);
@@ -1539,7 +1478,7 @@ test "UDP end-to-end: handshake + send/recv" {
 
     if (comptime has_kqueue) {
         const KqueueIO = std_impl.kqueue_io.KqueueIO;
-        const UDPImpl = UDP(StdCrypto, StdRt, KqueueIO);
+        const UDPImpl = UDP(StdCrypto, StdRt, KqueueIO, StdUdpSocket);
         const P = noise.Protocol(StdCrypto);
         const KeyPair = P.KeyPair;
 
@@ -1573,20 +1512,9 @@ test "UDP end-to-end: handshake + send/recv" {
         const port1 = udp1.getLocalPort();
         const port2 = udp2.getLocalPort();
 
-        // Set peer endpoints (using file-level posix import)
-        var ep1: posix.sockaddr.in = .{
-            .family = posix.AF.INET,
-            .port = mem.nativeToBig(u16, port1),
-            .addr = mem.nativeToBig(u32, 0x7F000001),
-        };
-        var ep2: posix.sockaddr.in = .{
-            .family = posix.AF.INET,
-            .port = mem.nativeToBig(u16, port2),
-            .addr = mem.nativeToBig(u32, 0x7F000001),
-        };
-
-        udp1.setPeerEndpoint(kp2.public, @as(*posix.sockaddr, @ptrCast(&ep2)).*, @sizeOf(posix.sockaddr.in));
-        udp2.setPeerEndpoint(kp1.public, @as(*posix.sockaddr, @ptrCast(&ep1)).*, @sizeOf(posix.sockaddr.in));
+        // Set peer endpoints using portable Endpoint type
+        udp1.setPeerEndpoint(kp2.public, Endpoint.init(.{ 127, 0, 0, 1 }, port2));
+        udp2.setPeerEndpoint(kp1.public, Endpoint.init(.{ 127, 0, 0, 1 }, port1));
 
         // Handshake: udp1 connects to udp2
         try udp1.connect(&kp2.public);

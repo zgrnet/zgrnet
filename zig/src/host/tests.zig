@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = std.posix;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const Atomic = std.atomic.Value;
@@ -25,18 +24,21 @@ const KeyPair = P.KeyPair;
 const host_mod = @import("mod.zig");
 const TunDevice = host_mod.TunDevice;
 const IPAllocator = host_mod.IPAllocator;
+const Endpoint = host_mod.Endpoint;
 const packet = host_mod.packet;
 const parseIpPacket = host_mod.parseIpPacket;
 const buildIpv4Packet = host_mod.buildIpv4Packet;
 
 const net_udp = @import("../net/udp.zig");
+const std_socket = @import("../net/std_socket.zig");
+const StdUdpSocket = std_socket.StdUdpSocket;
 
 // IOService resolves to kqueue (macOS/BSD) or epoll (Linux), void otherwise.
 const IOService = std_impl.IOService;
 const has_io_backend = (IOService != void);
 
-const UDPType = if (has_io_backend) net_udp.UDP(StdCrypto, StdRt, IOService) else void;
-const HostType = if (has_io_backend) host_mod.Host(UDPType) else void;
+const UDPType = if (has_io_backend) net_udp.UDP(StdCrypto, StdRt, IOService, StdUdpSocket) else void;
+const HostType = if (has_io_backend) host_mod.Host(UDPType, StdRt) else void;
 
 // ============================================================================
 // MockTUN
@@ -176,19 +178,11 @@ const MockTUN = struct {
 };
 
 // ============================================================================
-// Helper: sockaddr conversion
+// Helper: endpoint creation
 // ============================================================================
 
-fn sockaddrIn(port: u16) posix.sockaddr.in {
-    return .{
-        .family = posix.AF.INET,
-        .port = mem.nativeToBig(u16, port),
-        .addr = mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
-    };
-}
-
-fn toSockaddr(sin: *posix.sockaddr.in) posix.sockaddr {
-    return @as(*posix.sockaddr, @ptrCast(sin)).*;
+fn localhostEndpoint(port: u16) Endpoint {
+    return Endpoint.init(.{ 127, 0, 0, 1 }, port);
 }
 
 // ============================================================================
@@ -282,11 +276,8 @@ test "Host: ICMP forwarding A->B" {
     const port_a = host_a.getLocalPort();
     const port_b = host_b.getLocalPort();
 
-    var ep_b = sockaddrIn(port_b);
-    var ep_a = sockaddrIn(port_a);
-
-    host_a.addPeer(key_b.public, toSockaddr(&ep_b), @sizeOf(posix.sockaddr.in)) catch return error.SkipZigTest;
-    host_b.addPeer(key_a.public, toSockaddr(&ep_a), @sizeOf(posix.sockaddr.in)) catch return error.SkipZigTest;
+    host_a.addPeer(key_b.public, localhostEndpoint(port_b)) catch return error.SkipZigTest;
+    host_b.addPeer(key_a.public, localhostEndpoint(port_a)) catch return error.SkipZigTest;
 
     // Get allocated IPs
     const ip_b_on_a = host_a.ip_alloc.lookupByPubkey(key_b.public) orelse return error.SkipZigTest;
@@ -357,11 +348,8 @@ test "Host: bidirectional forwarding" {
     const port_a = host_a.getLocalPort();
     const port_b = host_b.getLocalPort();
 
-    var ep_b = sockaddrIn(port_b);
-    var ep_a = sockaddrIn(port_a);
-
-    host_a.addPeer(key_b.public, toSockaddr(&ep_b), @sizeOf(posix.sockaddr.in)) catch return error.SkipZigTest;
-    host_b.addPeer(key_a.public, toSockaddr(&ep_a), @sizeOf(posix.sockaddr.in)) catch return error.SkipZigTest;
+    host_a.addPeer(key_b.public, localhostEndpoint(port_b)) catch return error.SkipZigTest;
+    host_b.addPeer(key_a.public, localhostEndpoint(port_a)) catch return error.SkipZigTest;
 
     const ip_b_on_a = host_a.ip_alloc.lookupByPubkey(key_b.public) orelse return error.SkipZigTest;
     const ip_a_on_b = host_b.ip_alloc.lookupByPubkey(key_a.public) orelse return error.SkipZigTest;
@@ -420,11 +408,8 @@ test "Host: TCP forwarding with checksum" {
     const port_a = host_a.getLocalPort();
     const port_b = host_b.getLocalPort();
 
-    var ep_b = sockaddrIn(port_b);
-    var ep_a = sockaddrIn(port_a);
-
-    host_a.addPeer(key_b.public, toSockaddr(&ep_b), @sizeOf(posix.sockaddr.in)) catch return error.SkipZigTest;
-    host_b.addPeer(key_a.public, toSockaddr(&ep_a), @sizeOf(posix.sockaddr.in)) catch return error.SkipZigTest;
+    host_a.addPeer(key_b.public, localhostEndpoint(port_b)) catch return error.SkipZigTest;
+    host_b.addPeer(key_a.public, localhostEndpoint(port_a)) catch return error.SkipZigTest;
 
     const ip_b_on_a = host_a.ip_alloc.lookupByPubkey(key_b.public) orelse return error.SkipZigTest;
 

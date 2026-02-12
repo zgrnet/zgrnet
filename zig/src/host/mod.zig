@@ -13,14 +13,15 @@
 //! ```
 
 const std = @import("std");
-const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const Thread = std.Thread;
 const Atomic = std.atomic.Value;
 
 const noise = @import("../noise/mod.zig");
 const message = noise.message;
 const Key = noise.Key;
+
+const endpoint_mod = @import("../net/endpoint.zig");
+pub const Endpoint = endpoint_mod.Endpoint;
 
 pub const ipalloc = @import("ipalloc.zig");
 pub const packet = @import("packet.zig");
@@ -131,9 +132,8 @@ pub fn Config(comptime KeyPair: type) type {
 pub const PeerConfig = struct {
     /// Peer's Curve25519 public key.
     public_key: Key,
-    /// Peer's UDP endpoint (sockaddr + length). null = no known endpoint.
-    endpoint: ?posix.sockaddr = null,
-    endpoint_len: posix.socklen_t = 0,
+    /// Peer's UDP endpoint. null = no known endpoint.
+    endpoint: ?Endpoint = null,
     /// Optional static IPv4 assignment. null = auto-allocate.
     ipv4: ?[4]u8 = null,
 };
@@ -149,8 +149,9 @@ pub const HostError = error{
 };
 
 /// Host bridges a TUN virtual network device with encrypted UDP transport.
-/// Generic over `UDPType` to support different IO backends and Crypto/Runtime.
-pub fn Host(comptime UDPType: type) type {
+/// Generic over `UDPType` and `Rt` (runtime) to support different IO backends,
+/// Crypto/Runtime, and thread implementations.
+pub fn Host(comptime UDPType: type, comptime Rt: type) type {
     // Extract KeyPair type from UDPType's local_key field
     const KeyPairPtrType = @TypeOf(@as(UDPType, undefined).local_key);
     const KeyPair = @typeInfo(KeyPairPtrType).pointer.child;
@@ -167,9 +168,9 @@ pub fn Host(comptime UDPType: type) type {
         mtu: usize,
         closed: Atomic(bool),
 
-        // Threads
-        outbound_thread: ?Thread,
-        inbound_thread: ?Thread,
+        // Threads (joinable)
+        outbound_thread: ?Rt.Thread,
+        inbound_thread: ?Rt.Thread,
 
         pub fn init(
             allocator: Allocator,
@@ -214,7 +215,7 @@ pub fn Host(comptime UDPType: type) type {
         }
 
         /// Add a peer with optional static IP.
-        pub fn addPeerWithIp(self: *Self, pk: Key, endpoint: ?posix.sockaddr, endpoint_len: posix.socklen_t, ipv4: ?[4]u8) HostError!void {
+        pub fn addPeerWithIp(self: *Self, pk: Key, ep: ?Endpoint, ipv4: ?[4]u8) HostError!void {
             // Assign IP
             if (ipv4) |ip| {
                 self.ip_alloc.assignStatic(pk, ip) catch return HostError.AllocError;
@@ -223,14 +224,14 @@ pub fn Host(comptime UDPType: type) type {
             }
 
             // Set endpoint in UDP layer
-            if (endpoint) |ep| {
-                self.udp.setPeerEndpoint(pk, ep, endpoint_len);
+            if (ep) |endpoint| {
+                self.udp.setPeerEndpoint(pk, endpoint);
             }
         }
 
         /// Add a peer with auto-allocated IP.
-        pub fn addPeer(self: *Self, pk: Key, endpoint: ?posix.sockaddr, endpoint_len: posix.socklen_t) HostError!void {
-            return self.addPeerWithIp(pk, endpoint, endpoint_len, null);
+        pub fn addPeer(self: *Self, pk: Key, ep: ?Endpoint) HostError!void {
+            return self.addPeerWithIp(pk, ep, null);
         }
 
         /// Initiate a Noise handshake with the specified peer.
@@ -240,8 +241,8 @@ pub fn Host(comptime UDPType: type) type {
 
         /// Start the outbound and inbound forwarding loops.
         pub fn run(self: *Self) void {
-            self.outbound_thread = Thread.spawn(.{}, outboundLoop, .{self}) catch null;
-            self.inbound_thread = Thread.spawn(.{}, inboundLoop, .{self}) catch null;
+            self.outbound_thread = Rt.Thread.spawnFn(outboundLoop, .{self}) catch null;
+            self.inbound_thread = Rt.Thread.spawnFn(inboundLoop, .{self}) catch null;
         }
 
         /// Gracefully shut down the host.

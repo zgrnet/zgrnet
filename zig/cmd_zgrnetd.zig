@@ -20,8 +20,9 @@ const config_mod = noise.json_config;
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
 const UDPType = noise.UDP;
-const HostType = noise.Host(UDPType);
+const HostType = noise.Host(UDPType, noise.StdRt);
 const TunDevice = noise.TunDevice;
+const Endpoint = noise.Endpoint;
 
 const print = std.debug.print;
 
@@ -159,21 +160,17 @@ pub fn main() !void {
         // Parse first direct endpoint if available
         if (peer_cfg.direct.len > 0) {
             const ep_str = peer_cfg.direct[0];
-            // Parse "host:port" into sockaddr
-            if (parseEndpoint(ep_str)) |ep| {
-                host.addPeer(
-                    Key{ .data = pk },
-                    @as(*posix.sockaddr, @ptrCast(@constCast(&ep.addr))).*,
-                    ep.len,
-                ) catch {
+            // Parse "host:port" into Endpoint
+            if (Endpoint.parse(ep_str)) |ep| {
+                host.addPeer(Key{ .data = pk }, ep) catch {
                     print("[zgrnetd] warning: add peer failed: {s}\n", .{peer_cfg.alias});
                     continue;
                 };
             } else {
-                host.addPeer(Key{ .data = pk }, null, 0) catch continue;
+                host.addPeer(Key{ .data = pk }, null) catch continue;
             }
         } else {
-            host.addPeer(Key{ .data = pk }, null, 0) catch continue;
+            host.addPeer(Key{ .data = pk }, null) catch continue;
         }
         print("[zgrnetd] peer added: {s}\n", .{peer_cfg.alias});
     }
@@ -284,34 +281,7 @@ fn setupSignalHandler() void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
-const Endpoint = struct {
-    addr: posix.sockaddr.in,
-    len: posix.socklen_t,
-};
-
-fn parseEndpoint(s: []const u8) ?Endpoint {
-    // Find last ':' for port separator
-    var colon_pos: ?usize = null;
-    for (s, 0..) |c, i| {
-        if (c == ':') colon_pos = i;
-    }
-    const cp = colon_pos orelse return null;
-
-    const host_part = s[0..cp];
-    const port_str = s[cp + 1 ..];
-
-    const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
-    const ip = config_mod.parseIpv4(host_part) orelse return null;
-
-    return .{
-        .addr = .{
-            .family = posix.AF.INET,
-            .port = mem.nativeToBig(u16, port),
-            .addr = mem.nativeToBig(u32, @as(u32, ip[0]) << 24 | @as(u32, ip[1]) << 16 | @as(u32, ip[2]) << 8 | @as(u32, ip[3])),
-        },
-        .len = @sizeOf(posix.sockaddr.in),
-    };
-}
+// Endpoint parsing is now handled by noise.Endpoint.parse()
 
 fn loadOrGenerateKey(_: std.mem.Allocator, path: []const u8) !KeyPair {
 

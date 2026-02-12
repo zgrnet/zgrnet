@@ -1,7 +1,8 @@
 //! zgrnet Runtime — extends embed-zig's std runtime with additional primitives.
 //!
-//! Adds timedWait on Condition, sleepMs, and nowMs which are needed by
-//! KCP Mux and UDP network layer but not provided by embed-zig's minimal runtime.
+//! Adds timedWait on Condition, sleepMs, nowMs, nowNs, Thread (joinable),
+//! and getCpuCount which are needed by KCP Mux and UDP network layer
+//! but not provided by embed-zig's minimal runtime.
 
 const std = @import("std");
 const std_impl = @import("std_impl");
@@ -10,7 +11,7 @@ const base_runtime = std_impl.runtime;
 // Re-export Mutex unchanged
 pub const Mutex = base_runtime.Mutex;
 
-// Re-export spawn unchanged
+// Re-export spawn unchanged (fire-and-forget / detached)
 pub const Options = base_runtime.Options;
 pub const TaskFn = base_runtime.TaskFn;
 pub const spawn = base_runtime.spawn;
@@ -49,6 +50,22 @@ pub const Condition = struct {
     }
 };
 
+/// Joinable thread handle — wraps std.Thread for use by UDP/Host layers
+/// that need to wait for worker threads to exit on shutdown.
+pub const Thread = struct {
+    inner: std.Thread,
+
+    /// Spawn a joinable thread. The function signature matches std.Thread.spawn.
+    pub fn spawnFn(comptime f: anytype, args: anytype) !Thread {
+        return .{ .inner = try std.Thread.spawn(.{}, f, args) };
+    }
+
+    /// Wait for the thread to finish.
+    pub fn join(self: Thread) void {
+        self.inner.join();
+    }
+};
+
 /// Returns current time in nanoseconds.
 pub fn nowNs() u64 {
     return @intCast(std.time.nanoTimestamp());
@@ -62,4 +79,9 @@ pub fn nowMs() u64 {
 /// Sleep for the given number of milliseconds.
 pub fn sleepMs(ms: u32) void {
     std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
+}
+
+/// Returns the number of hardware threads available (CPU count).
+pub fn getCpuCount() usize {
+    return std.Thread.getCpuCount() catch 4;
 }

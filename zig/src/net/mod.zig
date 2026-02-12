@@ -6,7 +6,9 @@
 //! - `dial`: Client-side connection initiator (generic over Crypto + Rt)
 //! - `SessionManager`: Multi-peer session management (generic over Crypto + Rt)
 //! - `UdpTransport`: UDP-based transport implementation
-//! - `UDP`: High-level peer management layer with double-queue architecture (generic over Crypto + Rt + IOBackend)
+//! - `UDP`: High-level peer management layer with double-queue architecture (generic over Crypto + Rt + IOBackend + SocketImpl)
+//! - `Endpoint`: Portable IPv4 endpoint (replaces posix.sockaddr)
+//! - `StdUdpSocket`: POSIX-based UDP socket implementation
 
 const std = @import("std");
 
@@ -20,6 +22,11 @@ pub const manager = @import("manager.zig");
 // Transport modules
 pub const transport_udp = @import("transport_udp.zig");
 pub const udp = @import("udp.zig");
+
+// Socket abstraction
+pub const endpoint_mod = @import("endpoint.zig");
+pub const socket_mod = @import("socket.zig");
+pub const std_socket = @import("std_socket.zig");
 
 // Re-export generic type constructors
 pub const Conn = conn_impl.Conn;
@@ -54,6 +61,12 @@ pub const PacketPool = udp.PacketPool;
 pub const ReadResult = udp.ReadResult;
 pub const ReadPacketResult = udp.ReadPacketResult;
 
+// Re-export portable endpoint and socket types
+pub const Endpoint = endpoint_mod.Endpoint;
+pub const SocketError = socket_mod.SocketError;
+pub const RecvFromResult = socket_mod.RecvFromResult;
+pub const StdUdpSocket = std_socket.StdUdpSocket;
+
 // KCP types (convenience re-exports from udp module, for backward compat)
 pub const KcpMux = udp.StdKcpMux;
 pub const KcpStream = udp.StdKcpStream;
@@ -82,4 +95,7 @@ test {
     _ = manager;
     _ = transport_udp;
     _ = udp;
+    _ = endpoint_mod;
+    _ = socket_mod;
+    _ = std_socket;
 }

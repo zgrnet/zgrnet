@@ -74,8 +74,8 @@ pub fn Listener(comptime Crypto: type, comptime Rt: type) type {
         // Closed flag
         closed: bool = false,
 
-        // Receive thread handle (platform-specific, stored as opaque)
-        recv_thread: ?std.Thread = null,
+        // Receive thread handle (joinable)
+        recv_thread: ?Rt.Thread = null,
 
         /// Creates a new listener with the given configuration.
         /// Call `start()` to begin accepting connections.
@@ -102,7 +102,7 @@ pub fn Listener(comptime Crypto: type, comptime Rt: type) type {
         /// Starts the receive loop in a background thread.
         /// This must be called after creating the listener.
         pub fn start(self: *Self) void {
-            self.recv_thread = std.Thread.spawn(.{}, receiveLoopWrapper, .{self}) catch null;
+            self.recv_thread = Rt.Thread.spawnFn(receiveLoopWrapper, .{self}) catch null;
         }
 
         /// Wrapper for receive loop to work with thread spawn
