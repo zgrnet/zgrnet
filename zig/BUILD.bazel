@@ -2,49 +2,15 @@ load("@embed_zig//bazel/zig:defs.bzl", "zig_binary", "zig_library", "zig_package
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 
 # =============================================================================
-# Platform config settings
-# =============================================================================
-
-# ChaCha20 ASM uses Mach-O syntax (.section __TEXT, .private_extern) —
-# only valid on macOS. Linux aarch64 needs ELF syntax (not yet available).
-config_setting(
-    name = "is_macos_aarch64",
-    constraint_values = [
-        "@platforms//os:macos",
-        "@platforms//cpu:aarch64",
-    ],
-)
-
-# =============================================================================
-# C/ASM configuration for noise library
+# C configuration for KCP
 # =============================================================================
 
 # KCP patched C sources (platform-independent)
 # ikcp.h is vendored at src/kcp/ for @cImport resolution (same as upstream, unpatched)
 _KCP_C_SRCS = ["//third_party/kcp:srcs", "src/kcp/ikcp.h"]
 
-# ChaCha20-Poly1305 ASM backend (macOS aarch64 only — ASM uses Mach-O syntax)
-_CHACHA20_C_SRCS = select({
-    ":is_macos_aarch64": glob([
-        "src/noise/chacha20_poly1305/aarch64/*.c",
-        "src/noise/chacha20_poly1305/aarch64/*.h",
-    ]),
-    "//conditions:default": [],
-})
-
-# Only use the no-CFI version (Zig's linker doesn't support CFI directives)
-_CHACHA20_ASM_SRCS = select({
-    ":is_macos_aarch64": ["src/noise/chacha20_poly1305/aarch64/chacha20_poly1305_no_cfi.S"],
-    "//conditions:default": [],
-})
-
-# Include paths for @cImport: KCP header + ChaCha20 headers
+# Include paths for @cImport: KCP header
 _KCP_C_INCLUDES = ["src/kcp"]
-
-_CHACHA20_C_INCLUDES = select({
-    ":is_macos_aarch64": ["src/noise/chacha20_poly1305/aarch64"],
-    "//conditions:default": [],
-})
 
 # Shared C flags: -O3 for performance, -fno-sanitize=undefined for KCP
 # (KCP uses ((TYPE*)0)->member offsetof which triggers zig cc's UB sanitizer)
@@ -62,17 +28,8 @@ cc_binary(
 )
 
 # =============================================================================
-# Build options modules (replace build.zig addOptions)
+# Build options modules
 # =============================================================================
-
-# Cipher backend auto-detection (provides @import("build_options"))
-zig_library(
-    name = "build_options",
-    main = "build_options.zig",
-    srcs = ["build_options.zig"],
-    module_name = "build_options",
-    visibility = ["//visibility:public"],
-)
 
 # TUN build options (provides @import("tun_build_options"))
 zig_library(
@@ -88,19 +45,21 @@ zig_library(
 # =============================================================================
 
 # Creates :noise (zig_library) + :noise_test (zig_test)
+#
+# Crypto is now generic via Protocol(Crypto) pattern.
+# Desktop platforms use StdCrypto (std.crypto wrappers from embed-zig platform/std).
+# ChaCha20-Poly1305 ASM acceleration is provided by embed-zig platform/std.
 zig_package(
     name = "noise",
     main = "src/noise.zig",
     deps = [
-        ":build_options",
         "@embed_zig//lib/trait",
         "@embed_zig//lib/pkg/channel",
         "@embed_zig//lib/pkg/timer",
         "@embed_zig//lib/platform/std",
     ],
-    c_srcs = _KCP_C_SRCS + _CHACHA20_C_SRCS,
-    asm_srcs = _CHACHA20_ASM_SRCS,
-    c_includes = _KCP_C_INCLUDES + _CHACHA20_C_INCLUDES,
+    c_srcs = _KCP_C_SRCS,
+    c_includes = _KCP_C_INCLUDES,
     c_flags = _C_FLAGS,
     link_libc = True,
 )
@@ -148,4 +107,3 @@ zig_binary(
     target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
 )
-
