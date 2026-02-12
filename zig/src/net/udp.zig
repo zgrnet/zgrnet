@@ -1022,7 +1022,11 @@ pub fn UDP(comptime IOBackend: type) type {
 
     /// Callback invoked by IOService when socket is readable.
     fn onSocketReady(ptr: ?*anyopaque, _: posix.fd_t) void {
-        const self: *Self = @ptrCast(@alignCast(ptr.?));
+        const raw_ptr = ptr orelse return; // Guard: null ptr during shutdown race
+        const self: *Self = @ptrCast(@alignCast(raw_ptr));
+
+        // Early exit if already closed (race with deinit)
+        if (self.closed.load(.acquire)) return;
 
         // Drain all available packets from socket
         while (!self.closed.load(.acquire)) {
