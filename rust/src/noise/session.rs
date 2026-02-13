@@ -59,17 +59,17 @@ pub struct Session {
     remote_pk: Key,
     
     created_at: Instant,
-    // Use atomic timestamps (nanos since UNIX_EPOCH) to avoid lock contention
-    last_received_nanos: AtomicI64,
-    last_sent_nanos: AtomicI64,
+    // Use atomic timestamps (millis since UNIX_EPOCH) to avoid lock contention
+    last_received_millis: AtomicI64,
+    last_sent_millis: AtomicI64,
 }
 
-/// Get current time as nanos since UNIX_EPOCH
-fn now_nanos() -> i64 {
+/// Get current time as millis since UNIX_EPOCH
+fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as i64
+        .as_millis() as i64
 }
 
 impl Session {
@@ -85,7 +85,7 @@ impl Session {
         );
         
         let now = Instant::now();
-        let now_ns = now_nanos();
+        let now_ms = now_millis();
         Self {
             local_index: cfg.local_index,
             remote_index: RwLock::new(cfg.remote_index),
@@ -96,8 +96,8 @@ impl Session {
             state: RwLock::new(SessionState::Established),
             remote_pk: cfg.remote_pk,
             created_at: now,
-            last_received_nanos: AtomicI64::new(now_ns),
-            last_sent_nanos: AtomicI64::new(now_ns),
+            last_received_millis: AtomicI64::new(now_ms),
+            last_sent_millis: AtomicI64::new(now_ms),
         }
     }
 
@@ -155,7 +155,7 @@ impl Session {
             .map_err(|_| SessionError::EncryptFailed)?;
 
         // Atomic timestamp update - no lock contention
-        self.last_sent_nanos.store(now_nanos(), Ordering::Relaxed);
+        self.last_sent_millis.store(now_millis(), Ordering::Relaxed);
 
         Ok((buffer, nonce))
     }
@@ -184,7 +184,7 @@ impl Session {
         out[pt_len..pt_len + TAG_SIZE].copy_from_slice(tag.as_ref());
 
         // Atomic timestamp update - no lock contention
-        self.last_sent_nanos.store(now_nanos(), Ordering::Relaxed);
+        self.last_sent_millis.store(now_millis(), Ordering::Relaxed);
 
         Ok(nonce)
     }
@@ -213,7 +213,7 @@ impl Session {
         buffer.truncate(len);
 
         // Atomic timestamp update - no lock contention
-        self.last_received_nanos.store(now_nanos(), Ordering::Relaxed);
+        self.last_received_millis.store(now_millis(), Ordering::Relaxed);
 
         Ok(buffer)
     }
@@ -242,7 +242,7 @@ impl Session {
         
         let len = plaintext.len();
         // Atomic timestamp update - no lock contention
-        self.last_received_nanos.store(now_nanos(), Ordering::Relaxed);
+        self.last_received_millis.store(now_millis(), Ordering::Relaxed);
 
         Ok(len)
     }
@@ -252,9 +252,9 @@ impl Session {
         if self.state() == SessionState::Expired {
             return true;
         }
-        let last_nanos = self.last_received_nanos.load(Ordering::Relaxed);
-        let elapsed_nanos = now_nanos() - last_nanos;
-        elapsed_nanos > SESSION_TIMEOUT.as_nanos() as i64
+        let last_millis = self.last_received_millis.load(Ordering::Relaxed);
+        let elapsed_millis = now_millis() - last_millis;
+        elapsed_millis > SESSION_TIMEOUT.as_millis() as i64
     }
 
     /// Marks the session as expired.
@@ -267,14 +267,14 @@ impl Session {
         self.created_at
     }
 
-    /// Returns when last message was received (as nanos since UNIX_EPOCH).
-    pub fn last_received_nanos(&self) -> i64 {
-        self.last_received_nanos.load(Ordering::Relaxed)
+    /// Returns when last message was received (as millis since UNIX_EPOCH).
+    pub fn last_received_millis(&self) -> i64 {
+        self.last_received_millis.load(Ordering::Relaxed)
     }
 
-    /// Returns when last message was sent (as nanos since UNIX_EPOCH).
-    pub fn last_sent_nanos(&self) -> i64 {
-        self.last_sent_nanos.load(Ordering::Relaxed)
+    /// Returns when last message was sent (as millis since UNIX_EPOCH).
+    pub fn last_sent_millis(&self) -> i64 {
+        self.last_sent_millis.load(Ordering::Relaxed)
     }
 
     /// Returns current send nonce.

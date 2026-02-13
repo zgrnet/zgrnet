@@ -152,14 +152,14 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
 
         // Handshake state (for pending rekey)
         hs_state: ?HandshakeState = null,
-        handshake_started: ?i128 = null,
+        handshake_started: ?i64 = null,
 
-        // Timestamps (in nanoseconds from Rt.nowNs)
-        session_created: ?i128 = null,
-        last_sent: ?i128 = null,
-        last_received: ?i128 = null,
-        handshake_attempt_start: ?i128 = null,
-        last_handshake_sent: ?i128 = null,
+        // Timestamps (in milliseconds from Rt.nowMs)
+        session_created: ?i64 = null,
+        last_sent: ?i64 = null,
+        last_received: ?i64 = null,
+        handshake_attempt_start: ?i64 = null,
+        last_handshake_sent: ?i64 = null,
 
         // Role
         is_initiator: bool = false,
@@ -317,8 +317,8 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                 const ciphertext = self.allocator.alloc(u8, plaintext.len + session_mod.tag_size) catch return ConnError.OutOfMemory;
                 defer self.allocator.free(ciphertext);
 
-                const now_ns: u64 = Rt.nowNs();
-                const counter = session.encrypt(plaintext, ciphertext, now_ns) catch return ConnError.SessionError;
+                const now_ms: u64 = Rt.nowMs();
+                const counter = session.encrypt(plaintext, ciphertext, now_ms) catch return ConnError.SessionError;
 
                 // Build wire message
                 break :blk message.buildTransportMessage(self.allocator, session.remoteIndex(), counter, ciphertext) catch return ConnError.OutOfMemory;
@@ -330,7 +330,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
 
             // Update last sent time
             self.mutex.lock();
-            self.last_sent = @intCast(Rt.nowNs());
+            self.last_sent = @intCast(Rt.nowMs());
             self.mutex.unlock();
         }
 
@@ -394,8 +394,8 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                 };
                 defer self.allocator.free(plaintext);
 
-                const dec_now_ns: u64 = Rt.nowNs();
-                _ = session.decrypt(pkt.ciphertext, pkt.counter, plaintext, dec_now_ns) catch {
+                const dec_now_ms: u64 = Rt.nowMs();
+                _ = session.decrypt(pkt.ciphertext, pkt.counter, plaintext, dec_now_ms) catch {
                     self.mutex.unlock();
                     return ConnError.SessionError;
                 };
@@ -445,8 +445,8 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
             const plaintext = self.allocator.alloc(u8, plaintext_len) catch return ConnError.OutOfMemory;
             defer self.allocator.free(plaintext);
 
-            const dec2_now_ns: u64 = Rt.nowNs();
-            _ = session.decrypt(tmsg.ciphertext, tmsg.counter, plaintext, dec2_now_ns) catch return ConnError.SessionError;
+            const dec2_now_ms: u64 = Rt.nowMs();
+            _ = session.decrypt(tmsg.ciphertext, tmsg.counter, plaintext, dec2_now_ms) catch return ConnError.SessionError;
 
             // Decode protocol and payload
             const decoded = message.decodePayload(plaintext) catch return ConnError.MessageError;
@@ -501,7 +501,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
             self.transport.sendTo(&wire_msg, remote_addr) catch return ConnError.TransportError;
 
             // Update state with lock
-            const now: i128 = @intCast(Rt.nowNs());
+            const now: i64 = @intCast(Rt.nowMs());
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -560,7 +560,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
             self.transport.sendTo(&wire_msg, remote_addr) catch return ConnError.TransportError;
 
             // Update state with lock
-            const now: i128 = @intCast(Rt.nowNs());
+            const now: i64 = @intCast(Rt.nowMs());
             self.mutex.lock();
             defer self.mutex.unlock();
 
@@ -580,15 +580,15 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
         /// - HandshakeTimeout: handshake attempt exceeded RekeyAttemptTime (90s)
         /// - SessionExpired: session expired (too many messages)
         pub fn tick(self: *Self) ConnError!void {
-            const now: i128 = @intCast(Rt.nowNs());
+            const now: i64 = @intCast(Rt.nowMs());
 
             // Read state under lock
             var state: ConnState = undefined;
-            var last_sent_time: ?i128 = null;
-            var last_recv_time: ?i128 = null;
-            var session_created_time: ?i128 = null;
-            var handshake_attempt_start_time: ?i128 = null;
-            var last_handshake_sent_time: ?i128 = null;
+            var last_sent_time: ?i64 = null;
+            var last_recv_time: ?i64 = null;
+            var session_created_time: ?i64 = null;
+            var handshake_attempt_start_time: ?i64 = null;
+            var last_handshake_sent_time: ?i64 = null;
             var is_initiator: bool = false;
             var rekey_triggered: bool = false;
             var has_hs_state: bool = false;
@@ -624,7 +624,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                     // Check if handshake attempt has exceeded RekeyAttemptTime (90s)
                     if (handshake_attempt_start_time) |start| {
                         const elapsed: u64 = @intCast(now - start);
-                        if (elapsed > consts.rekey_attempt_time_ns) {
+                        if (elapsed > consts.rekey_attempt_time_ms) {
                             return ConnError.HandshakeTimeout;
                         }
                     }
@@ -633,7 +633,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                     if (has_hs_state) {
                         if (last_handshake_sent_time) |last_sent| {
                             const elapsed: u64 = @intCast(now - last_sent);
-                            if (elapsed > consts.rekey_timeout_ns) {
+                            if (elapsed > consts.rekey_timeout_ms) {
                                 try self.retransmitHandshake();
                             }
                         }
@@ -644,7 +644,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                     // Check if connection has timed out (no messages received)
                     if (last_recv_time) |last_recv| {
                         const elapsed: u64 = @intCast(now - last_recv);
-                        if (elapsed > consts.reject_after_time_ns) {
+                        if (elapsed > consts.reject_after_time_ms) {
                             return ConnError.ConnTimeout;
                         }
                     }
@@ -659,7 +659,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                         // Check if handshake attempt has exceeded RekeyAttemptTime (90s)
                         if (handshake_attempt_start_time) |start| {
                             const elapsed: u64 = @intCast(now - start);
-                            if (elapsed > consts.rekey_attempt_time_ns) {
+                            if (elapsed > consts.rekey_attempt_time_ms) {
                                 return ConnError.HandshakeTimeout;
                             }
                         }
@@ -667,7 +667,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                         // Check if we need to retransmit handshake (every RekeyTimeout = 5s)
                         if (last_handshake_sent_time) |last_sent| {
                             const elapsed: u64 = @intCast(now - last_sent);
-                            if (elapsed > consts.rekey_timeout_ns) {
+                            if (elapsed > consts.rekey_timeout_ms) {
                                 try self.retransmitHandshake();
                             }
                         }
@@ -677,11 +677,11 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                     // Disconnection detection (WireGuard Section 5):
                     // If no packets received for KeepaliveTimeout + RekeyTimeout (15s),
                     // initiate a new handshake to re-establish connection
-                    const disconnection_threshold_ns = consts.keepalive_timeout_ns + consts.rekey_timeout_ns;
+                    const disconnection_threshold_ms = consts.keepalive_timeout_ms + consts.rekey_timeout_ms;
                     if (is_initiator) {
                         if (last_recv_time) |last_recv| {
                             const elapsed: u64 = @intCast(now - last_recv);
-                            if (elapsed > disconnection_threshold_ns) {
+                            if (elapsed > disconnection_threshold_ms) {
                                 try self.initiateRekey();
                                 return;
                             }
@@ -695,7 +695,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                         // Time-based rekey trigger
                         if (session_created_time) |session_time| {
                             const elapsed: u64 = @intCast(now - session_time);
-                            if (elapsed > consts.rekey_after_time_ns) {
+                            if (elapsed > consts.rekey_after_time_ms) {
                                 needs_rekey = true;
                             }
                         }
@@ -717,7 +717,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
                         if (last_recv_time) |last_recv| {
                             const sent_delta: u64 = @intCast(now - last_sent);
                             const recv_delta: u64 = @intCast(now - last_recv);
-                            if (sent_delta > consts.keepalive_timeout_ns and recv_delta < consts.keepalive_timeout_ns) {
+                            if (sent_delta > consts.keepalive_timeout_ms and recv_delta < consts.keepalive_timeout_ms) {
                                 _ = self.sendKeepalive() catch {};
                             }
                         }
@@ -765,7 +765,7 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.current = session;
-            self.session_created = @intCast(Rt.nowNs());
+            self.session_created = @intCast(Rt.nowMs());
         }
 
         /// Returns the remote peer's public key.
@@ -1048,11 +1048,11 @@ test "tick conn timeout" {
     });
 
     // Manually set established state with old lastReceived
-    const now: i128 = @intCast(StdRt.nowNs());
+    const now: i64 = @intCast(StdRt.nowMs());
     conn.state = .established;
     conn.current = session;
     conn.last_sent = now;
-    conn.last_received = now - @as(i128, consts.reject_after_time_ns) - std.time.ns_per_s;
+    conn.last_received = now - @as(i64, consts.reject_after_time_ms) - 1000;
     conn.session_created = now;
 
     const result = conn.tick();
@@ -1071,9 +1071,9 @@ test "tick handshake timeout" {
     });
 
     // Manually set handshaking state with expired attempt
-    const now: i128 = @intCast(StdRt.nowNs());
+    const now: i64 = @intCast(StdRt.nowMs());
     conn.state = .handshaking;
-    conn.handshake_attempt_start = now - @as(i128, consts.rekey_attempt_time_ns) - std.time.ns_per_s;
+    conn.handshake_attempt_start = now - @as(i64, consts.rekey_attempt_time_ms) - 1000;
 
     const result = conn.tick();
     try std.testing.expectError(ConnError.HandshakeTimeout, result);
@@ -1100,7 +1100,7 @@ test "tick no action when recent" {
         .transport = Transport{ .mock = transport },
     });
 
-    const now: i128 = @intCast(StdRt.nowNs());
+    const now: i64 = @intCast(StdRt.nowMs());
     conn.state = .established;
     conn.current = session;
     conn.last_sent = now;
@@ -1132,14 +1132,14 @@ test "tick responder no rekey" {
         .transport = Transport{ .mock = transport },
     });
 
-    const now: i128 = @intCast(StdRt.nowNs());
+    const now: i64 = @intCast(StdRt.nowMs());
     conn.state = .established;
     conn.current = session;
     conn.is_initiator = false; // Responder
     conn.last_sent = now;
     conn.last_received = now;
     // Old session (past RekeyAfterTime)
-    conn.session_created = now - @as(i128, consts.rekey_after_time_ns) - std.time.ns_per_s;
+    conn.session_created = now - @as(i64, consts.rekey_after_time_ms) - 1000;
 
     try conn.tick();
 
@@ -1168,14 +1168,14 @@ test "tick rekey not duplicate" {
         .transport = Transport{ .mock = transport },
     });
 
-    const now: i128 = @intCast(StdRt.nowNs());
+    const now: i64 = @intCast(StdRt.nowMs());
     conn.state = .established;
     conn.current = session;
     conn.is_initiator = true;
     conn.rekey_triggered = true; // Already triggered
     conn.last_sent = now;
     conn.last_received = now;
-    conn.session_created = now - @as(i128, consts.rekey_after_time_ns) - std.time.ns_per_s;
+    conn.session_created = now - @as(i64, consts.rekey_after_time_ms) - 1000;
 
     try conn.tick();
 
@@ -1232,13 +1232,13 @@ test "tick disconnection detection initiator" {
     });
 
     // Set as initiator with no recent received data (past disconnection threshold)
-    const disconnection_threshold_ns = consts.keepalive_timeout_ns + consts.rekey_timeout_ns;
-    const now: i128 = @intCast(StdRt.nowNs());
+    const disconnection_threshold_ms = consts.keepalive_timeout_ms + consts.rekey_timeout_ms;
+    const now: i64 = @intCast(StdRt.nowMs());
     conn.state = .established;
     conn.current = session;
     conn.is_initiator = true;
     conn.last_sent = now;
-    conn.last_received = now - @as(i128, disconnection_threshold_ns) - std.time.ns_per_s;
+    conn.last_received = now - @as(i64, disconnection_threshold_ms) - 1000;
     conn.session_created = now;
 
     // Tick should detect disconnection and initiate rekey
@@ -1273,13 +1273,13 @@ test "tick disconnection detection responder no action" {
     });
 
     // Set as responder with no recent received data
-    const disconnection_threshold_ns = consts.keepalive_timeout_ns + consts.rekey_timeout_ns;
-    const now: i128 = @intCast(StdRt.nowNs());
+    const disconnection_threshold_ms = consts.keepalive_timeout_ms + consts.rekey_timeout_ms;
+    const now: i64 = @intCast(StdRt.nowMs());
     conn.state = .established;
     conn.current = session;
     conn.is_initiator = false; // Responder
     conn.last_sent = now;
-    conn.last_received = now - @as(i128, disconnection_threshold_ns) - std.time.ns_per_s;
+    conn.last_received = now - @as(i64, disconnection_threshold_ms) - 1000;
     conn.session_created = now;
 
     try conn.tick();

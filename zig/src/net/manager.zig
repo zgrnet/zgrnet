@@ -72,7 +72,7 @@ pub fn SessionManager(comptime Crypto: type, comptime Rt: type) type {
                 .send_key = send_key,
                 .recv_key = recv_key,
                 .remote_pk = remote_pk,
-                .now_ns = Rt.nowNs(),
+                .now_ms = Rt.nowMs(),
             });
 
             // Remove existing session for this peer
@@ -164,13 +164,13 @@ pub fn SessionManager(comptime Crypto: type, comptime Rt: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            const now_ns: u64 = Rt.nowNs();
+            const now_ms: u64 = Rt.nowMs();
             var expired = std.ArrayListUnmanaged(u32){};
             defer expired.deinit(self.allocator);
 
             var it = self.by_index.iterator();
             while (it.next()) |entry| {
-                if (entry.value_ptr.*.isExpired(now_ns)) {
+                if (entry.value_ptr.*.isExpired(now_ms)) {
                     expired.append(self.allocator, entry.key_ptr.*) catch continue;
                 }
             }

@@ -1,7 +1,7 @@
 //! Session management for transport phase.
 //!
 //! NOT thread-safe. Caller must provide external synchronization
-//! and pass timestamps explicitly. No std.Thread or std.time dependencies.
+//! and pass timestamps explicitly (in milliseconds). No std.Thread or std.time dependencies.
 
 const std = @import("std");
 const mem = std.mem;
@@ -22,8 +22,8 @@ pub const SessionState = enum {
     expired,
 };
 
-/// Session timeout in nanoseconds (180 seconds).
-pub const session_timeout_ns: u64 = 180 * std.time.ns_per_s;
+/// Session timeout in milliseconds (180 seconds).
+pub const session_timeout_ms: u64 = 180_000;
 
 /// Maximum nonce value.
 pub const max_nonce: u64 = std.math.maxInt(u64) - 1;
@@ -45,8 +45,8 @@ pub const SessionConfig = struct {
     send_key: Key,
     recv_key: Key,
     remote_pk: Key = Key.zero,
-    /// Current timestamp in nanoseconds (caller-provided).
-    now_ns: u64 = 0,
+    /// Current timestamp in milliseconds (caller-provided).
+    now_ms: u64 = 0,
 };
 
 /// Instantiate session for a given Crypto implementation and cipher suite.
@@ -71,9 +71,9 @@ pub fn SessionMod(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite)
             state: SessionState = .established,
             remote_pk: Key,
 
-            created_ns: u64,
-            last_received_ns: u64 = 0,
-            last_sent_ns: u64 = 0,
+            created_ms: u64,
+            last_received_ms: u64 = 0,
+            last_sent_ms: u64 = 0,
 
             /// Creates a new session.
             pub fn init(cfg: SessionConfig) Session {
@@ -83,9 +83,9 @@ pub fn SessionMod(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite)
                     .send_key = cfg.send_key,
                     .recv_key = cfg.recv_key,
                     .remote_pk = cfg.remote_pk,
-                    .created_ns = cfg.now_ns,
-                    .last_received_ns = cfg.now_ns,
-                    .last_sent_ns = cfg.now_ns,
+                    .created_ms = cfg.now_ms,
+                    .last_received_ms = cfg.now_ms,
+                    .last_sent_ms = cfg.now_ms,
                 };
             }
 
@@ -114,8 +114,8 @@ pub fn SessionMod(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite)
             }
 
             /// Encrypts a message. Returns the nonce used.
-            /// `now_ns` is the current timestamp in nanoseconds (caller-provided).
-            pub fn encrypt(self: *Session, plaintext: []const u8, out: []u8, now_ns: u64) SessionError!u64 {
+            /// `now_ms` is the current timestamp in milliseconds (caller-provided).
+            pub fn encrypt(self: *Session, plaintext: []const u8, out: []u8, now_ms: u64) SessionError!u64 {
                 if (self.state != .established) {
                     return SessionError.NotEstablished;
                 }
@@ -127,14 +127,14 @@ pub fn SessionMod(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite)
                 self.send_nonce += 1;
 
                 cipher.encrypt(&self.send_key.data, nonce, plaintext, "", out);
-                self.last_sent_ns = now_ns;
+                self.last_sent_ms = now_ms;
 
                 return nonce;
             }
 
             /// Decrypts a message.
-            /// `now_ns` is the current timestamp in nanoseconds (caller-provided).
-            pub fn decrypt(self: *Session, ciphertext: []const u8, nonce: u64, out: []u8, now_ns: u64) SessionError!usize {
+            /// `now_ms` is the current timestamp in milliseconds (caller-provided).
+            pub fn decrypt(self: *Session, ciphertext: []const u8, nonce: u64, out: []u8, now_ms: u64) SessionError!usize {
                 if (self.state != .established) {
                     return SessionError.NotEstablished;
                 }
@@ -151,15 +151,15 @@ pub fn SessionMod(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite)
                     return SessionError.AuthenticationFailed;
                 };
 
-                self.last_received_ns = now_ns;
+                self.last_received_ms = now_ms;
 
                 return ciphertext.len - tag_size;
             }
 
-            pub fn isExpired(self: *const Session, now_ns: u64) bool {
+            pub fn isExpired(self: *const Session, now_ms: u64) bool {
                 if (self.state == .expired) return true;
-                if (now_ns < self.last_received_ns) return false;
-                return (now_ns - self.last_received_ns) > session_timeout_ns;
+                if (now_ms < self.last_received_ms) return false;
+                return (now_ms - self.last_received_ms) > session_timeout_ms;
             }
 
             pub fn expire(self: *Session) void {
@@ -174,16 +174,16 @@ pub fn SessionMod(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite)
                 return self.recv_filter.maxNonce();
             }
 
-            pub fn createdNs(self: *const Session) u64 {
-                return self.created_ns;
+            pub fn createdMs(self: *const Session) u64 {
+                return self.created_ms;
             }
 
-            pub fn lastReceivedNs(self: *const Session) u64 {
-                return self.last_received_ns;
+            pub fn lastReceivedMs(self: *const Session) u64 {
+                return self.last_received_ms;
             }
 
-            pub fn lastSentNs(self: *const Session) u64 {
-                return self.last_sent_ns;
+            pub fn lastSentMs(self: *const Session) u64 {
+                return self.last_sent_ms;
             }
         };
     };

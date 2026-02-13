@@ -51,9 +51,9 @@ pub fn DialOptions(comptime Crypto: type) type {
         transport: Transport,
         /// Remote peer's address.
         remote_addr: Addr,
-        /// Deadline in nanoseconds (absolute timestamp).
+        /// Deadline in milliseconds (absolute timestamp).
         /// If null, defaults to now + REKEY_ATTEMPT_TIME (90s).
-        deadline_ns: ?i128 = null,
+        deadline_ms: ?i64 = null,
     };
 }
 
@@ -75,8 +75,8 @@ pub fn dial(comptime Crypto: type, comptime Rt: type, opts: DialOptions(Crypto))
         return DialError.MissingRemotePK;
     }
 
-    const now: i128 = @intCast(Rt.nowNs());
-    const deadline = opts.deadline_ns orelse (now + @as(i128, consts.rekey_attempt_time_ns));
+    const now: i64 = @intCast(Rt.nowMs());
+    const deadline = opts.deadline_ms orelse (now + @as(i64, consts.rekey_attempt_time_ms));
 
     // Create the connection
     const conn = opts.allocator.create(ConnType) catch return DialError.OutOfMemory;
@@ -96,7 +96,7 @@ pub fn dial(comptime Crypto: type, comptime Rt: type, opts: DialOptions(Crypto))
     // Retry loop with fresh ephemeral keys each attempt
     while (true) {
         // Check deadline
-        const current_time: i128 = @intCast(Rt.nowNs());
+        const current_time: i64 = @intCast(Rt.nowMs());
         if (current_time >= deadline) {
             conn.setState(.new);
             opts.allocator.destroy(conn);
@@ -145,8 +145,8 @@ pub fn dial(comptime Crypto: type, comptime Rt: type, opts: DialOptions(Crypto))
         };
 
         // Calculate read deadline: min(now + REKEY_TIMEOUT, total deadline)
-        const recv_time: i128 = @intCast(Rt.nowNs());
-        const rekey_deadline = recv_time + @as(i128, consts.rekey_timeout_ns);
+        const recv_time: i64 = @intCast(Rt.nowMs());
+        const rekey_deadline = recv_time + @as(i64, consts.rekey_timeout_ms);
         const read_deadline = @min(rekey_deadline, deadline);
 
         // Set read deadline on transport
@@ -249,7 +249,7 @@ test "dial options default deadline" {
         .transport = .{ .mock = undefined },
         .remote_addr = .{ .mock = .{ .name = "test" } },
     };
-    try std.testing.expectEqual(@as(?i128, null), opts.deadline_ns);
+    try std.testing.expectEqual(@as(?i64, null), opts.deadline_ms);
 }
 
 test "dial missing remote pk" {

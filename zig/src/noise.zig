@@ -31,7 +31,7 @@ pub const json_config = @import("config.zig");
 pub const StdCrypto = noise.test_crypto;
 
 /// StdRt — zgrnet runtime extending embed-zig's std runtime with
-/// timedWait, sleepMs, nowMs, nowNs.
+/// timedWait, sleepMs, nowMs.
 pub const StdRt = @import("runtime.zig");
 
 /// Concrete Noise Protocol instantiation for desktop platforms.

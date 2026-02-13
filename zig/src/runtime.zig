@@ -1,6 +1,6 @@
 //! zgrnet Runtime — extends embed-zig's std runtime with additional primitives.
 //!
-//! Adds timedWait on Condition, sleepMs, nowMs, nowNs, Thread (joinable),
+//! Adds timedWait on Condition, sleepMs, nowMs, Thread (joinable),
 //! and getCpuCount which are needed by KCP Mux and UDP network layer
 //! but not provided by embed-zig's minimal runtime.
 
@@ -65,11 +65,6 @@ pub const Thread = struct {
         self.inner.join();
     }
 };
-
-/// Returns current time in nanoseconds.
-pub fn nowNs() u64 {
-    return @intCast(std.time.nanoTimestamp());
-}
 
 /// Returns current time in milliseconds.
 pub fn nowMs() u64 {

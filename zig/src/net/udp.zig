@@ -333,13 +333,15 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
         pk: Key,
         done: SignalT(Rt),
         success: bool,
-        created_at: i128,
+        created_at: i64,
 
-        // Wait for done signal with timeout. Returns true if signaled, false on timeout.
-        fn waitTimeout(self: *@This(), timeout_ns: u64) bool {
+        // Wait for done signal with timeout (in milliseconds). Returns true if signaled, false on timeout.
+        fn waitTimeout(self: *@This(), timeout_ms: u64) bool {
             self.done.mutex.lock();
             defer self.done.mutex.unlock();
             while (!self.done.signaled) {
+                // Convert ms to ns for timedWait
+                const timeout_ns = timeout_ms * std.time.ns_per_ms;
                 const result = self.done.cond.timedWait(&self.done.mutex, timeout_ns);
                 if (result == .timed_out) return false;
             }
@@ -604,11 +606,11 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
 
         /// Connect to a peer (initiate handshake).
         pub fn connect(self: *Self, pk: *const Key) UdpError!void {
-            return self.connectTimeout(pk, 5 * std.time.ns_per_s);
+            return self.connectTimeout(pk, 5_000);
         }
 
-        /// Connect with timeout.
-        pub fn connectTimeout(self: *Self, pk: *const Key, timeout_ns: i128) UdpError!void {
+        /// Connect with timeout (in milliseconds).
+        pub fn connectTimeout(self: *Self, pk: *const Key, timeout_ms: u64) UdpError!void {
             if (self.closed.load(.acquire)) {
                 return UdpError.Closed;
             }
@@ -652,7 +654,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 .pk = pk.*,
                 .done = SignalT(Rt).init(),
                 .success = false,
-                .created_at = @intCast(Rt.nowNs()),
+                .created_at = @intCast(Rt.nowMs()),
             };
 
             {
@@ -687,8 +689,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             };
 
             // Wait for response
-            const timeout_u64: u64 = @intCast(@max(0, timeout_ns));
-            if (!pending.waitTimeout(timeout_u64)) {
+            if (!pending.waitTimeout(timeout_ms)) {
                 self.cleanupPending(sender_index);
                 return UdpError.HandshakeTimeout;
             }
@@ -737,8 +738,8 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             const ciphertext_len = plaintext_len + noise.tag_size;
 
             // encrypt returns nonce, writes ciphertext to msg_buf[13..]
-            const enc_now_ns: u64 = Rt.nowNs();
-            const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..], enc_now_ns) catch {
+            const enc_now_ms: u64 = Rt.nowMs();
+            const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..], enc_now_ms) catch {
                 return UdpError.SendFailed;
             };
 
@@ -900,8 +901,8 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             const plaintext_len = data.len + 1;
             const ciphertext_len = plaintext_len + noise.tag_size;
 
-            const enc2_now_ns: u64 = Rt.nowNs();
-            const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..], enc2_now_ns) catch {
+            const enc2_now_ms: u64 = Rt.nowMs();
+            const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..], enc2_now_ms) catch {
                 return UdpError.SendFailed;
             };
 
@@ -1011,7 +1012,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
 
                 // Update stats
                 _ = self.total_rx.fetchAdd(@intCast(recv_result.len), .release);
-                self.last_seen.store(@intCast(Rt.nowNs()), .release);
+                self.last_seen.store(@intCast(Rt.nowMs()), .release);
 
                 // Dual-channel send: packet must be in both channels or neither.
                 self.output_chan.trySend(pkt) catch {
@@ -1118,8 +1119,8 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             };
 
             // Decrypt - returns plaintext length
-            const dec_now_ns: u64 = Rt.nowNs();
-            const plaintext_len = session.decrypt(msg.ciphertext, msg.counter, &pkt.out_buf, dec_now_ns) catch {
+            const dec_now_ms: u64 = Rt.nowMs();
+            const plaintext_len = session.decrypt(msg.ciphertext, msg.counter, &pkt.out_buf, dec_now_ms) catch {
                 pkt.err = UdpError.DecryptFailed;
                 return;
             };
@@ -1246,8 +1247,8 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             }
             @memcpy(pkt.data[0..ct_len], inner_msg.ciphertext);
 
-            const inner_dec_now_ns: u64 = Rt.nowNs();
-            const inner_pt_len = inner_session.decrypt(pkt.data[0..ct_len], inner_msg.counter, &pkt.out_buf, inner_dec_now_ns) catch {
+            const inner_dec_now_ms: u64 = Rt.nowMs();
+            const inner_pt_len = inner_session.decrypt(pkt.data[0..ct_len], inner_msg.counter, &pkt.out_buf, inner_dec_now_ms) catch {
                 pkt.err = UdpError.DecryptFailed;
                 return;
             };

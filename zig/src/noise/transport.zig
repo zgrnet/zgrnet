@@ -154,17 +154,16 @@ pub const Transport = union(enum) {
     }
 
     /// Sets the deadline for future recvFrom calls.
-    /// null means recvFrom will not time out.
-    pub fn setReadDeadline(self: Transport, deadline_ns: ?i128) TransportError!void {
+    /// Deadline is an absolute timestamp in milliseconds. null means no timeout.
+    pub fn setReadDeadline(self: Transport, deadline_ms: ?i64) TransportError!void {
         switch (self) {
-            .mock => |t| try t.setReadDeadline(deadline_ns),
+            .mock => |t| try t.setReadDeadline(deadline_ms),
             .udp => |t| {
-                if (deadline_ns) |ns| {
-                    const now = std.time.nanoTimestamp();
-                    const timeout_ns = ns - now;
-                    if (timeout_ns > 0) {
-                        const timeout_ms: u32 = @intCast(@divFloor(timeout_ns, 1_000_000));
-                        t.setRecvTimeout(timeout_ms) catch return TransportError.IoError;
+                if (deadline_ms) |ms| {
+                    const now = std.time.milliTimestamp();
+                    const timeout_ms = ms - now;
+                    if (timeout_ms > 0) {
+                        t.setRecvTimeout(@intCast(timeout_ms)) catch return TransportError.IoError;
                     }
                 } else {
                     t.setRecvTimeout(0) catch return TransportError.IoError;
@@ -174,17 +173,16 @@ pub const Transport = union(enum) {
     }
 
     /// Sets the deadline for future sendTo calls.
-    /// null means sendTo will not time out.
-    pub fn setWriteDeadline(self: Transport, deadline_ns: ?i128) TransportError!void {
+    /// Deadline is an absolute timestamp in milliseconds. null means no timeout.
+    pub fn setWriteDeadline(self: Transport, deadline_ms: ?i64) TransportError!void {
         switch (self) {
-            .mock => |t| try t.setWriteDeadline(deadline_ns),
+            .mock => |t| try t.setWriteDeadline(deadline_ms),
             .udp => |t| {
-                if (deadline_ns) |ns| {
-                    const now = std.time.nanoTimestamp();
-                    const timeout_ns = ns - now;
-                    if (timeout_ns > 0) {
-                        const timeout_ms: u32 = @intCast(@divFloor(timeout_ns, 1_000_000));
-                        t.setSendTimeout(timeout_ms) catch return TransportError.IoError;
+                if (deadline_ms) |ms| {
+                    const now = std.time.milliTimestamp();
+                    const timeout_ms = ms - now;
+                    if (timeout_ms > 0) {
+                        t.setSendTimeout(@intCast(timeout_ms)) catch return TransportError.IoError;
                     }
                 } else {
                     t.setSendTimeout(0) catch return TransportError.IoError;
@@ -309,16 +307,16 @@ pub const MockTransport = struct {
     }
 
     /// Sets the read deadline (no-op for mock transport).
-    pub fn setReadDeadline(self: *MockTransport, deadline_ns: ?i128) TransportError!void {
+    pub fn setReadDeadline(self: *MockTransport, deadline_ms: ?i64) TransportError!void {
         _ = self;
-        _ = deadline_ns;
+        _ = deadline_ms;
         // No-op for mock transport
     }
 
     /// Sets the write deadline (no-op for mock transport).
-    pub fn setWriteDeadline(self: *MockTransport, deadline_ns: ?i128) TransportError!void {
+    pub fn setWriteDeadline(self: *MockTransport, deadline_ms: ?i64) TransportError!void {
         _ = self;
-        _ = deadline_ns;
+        _ = deadline_ms;
         // No-op for mock transport
     }
 

@@ -77,13 +77,13 @@ pub const OutputChanSize = udp.OutputChanSize;
 pub const MaxPacketSize = udp.MaxPacketSize;
 
 // Re-export constants
-pub const rekey_after_time_ns = consts.rekey_after_time_ns;
-pub const reject_after_time_ns = consts.reject_after_time_ns;
-pub const rekey_attempt_time_ns = consts.rekey_attempt_time_ns;
-pub const rekey_timeout_ns = consts.rekey_timeout_ns;
-pub const keepalive_timeout_ns = consts.keepalive_timeout_ns;
-pub const rekey_on_recv_threshold_ns = consts.rekey_on_recv_threshold_ns;
-pub const session_cleanup_time_ns = consts.session_cleanup_time_ns;
+pub const rekey_after_time_ms = consts.rekey_after_time_ms;
+pub const reject_after_time_ms = consts.reject_after_time_ms;
+pub const rekey_attempt_time_ms = consts.rekey_attempt_time_ms;
+pub const rekey_timeout_ms = consts.rekey_timeout_ms;
+pub const keepalive_timeout_ms = consts.keepalive_timeout_ms;
+pub const rekey_on_recv_threshold_ms = consts.rekey_on_recv_threshold_ms;
+pub const session_cleanup_time_ms = consts.session_cleanup_time_ms;
 pub const rekey_after_messages = consts.rekey_after_messages;
 pub const reject_after_messages = consts.reject_after_messages;
 
