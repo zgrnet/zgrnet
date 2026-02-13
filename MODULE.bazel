@@ -40,9 +40,10 @@ use_repo(
 
 # embed-zig: Bazel-native Zig build rules + Zig toolchain
 bazel_dep(name = "embed_zig", version = "0.1.0")
-local_path_override(
+git_override(
     module_name = "embed_zig",
-    path = "../../embed-zig/esp-trait-complete",
+    remote = "https://github.com/haivivi/embed-zig.git",
+    commit = "beb8bebc499903d1f2167c63a5ebbf8e492af427",  # fix/esp-trait-complete: Thread, nowMs, getCpuCount, Socket trait
 )
 
 # Zig toolchain (provided by embed-zig, needed by //third_party/kcp for zig cc)
