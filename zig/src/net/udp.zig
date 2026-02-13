@@ -430,7 +430,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             // Determine worker count
             var num_workers = options.decrypt_workers;
             if (num_workers == 0) {
-                num_workers = @max(1, Rt.getCpuCount());
+                num_workers = @max(1, Rt.getCpuCount() catch 4);
             }
 
             // Allocate self
@@ -489,14 +489,14 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             };
 
             // Start IO thread
-            self.io_thread = Rt.Thread.spawnFn(ioLoop, .{self}) catch return UdpError.OutOfMemory;
+            self.io_thread = Rt.Thread.spawn(.{}, ioLoop, .{self}) catch return UdpError.OutOfMemory;
 
             // Start timer thread for KCP updates
-            self.timer_thread = Rt.Thread.spawnFn(timerLoop, .{self}) catch return UdpError.OutOfMemory;
+            self.timer_thread = Rt.Thread.spawn(.{}, timerLoop, .{self}) catch return UdpError.OutOfMemory;
 
             // Start decrypt workers
             for (self.workers) |*w| {
-                w.* = Rt.Thread.spawnFn(decryptWorker, .{self}) catch return UdpError.OutOfMemory;
+                w.* = Rt.Thread.spawn(.{}, decryptWorker, .{self}) catch return UdpError.OutOfMemory;
             }
 
             return self;

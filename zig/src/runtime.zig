@@ -1,22 +1,36 @@
-//! zgrnet Runtime — extends embed-zig's std runtime with additional primitives.
+//! zgrnet Runtime — thin shim over embed-zig's std_impl.runtime.
 //!
-//! Adds timedWait on Condition, sleepMs, nowMs, Thread (joinable),
-//! and getCpuCount which are needed by KCP Mux and UDP network layer
-//! but not provided by embed-zig's minimal runtime.
+//! Re-exports everything from std_impl.runtime and adds two features
+//! that embed-zig's std runtime does not yet provide:
+//!   - Condition.timedWait (ESP32 runtime has it, std runtime doesn't)
+//!   - sleepMs (ESP32 runtime has it, std runtime doesn't)
+//!
+//! Once embed-zig adds these to std_impl.runtime, this file can be deleted
+//! and all imports replaced with `@import("std_impl").runtime`.
 
 const std = @import("std");
 const std_impl = @import("std_impl");
-const base_runtime = std_impl.runtime;
+const base = std_impl.runtime;
 
-// Re-export Mutex unchanged
-pub const Mutex = base_runtime.Mutex;
+// ============================================================================
+// Re-exports from std_impl.runtime (unchanged)
+// ============================================================================
 
-// Re-export spawn unchanged (fire-and-forget / detached)
-pub const Options = base_runtime.Options;
-pub const TaskFn = base_runtime.TaskFn;
-pub const spawn = base_runtime.spawn;
+pub const Mutex = base.Mutex;
+pub const Options = base.Options;
+pub const TaskFn = base.TaskFn;
+pub const spawn = base.spawn;
+pub const Thread = base.Thread;
+pub const nowMs = base.nowMs;
+pub const getCpuCount = base.getCpuCount;
 
-/// Condition — extends base runtime Condition with timedWait.
+// ============================================================================
+// Condition — re-wraps base Condition to add timedWait
+// ============================================================================
+
+/// Condition variable with timedWait support.
+/// embed-zig's std runtime Condition only has wait/signal/broadcast.
+/// This wrapper adds timedWait using std.Thread.Condition.timedWait.
 pub const Condition = struct {
     inner: std.Thread.Condition,
 
@@ -50,33 +64,11 @@ pub const Condition = struct {
     }
 };
 
-/// Joinable thread handle — wraps std.Thread for use by UDP/Host layers
-/// that need to wait for worker threads to exit on shutdown.
-pub const Thread = struct {
-    inner: std.Thread,
-
-    /// Spawn a joinable thread. The function signature matches std.Thread.spawn.
-    pub fn spawnFn(comptime f: anytype, args: anytype) !Thread {
-        return .{ .inner = try std.Thread.spawn(.{}, f, args) };
-    }
-
-    /// Wait for the thread to finish.
-    pub fn join(self: Thread) void {
-        self.inner.join();
-    }
-};
-
-/// Returns current time in milliseconds.
-pub fn nowMs() u64 {
-    return @intCast(std.time.milliTimestamp());
-}
+// ============================================================================
+// sleepMs — not yet in embed-zig's std runtime (ESP32 has it)
+// ============================================================================
 
 /// Sleep for the given number of milliseconds.
 pub fn sleepMs(ms: u32) void {
     std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
-}
-
-/// Returns the number of hardware threads available (CPU count).
-pub fn getCpuCount() usize {
-    return std.Thread.getCpuCount() catch 4;
 }

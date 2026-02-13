@@ -54,8 +54,8 @@ zig_package(
     main = "src/noise.zig",
     deps = [
         "@embed_zig//lib/trait",
-        "@embed_zig//lib/pkg/channel",
-        "@embed_zig//lib/pkg/timer",
+        "@embed_zig//lib/pkg/async/channel",
+        "@embed_zig//lib/pkg/async/timer",
         "@embed_zig//lib/platform/std",
     ],
     c_srcs = _KCP_C_SRCS,

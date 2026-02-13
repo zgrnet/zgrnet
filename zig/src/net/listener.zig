@@ -102,7 +102,7 @@ pub fn Listener(comptime Crypto: type, comptime Rt: type) type {
         /// Starts the receive loop in a background thread.
         /// This must be called after creating the listener.
         pub fn start(self: *Self) void {
-            self.recv_thread = Rt.Thread.spawnFn(receiveLoopWrapper, .{self}) catch null;
+            self.recv_thread = Rt.Thread.spawn(.{}, receiveLoopWrapper, .{self}) catch null;
         }
 
         /// Wrapper for receive loop to work with thread spawn

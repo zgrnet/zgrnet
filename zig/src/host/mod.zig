@@ -241,8 +241,8 @@ pub fn Host(comptime UDPType: type, comptime Rt: type) type {
 
         /// Start the outbound and inbound forwarding loops.
         pub fn run(self: *Self) void {
-            self.outbound_thread = Rt.Thread.spawnFn(outboundLoop, .{self}) catch null;
-            self.inbound_thread = Rt.Thread.spawnFn(inboundLoop, .{self}) catch null;
+            self.outbound_thread = Rt.Thread.spawn(.{}, outboundLoop, .{self}) catch null;
+            self.inbound_thread = Rt.Thread.spawn(.{}, inboundLoop, .{self}) catch null;
         }
 
         /// Gracefully shut down the host.

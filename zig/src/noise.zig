@@ -30,8 +30,9 @@ pub const json_config = @import("config.zig");
 /// Provides Blake2s256, ChaCha20Poly1305, X25519 for Noise Protocol.
 pub const StdCrypto = noise.test_crypto;
 
-/// StdRt — zgrnet runtime extending embed-zig's std runtime with
-/// timedWait, sleepMs, nowMs.
+/// StdRt — embed-zig's std runtime + timedWait/sleepMs shim.
+/// Once embed-zig adds these to std_impl.runtime, this can be
+/// changed to `@import("std_impl").runtime` directly.
 pub const StdRt = @import("runtime.zig");
 
 /// Concrete Noise Protocol instantiation for desktop platforms.
