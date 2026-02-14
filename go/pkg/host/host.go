@@ -20,6 +20,25 @@ type TunDevice interface {
 	Close() error
 }
 
+// FakeIPLookup provides Fake IP → domain + peer resolution.
+// This interface decouples the host from the DNS/FakeIP package.
+type FakeIPLookup interface {
+	// LookupFakeIP checks if the IP is a Fake IP and returns the domain + peer.
+	// Returns empty strings and false if the IP is not a Fake IP.
+	LookupFakeIP(ip net.IP) (domain, peer string, ok bool)
+}
+
+// FakeIPHandler handles outbound traffic destined for Fake IPs.
+// The handler is responsible for creating TCP_PROXY KCP streams to
+// the appropriate peer and forwarding the traffic.
+type FakeIPHandler interface {
+	// HandleFakeIP is called when an outbound IP packet's destination
+	// matches a Fake IP. domain is the original domain (e.g., "google.com"),
+	// peer is the target peer alias (e.g., "peer_us"), and ipPkt is the
+	// complete IP packet from the TUN device.
+	HandleFakeIP(domain, peer string, ipPkt []byte)
+}
+
 // Config holds the configuration for creating a Host.
 type Config struct {
 	// PrivateKey is the local keypair for Noise Protocol handshakes.
@@ -38,6 +57,14 @@ type Config struct {
 
 	// Peers is the list of initial peers.
 	Peers []PeerConfig
+
+	// FakeIPLookup provides Fake IP resolution (optional).
+	// When set, outbound packets to Fake IPs are handled by FakeIPHandler.
+	FakeIPLookup FakeIPLookup
+
+	// FakeIPHandler handles outbound traffic to Fake IPs (optional).
+	// If FakeIPLookup is set but FakeIPHandler is nil, Fake IP packets are dropped.
+	FakeIPHandler FakeIPHandler
 }
 
 // PeerConfig holds the configuration for a peer.
@@ -66,6 +93,9 @@ type Host struct {
 	ipAlloc *IPAllocator
 	tunIPv4 net.IP
 	mtu     int
+
+	fakeIPLookup  FakeIPLookup
+	fakeIPHandler FakeIPHandler
 
 	closeChan chan struct{}
 	closed    atomic.Bool
@@ -104,13 +134,15 @@ func New(cfg Config, tunDev TunDevice) (*Host, error) {
 	}
 
 	h := &Host{
-		tun:       tunDev,
-		udp:       udp,
-		ipAlloc:   NewIPAllocator(),
-		tunIPv4:   cfg.TunIPv4.To4(),
-		mtu:       mtu,
-		closeChan: make(chan struct{}),
-		peers:     make(map[noise.PublicKey]*PeerConfig),
+		tun:           tunDev,
+		udp:           udp,
+		ipAlloc:       NewIPAllocator(),
+		tunIPv4:       cfg.TunIPv4.To4(),
+		mtu:           mtu,
+		fakeIPLookup:  cfg.FakeIPLookup,
+		fakeIPHandler: cfg.FakeIPHandler,
+		closeChan:     make(chan struct{}),
+		peers:         make(map[noise.PublicKey]*PeerConfig),
 	}
 
 	// Register initial peers
@@ -269,6 +301,16 @@ func (h *Host) handleOutbound(ipPkt []byte) {
 	info, err := ParseIPPacket(ipPkt)
 	if err != nil {
 		return
+	}
+
+	// Check if destination is a Fake IP (route-matched domain)
+	if h.fakeIPLookup != nil {
+		if domain, peer, ok := h.fakeIPLookup.LookupFakeIP(info.DstIP); ok {
+			if h.fakeIPHandler != nil {
+				h.fakeIPHandler.HandleFakeIP(domain, peer, ipPkt)
+			}
+			return
+		}
 	}
 
 	// Look up peer by destination IP

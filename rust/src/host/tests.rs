@@ -241,6 +241,8 @@ fn test_host_new() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun,
     )
@@ -265,6 +267,8 @@ fn test_host_add_peer() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun,
     )
@@ -296,6 +300,8 @@ fn test_host_icmp_forwarding() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun_a,
     )
@@ -309,6 +315,8 @@ fn test_host_icmp_forwarding() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun_b,
     )
@@ -381,6 +389,8 @@ fn test_host_tcp_forwarding() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun_a,
     )
@@ -393,6 +403,8 @@ fn test_host_tcp_forwarding() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun_b,
     )
@@ -481,6 +493,8 @@ fn test_host_bidirectional() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun_a,
     )
@@ -493,6 +507,8 @@ fn test_host_bidirectional() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun_b,
     )
@@ -567,6 +583,8 @@ fn test_host_close() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         tun,
     )
