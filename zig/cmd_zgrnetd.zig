@@ -187,11 +187,32 @@ pub fn main() !void {
     // 9. Start Host forwarding
     host.run();
 
+    // 10. Start RESTful API server
+    const api_addr = std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}:80", .{ tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3] }) catch "";
+    var pub_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&pub_hex, "{}", .{std.fmt.fmtSliceHexLower(&key_pair.public.data)}) catch unreachable;
+
+    var api_server = noise.api_mod.Server.init(allocator, .{
+        .listen_addr = api_addr,
+        .config_path = config_path,
+        .host_ptr = @ptrCast(host),
+        .host_vtable = &host_api_vtable,
+        .config_mgr_ptr = undefined, // Config manager not used in simple mode
+        .config_mgr_vtable = &config_mgr_api_vtable,
+        .tun_ipv4 = cfg.net.tun_ipv4,
+        .public_key_hex = &pub_hex,
+    });
+
+    _ = std.Thread.spawn(.{}, apiLoop, .{&api_server}) catch |err| {
+        print("[zgrnetd] warning: api thread: {}\n", .{err});
+    };
+
     print("[zgrnetd] running\n", .{});
     print("[zgrnetd]   TUN:   {s} ({d}.{d}.{d}.{d}/10)\n", .{
         tun_dev.getName(), tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3],
     });
     print("[zgrnetd]   UDP:   :{d}\n", .{host.getLocalPort()});
+    print("[zgrnetd]   API:   {s}\n", .{api_addr});
     print("[zgrnetd]   Peers: {d}\n", .{cfg.peers.map.count()});
 
     // 10. Wait for signal
@@ -282,6 +303,52 @@ fn setupSignalHandler() void {
 }
 
 // Endpoint parsing is now handled by noise.Endpoint.parse()
+
+fn apiLoop(server: *noise.api_mod.Server) void {
+    print("[zgrnetd] api listening on {s}\n", .{server.config.listen_addr});
+    server.serve();
+}
+
+// Host VTable for API server — adapts generic Host methods to opaque pointers.
+const host_api_vtable = noise.api_mod.HostVTable{
+    .addPeer = struct {
+        fn f(ptr: *anyopaque, pk: Key, endpoint_str: []const u8) bool {
+            const h: *HostType = @ptrCast(@alignCast(ptr));
+            const ep = if (endpoint_str.len > 0) Endpoint.parse(endpoint_str) else null;
+            h.addPeer(pk, ep) catch return false;
+            return true;
+        }
+    }.f,
+    .removePeer = struct {
+        fn f(ptr: *anyopaque, pk: Key) void {
+            const h: *HostType = @ptrCast(@alignCast(ptr));
+            h.removePeer(pk);
+        }
+    }.f,
+    .lookupIpByPubkey = struct {
+        fn f(ptr: *anyopaque, pk: Key) ?[4]u8 {
+            const h: *HostType = @ptrCast(@alignCast(ptr));
+            return h.ip_alloc.lookupByPubkey(pk);
+        }
+    }.f,
+    .lookupPubkeyByIp = struct {
+        fn f(ptr: *anyopaque, ip: [4]u8) ?Key {
+            const h: *HostType = @ptrCast(@alignCast(ptr));
+            return h.ip_alloc.lookupByIp(ip);
+        }
+    }.f,
+};
+
+// Config manager VTable — simple implementation that reloads from disk.
+const config_mgr_api_vtable = noise.api_mod.ConfigMgrVTable{
+    .reload = struct {
+        fn f(_: *anyopaque) bool {
+            // In the simple daemon mode, config reload is a no-op
+            // (the full config manager integration comes later).
+            return false;
+        }
+    }.f,
+};
 
 fn loadOrGenerateKey(_: std.mem.Allocator, path: []const u8) !KeyPair {
 
