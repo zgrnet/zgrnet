@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use super::{InboundPolicy, InboundRule, ServiceConfig};
+use super::labels::{LabelStore, match_labels};
 
 /// Result of checking inbound access for a peer.
 #[derive(Debug, Clone)]
@@ -21,16 +22,17 @@ struct CompiledEntry {
     list_path: String,
 }
 
-/// Evaluates inbound policy rules against peer public keys.
+/// Evaluates inbound policy rules against peer public keys and labels.
 /// Thread-safe for concurrent reads.
 pub struct PolicyEngine {
     default_action: String,
     entries: RwLock<Vec<CompiledEntry>>,
+    label_store: RwLock<Option<Arc<LabelStore>>>,
 }
 
 impl PolicyEngine {
     /// Create a PolicyEngine from an InboundPolicy.
-    /// Whitelist files are loaded eagerly.
+    /// Whitelist files are loaded eagerly. LabelStore is optional.
     pub fn new(policy: &InboundPolicy) -> io::Result<Self> {
         let entries = Self::compile(&policy.rules)?;
         let default_action = if policy.default.is_empty() {
@@ -41,7 +43,20 @@ impl PolicyEngine {
         Ok(Self {
             default_action,
             entries: RwLock::new(entries),
+            label_store: RwLock::new(None),
         })
+    }
+
+    /// Create a PolicyEngine with a LabelStore for label-based matching.
+    pub fn with_label_store(policy: &InboundPolicy, store: Arc<LabelStore>) -> io::Result<Self> {
+        let pe = Self::new(policy)?;
+        *pe.label_store.write().unwrap() = Some(store);
+        Ok(pe)
+    }
+
+    /// Set or replace the label store.
+    pub fn set_label_store(&self, store: Arc<LabelStore>) {
+        *self.label_store.write().unwrap() = Some(store);
     }
 
     fn compile(rules: &[InboundRule]) -> io::Result<Vec<CompiledEntry>> {
@@ -66,41 +81,56 @@ impl PolicyEngine {
     pub fn check(&self, pubkey: &[u8; 32]) -> PolicyResult {
         let pubkey_hex = hex::encode(pubkey);
 
+        // Look up labels once
+        let peer_labels: Vec<String> = {
+            let store_guard = self.label_store.read().unwrap();
+            match store_guard.as_ref() {
+                Some(store) => store.labels(&pubkey_hex),
+                None => vec![],
+            }
+        };
+
         let entries = self.entries.read().unwrap();
         for entry in entries.iter() {
             let rule = &entry.rule;
+
+            let pubkey_matched;
+            let mut needs_zgrlan = false;
+            let mut zgrlan_peer = String::new();
+
             match rule.match_config.pubkey.match_type.as_str() {
                 "any" => {
-                    return PolicyResult {
-                        action: rule.action.clone(),
-                        services: rule.services.clone(),
-                        rule_name: rule.name.clone(),
-                        needs_zgrlan_verify: false,
-                        zgrlan_peer: String::new(),
-                    };
+                    pubkey_matched = true;
                 }
                 "whitelist" => {
-                    if entry.whitelist.contains(&pubkey_hex) {
-                        return PolicyResult {
-                            action: rule.action.clone(),
-                            services: rule.services.clone(),
-                            rule_name: rule.name.clone(),
-                            needs_zgrlan_verify: false,
-                            zgrlan_peer: String::new(),
-                        };
-                    }
+                    pubkey_matched = entry.whitelist.contains(&pubkey_hex);
                 }
                 "zgrlan" => {
-                    return PolicyResult {
-                        action: rule.action.clone(),
-                        services: rule.services.clone(),
-                        rule_name: rule.name.clone(),
-                        needs_zgrlan_verify: true,
-                        zgrlan_peer: rule.match_config.pubkey.peer.clone(),
-                    };
+                    pubkey_matched = true;
+                    needs_zgrlan = true;
+                    zgrlan_peer = rule.match_config.pubkey.peer.clone();
                 }
                 _ => continue,
             }
+
+            if !pubkey_matched {
+                continue;
+            }
+
+            // If the rule has label patterns, the peer must also match at least one
+            if !rule.match_config.labels.is_empty() {
+                if !match_labels(&peer_labels, &rule.match_config.labels) {
+                    continue;
+                }
+            }
+
+            return PolicyResult {
+                action: rule.action.clone(),
+                services: rule.services.clone(),
+                rule_name: rule.name.clone(),
+                needs_zgrlan_verify: needs_zgrlan,
+                zgrlan_peer,
+            };
         }
 
         PolicyResult {
@@ -155,6 +185,7 @@ fn load_pubkey_list(path: &str) -> io::Result<HashSet<String>> {
 mod tests {
     use super::*;
     use super::super::{MatchConfig, PubkeyMatch};
+    use std::sync::Arc;
 
     fn hex_key(hex_str: &str) -> [u8; 32] {
         let mut key = [0u8; 32];
@@ -288,6 +319,77 @@ mod tests {
         assert_eq!(result.rule_name, "any-limited");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_label_match() {
+        let store = Arc::new(LabelStore::new());
+        let trusted_key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        store.set_labels(trusted_key, &["host.zigor.net/trusted".into()]);
+
+        let policy = make_policy("deny", vec![InboundRule {
+            name: "label-trusted".into(),
+            match_config: MatchConfig {
+                pubkey: PubkeyMatch {
+                    match_type: "any".into(), path: String::new(), peer: String::new(),
+                },
+                labels: vec!["host.zigor.net/trusted".into()],
+            },
+            services: vec![ServiceConfig { proto: "tcp".into(), port: "80,443".into() }],
+            action: "allow".into(),
+        }]);
+        let pe = PolicyEngine::with_label_store(&policy, store).unwrap();
+
+        let result = pe.check(&hex_key(trusted_key));
+        assert_eq!(result.action, "allow");
+        assert_eq!(result.rule_name, "label-trusted");
+
+        // Unknown key has no labels -> deny
+        let result = pe.check(&hex_key("0000000000000000000000000000000000000000000000000000000000000001"));
+        assert_eq!(result.action, "deny");
+    }
+
+    #[test]
+    fn test_label_wildcard() {
+        let store = Arc::new(LabelStore::new());
+        let key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        store.set_labels(key, &["company.zigor.net/employee".into()]);
+
+        let policy = make_policy("deny", vec![InboundRule {
+            name: "company-all".into(),
+            match_config: MatchConfig {
+                pubkey: PubkeyMatch {
+                    match_type: "any".into(), path: String::new(), peer: String::new(),
+                },
+                labels: vec!["company.zigor.net/*".into()],
+            },
+            services: vec![ServiceConfig { proto: "*".into(), port: "*".into() }],
+            action: "allow".into(),
+        }]);
+        let pe = PolicyEngine::with_label_store(&policy, store).unwrap();
+
+        let result = pe.check(&hex_key(key));
+        assert_eq!(result.action, "allow");
+    }
+
+    #[test]
+    fn test_no_label_store() {
+        // Without a LabelStore, label rules skip
+        let policy = make_policy("deny", vec![InboundRule {
+            name: "label-only".into(),
+            match_config: MatchConfig {
+                pubkey: PubkeyMatch {
+                    match_type: "any".into(), path: String::new(), peer: String::new(),
+                },
+                labels: vec!["host.zigor.net/trusted".into()],
+            },
+            services: vec![ServiceConfig { proto: "*".into(), port: "*".into() }],
+            action: "allow".into(),
+        }]);
+        let pe = PolicyEngine::new(&policy).unwrap();
+
+        let result = pe.check(&hex_key("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"));
+        assert_eq!(result.action, "deny");
     }
 
     #[test]

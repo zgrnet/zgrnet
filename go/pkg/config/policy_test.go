@@ -266,6 +266,156 @@ func TestPolicyEngine_WhitelistFileNotFound(t *testing.T) {
 	}
 }
 
+func TestPolicyEngine_LabelMatch(t *testing.T) {
+	store := NewLabelStore()
+	trustedKey := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	unknownKey := "0000000000000000000000000000000000000000000000000000000000000001"
+
+	store.SetLabels(trustedKey, []string{"host.zigor.net/trusted", "host.zigor.net/exit-node"})
+
+	policy := &InboundPolicy{
+		Default: "deny",
+		Rules: []InboundRule{
+			{
+				Name: "label-trusted",
+				Match: MatchConfig{
+					Pubkey: PubkeyMatch{Type: "any"},
+					Labels: []string{"host.zigor.net/trusted"},
+				},
+				Services: []ServiceConfig{{Proto: "tcp", Port: "80,443"}},
+				Action:   "allow",
+			},
+		},
+	}
+
+	pe, err := NewPolicyEngine(policy, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Trusted key has the label -> allow
+	result := pe.Check(hexKey(trustedKey))
+	if result.Action != "allow" {
+		t.Errorf("trusted key: action = %q, want allow", result.Action)
+	}
+	if result.RuleName != "label-trusted" {
+		t.Errorf("trusted key: rule = %q, want label-trusted", result.RuleName)
+	}
+
+	// Unknown key has no labels -> deny (falls through to default)
+	result = pe.Check(hexKey(unknownKey))
+	if result.Action != "deny" {
+		t.Errorf("unknown key: action = %q, want deny", result.Action)
+	}
+}
+
+func TestPolicyEngine_LabelWildcard(t *testing.T) {
+	store := NewLabelStore()
+	companyKey := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	store.SetLabels(companyKey, []string{"company.zigor.net/employee", "company.zigor.net/dev-team"})
+
+	policy := &InboundPolicy{
+		Default: "deny",
+		Rules: []InboundRule{
+			{
+				Name: "company-all",
+				Match: MatchConfig{
+					Pubkey: PubkeyMatch{Type: "any"},
+					Labels: []string{"company.zigor.net/*"},
+				},
+				Services: []ServiceConfig{{Proto: "*", Port: "*"}},
+				Action:   "allow",
+			},
+		},
+	}
+
+	pe, err := NewPolicyEngine(policy, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := pe.Check(hexKey(companyKey))
+	if result.Action != "allow" {
+		t.Errorf("company key: action = %q, want allow", result.Action)
+	}
+}
+
+func TestPolicyEngine_LabelAndPubkey(t *testing.T) {
+	// Test that both pubkey AND label must match when both are specified
+	dir := t.TempDir()
+	listPath := filepath.Join(dir, "trusted.txt")
+	trustedKey := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	otherKey := "0000000000000000000000000000000000000000000000000000000000000001"
+	if err := os.WriteFile(listPath, []byte(trustedKey+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewLabelStore()
+	// Both keys have the label, but only trustedKey is in the whitelist
+	store.SetLabels(trustedKey, []string{"host.zigor.net/admin"})
+	store.SetLabels(otherKey, []string{"host.zigor.net/admin"})
+
+	policy := &InboundPolicy{
+		Default: "deny",
+		Rules: []InboundRule{
+			{
+				Name: "whitelist-plus-label",
+				Match: MatchConfig{
+					Pubkey: PubkeyMatch{Type: "whitelist", Path: listPath},
+					Labels: []string{"host.zigor.net/admin"},
+				},
+				Services: []ServiceConfig{{Proto: "*", Port: "*"}},
+				Action:   "allow",
+			},
+		},
+	}
+
+	pe, err := NewPolicyEngine(policy, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// trustedKey: in whitelist + has label -> allow
+	result := pe.Check(hexKey(trustedKey))
+	if result.Action != "allow" {
+		t.Errorf("trusted key: action = %q, want allow", result.Action)
+	}
+
+	// otherKey: NOT in whitelist (pubkey match fails) -> deny
+	result = pe.Check(hexKey(otherKey))
+	if result.Action != "deny" {
+		t.Errorf("other key: action = %q, want deny (not in whitelist)", result.Action)
+	}
+}
+
+func TestPolicyEngine_NoLabelStore(t *testing.T) {
+	// Without a LabelStore, label rules skip (no labels to match against)
+	policy := &InboundPolicy{
+		Default: "deny",
+		Rules: []InboundRule{
+			{
+				Name: "label-only",
+				Match: MatchConfig{
+					Pubkey: PubkeyMatch{Type: "any"},
+					Labels: []string{"host.zigor.net/trusted"},
+				},
+				Services: []ServiceConfig{{Proto: "*", Port: "*"}},
+				Action:   "allow",
+			},
+		},
+	}
+
+	pe, err := NewPolicyEngine(policy) // no label store
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := pe.Check(hexKey("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"))
+	if result.Action != "deny" {
+		t.Errorf("action = %q, want deny (no label store)", result.Action)
+	}
+}
+
 func TestPolicyEngine_WhitelistInvalidFormat(t *testing.T) {
 	dir := t.TempDir()
 	listPath := filepath.Join(dir, "bad.txt")

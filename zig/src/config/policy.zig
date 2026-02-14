@@ -1,12 +1,15 @@
-//! Inbound policy engine: evaluates rules against peer public keys.
+//! Inbound policy engine: evaluates rules against peer public keys and labels.
 
 const std = @import("std");
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
+const labels_mod = @import("labels.zig");
 const InboundPolicy = types.InboundPolicy;
 const InboundRule = types.InboundRule;
 const ServiceConfig = types.ServiceConfig;
+const LabelStore = labels_mod.LabelStore;
+const matchLabels = labels_mod.matchLabels;
 
 pub const PolicyResult = struct {
     action: []const u8,
@@ -22,11 +25,12 @@ const CompiledEntry = struct {
     list_path: []const u8,
 };
 
-/// Evaluates inbound policy rules against peer public keys.
+/// Evaluates inbound policy rules against peer public keys and labels.
 pub const PolicyEngine = struct {
     default_action: []const u8,
     entries: std.ArrayListUnmanaged(CompiledEntry) = .{},
     allocator: Allocator,
+    label_store: ?*const LabelStore = null,
 
     pub fn init(allocator: Allocator, policy: *const InboundPolicy) !PolicyEngine {
         var pe = PolicyEngine{
@@ -53,6 +57,18 @@ pub const PolicyEngine = struct {
         return pe;
     }
 
+    /// Create a PolicyEngine with a LabelStore for label-based matching.
+    pub fn initWithLabelStore(allocator: Allocator, policy: *const InboundPolicy, store: *const LabelStore) !PolicyEngine {
+        var pe = try init(allocator, policy);
+        pe.label_store = store;
+        return pe;
+    }
+
+    /// Set or replace the label store.
+    pub fn setLabelStore(self: *PolicyEngine, store: ?*const LabelStore) void {
+        self.label_store = store;
+    }
+
     pub fn deinit(self: *PolicyEngine) void {
         for (self.entries.items) |*e| {
             if (e.whitelist) |*w| {
@@ -73,39 +89,52 @@ pub const PolicyEngine = struct {
         }
         const pubkey_hex: []const u8 = &hex_buf;
 
+        // Look up labels once (only if label store is set)
+        const peer_labels: []const []const u8 = if (self.label_store) |store|
+            store.getLabels(pubkey_hex)
+        else
+            &.{};
+
         for (self.entries.items) |*entry| {
             const rule = entry.rule;
             const match_type = rule.@"match".pubkey.@"type";
 
+            var pubkey_matched = false;
+            var needs_zgrlan = false;
+            var zgrlan_peer: []const u8 = "";
+
             if (mem.eql(u8, match_type, "any")) {
-                return .{
-                    .action = rule.action,
-                    .services = rule.services,
-                    .rule_name = rule.name,
-                    .needs_zgrlan_verify = false,
-                    .zgrlan_peer = "",
-                };
+                pubkey_matched = true;
             } else if (mem.eql(u8, match_type, "whitelist")) {
                 if (entry.whitelist) |wl| {
                     if (wl.get(pubkey_hex) != null) {
-                        return .{
-                            .action = rule.action,
-                            .services = rule.services,
-                            .rule_name = rule.name,
-                            .needs_zgrlan_verify = false,
-                            .zgrlan_peer = "",
-                        };
+                        pubkey_matched = true;
                     }
                 }
             } else if (mem.eql(u8, match_type, "zgrlan")) {
-                return .{
-                    .action = rule.action,
-                    .services = rule.services,
-                    .rule_name = rule.name,
-                    .needs_zgrlan_verify = true,
-                    .zgrlan_peer = rule.@"match".pubkey.peer,
-                };
+                pubkey_matched = true;
+                needs_zgrlan = true;
+                zgrlan_peer = rule.@"match".pubkey.peer;
+            } else {
+                continue;
             }
+
+            if (!pubkey_matched) continue;
+
+            // If the rule has label patterns, the peer must also match at least one
+            if (rule.@"match".labels.len > 0) {
+                if (!matchLabels(peer_labels, rule.@"match".labels)) {
+                    continue;
+                }
+            }
+
+            return .{
+                .action = rule.action,
+                .services = rule.services,
+                .rule_name = rule.name,
+                .needs_zgrlan_verify = needs_zgrlan,
+                .zgrlan_peer = zgrlan_peer,
+            };
         }
 
         return .{
@@ -220,4 +249,56 @@ test "default allow" {
     const key = [_]u8{0} ** 32;
     const result = pe.check(&key);
     try std.testing.expectEqualStrings("allow", result.action);
+}
+
+test "label match" {
+    var store = LabelStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    // key 0xab repeated = "abababab..." in hex
+    const pk_hex = "abababababababababababababababababababababababababababababababab";
+    try store.addLabels(pk_hex, &.{"host.zigor.net/trusted"});
+
+    const rules = [_]InboundRule{.{
+        .name = "label-trusted",
+        .@"match" = .{
+            .pubkey = .{ .@"type" = "any" },
+            .labels = &.{"host.zigor.net/trusted"},
+        },
+        .services = &.{.{ .proto = "tcp", .port = "80,443" }},
+        .action = "allow",
+    }};
+    const policy = InboundPolicy{ .default = "deny", .rules = &rules };
+    var pe = try PolicyEngine.init(std.testing.allocator, &policy);
+    defer pe.deinit();
+    pe.setLabelStore(&store);
+
+    const key = [_]u8{0xab} ** 32;
+    const result = pe.check(&key);
+    try std.testing.expectEqualStrings("allow", result.action);
+    try std.testing.expectEqualStrings("label-trusted", result.rule_name);
+
+    // Unknown key has no labels -> deny
+    const unknown = [_]u8{0} ** 32;
+    const result2 = pe.check(&unknown);
+    try std.testing.expectEqualStrings("deny", result2.action);
+}
+
+test "no label store - label rules skip" {
+    const rules = [_]InboundRule{.{
+        .name = "label-only",
+        .@"match" = .{
+            .pubkey = .{ .@"type" = "any" },
+            .labels = &.{"host.zigor.net/trusted"},
+        },
+        .services = &.{.{ .proto = "*", .port = "*" }},
+        .action = "allow",
+    }};
+    const policy = InboundPolicy{ .default = "deny", .rules = &rules };
+    var pe = try PolicyEngine.init(std.testing.allocator, &policy);
+    defer pe.deinit();
+
+    const key = [_]u8{0xab} ** 32;
+    const result = pe.check(&key);
+    try std.testing.expectEqualStrings("deny", result.action);
 }
