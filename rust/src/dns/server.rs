@@ -19,6 +19,13 @@ pub trait IPAllocator: Send + Sync {
     fn lookup_by_ip(&self, ip: Ipv4Addr) -> Option<[u8; 32]>;
 }
 
+/// Route matcher trait for domain -> peer resolution.
+pub trait RouteMatcher: Send + Sync {
+    /// Check if a domain matches an outbound route rule.
+    /// Returns (peer, true) if matched, or ("", false) if not.
+    fn match_route(&self, domain: &str) -> (String, bool);
+}
+
 /// Server configuration.
 pub struct ServerConfig {
     pub listen_addr: String,
@@ -27,6 +34,9 @@ pub struct ServerConfig {
     pub upstream: String,
     pub ip_alloc: Option<Arc<dyn IPAllocator>>,
     pub fake_pool: Option<Arc<Mutex<FakeIPPool>>>,
+    /// Route matcher for determining which domains get Fake IPs (preferred).
+    pub route_matcher: Option<Arc<dyn RouteMatcher>>,
+    /// Legacy domain suffix matching (deprecated, use route_matcher).
     pub match_domains: Vec<String>,
 }
 
@@ -39,6 +49,7 @@ impl Default for ServerConfig {
             upstream: DEFAULT_UPSTREAM.to_string(),
             ip_alloc: None,
             fake_pool: None,
+            route_matcher: None,
             match_domains: Vec::new(),
         }
     }
@@ -72,9 +83,16 @@ impl Server {
             return self.resolve_zigor_net(&msg, &name, q.qtype);
         }
 
-        // Try Fake IP matching
-        if self.config.fake_pool.is_some() && self.matches_domain(&name) {
-            return self.resolve_fake_ip(&msg, &name, q.qtype);
+        // Try Fake IP matching via RouteMatcher (preferred) or legacy MatchDomains
+        if self.config.fake_pool.is_some() {
+            if let Some(ref matcher) = self.config.route_matcher {
+                let (peer, matched) = matcher.match_route(&name);
+                if matched {
+                    return self.resolve_fake_ip_with_peer(&msg, &name, &peer, q.qtype);
+                }
+            } else if self.matches_domain(&name) {
+                return self.resolve_fake_ip_with_peer(&msg, &name, "", q.qtype);
+            }
         }
 
         // Forward to upstream
@@ -181,10 +199,11 @@ impl Server {
         }
     }
 
-    fn resolve_fake_ip(
+    fn resolve_fake_ip_with_peer(
         &self,
         query: &Message,
         name: &str,
+        peer: &str,
         qtype: u16,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         if qtype != TYPE_A {
@@ -193,7 +212,7 @@ impl Server {
         }
 
         let pool = self.config.fake_pool.as_ref().unwrap();
-        let ip = pool.lock().unwrap().assign(name);
+        let ip = pool.lock().unwrap().assign_with_peer(name, peer);
         let mut resp = Message::new_response(query, RCODE_NOERROR);
         resp.answers.push(new_a_record(name, DEFAULT_TTL, ip.octets()));
         Ok(resp.encode()?)

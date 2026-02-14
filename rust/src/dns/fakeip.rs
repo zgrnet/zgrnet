@@ -12,10 +12,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 
+/// Entry holding domain and associated peer for a Fake IP.
+#[derive(Debug, Clone)]
+pub struct FakeIPEntry {
+    pub domain: String,
+    pub peer: String,
+}
+
 /// Fake IP pool with bidirectional mapping and O(1) amortized LRU eviction.
 pub struct FakeIPPool {
     domain_to_ip: HashMap<String, Ipv4Addr>,
-    ip_to_domain: HashMap<u32, String>,
+    ip_to_entry: HashMap<u32, FakeIPEntry>,
+    domain_to_peer: HashMap<String, String>,
     /// Generation counter per domain (incremented on each touch).
     domain_gen: HashMap<String, u64>,
     /// LRU queue: (domain, generation_at_insert). Stale entries are skipped.
@@ -32,7 +40,8 @@ impl FakeIPPool {
         let max_size = if max_size == 0 { 65536 } else { max_size };
         FakeIPPool {
             domain_to_ip: HashMap::new(),
-            ip_to_domain: HashMap::new(),
+            ip_to_entry: HashMap::new(),
+            domain_to_peer: HashMap::new(),
             domain_gen: HashMap::new(),
             lru_queue: VecDeque::new(),
             max_size,
@@ -44,7 +53,19 @@ impl FakeIPPool {
 
     /// Assign a Fake IP for the given domain. O(1) amortized.
     pub fn assign(&mut self, domain: &str) -> Ipv4Addr {
+        self.assign_with_peer(domain, "")
+    }
+
+    /// Assign a Fake IP for the given domain and store the associated peer.
+    pub fn assign_with_peer(&mut self, domain: &str, peer: &str) -> Ipv4Addr {
         if let Some(&ip) = self.domain_to_ip.get(domain) {
+            if !peer.is_empty() {
+                self.domain_to_peer.insert(domain.to_string(), peer.to_string());
+                let ip_key = u32::from(ip);
+                self.ip_to_entry.insert(ip_key, FakeIPEntry {
+                    domain: domain.to_string(), peer: peer.to_string(),
+                });
+            }
             self.touch_lru(domain);
             return ip;
         }
@@ -57,7 +78,10 @@ impl FakeIPPool {
         let ip_key = u32::from(ip);
 
         self.domain_to_ip.insert(domain.to_string(), ip);
-        self.ip_to_domain.insert(ip_key, domain.to_string());
+        self.domain_to_peer.insert(domain.to_string(), peer.to_string());
+        self.ip_to_entry.insert(ip_key, FakeIPEntry {
+            domain: domain.to_string(), peer: peer.to_string(),
+        });
         // Insert into LRU queue with generation 0
         self.domain_gen.insert(domain.to_string(), 0);
         self.lru_queue.push_back((domain.to_string(), 0));
@@ -67,7 +91,12 @@ impl FakeIPPool {
 
     /// Lookup the domain for a given Fake IP.
     pub fn lookup(&self, ip: Ipv4Addr) -> Option<&str> {
-        self.ip_to_domain.get(&u32::from(ip)).map(|s| s.as_str())
+        self.ip_to_entry.get(&u32::from(ip)).map(|e| e.domain.as_str())
+    }
+
+    /// Lookup the full entry (domain + peer) for a given Fake IP.
+    pub fn lookup_entry(&self, ip: Ipv4Addr) -> Option<&FakeIPEntry> {
+        self.ip_to_entry.get(&u32::from(ip))
     }
 
     /// Lookup the Fake IP for a given domain without allocating.
@@ -89,9 +118,10 @@ impl FakeIPPool {
 
         // Check for IP collision from wrap-around: if this IP is still held
         // by an active domain, evict it first.
-        if let Some(old_domain) = self.ip_to_domain.remove(&ip_val) {
-            self.domain_to_ip.remove(&old_domain);
-            self.domain_gen.remove(&old_domain);
+        if let Some(old_entry) = self.ip_to_entry.remove(&ip_val) {
+            self.domain_to_ip.remove(&old_entry.domain);
+            self.domain_to_peer.remove(&old_entry.domain);
+            self.domain_gen.remove(&old_entry.domain);
         }
 
         Ipv4Addr::from(ip_val)
@@ -113,7 +143,8 @@ impl FakeIPPool {
                     // This is the current entry — evict it
                     self.domain_gen.remove(&domain);
                     if let Some(ip) = self.domain_to_ip.remove(&domain) {
-                        self.ip_to_domain.remove(&u32::from(ip));
+                        self.ip_to_entry.remove(&u32::from(ip));
+                        self.domain_to_peer.remove(&domain);
                     }
                     return;
                 }

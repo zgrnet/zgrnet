@@ -27,6 +27,14 @@ type IPAllocator interface {
 	LookupByIP(ip net.IP) ([32]byte, bool)
 }
 
+// RouteMatcher checks if a domain matches an outbound route rule.
+// This interface decouples the DNS server from the config package.
+type RouteMatcher interface {
+	// MatchRoute checks if a domain matches any outbound route rule.
+	// Returns the peer name and true if matched, or empty and false if not.
+	MatchRoute(domain string) (peer string, matched bool)
+}
+
 // ServerConfig holds configuration for the DNS server.
 type ServerConfig struct {
 	// ListenAddr is the address to listen on (e.g., "100.64.0.1:53" or ":5353").
@@ -41,8 +49,11 @@ type ServerConfig struct {
 	IPAlloc IPAllocator
 	// FakePool is the Fake IP pool for route-matched domains (optional).
 	FakePool *FakeIPPool
-	// MatchDomains are domain suffixes that should get Fake IPs.
-	// If a query matches one of these suffixes, a Fake IP is assigned.
+	// RouteMatcher checks if a domain matches an outbound route rule (optional).
+	// When set, replaces MatchDomains for determining which domains get Fake IPs.
+	RouteMatcher RouteMatcher
+	// MatchDomains are domain suffixes that should get Fake IPs (legacy).
+	// Deprecated: use RouteMatcher instead.
 	MatchDomains []string
 }
 
@@ -156,9 +167,15 @@ func (s *Server) HandleQuery(queryData []byte) ([]byte, error) {
 		return s.resolveZigorNet(msg, name, q.Type)
 	}
 
-	// Try Fake IP matching
-	if s.config.FakePool != nil && s.matchesDomain(name) {
-		return s.resolveFakeIP(msg, name, q.Type)
+	// Try Fake IP matching via RouteMatcher (preferred) or legacy MatchDomains
+	if s.config.FakePool != nil {
+		if s.config.RouteMatcher != nil {
+			if peer, matched := s.config.RouteMatcher.MatchRoute(name); matched {
+				return s.resolveFakeIPWithPeer(msg, name, peer, q.Type)
+			}
+		} else if s.shouldAssignFakeIP(name) {
+			return s.resolveFakeIPWithPeer(msg, name, "", q.Type)
+		}
 	}
 
 	// Forward to upstream
@@ -254,15 +271,16 @@ func (s *Server) respondWithPeerIP(query *Message, name, hexPubkey string, qtype
 	return EncodeMessage(resp)
 }
 
-// resolveFakeIP assigns a Fake IP for a route-matched domain.
-func (s *Server) resolveFakeIP(query *Message, name string, qtype uint16) ([]byte, error) {
+// resolveFakeIPWithPeer assigns a Fake IP for a route-matched domain,
+// storing the associated peer name for use by the Host outbound path.
+func (s *Server) resolveFakeIPWithPeer(query *Message, name, peer string, qtype uint16) ([]byte, error) {
 	if qtype != TypeA {
 		// Only A records for Fake IPs
 		resp := NewResponse(query, RCodeNoError)
 		return EncodeMessage(resp)
 	}
 
-	ip := s.config.FakePool.Assign(name)
+	ip := s.config.FakePool.AssignWithPeer(name, peer)
 	resp := NewResponse(query, RCodeNoError)
 	var addr [4]byte
 	copy(addr[:], ip.To4())
@@ -303,8 +321,13 @@ func (s *Server) forwardUpstream(queryData []byte) ([]byte, error) {
 	return buf[:n], nil
 }
 
-// matchesDomain checks if the query name matches any of the configured match domains.
-func (s *Server) matchesDomain(name string) bool {
+// shouldAssignFakeIP checks if the domain should get a Fake IP.
+// Prefers RouteMatcher, falls back to legacy MatchDomains.
+func (s *Server) shouldAssignFakeIP(name string) bool {
+	if s.config.RouteMatcher != nil {
+		_, matched := s.config.RouteMatcher.MatchRoute(name)
+		return matched
+	}
 	for _, suffix := range s.config.MatchDomains {
 		if strings.HasSuffix(name, suffix) {
 			return true
