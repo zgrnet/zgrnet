@@ -5,6 +5,7 @@
 //!   - Noise Protocol encrypted UDP transport
 //!   - Host (bridges TUN <-> UDP, routes IP packets to/from peers)
 //!   - Magic DNS server (resolves *.zigor.net -> TUN IPs)
+//!   - RESTful API server (HTTP on TUN_IP:80)
 //!   - Signal handling for graceful shutdown
 //!
 //! Usage:
@@ -13,6 +14,7 @@
 const std = @import("std");
 const posix = std.posix;
 const mem = std.mem;
+const fmt = std.fmt;
 const noise = @import("noise");
 const tun_mod = @import("tun");
 const config_mod = noise.json_config;
@@ -23,8 +25,10 @@ const UDPType = noise.UDP;
 const HostType = noise.Host(UDPType, noise.StdRt);
 const TunDevice = noise.TunDevice;
 const Endpoint = noise.Endpoint;
+const IPAllocator = noise.IPAllocator;
 
 const print = std.debug.print;
+const Allocator = std.mem.Allocator;
 
 // ============================================================================
 // RealTun wrapper: adapts tun.Tun to TunDevice interface
@@ -187,23 +191,15 @@ pub fn main() !void {
     // 9. Start Host forwarding
     host.run();
 
-    // 10. Start RESTful API server
-    const api_addr = std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}:80", .{ tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3] }) catch "";
-    var pub_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&pub_hex, "{}", .{std.fmt.fmtSliceHexLower(&key_pair.public.data)}) catch unreachable;
-
-    var api_server = noise.api_mod.Server.init(allocator, .{
-        .listen_addr = api_addr,
+    // 10. Start API server
+    var api_ctx = ApiContext{
+        .allocator = allocator,
+        .host = host,
         .config_path = config_path,
-        .host_ptr = @ptrCast(host),
-        .host_vtable = &host_api_vtable,
-        .config_mgr_ptr = undefined, // Config manager not used in simple mode
-        .config_mgr_vtable = &config_mgr_api_vtable,
         .tun_ipv4 = cfg.net.tun_ipv4,
-        .public_key_hex = &pub_hex,
-    });
-
-    _ = std.Thread.spawn(.{}, apiLoop, .{&api_server}) catch |err| {
+        .public_key = &key_pair.public,
+    };
+    _ = std.Thread.spawn(.{}, apiServe, .{ &api_ctx, tun_ip }) catch |err| {
         print("[zgrnetd] warning: api thread: {}\n", .{err});
     };
 
@@ -212,10 +208,10 @@ pub fn main() !void {
         tun_dev.getName(), tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3],
     });
     print("[zgrnetd]   UDP:   :{d}\n", .{host.getLocalPort()});
-    print("[zgrnetd]   API:   {s}\n", .{api_addr});
+    print("[zgrnetd]   API:   {d}.{d}.{d}.{d}:80\n", .{ tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3] });
     print("[zgrnetd]   Peers: {d}\n", .{cfg.peers.map.count()});
 
-    // 10. Wait for signal
+    // 11. Wait for signal
     setupSignalHandler();
     waitForSignal();
 
@@ -225,22 +221,243 @@ pub fn main() !void {
 }
 
 // ============================================================================
-// Helpers
+// API server — direct concrete types, no generics
 // ============================================================================
 
-fn parseArgs() ?[]const u8 {
-    var args = std.process.args();
-    _ = args.skip(); // program name
-    while (args.next()) |arg| {
-        if (mem.eql(u8, arg, "-c")) {
-            return args.next();
+const ApiContext = struct {
+    allocator: Allocator,
+    host: *HostType,
+    config_path: []const u8,
+    tun_ipv4: []const u8,
+    public_key: *const Key,
+};
+
+fn apiServe(ctx: *ApiContext, tun_ip: [4]u8) void {
+    const sa = std.net.Address.initIp4(tun_ip, 80);
+    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return;
+
+    const one: c_int = 1;
+    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.REUSEADDR, mem.asBytes(&one)) catch {};
+    posix.bind(sock, &sa.any, sa.getOsSockLen()) catch return;
+    posix.listen(sock, 128) catch return;
+
+    print("[zgrnetd] api listening on {d}.{d}.{d}.{d}:80\n", .{ tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3] });
+
+    while (true) {
+        var client_addr: posix.sockaddr.storage = undefined;
+        var client_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        const client = posix.accept(sock, @ptrCast(&client_addr), &client_len, 0) catch continue;
+        _ = std.Thread.spawn(.{}, apiHandleConn, .{ ctx, client }) catch {
+            posix.close(client);
+            continue;
+        };
+    }
+}
+
+fn apiHandleConn(ctx: *ApiContext, client: posix.socket_t) void {
+    defer posix.close(client);
+
+    const tv = posix.timeval{ .sec = 10, .usec = 0 };
+    posix.setsockopt(client, posix.SOL.SOCKET, posix.SO.RCVTIMEO, mem.asBytes(&tv)) catch {};
+
+    var buf: [8192]u8 = undefined;
+    const n = posix.read(client, &buf) catch return;
+    if (n == 0) return;
+
+    const req = buf[0..n];
+    const first_line_end = mem.indexOf(u8, req, "\r\n") orelse return;
+    var parts = mem.splitScalar(u8, req[0..first_line_end], ' ');
+    const method = parts.next() orelse return;
+    const full_path = parts.next() orelse return;
+
+    const q_idx = mem.indexOfScalar(u8, full_path, '?');
+    const path = if (q_idx) |qi| full_path[0..qi] else full_path;
+    const query = if (q_idx) |qi| full_path[qi + 1 ..] else "";
+
+    const body_start = mem.indexOf(u8, req, "\r\n\r\n");
+    const body = if (body_start) |bs| req[bs + 4 ..] else "";
+
+    const resp = apiRoute(ctx, method, path, query, body);
+    defer ctx.allocator.free(resp);
+    _ = writeAllFd(client, resp) catch {};
+}
+
+fn apiRoute(ctx: *ApiContext, method: []const u8, path: []const u8, query: []const u8, body: []const u8) []const u8 {
+    const a = ctx.allocator;
+
+    // GET /api/whoami
+    if (eql(method, "GET") and eql(path, "/api/whoami")) {
+        var hex: [64]u8 = undefined;
+        _ = fmt.bufPrint(&hex, "{}", .{std.fmt.fmtSliceHexLower(&ctx.public_key.data)}) catch return httpResp(a, 500, "");
+        return httpResp(a, 200, fmt.allocPrint(a,
+            "{{\"pubkey\":\"{s}\",\"tun_ip\":\"{s}\"}}", .{ &hex, ctx.tun_ipv4 }) catch return httpResp(a, 500, ""));
+    }
+
+    // GET /api/config/net
+    if (eql(method, "GET") and eql(path, "/api/config/net")) {
+        return jsonSection(a, ctx.config_path, "net");
+    }
+
+    // GET /api/peers
+    if (eql(method, "GET") and eql(path, "/api/peers")) {
+        return jsonSection(a, ctx.config_path, "peers");
+    }
+
+    // POST /api/peers — add peer
+    if (eql(method, "POST") and eql(path, "/api/peers")) {
+        const pk_hex = jsonStr(body, "pubkey") orelse
+            return httpResp(a, 400, "{\"error\":\"pubkey is required\"}");
+        var pk_bytes: [32]u8 = undefined;
+        _ = fmt.hexToBytes(&pk_bytes, pk_hex) catch
+            return httpResp(a, 400, "{\"error\":\"invalid pubkey\"}");
+        const ep_str = jsonStr(body, "endpoint") orelse "";
+        const ep = if (ep_str.len > 0) Endpoint.parse(ep_str) else null;
+        ctx.host.addPeer(Key{ .data = pk_bytes }, ep) catch
+            return httpResp(a, 500, "{\"error\":\"add peer failed\"}");
+        return httpResp(a, 201, body);
+    }
+
+    // DELETE /api/peers/:pubkey
+    if (eql(method, "DELETE") and mem.startsWith(u8, path, "/api/peers/")) {
+        const hex_pk = path["/api/peers/".len..];
+        var pk_bytes: [32]u8 = undefined;
+        _ = fmt.hexToBytes(&pk_bytes, hex_pk) catch
+            return httpResp(a, 400, "{\"error\":\"invalid pubkey\"}");
+        ctx.host.removePeer(Key{ .data = pk_bytes });
+        return httpResp(a, 204, "");
+    }
+
+    // GET /api/lans
+    if (eql(method, "GET") and eql(path, "/api/lans")) {
+        return jsonSection(a, ctx.config_path, "lans");
+    }
+
+    // GET /api/policy
+    if (eql(method, "GET") and eql(path, "/api/policy")) {
+        return jsonSection(a, ctx.config_path, "inbound_policy");
+    }
+
+    // GET /api/routes
+    if (eql(method, "GET") and eql(path, "/api/routes")) {
+        return jsonSection(a, ctx.config_path, "route");
+    }
+
+    // GET /internal/identity?ip=x
+    if (eql(method, "GET") and eql(path, "/internal/identity")) {
+        const ip_str = queryParam(query, "ip") orelse
+            return httpResp(a, 400, "{\"error\":\"ip parameter is required\"}");
+        var ip: [4]u8 = undefined;
+        parseIp4(ip_str, &ip) orelse
+            return httpResp(a, 400, "{\"error\":\"invalid IP\"}");
+        const pk = ctx.host.ip_alloc.lookupByIp(ip) orelse
+            return httpResp(a, 404, "{\"error\":\"no peer for IP\"}");
+        var hex: [64]u8 = undefined;
+        _ = fmt.bufPrint(&hex, "{}", .{std.fmt.fmtSliceHexLower(&pk.data)}) catch return httpResp(a, 500, "");
+        return httpResp(a, 200, fmt.allocPrint(a,
+            "{{\"pubkey\":\"{s}\",\"ip\":\"{s}\"}}", .{ &hex, ip_str }) catch return httpResp(a, 500, ""));
+    }
+
+    // POST /api/config/reload
+    if (eql(method, "POST") and eql(path, "/api/config/reload")) {
+        return httpResp(a, 200, "{\"status\":\"no changes\"}");
+    }
+
+    return httpResp(a, 404, "{\"error\":\"not found\"}");
+}
+
+// ── API helpers ─────────────────────────────────────────────────────────────
+
+fn httpResp(a: Allocator, status: u16, body: []const u8) []const u8 {
+    const status_text: []const u8 = switch (status) {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        else => "Unknown",
+    };
+    return fmt.allocPrint(a,
+        "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+        status, status_text, body.len, body,
+    }) catch "";
+}
+
+fn jsonSection(a: Allocator, config_path: []const u8, key: []const u8) []const u8 {
+    const data = std.fs.cwd().readFileAlloc(a, config_path, 10 * 1024 * 1024) catch
+        return httpResp(a, 500, "{\"error\":\"read config\"}");
+    defer a.free(data);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, a, data, .{}) catch
+        return httpResp(a, 500, "{\"error\":\"parse config\"}");
+    defer parsed.deinit();
+
+    const val = parsed.value.object.get(key) orelse return httpResp(a, 200, "{}");
+
+    var buf = std.ArrayList(u8).init(a);
+    std.json.stringify(val, .{}, buf.writer()) catch return httpResp(a, 500, "");
+    const result = buf.toOwnedSlice() catch return httpResp(a, 500, "");
+    return httpResp(a, 200, result);
+}
+
+fn jsonStr(data: []const u8, key: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + key.len + 4 < data.len) : (i += 1) {
+        if (data[i] == '"' and i + 1 + key.len < data.len and
+            mem.eql(u8, data[i + 1 .. i + 1 + key.len], key) and
+            data[i + 1 + key.len] == '"')
+        {
+            var j = i + 1 + key.len + 1;
+            while (j < data.len and (data[j] == ':' or data[j] == ' ')) : (j += 1) {}
+            if (j < data.len and data[j] == '"') {
+                j += 1;
+                const start = j;
+                while (j < data.len and data[j] != '"') : (j += 1) {}
+                return data[start..j];
+            }
         }
     }
     return null;
 }
 
+fn queryParam(query: []const u8, key: []const u8) ?[]const u8 {
+    var iter = mem.splitScalar(u8, query, '&');
+    while (iter.next()) |pair| {
+        if (mem.indexOfScalar(u8, pair, '=')) |eq| {
+            if (mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+        }
+    }
+    return null;
+}
+
+fn parseIp4(s: []const u8, out: *[4]u8) ?void {
+    var p = mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (p.next()) |part| {
+        if (i >= 4) return null;
+        out[i] = fmt.parseInt(u8, part, 10) catch return null;
+        i += 1;
+    }
+    if (i != 4) return null;
+}
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return mem.eql(u8, a, b);
+}
+
+fn writeAllFd(fd: posix.socket_t, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const n = posix.write(fd, data[written..]) catch |e| return e;
+        written += n;
+    }
+}
+
+// ============================================================================
+// DNS loop
+// ============================================================================
+
 fn dnsLoop(server: *const noise.dns_mod.server.Server, tun_ip: [4]u8) void {
-    // Bind UDP socket
     const addr = posix.sockaddr.in{
         .family = posix.AF.INET,
         .port = mem.nativeToBig(u16, 53),
@@ -275,9 +492,11 @@ fn dnsLoop(server: *const noise.dns_mod.server.Server, tun_ip: [4]u8) void {
     }
 }
 
+// ============================================================================
+// Signal handling
+// ============================================================================
+
 fn waitForSignal() void {
-    // Simple approach: sleep and poll a signal flag
-    // (Zig's std.posix doesn't expose sigwait on all platforms)
     while (!signal_received.load(.seq_cst)) {
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
@@ -302,62 +521,27 @@ fn setupSignalHandler() void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
-// Endpoint parsing is now handled by noise.Endpoint.parse()
+// ============================================================================
+// Key management
+// ============================================================================
 
-fn apiLoop(server: *noise.api_mod.Server) void {
-    print("[zgrnetd] api listening on {s}\n", .{server.config.listen_addr});
-    server.serve();
+fn parseArgs() ?[]const u8 {
+    var args = std.process.args();
+    _ = args.skip(); // program name
+    while (args.next()) |arg| {
+        if (mem.eql(u8, arg, "-c")) {
+            return args.next();
+        }
+    }
+    return null;
 }
 
-// Host VTable for API server — adapts generic Host methods to opaque pointers.
-const host_api_vtable = noise.api_mod.HostVTable{
-    .addPeer = struct {
-        fn f(ptr: *anyopaque, pk: Key, endpoint_str: []const u8) bool {
-            const h: *HostType = @ptrCast(@alignCast(ptr));
-            const ep = if (endpoint_str.len > 0) Endpoint.parse(endpoint_str) else null;
-            h.addPeer(pk, ep) catch return false;
-            return true;
-        }
-    }.f,
-    .removePeer = struct {
-        fn f(ptr: *anyopaque, pk: Key) void {
-            const h: *HostType = @ptrCast(@alignCast(ptr));
-            h.removePeer(pk);
-        }
-    }.f,
-    .lookupIpByPubkey = struct {
-        fn f(ptr: *anyopaque, pk: Key) ?[4]u8 {
-            const h: *HostType = @ptrCast(@alignCast(ptr));
-            return h.ip_alloc.lookupByPubkey(pk);
-        }
-    }.f,
-    .lookupPubkeyByIp = struct {
-        fn f(ptr: *anyopaque, ip: [4]u8) ?Key {
-            const h: *HostType = @ptrCast(@alignCast(ptr));
-            return h.ip_alloc.lookupByIp(ip);
-        }
-    }.f,
-};
-
-// Config manager VTable — simple implementation that reloads from disk.
-const config_mgr_api_vtable = noise.api_mod.ConfigMgrVTable{
-    .reload = struct {
-        fn f(_: *anyopaque) bool {
-            // In the simple daemon mode, config reload is a no-op
-            // (the full config manager integration comes later).
-            return false;
-        }
-    }.f,
-};
-
 fn loadOrGenerateKey(_: std.mem.Allocator, path: []const u8) !KeyPair {
-
     // Try to read existing key
     if (std.fs.cwd().openFile(path, .{})) |file| {
         defer file.close();
         var buf: [128]u8 = undefined;
         const n = file.readAll(&buf) catch return error.ReadError;
-        // Trim whitespace
         const hex_str = mem.trim(u8, buf[0..n], &[_]u8{ ' ', '\t', '\n', '\r' });
         if (hex_str.len != 64) return error.InvalidKeyFile;
         var key_bytes: [32]u8 = undefined;
