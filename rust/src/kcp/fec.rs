@@ -57,6 +57,9 @@ impl std::fmt::Display for FecError {
 
 impl std::error::Error for FecError {}
 
+/// Output callback type for FEC encoder/decoder.
+pub type OutputFn = Box<dyn FnMut(&[u8]) + Send>;
+
 /// Encode a FEC header into the buffer (must be >= HEADER_SIZE).
 pub fn encode_header(buf: &mut [u8], group_id: u16, index: u8, count: u8, payload_len: u16) {
     buf[0..2].copy_from_slice(&group_id.to_le_bytes());
@@ -111,12 +114,12 @@ pub struct Encoder {
     max_payload_len: u16,
 
     /// Output callback: called with each FEC-wrapped packet.
-    output_fn: Box<dyn FnMut(&[u8]) + Send>,
+    output_fn: OutputFn,
 }
 
 impl Encoder {
     /// Create a new FEC encoder with the given group size.
-    pub fn new(group_size: u8, output_fn: Box<dyn FnMut(&[u8]) + Send>) -> Self {
+    pub fn new(group_size: u8, output_fn: OutputFn) -> Self {
         Encoder {
             group_size: if group_size > MAX_GROUP_SIZE as u8 { MAX_GROUP_SIZE as u8 } else { group_size },
             group_id: 0,
@@ -242,12 +245,12 @@ pub struct Decoder {
     group_active: [bool; DECODER_WINDOW_SIZE],
 
     /// Output callback: called with each recovered/received data packet.
-    output_fn: Box<dyn FnMut(&[u8]) + Send>,
+    output_fn: OutputFn,
 }
 
 impl Decoder {
     /// Create a new FEC decoder.
-    pub fn new(output_fn: Box<dyn FnMut(&[u8]) + Send>) -> Self {
+    pub fn new(output_fn: OutputFn) -> Self {
         let mut groups = Vec::with_capacity(DECODER_WINDOW_SIZE);
         for _ in 0..DECODER_WINDOW_SIZE {
             groups.push(Group::default());
