@@ -6,16 +6,16 @@
 //!   zig build host_test && sudo ./zig-out/bin/host_test
 
 const std = @import("std");
-const posix = std.posix;
 const mem = std.mem;
 const noise = @import("noise");
 const tun = @import("tun");
 
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
-const UDPType = noise.UDP(noise.KqueueIO);
-const HostType = noise.Host(UDPType);
+const UDPType = noise.UDP;
+const HostType = noise.Host(UDPType, noise.StdRt);
 const TunDevice = noise.TunDevice;
+const Endpoint = noise.Endpoint;
 
 // ============================================================================
 // RealTun wrapper: adapts tun.Tun to TunDevice interface
@@ -156,22 +156,10 @@ pub fn main() !void {
     print("  Host A: UDP :{d}\n", .{port_a});
     print("  Host B: UDP :{d}\n", .{port_b});
 
-    // Add peers with static IPs
-    var ep_b: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = mem.nativeToBig(u16, port_b),
-        .addr = mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
-    };
-    var ep_a: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = mem.nativeToBig(u16, port_a),
-        .addr = mem.nativeToBig(u32, 0x7F000001),
-    };
-
+    // Add peers with static IPs using portable Endpoint
     host_a.addPeerWithIp(
         key_b.public,
-        @as(*posix.sockaddr, @ptrCast(&ep_b)).*,
-        @sizeOf(posix.sockaddr.in),
+        Endpoint.init(.{ 127, 0, 0, 1 }, port_b),
         .{ 100, 64, 0, 2 },
     ) catch {
         print("FATAL: add peer B on A\n", .{});
@@ -180,8 +168,7 @@ pub fn main() !void {
 
     host_b.addPeerWithIp(
         key_a.public,
-        @as(*posix.sockaddr, @ptrCast(&ep_a)).*,
-        @sizeOf(posix.sockaddr.in),
+        Endpoint.init(.{ 127, 0, 0, 1 }, port_a),
         .{ 100, 64, 1, 2 },
     ) catch {
         print("FATAL: add peer A on B\n", .{});

@@ -1,42 +1,43 @@
 //! Time constants for connection management.
 //!
 //! These values are based on WireGuard's timing parameters (Section 6 of whitepaper).
+//! All time constants are in milliseconds.
 
 const std = @import("std");
 
 /// Duration after which a rekey should be initiated.
 /// After this time, the initiator should start a new handshake.
 /// WireGuard: 120 seconds
-pub const rekey_after_time_ns: u64 = 120 * std.time.ns_per_s;
+pub const rekey_after_time_ms: u64 = 120_000;
 
 /// Duration after which a session should be rejected.
 /// Messages using sessions older than this should not be accepted.
 /// WireGuard: 180 seconds
-pub const reject_after_time_ns: u64 = 180 * std.time.ns_per_s;
+pub const reject_after_time_ms: u64 = 180_000;
 
 /// Maximum duration to keep retrying handshake.
 /// After this time without successful handshake, give up.
 /// WireGuard: 90 seconds
-pub const rekey_attempt_time_ns: u64 = 90 * std.time.ns_per_s;
+pub const rekey_attempt_time_ms: u64 = 90_000;
 
 /// Interval between handshake retransmissions.
 /// Also used as the timeout for waiting handshake response.
 /// WireGuard: 5 seconds
-pub const rekey_timeout_ns: u64 = 5 * std.time.ns_per_s;
+pub const rekey_timeout_ms: u64 = 5_000;
 
 /// Duration of inactivity after which a keepalive should be sent
 /// to maintain the connection and NAT mappings.
 /// WireGuard: 10 seconds
-pub const keepalive_timeout_ns: u64 = 10 * std.time.ns_per_s;
+pub const keepalive_timeout_ms: u64 = 10_000;
 
 /// Session age at which receiving data triggers rekey.
 /// Calculated as: reject_after_time - keepalive_timeout - rekey_timeout = 165s
 /// This gives enough time to complete rekey before session rejection.
-pub const rekey_on_recv_threshold_ns: u64 = 165 * std.time.ns_per_s;
+pub const rekey_on_recv_threshold_ms: u64 = 165_000;
 
 /// When all sessions should be cleared if no new session.
 /// WireGuard: reject_after_time * 3 = 540 seconds
-pub const session_cleanup_time_ns: u64 = 540 * std.time.ns_per_s;
+pub const session_cleanup_time_ms: u64 = 540_000;
 
 /// Number of messages after which a rekey should be triggered,
 /// regardless of time elapsed.
@@ -53,13 +54,13 @@ pub const reject_after_messages: u64 = std.math.maxInt(u64) - (1 << 13);
 // =============================================================================
 
 test "time constants values" {
-    try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_s), rekey_after_time_ns);
-    try std.testing.expectEqual(@as(u64, 180 * std.time.ns_per_s), reject_after_time_ns);
-    try std.testing.expectEqual(@as(u64, 90 * std.time.ns_per_s), rekey_attempt_time_ns);
-    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), rekey_timeout_ns);
-    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), keepalive_timeout_ns);
-    try std.testing.expectEqual(@as(u64, 165 * std.time.ns_per_s), rekey_on_recv_threshold_ns);
-    try std.testing.expectEqual(@as(u64, 540 * std.time.ns_per_s), session_cleanup_time_ns);
+    try std.testing.expectEqual(@as(u64, 120_000), rekey_after_time_ms);
+    try std.testing.expectEqual(@as(u64, 180_000), reject_after_time_ms);
+    try std.testing.expectEqual(@as(u64, 90_000), rekey_attempt_time_ms);
+    try std.testing.expectEqual(@as(u64, 5_000), rekey_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 10_000), keepalive_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 165_000), rekey_on_recv_threshold_ms);
+    try std.testing.expectEqual(@as(u64, 540_000), session_cleanup_time_ms);
 }
 
 test "message constants values" {
@@ -70,6 +71,6 @@ test "message constants values" {
 
 test "rekey_on_recv_threshold calculation" {
     // reject_after_time - keepalive_timeout - rekey_timeout = 165s
-    const expected = reject_after_time_ns - keepalive_timeout_ns - rekey_timeout_ns;
-    try std.testing.expectEqual(expected, rekey_on_recv_threshold_ns);
+    const expected = reject_after_time_ms - keepalive_timeout_ms - rekey_timeout_ms;
+    try std.testing.expectEqual(expected, rekey_on_recv_threshold_ms);
 }

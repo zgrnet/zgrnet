@@ -4,7 +4,7 @@
 //! including handshake messages and transport messages.
 
 const std = @import("std");
-const crypto = @import("cipher.zig");
+const crypto = @import("crypto.zig");
 const keypair = @import("keypair.zig");
 
 const Key = keypair.Key;

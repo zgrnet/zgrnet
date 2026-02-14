@@ -1,28 +1,28 @@
 //! Stream - A multiplexed reliable stream over KCP.
 //!
-//! Uses comptime generics for zero-cost async primitives:
-//! - TimerServiceT: For KCP update scheduling (1ms interval)
-//! - Output is synchronous (caller provides callback)
+//! Generic over Runtime (Rt) for cross-platform sync primitives.
 //!
-//! ## Architecture
+//! ## Two usage modes:
 //!
+//! ### Manual mode (backward compatible):
 //! ```
-//! Mux<TimerServiceT>
-//!   ├── timer_service: *TimerServiceT (injected)
-//!   ├── streams: HashMap<u32, *Stream>
-//!   ├── update_handle: TimerHandle (KCP timer)
-//!   └── output_fn: callback to send data
+//! var mux = Mux.init(alloc, config, true, output_fn, on_new_stream, null);
+//! // Caller drives: mux.update(), mux.input(data)
+//! ```
+//!
+//! ### Auto mode (recommended):
+//! ```
+//! var mux = Mux.init(alloc, config, true, output_fn, on_new_stream, null);
+//! mux.start(recv_fn, null);   // spawns single runLoop thread
+//! // Just use stream.write() / stream.readBlocking()
+//! mux.stop();
 //! ```
 
 const std = @import("std");
 const kcp_mod = @import("kcp.zig");
 const ring_buffer = @import("ring_buffer.zig");
-const trait = @import("trait");
-const channel_pkg = @import("channel");
-const timer_pkg = @import("timer");
 
 const kcp = kcp_mod;
-const TimerHandle = timer_pkg.TimerHandle;
 
 /// Re-export RingBuffer for convenience
 pub const RingBuffer = ring_buffer.RingBuffer;
@@ -55,29 +55,42 @@ pub const MuxConfig = struct {
     max_frame_size: usize = 32 * 1024,
     max_receive_buffer: usize = 16 * 1024 * 1024, // 16MB to allow larger transfers
     update_interval_ms: u32 = 1, // KCP update interval
+    spawn_stack_size: u32 = 16384, // Stack size for spawned threads (recvLoop, updateLoop)
 };
 
-/// Output callback type.
+/// Output callback type — sends a frame to the network (encrypt + UDP send).
 pub const OutputFn = *const fn (data: []const u8, user_data: ?*anyopaque) anyerror!void;
 
-/// Callback when a new stream is accepted.
-pub const OnNewStreamFn = *const fn (stream: *Stream, user_data: ?*anyopaque) void;
+/// Receive callback type — blocks until a packet arrives (UDP recv + decrypt).
+/// Returns the number of decrypted bytes written to buf, or error.
+/// Should return error.Timeout or error.Closed to allow the recv loop to check stop flag.
+pub const RecvFn = *const fn (buf: []u8, user_data: ?*anyopaque) anyerror!usize;
 
-/// Stream represents a multiplexed stream over KCP.
-/// Uses fine-grained locking for better concurrency.
-pub const Stream = struct {
+/// Callback when a new stream is accepted (type-erased stream pointer).
+pub const OnNewStreamFn = *const fn (stream: *anyopaque, user_data: ?*anyopaque) void;
+
+/// Stream represents a multiplexed reliable stream over KCP.
+/// Generic over Runtime type for cross-platform sync primitives.
+///
+/// Rt must provide:
+///   - Rt.Mutex: with init(), deinit(), lock(), unlock()
+///   - Rt.Condition: with init(), deinit(), wait(*Mutex), timedWait(*Mutex, u64), signal(), broadcast()
+pub fn Stream(comptime Rt: type) type {
+    return struct {
+    const Self = @This();
+
     id: u32,
-    proto: u8, // Stream protocol type (from SYN payload)
-    metadata: []const u8, // Stream metadata (from SYN payload), owned
-    mux_ptr: *anyopaque, // Type-erased Mux pointer (to avoid circular comptime dependency)
+    proto: u8,
+    metadata: []const u8,
+    mux_ptr: *anyopaque,
     send_frame_fn: *const fn (mux: *anyopaque, cmd: kcp.Cmd, stream_id: u32, payload: []const u8) anyerror!void,
     kcp_instance: ?kcp.Kcp,
     recv_buf: RingBuffer(u8),
     allocator: std.mem.Allocator,
 
-    // Fine-grained locks
-    kcp_mutex: std.Thread.Mutex,
-    recv_mutex: std.Thread.Mutex,
+    // Fine-grained locks (from Rt)
+    kcp_mutex: Rt.Mutex,
+    recv_mutex: Rt.Mutex,
 
     // Atomic state
     state: std.atomic.Value(StreamState),
@@ -89,8 +102,8 @@ pub const Stream = struct {
     // Max receive buffer (from config)
     max_receive_buffer: usize,
 
-    // Condition variable for blocking read
-    data_available: std.Thread.Condition,
+    // Condition variable for blocking read (from Rt)
+    data_available: Rt.Condition,
 
     /// Initialize a new stream with protocol type and metadata.
     pub fn init(
@@ -101,17 +114,16 @@ pub const Stream = struct {
         mux_ptr: *anyopaque,
         send_frame_fn: *const fn (*anyopaque, kcp.Cmd, u32, []const u8) anyerror!void,
         max_recv_buf: usize,
-    ) !*Stream {
-        const self = try allocator.create(Stream);
+    ) !*Self {
+        const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
 
-        // Copy metadata to owned memory
         const meta_copy = if (metadata.len > 0)
             try allocator.dupe(u8, metadata)
         else
             &[_]u8{};
 
-        self.* = Stream{
+        self.* = Self{
             .id = id,
             .proto = proto,
             .metadata = meta_copy,
@@ -120,17 +132,16 @@ pub const Stream = struct {
             .kcp_instance = null,
             .recv_buf = RingBuffer(u8).init(allocator),
             .allocator = allocator,
-            .kcp_mutex = .{},
-            .recv_mutex = .{},
+            .kcp_mutex = Rt.Mutex.init(),
+            .recv_mutex = Rt.Mutex.init(),
             .state = std.atomic.Value(StreamState).init(.open),
             .output_error = std.atomic.Value(bool).init(false),
             .ref_count = std.atomic.Value(u32).init(1),
             .max_receive_buffer = max_recv_buf,
-            .data_available = .{},
+            .data_available = Rt.Condition.init(),
         };
 
-        // Create KCP with output callback
-        self.kcp_instance = try kcp.Kcp.init(id, &Stream.kcpOutput, self);
+        self.kcp_instance = try kcp.Kcp.init(id, &Self.kcpOutput, self);
         if (self.kcp_instance) |*k| {
             k.setUserPtr();
             k.setDefaultConfig();
@@ -140,12 +151,12 @@ pub const Stream = struct {
     }
 
     /// Increment reference count.
-    pub fn retain(self: *Stream) void {
+    pub fn retain(self: *Self) void {
         _ = self.ref_count.fetchAdd(1, .seq_cst);
     }
 
     /// Decrement reference count and free if zero.
-    pub fn release(self: *Stream) bool {
+    pub fn release(self: *Self) bool {
         const old = self.ref_count.fetchSub(1, .seq_cst);
         if (old == 1) {
             self.deinitInternal();
@@ -155,12 +166,12 @@ pub const Stream = struct {
     }
 
     /// Close the stream (user API).
-    pub fn close(self: *Stream) void {
+    pub fn close(self: *Self) void {
         self.shutdown();
         _ = self.release();
     }
 
-    fn deinitInternal(self: *Stream) void {
+    fn deinitInternal(self: *Self) void {
         if (self.kcp_instance) |*k| {
             k.deinit();
         }
@@ -168,33 +179,41 @@ pub const Stream = struct {
             self.allocator.free(@constCast(self.metadata));
         }
         self.recv_buf.deinit();
+        // Release sync primitives (important on ESP32/FreeRTOS where
+        // Mutex/Condition wrap OS semaphores)
+        self.data_available.deinit();
+        self.recv_mutex.deinit();
+        self.kcp_mutex.deinit();
         self.allocator.destroy(self);
     }
 
     /// Get stream ID.
-    pub fn getId(self: *const Stream) u32 {
+    pub fn getId(self: *const Self) u32 {
         return self.id;
     }
 
     /// Get stream protocol type (from SYN payload).
     /// Returns 0 (RAW) if no protocol was specified.
-    pub fn getProto(self: *const Stream) u8 {
+    pub fn getProto(self: *const Self) u8 {
         return self.proto;
     }
 
     /// Get stream metadata (from SYN payload).
     /// Returns empty slice if no metadata was specified.
-    pub fn getMetadata(self: *const Stream) []const u8 {
+    pub fn getMetadata(self: *const Self) []const u8 {
         return self.metadata;
     }
 
     /// Get stream state.
-    pub fn getState(self: *const Stream) StreamState {
+    pub fn getState(self: *const Self) StreamState {
         return self.state.load(.seq_cst);
     }
 
     /// Write data to the stream.
-    pub fn write(self: *Stream, data: []const u8) StreamError!usize {
+    /// Data is queued to KCP's send buffer. The runLoop thread flushes
+    /// it on the next mux.update() cycle (~1ms), keeping all encrypt
+    /// calls on a single thread.
+    pub fn write(self: *Self, data: []const u8) StreamError!usize {
         const current_state = self.state.load(.seq_cst);
         if (current_state == .closed or current_state == .local_close) {
             return StreamError.StreamClosed;
@@ -208,7 +227,6 @@ pub const Stream = struct {
             if (ret < 0) {
                 return StreamError.KcpSendFailed;
             }
-            k.flush();
             return data.len;
         }
 
@@ -216,7 +234,7 @@ pub const Stream = struct {
     }
 
     /// Flush pending data.
-    pub fn flush(self: *Stream) StreamError!void {
+    pub fn flush(self: *Self) StreamError!void {
         self.kcp_mutex.lock();
         defer self.kcp_mutex.unlock();
 
@@ -227,7 +245,7 @@ pub const Stream = struct {
 
     /// Read data from the stream (non-blocking).
     /// Returns 0 if no data available or EOF.
-    pub fn read(self: *Stream, buffer: []u8) StreamError!usize {
+    pub fn read(self: *Self, buffer: []u8) StreamError!usize {
         self.recv_mutex.lock();
         defer self.recv_mutex.unlock();
 
@@ -244,7 +262,7 @@ pub const Stream = struct {
 
     /// Read data from the stream (blocking).
     /// Blocks until data is available, EOF, or timeout.
-    pub fn readBlocking(self: *Stream, buffer: []u8, timeout_ns: ?u64) StreamError!usize {
+    pub fn readBlocking(self: *Self, buffer: []u8, timeout_ns: ?u64) StreamError!usize {
         self.recv_mutex.lock();
         defer self.recv_mutex.unlock();
 
@@ -256,10 +274,8 @@ pub const Stream = struct {
             }
 
             if (timeout_ns) |ns| {
-                self.data_available.timedWait(&self.recv_mutex, ns) catch {
-                    // Timeout
-                    return 0;
-                };
+                const result = self.data_available.timedWait(&self.recv_mutex, ns);
+                if (result == .timed_out) return StreamError.Timeout;
             } else {
                 self.data_available.wait(&self.recv_mutex);
             }
@@ -269,7 +285,7 @@ pub const Stream = struct {
     }
 
     /// Shutdown write side.
-    pub fn shutdown(self: *Stream) void {
+    pub fn shutdown(self: *Self) void {
         const current_state = self.state.load(.seq_cst);
         if (current_state == .closed or current_state == .local_close) return;
 
@@ -287,7 +303,7 @@ pub const Stream = struct {
     }
 
     /// Input data from KCP.
-    pub fn kcpInput(self: *Stream, data: []const u8) void {
+    pub fn kcpInput(self: *Self, data: []const u8) void {
         if (self.state.load(.seq_cst) == .closed) return;
 
         self.kcp_mutex.lock();
@@ -299,7 +315,7 @@ pub const Stream = struct {
     }
 
     /// Receive from KCP and buffer.
-    pub fn kcpRecv(self: *Stream) bool {
+    pub fn kcpRecv(self: *Self) bool {
         var received = false;
         var stack_buf: [1500]u8 = undefined;
         var heap_buf: ?[]u8 = null;
@@ -355,7 +371,7 @@ pub const Stream = struct {
     }
 
     /// Update KCP state.
-    pub fn kcpUpdate(self: *Stream, current: u32) void {
+    pub fn kcpUpdate(self: *Self, current: u32) void {
         if (self.state.load(.seq_cst) == .closed) return;
 
         self.kcp_mutex.lock();
@@ -367,7 +383,7 @@ pub const Stream = struct {
     }
 
     /// Handle FIN from remote.
-    pub fn handleFin(self: *Stream) void {
+    pub fn handleFin(self: *Self) void {
         const current_state = self.state.load(.seq_cst);
         if (current_state == .local_close) {
             self.state.store(.closed, .seq_cst);
@@ -381,53 +397,87 @@ pub const Stream = struct {
     /// KCP output callback.
     fn kcpOutput(data: []const u8, user: ?*anyopaque) void {
         if (user) |u| {
-            const stream: *Stream = @ptrCast(@alignCast(u));
+            const stream: *Self = @ptrCast(@alignCast(u));
             stream.send_frame_fn(stream.mux_ptr, .psh, stream.id, data) catch |err| {
                 stream.output_error.store(true, .seq_cst);
                 std.log.err("Stream {d} output error: {s}", .{ stream.id, @errorName(err) });
             };
         }
     }
-};
+
+    };  // return struct
+}  // pub fn Stream
 
 /// Mux multiplexes streams over a single connection.
-/// Uses comptime generics for zero-cost timer scheduling.
+/// Generic over Runtime type for cross-platform sync + timer.
 ///
-/// - `Rt`: Runtime type providing Mutex/Condition (for Channel)
-/// - `TimerServiceT`: Timer service with schedule/cancel (for KCP updates)
-pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
-    // Compile-time check for TimerService interface
-    comptime {
-        if (!@hasDecl(TimerServiceT, "schedule")) @compileError("TimerService missing schedule()");
-        if (!@hasDecl(TimerServiceT, "cancel")) @compileError("TimerService missing cancel()");
-    }
-
-    const AcceptChan = channel_pkg.Channel(*Stream, 16, Rt);
+/// Rt must provide:
+///   - Rt.Mutex: sync.Mutex trait (with init/deinit/lock/unlock)
+///   - Rt.Condition: sync.Condition trait (with timedWait)
+///   - Rt.Thread: joinable thread (with spawn/join)
+///   - Rt.nowMs() -> u64: current time in milliseconds
+///   - Rt.sleepMs(ms) -> void: sleep for milliseconds
+pub fn Mux(comptime Rt: type) type {
+    const StreamType = Stream(Rt);
 
     return struct {
         const Self = @This();
 
         config: MuxConfig,
-        timer_service: *TimerServiceT,
         output_fn: OutputFn,
         on_new_stream: OnNewStreamFn,
         user_data: ?*anyopaque,
         is_client: bool,
-        streams: std.AutoHashMap(u32, *Stream),
+        streams: std.AutoHashMap(u32, *StreamType),
         next_id: u32,
         closed: std.atomic.Value(bool),
         allocator: std.mem.Allocator,
-        mutex: std.Thread.Mutex,
-        update_handle: TimerHandle,
+        mutex: Rt.Mutex,
         ref_count: std.atomic.Value(u32),
 
-        // Accept channel for incoming streams (comptime-sized, inline)
-        accept_chan: AcceptChan,
+        // Accept queue for incoming streams (simple bounded buffer)
+        accept_queue: AcceptQueue,
+        accept_cond: Rt.Condition,
+
+        // Output serialization — ensures CipherState nonce ordering
+        // (output_fn may be called from main thread via openStream/write
+        //  AND from updateLoop thread via kcp.update flush)
+        output_mutex: Rt.Mutex,
+
+        // Auto mode: recv callback + stop flag + joinable thread
+        recv_fn: ?RecvFn,
+        recv_user_data: ?*anyopaque,
+        stop_flag: std.atomic.Value(bool),
+        run_thread: ?Rt.Thread,
+
+        const AcceptQueue = struct {
+            buf: [16]?*StreamType = [_]?*StreamType{null} ** 16,
+            head: usize = 0,
+            tail: usize = 0,
+            len: usize = 0,
+            is_closed: bool = false,
+
+            fn push(self: *AcceptQueue, item: *StreamType) bool {
+                if (self.len >= 16) return false;
+                self.buf[self.tail] = item;
+                self.tail = (self.tail + 1) % 16;
+                self.len += 1;
+                return true;
+            }
+
+            fn pop(self: *AcceptQueue) ?*StreamType {
+                if (self.len == 0) return null;
+                const item = self.buf[self.head];
+                self.buf[self.head] = null;
+                self.head = (self.head + 1) % 16;
+                self.len -= 1;
+                return item;
+            }
+        };
 
         /// Initialize a new Mux.
         pub fn init(
             allocator: std.mem.Allocator,
-            timer_service: *TimerServiceT,
             config: MuxConfig,
             is_client: bool,
             output_fn: OutputFn,
@@ -439,72 +489,97 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
 
             self.* = Self{
                 .config = config,
-                .timer_service = timer_service,
                 .output_fn = output_fn,
                 .on_new_stream = on_new_stream,
                 .user_data = user_data,
                 .is_client = is_client,
-                .streams = std.AutoHashMap(u32, *Stream).init(allocator),
+                .streams = std.AutoHashMap(u32, *StreamType).init(allocator),
                 .next_id = if (is_client) 1 else 2,
                 .closed = std.atomic.Value(bool).init(false),
                 .allocator = allocator,
-                .mutex = .{},
-                .update_handle = TimerHandle.null_handle,
+                .mutex = Rt.Mutex.init(),
                 .ref_count = std.atomic.Value(u32).init(1),
-                .accept_chan = AcceptChan.init(),
+                .accept_queue = .{},
+                .accept_cond = Rt.Condition.init(),
+                .output_mutex = Rt.Mutex.init(),
+                .recv_fn = null,
+                .recv_user_data = null,
+                .stop_flag = std.atomic.Value(bool).init(false),
+                .run_thread = null,
             };
-
-            // Schedule first KCP update
-            self.scheduleUpdate();
 
             return self;
         }
 
-        /// Schedule the next KCP update.
-        fn scheduleUpdate(self: *Self) void {
-            if (self.closed.load(.acquire)) return;
+        // ================================================================
+        // Auto mode: start/stop (single runLoop thread)
+        // ================================================================
 
-            self.update_handle = self.timer_service.schedule(
-                self.config.update_interval_ms,
-                onUpdateTimer,
-                @ptrCast(self),
-            );
+        /// Start auto mode: spawn a single runLoop background thread.
+        /// The runLoop handles both recv and KCP update in one loop.
+        /// After start(), just use stream.write() / stream.readBlocking().
+        pub fn start(self: *Self, recv_fn: RecvFn, recv_user_data: ?*anyopaque) !void {
+            self.recv_fn = recv_fn;
+            self.recv_user_data = recv_user_data;
+            self.stop_flag.store(false, .release);
+            self.run_thread = Rt.Thread.spawn(.{}, runLoopWrapper, .{self});
         }
 
-        /// Timer callback wrapper — dispatches to doUpdate.
-        fn onUpdateTimer(ctx: ?*anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            self.doUpdate();
+        /// Stop auto mode: signal the runLoop to exit and join the thread.
+        pub fn stop(self: *Self) void {
+            self.stop_flag.store(true, .release);
+            if (self.run_thread) |t| {
+                t.join();
+                self.run_thread = null;
+            }
         }
 
-        /// KCP update task (called by timer).
-        fn doUpdate(self: *Self) void {
+        /// Wrapper for runLoop (matches Rt.Thread.spawn signature).
+        fn runLoopWrapper(self: *Self) void {
+            self.runLoop();
+        }
+
+        /// Combined recv + update loop (single thread).
+        /// recv_fn should have a short timeout (~1ms) so update runs frequently.
+        fn runLoop(self: *Self) void {
+            const recv_fn = self.recv_fn orelse return;
+            var buf: [2048]u8 = undefined;
+
+            while (!self.stop_flag.load(.acquire)) {
+                // Recv: non-blocking or short timeout
+                const n = recv_fn(&buf, self.recv_user_data) catch 0;
+                if (n > 0) {
+                    self.input(buf[0..n]) catch {};
+                }
+                // Update: flush KCP, process retransmits
+                self.update();
+            }
+        }
+
+        // ================================================================
+        // Manual mode (backward compatible)
+        // ================================================================
+
+        /// Update all KCP streams. Call this periodically (every 1-10ms).
+        pub fn update(self: *Self) void {
             if (self.closed.load(.acquire)) return;
 
-            const current: u32 = @intCast(@mod(std.time.milliTimestamp(), std.math.maxInt(u32)));
+            const current: u32 = @intCast(Rt.nowMs() & 0xFFFFFFFF);
 
-            // Collect all streams with dynamic array to avoid missing any
-            var stream_list: std.ArrayListUnmanaged(*Stream) = .{};
+            var stream_list: std.ArrayListUnmanaged(*StreamType) = .{};
             defer stream_list.deinit(self.allocator);
 
             self.mutex.lock();
             var iter = self.streams.valueIterator();
             while (iter.next()) |stream_ptr| {
-                stream_list.append(self.allocator, stream_ptr.*) catch {
-                    // On OOM, update what we have so far
-                    break;
-                };
+                stream_list.append(self.allocator, stream_ptr.*) catch break;
             }
             self.mutex.unlock();
 
-            // Update outside lock
             for (stream_list.items) |stream| {
                 stream.kcpUpdate(current);
                 _ = stream.kcpRecv();
             }
-
-            // Schedule next update
-            self.scheduleUpdate();
         }
 
         /// Retain reference.
@@ -524,16 +599,17 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
 
         /// Close the Mux.
         pub fn deinit(self: *Self) void {
+            // Stop auto-mode threads first
+            if (self.recv_fn != null) {
+                self.stop();
+            }
+
             self.closed.store(true, .release);
 
-            // Cancel timer
-            self.timer_service.cancel(self.update_handle);
-
-            // Close accept channel
-            self.accept_chan.close();
-
-            // Release all streams
+            // Release all streams and wake blocked acceptors under mutex
             self.mutex.lock();
+            self.accept_queue.is_closed = true;
+            self.accept_cond.broadcast();
             var iter = self.streams.valueIterator();
             while (iter.next()) |stream_ptr| {
                 stream_ptr.*.state.store(.closed, .seq_cst);
@@ -546,7 +622,11 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
         }
 
         fn deinitInternal(self: *Self) void {
-            self.accept_chan.deinit();
+            // Release sync primitives (important on ESP32/FreeRTOS where
+            // Mutex/Condition wrap OS semaphores)
+            self.output_mutex.deinit();
+            self.accept_cond.deinit();
+            self.mutex.deinit();
             self.allocator.destroy(self);
         }
 
@@ -556,10 +636,7 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
         }
 
         /// Open a new stream with protocol type and metadata.
-        /// The proto and metadata are sent in the SYN frame payload so the remote
-        /// side can identify the stream type upon acceptance.
-        /// Use proto=0 (RAW) and metadata=&.{} for untyped streams.
-        pub fn openStream(self: *Self, proto: u8, metadata: []const u8) MuxError!*Stream {
+        pub fn openStream(self: *Self, proto: u8, metadata: []const u8) MuxError!*StreamType {
             if (self.closed.load(.acquire)) return MuxError.MuxClosed;
 
             self.mutex.lock();
@@ -568,7 +645,7 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
             const id = self.next_id;
             self.next_id += 2;
 
-            const stream = Stream.init(
+            const stream = StreamType.init(
                 self.allocator,
                 id,
                 proto,
@@ -606,13 +683,35 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
         }
 
         /// Accept an incoming stream (blocks until available or closed).
-        pub fn acceptStream(self: *Self) ?*Stream {
-            return self.accept_chan.recv();
+        pub fn acceptStream(self: *Self) ?*StreamType {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            while (self.accept_queue.len == 0) {
+                if (self.accept_queue.is_closed) return null;
+                self.accept_cond.wait(&self.mutex);
+            }
+            return self.accept_queue.pop();
+        }
+
+        /// Accept with timeout (nanoseconds). Returns null on timeout or closed.
+        pub fn acceptStreamTimeout(self: *Self, timeout_ns: u64) ?*StreamType {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            while (self.accept_queue.len == 0) {
+                if (self.accept_queue.is_closed) return null;
+                const result = self.accept_cond.timedWait(&self.mutex, timeout_ns);
+                if (result == .timed_out) return null;
+            }
+            return self.accept_queue.pop();
         }
 
         /// Try to accept a stream without blocking.
-        pub fn tryAcceptStream(self: *Self) ?*Stream {
-            return self.accept_chan.tryRecv();
+        pub fn tryAcceptStream(self: *Self) ?*StreamType {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.accept_queue.pop();
         }
 
         /// Input a frame from the network.
@@ -635,11 +734,10 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
         fn handleSynWithPayload(self: *Self, id: u32, payload: []const u8) void {
             if (self.streams.contains(id)) return;
 
-            // Parse proto + metadata from SYN payload
             const proto: u8 = if (payload.len >= 1) payload[0] else 0;
             const metadata: []const u8 = if (payload.len > 1) payload[1..] else &[_]u8{};
 
-            const stream = Stream.init(
+            const stream = StreamType.init(
                 self.allocator,
                 id,
                 proto,
@@ -654,15 +752,17 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
                 return;
             };
 
-            // Push to accept channel
-            stream.retain(); // Reference for accept channel
-            self.accept_chan.trySend(stream) catch {
-                _ = stream.release(); // Channel full or closed
-            };
+            // Push to accept queue
+            stream.retain();
+            if (!self.accept_queue.push(stream)) {
+                _ = stream.release(); // Queue full
+            } else {
+                self.accept_cond.signal();
+            }
 
-            // Also call callback
+            // Also call callback (type-erased)
             self.mutex.unlock();
-            self.on_new_stream(stream, self.user_data);
+            self.on_new_stream(@ptrCast(stream), self.user_data);
             self.mutex.lock();
         }
 
@@ -701,6 +801,12 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
             const required_size = kcp.FrameHeaderSize + payload.len;
             var stack_buf: [1500]u8 = undefined;
 
+            // output_mutex serializes ALL output_fn calls across threads.
+            // This ensures CipherState nonce ordering: encrypt+sendto are atomic,
+            // so packet order on the wire matches nonce sequence.
+            self.output_mutex.lock();
+            defer self.output_mutex.unlock();
+
             if (required_size <= stack_buf.len) {
                 const encoded = try frame.encode(&stack_buf);
                 try self.output_fn(encoded, self.user_data);
@@ -733,18 +839,44 @@ pub fn Mux(comptime Rt: type, comptime TimerServiceT: type) type {
 }
 
 // ============================================================================
+// Test Runtime (uses std.Thread for tests only)
+// ============================================================================
+
+const TestRuntime = if (@import("builtin").os.tag != .freestanding) struct {
+    pub const Mutex = struct {
+        inner: std.Thread.Mutex = .{},
+        pub fn init() Mutex { return .{}; }
+        pub fn deinit(_: *Mutex) void {}
+        pub fn lock(self: *Mutex) void { self.inner.lock(); }
+        pub fn unlock(self: *Mutex) void { self.inner.unlock(); }
+    };
+    pub const Condition = struct {
+        inner: std.Thread.Condition = .{},
+        pub const TimedWaitResult = enum { signaled, timed_out };
+        pub fn init() Condition { return .{}; }
+        pub fn deinit(_: *Condition) void {}
+        pub fn wait(self: *Condition, mutex: *Mutex) void { self.inner.wait(&mutex.inner); }
+        pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) TimedWaitResult {
+            return if (self.inner.timedWait(&mutex.inner, timeout_ns) == .timed_out) .timed_out else .signaled;
+        }
+        pub fn signal(self: *Condition) void { self.inner.signal(); }
+        pub fn broadcast(self: *Condition) void { self.inner.broadcast(); }
+    };
+    pub const Thread = std.Thread;
+    pub fn nowMs() u64 {
+        return @intCast(std.time.milliTimestamp());
+    }
+    pub fn sleepMs(ms: u32) void {
+        std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
+    }
+} else struct {};
+
+// ============================================================================
 // Tests
 // ============================================================================
 
-test "Mux comptime check" {
-    // Verify the type compiles with a minimal Rt and TimerService
-    const TestRt = @import("std_impl").runtime;
-    const TimerSvc = timer_pkg.TimerService(TestRt);
-    const MuxType = Mux(TestRt, TimerSvc);
-    _ = MuxType;
-}
-
 test "Stream init deinit" {
+    if (@import("builtin").os.tag == .freestanding) return;
     const allocator = std.testing.allocator;
 
     const DummyMux = struct {
@@ -752,7 +884,8 @@ test "Stream init deinit" {
     };
 
     var dummy: u8 = 0;
-    const stream = try Stream.init(allocator, 1, 0, &[_]u8{}, &dummy, DummyMux.sendFrame, 256 * 1024);
+    const StreamT = Stream(TestRuntime);
+    const stream = try StreamT.init(allocator, 1, 0, &[_]u8{}, &dummy, DummyMux.sendFrame, 256 * 1024);
     defer _ = stream.release();
 
     try std.testing.expectEqual(@as(u32, 1), stream.getId());

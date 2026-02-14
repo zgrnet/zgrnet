@@ -1,7 +1,9 @@
 //! Replay protection using sliding window.
+//!
+//! This module is NOT thread-safe. The caller must provide external
+//! synchronization if used concurrently.
 
 const std = @import("std");
-const Mutex = std.Thread.Mutex;
 
 /// Size of the sliding window in bits.
 pub const window_size: usize = 2048;
@@ -12,8 +14,9 @@ const window_words: usize = window_size / 64;
 /// Replay filter using sliding window algorithm.
 ///
 /// Tracks received nonces and rejects duplicates or nonces that are too old.
+///
+/// NOT thread-safe. Caller must synchronize access externally.
 pub const ReplayFilter = struct {
-    mutex: Mutex = .{},
     bitmap: [window_words]u64 = [_]u64{0} ** window_words,
     max_nonce: u64 = 0,
 
@@ -24,13 +27,7 @@ pub const ReplayFilter = struct {
 
     /// Checks if a nonce is valid (not a replay).
     /// Returns true if valid, false if replay.
-    pub fn check(self: *ReplayFilter, nonce: u64) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.checkLocked(nonce);
-    }
-
-    fn checkLocked(self: *const ReplayFilter, nonce: u64) bool {
+    pub fn check(self: *const ReplayFilter, nonce: u64) bool {
         if (nonce > self.max_nonce) {
             return true;
         }
@@ -47,12 +44,6 @@ pub const ReplayFilter = struct {
 
     /// Updates the filter with a nonce.
     pub fn update(self: *ReplayFilter, nonce: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.updateLocked(nonce);
-    }
-
-    fn updateLocked(self: *ReplayFilter, nonce: u64) void {
         if (nonce > self.max_nonce) {
             const shift = nonce - self.max_nonce;
             self.slideWindow(shift);
@@ -71,12 +62,10 @@ pub const ReplayFilter = struct {
     /// Atomically checks and updates.
     /// Returns true if nonce is valid and was recorded.
     pub fn checkAndUpdate(self: *ReplayFilter, nonce: u64) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (!self.checkLocked(nonce)) {
+        if (!self.check(nonce)) {
             return false;
         }
-        self.updateLocked(nonce);
+        self.update(nonce);
         return true;
     }
 
@@ -89,17 +78,13 @@ pub const ReplayFilter = struct {
         const word_shift: usize = @intCast(shift / 64);
         const bit_shift: u6 = @intCast(shift % 64);
 
-        // First handle word shifts using memmove for efficiency
         if (word_shift > 0) {
             const src = self.bitmap[0 .. window_words - word_shift];
             const dst = self.bitmap[word_shift..window_words];
-            // Use backward copy to handle overlapping regions
             std.mem.copyBackwards(u64, dst, src);
-            // Clear the lower words
             @memset(self.bitmap[0..word_shift], 0);
         }
 
-        // Then handle bit shifts
         if (bit_shift > 0) {
             var carry: u64 = 0;
             const complement_shift: u6 = @intCast(64 - @as(u7, bit_shift));
@@ -113,16 +98,12 @@ pub const ReplayFilter = struct {
 
     /// Resets the filter.
     pub fn reset(self: *ReplayFilter) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         self.bitmap = [_]u64{0} ** window_words;
         self.max_nonce = 0;
     }
 
     /// Returns the highest nonce seen.
-    pub fn maxNonce(self: *ReplayFilter) u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn maxNonce(self: *const ReplayFilter) u64 {
         return self.max_nonce;
     }
 };
@@ -144,11 +125,9 @@ test "duplicate" {
 test "out of order" {
     var rf = ReplayFilter.init();
     const nonces = [_]u64{ 100, 50, 75, 25, 99, 1 };
-
     for (nonces) |n| {
         try std.testing.expect(rf.checkAndUpdate(n));
     }
-
     for (nonces) |n| {
         try std.testing.expect(!rf.checkAndUpdate(n));
     }
@@ -156,27 +135,18 @@ test "out of order" {
 
 test "window boundary" {
     var rf = ReplayFilter.init();
-
     try std.testing.expect(rf.checkAndUpdate(window_size + 100));
-
-    // Just within window
     try std.testing.expect(rf.checkAndUpdate(101));
-
-    // Outside window
     try std.testing.expect(!rf.checkAndUpdate(100));
 }
 
 test "too old" {
     var rf = ReplayFilter.init();
     try std.testing.expect(rf.checkAndUpdate(5000));
-
-    // Outside window (5000 - 2047 = 2953)
     const outside = [_]u64{ 0, 1, 100, 2952 };
     for (outside) |n| {
         try std.testing.expect(!rf.checkAndUpdate(n));
     }
-
-    // Within window
     const inside = [_]u64{ 2953, 3000, 4000, 4999 };
     for (inside) |n| {
         try std.testing.expect(rf.checkAndUpdate(n));
@@ -185,13 +155,10 @@ test "too old" {
 
 test "large jump" {
     var rf = ReplayFilter.init();
-
     for (0..10) |i| {
         _ = rf.checkAndUpdate(i);
     }
-
     try std.testing.expect(rf.checkAndUpdate(10000));
-
     for (0..10) |i| {
         try std.testing.expect(!rf.checkAndUpdate(i));
     }
@@ -200,26 +167,20 @@ test "large jump" {
 test "max nonce" {
     var rf = ReplayFilter.init();
     try std.testing.expectEqual(@as(u64, 0), rf.maxNonce());
-
     _ = rf.checkAndUpdate(100);
     try std.testing.expectEqual(@as(u64, 100), rf.maxNonce());
-
     _ = rf.checkAndUpdate(50);
     try std.testing.expectEqual(@as(u64, 100), rf.maxNonce());
-
     _ = rf.checkAndUpdate(200);
     try std.testing.expectEqual(@as(u64, 200), rf.maxNonce());
 }
 
 test "reset" {
     var rf = ReplayFilter.init();
-
     for (0..100) |i| {
         _ = rf.checkAndUpdate(i);
     }
-
     rf.reset();
-
     for (0..100) |i| {
         try std.testing.expect(rf.checkAndUpdate(i));
     }
@@ -227,22 +188,18 @@ test "reset" {
 
 test "check without update" {
     var rf = ReplayFilter.init();
-
     try std.testing.expect(rf.check(100));
-    try std.testing.expect(rf.check(100)); // Still true
-
+    try std.testing.expect(rf.check(100));
     rf.update(100);
-    try std.testing.expect(!rf.check(100)); // Now false
+    try std.testing.expect(!rf.check(100));
 }
 
 test "bit boundaries" {
     var rf = ReplayFilter.init();
-
     const boundaries = [_]u64{ 63, 64, 65, 127, 128, 129, 2047 };
     for (boundaries) |n| {
         try std.testing.expect(rf.checkAndUpdate(n));
     }
-
     for (boundaries) |n| {
         try std.testing.expect(!rf.checkAndUpdate(n));
     }

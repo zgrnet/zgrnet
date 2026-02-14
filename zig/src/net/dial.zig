@@ -2,7 +2,7 @@
 //!
 //! This module provides a `dial` function that creates a connection
 //! and performs the handshake with the remote peer using WireGuard-style
-//! retry mechanism.
+//! retry mechanism. Generic over Crypto and Runtime.
 
 const std = @import("std");
 const noise = @import("../noise/mod.zig");
@@ -10,21 +10,12 @@ const conn_mod = @import("conn.zig");
 const consts = @import("consts.zig");
 
 const Key = noise.Key;
-const KeyPair = noise.KeyPair;
 const key_size = noise.key_size;
 const Transport = noise.Transport;
 const TransportError = noise.transport.TransportError;
 const Addr = noise.Addr;
-const HandshakeState = noise.HandshakeState;
-const Pattern = noise.Pattern;
-const Session = noise.Session;
 const SessionConfig = noise.SessionConfig;
 const message = noise.message;
-
-const Conn = conn_mod.Conn;
-const ConnConfig = conn_mod.ConnConfig;
-const ConnState = conn_mod.ConnState;
-const ConnError = conn_mod.ConnError;
 
 /// Dial errors.
 pub const DialError = error{
@@ -44,22 +35,27 @@ pub const DialError = error{
     OutOfMemory,
 };
 
-/// Options for dialing a remote peer.
-pub const DialOptions = struct {
-    /// Memory allocator.
-    allocator: std.mem.Allocator,
-    /// Local static key pair.
-    local_key: KeyPair,
-    /// Remote peer's public key.
-    remote_pk: Key,
-    /// Underlying datagram transport.
-    transport: Transport,
-    /// Remote peer's address.
-    remote_addr: Addr,
-    /// Deadline in nanoseconds (absolute timestamp).
-    /// If null, defaults to now + REKEY_ATTEMPT_TIME (90s).
-    deadline_ns: ?i128 = null,
-};
+/// Options for dialing a remote peer (generic over Crypto).
+pub fn DialOptions(comptime Crypto: type) type {
+    const P = noise.Protocol(Crypto);
+    const KeyPair = P.KeyPair;
+
+    return struct {
+        /// Memory allocator.
+        allocator: std.mem.Allocator,
+        /// Local static key pair.
+        local_key: KeyPair,
+        /// Remote peer's public key.
+        remote_pk: Key,
+        /// Underlying datagram transport.
+        transport: Transport,
+        /// Remote peer's address.
+        remote_addr: Addr,
+        /// Deadline in milliseconds (absolute timestamp).
+        /// If null, defaults to now + REKEY_ATTEMPT_TIME (90s).
+        deadline_ms: ?i64 = null,
+    };
+}
 
 /// Dials a remote peer and returns an established connection.
 ///
@@ -68,18 +64,23 @@ pub const DialOptions = struct {
 /// - Waits up to REKEY_TIMEOUT (5s) for response
 /// - Retransmits with new ephemeral keys on timeout
 /// - Gives up after deadline is reached
-pub fn dial(opts: DialOptions) DialError!*Conn {
+pub fn dial(comptime Crypto: type, comptime Rt: type, opts: DialOptions(Crypto)) DialError!*conn_mod.Conn(Crypto, Rt) {
+    const P = noise.Protocol(Crypto);
+    const HandshakeState = P.HandshakeState;
+    const Session = P.Session;
+    const ConnType = conn_mod.Conn(Crypto, Rt);
+
     // Validate inputs
     if (opts.remote_pk.isZero()) {
         return DialError.MissingRemotePK;
     }
 
-    const now = std.time.nanoTimestamp();
-    const deadline = opts.deadline_ns orelse (now + @as(i128, consts.rekey_attempt_time_ns));
+    const now: i64 = @intCast(Rt.nowMs());
+    const deadline = opts.deadline_ms orelse (now + @as(i64, consts.rekey_attempt_time_ms));
 
     // Create the connection
-    const conn = opts.allocator.create(Conn) catch return DialError.OutOfMemory;
-    conn.* = Conn.init(opts.allocator, .{
+    const conn = opts.allocator.create(ConnType) catch return DialError.OutOfMemory;
+    conn.* = ConnType.init(opts.allocator, .{
         .local_key = opts.local_key,
         .remote_pk = opts.remote_pk,
         .transport = opts.transport,
@@ -95,7 +96,7 @@ pub fn dial(opts: DialOptions) DialError!*Conn {
     // Retry loop with fresh ephemeral keys each attempt
     while (true) {
         // Check deadline
-        const current_time = std.time.nanoTimestamp();
+        const current_time: i64 = @intCast(Rt.nowMs());
         if (current_time >= deadline) {
             conn.setState(.new);
             opts.allocator.destroy(conn);
@@ -144,8 +145,8 @@ pub fn dial(opts: DialOptions) DialError!*Conn {
         };
 
         // Calculate read deadline: min(now + REKEY_TIMEOUT, total deadline)
-        const recv_time = std.time.nanoTimestamp();
-        const rekey_deadline = recv_time + @as(i128, consts.rekey_timeout_ns);
+        const recv_time: i64 = @intCast(Rt.nowMs());
+        const rekey_deadline = recv_time + @as(i64, consts.rekey_timeout_ms);
         const read_deadline = @min(rekey_deadline, deadline);
 
         // Set read deadline on transport
@@ -233,15 +234,22 @@ pub fn dial(opts: DialOptions) DialError!*Conn {
     }
 }
 
+// Tests
+const zgrnet_runtime = @import("../runtime.zig");
+const StdCrypto = noise.test_crypto;
+const StdRt = zgrnet_runtime;
+const TestP = noise.Protocol(StdCrypto);
+const TestKeyPair = TestP.KeyPair;
+
 test "dial options default deadline" {
-    const opts = DialOptions{
+    const opts = DialOptions(StdCrypto){
         .allocator = std.testing.allocator,
-        .local_key = KeyPair.generate(),
+        .local_key = TestKeyPair.generate(),
         .remote_pk = Key.zero,
         .transport = .{ .mock = undefined },
         .remote_addr = .{ .mock = .{ .name = "test" } },
     };
-    try std.testing.expectEqual(@as(?i128, null), opts.deadline_ns);
+    try std.testing.expectEqual(@as(?i64, null), opts.deadline_ms);
 }
 
 test "dial missing remote pk" {
@@ -249,9 +257,9 @@ test "dial missing remote pk" {
     const transport = try noise.transport.MockTransport.init(allocator, "test");
     defer transport.deinit();
 
-    const result = dial(.{
+    const result = dial(StdCrypto, StdRt, .{
         .allocator = allocator,
-        .local_key = KeyPair.generate(),
+        .local_key = TestKeyPair.generate(),
         .remote_pk = Key.zero,
         .transport = .{ .mock = transport },
         .remote_addr = .{ .mock = .{ .name = "peer" } },
