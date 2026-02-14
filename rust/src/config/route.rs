@@ -62,10 +62,10 @@ impl RouteMatcher {
         let mut best: Option<&CompiledRule> = None;
 
         for r in rules.iter() {
-            if match_suffix(domain, &r.suffix) {
-                if best.is_none() || r.suffix.len() > best.unwrap().suffix.len() {
-                    best = Some(r);
-                }
+            if match_suffix(domain, &r.suffix)
+                && (best.is_none() || r.suffix.len() > best.unwrap().suffix.len())
+            {
+                best = Some(r);
             }
         }
 

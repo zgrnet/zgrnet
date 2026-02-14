@@ -118,10 +118,10 @@ impl PolicyEngine {
             }
 
             // If the rule has label patterns, the peer must also match at least one
-            if !rule.match_config.labels.is_empty() {
-                if !match_labels(&peer_labels, &rule.match_config.labels) {
-                    continue;
-                }
+            if !rule.match_config.labels.is_empty()
+                && !match_labels(&peer_labels, &rule.match_config.labels)
+            {
+                continue;
             }
 
             return PolicyResult {

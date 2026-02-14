@@ -105,12 +105,12 @@ fn run_test() {
     // ── Create Hosts ─────────────────────────────────────────────────
     step("Creating Hosts (TUN + encrypted UDP)");
     let host_a = Host::new(
-        Config { private_key: key_a.clone(), tun_ipv4: Ipv4Addr::new(100, 64, 0, 1), mtu: 1400, listen_port: 0, peers: vec![] },
+        Config { private_key: key_a.clone(), tun_ipv4: Ipv4Addr::new(100, 64, 0, 1), mtu: 1400, listen_port: 0, peers: vec![], fake_ip_lookup: None, fake_ip_handler: None },
         Arc::new(RealTun { dev: tun_a }),
     ).expect("host A");
 
     let host_b = Host::new(
-        Config { private_key: key_b.clone(), tun_ipv4: Ipv4Addr::new(100, 64, 1, 1), mtu: 1400, listen_port: 0, peers: vec![] },
+        Config { private_key: key_b.clone(), tun_ipv4: Ipv4Addr::new(100, 64, 1, 1), mtu: 1400, listen_port: 0, peers: vec![], fake_ip_lookup: None, fake_ip_handler: None },
         Arc::new(RealTun { dev: tun_b }),
     ).expect("host B");
 
