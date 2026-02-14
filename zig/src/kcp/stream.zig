@@ -179,6 +179,11 @@ pub fn Stream(comptime Rt: type) type {
             self.allocator.free(@constCast(self.metadata));
         }
         self.recv_buf.deinit();
+        // Release sync primitives (important on ESP32/FreeRTOS where
+        // Mutex/Condition wrap OS semaphores)
+        self.data_available.deinit();
+        self.recv_mutex.deinit();
+        self.kcp_mutex.deinit();
         self.allocator.destroy(self);
     }
 
@@ -407,10 +412,10 @@ pub fn Stream(comptime Rt: type) type {
 /// Generic over Runtime type for cross-platform sync + timer.
 ///
 /// Rt must provide:
-///   - Rt.Mutex: sync.Mutex trait
+///   - Rt.Mutex: sync.Mutex trait (with init/deinit/lock/unlock)
 ///   - Rt.Condition: sync.Condition trait (with timedWait)
+///   - Rt.Thread: joinable thread (with spawn/join)
 ///   - Rt.nowMs() -> u64: current time in milliseconds
-///   - Rt.spawn(name, fn, ctx, opts) -> !void: spawn a background thread/task
 ///   - Rt.sleepMs(ms) -> void: sleep for milliseconds
 pub fn Mux(comptime Rt: type) type {
     const StreamType = Stream(Rt);
@@ -439,11 +444,11 @@ pub fn Mux(comptime Rt: type) type {
         //  AND from updateLoop thread via kcp.update flush)
         output_mutex: Rt.Mutex,
 
-        // Auto mode: recv callback + stop flag + thread tracking
+        // Auto mode: recv callback + stop flag + joinable thread
         recv_fn: ?RecvFn,
         recv_user_data: ?*anyopaque,
         stop_flag: std.atomic.Value(bool),
-        threads_running: std.atomic.Value(u32),
+        run_thread: ?Rt.Thread,
 
         const AcceptQueue = struct {
             buf: [16]?*StreamType = [_]?*StreamType{null} ** 16,
@@ -500,7 +505,7 @@ pub fn Mux(comptime Rt: type) type {
                 .recv_fn = null,
                 .recv_user_data = null,
                 .stop_flag = std.atomic.Value(bool).init(false),
-                .threads_running = std.atomic.Value(u32).init(0),
+                .run_thread = null,
             };
 
             return self;
@@ -517,30 +522,26 @@ pub fn Mux(comptime Rt: type) type {
             self.recv_fn = recv_fn;
             self.recv_user_data = recv_user_data;
             self.stop_flag.store(false, .release);
-            self.threads_running.store(1, .release);
-            try Rt.spawn("mux_run", Self.runLoopEntry, self, .{ .stack_size = self.config.spawn_stack_size });
+            self.run_thread = Rt.Thread.spawn(.{}, runLoopWrapper, .{self});
         }
 
-        /// Stop auto mode: signal the runLoop to exit and wait for it.
+        /// Stop auto mode: signal the runLoop to exit and join the thread.
         pub fn stop(self: *Self) void {
             self.stop_flag.store(true, .release);
-            var wait_ms: u32 = 0;
-            while (self.threads_running.load(.acquire) > 0 and wait_ms < 2000) {
-                Rt.sleepMs(1);
-                wait_ms += 1;
+            if (self.run_thread) |t| {
+                t.join();
+                self.run_thread = null;
             }
         }
 
-        /// Entry point for runLoop (matches Rt.spawn signature).
-        fn runLoopEntry(ctx: ?*anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
+        /// Wrapper for runLoop (matches Rt.Thread.spawn signature).
+        fn runLoopWrapper(self: *Self) void {
             self.runLoop();
         }
 
         /// Combined recv + update loop (single thread).
         /// recv_fn should have a short timeout (~1ms) so update runs frequently.
         fn runLoop(self: *Self) void {
-            defer _ = self.threads_running.fetchSub(1, .release);
             const recv_fn = self.recv_fn orelse return;
             var buf: [2048]u8 = undefined;
 
@@ -605,12 +606,10 @@ pub fn Mux(comptime Rt: type) type {
 
             self.closed.store(true, .release);
 
-            // Wake up any blocked acceptStream
+            // Release all streams and wake blocked acceptors under mutex
+            self.mutex.lock();
             self.accept_queue.is_closed = true;
             self.accept_cond.broadcast();
-
-            // Release all streams
-            self.mutex.lock();
             var iter = self.streams.valueIterator();
             while (iter.next()) |stream_ptr| {
                 stream_ptr.*.state.store(.closed, .seq_cst);
@@ -623,6 +622,11 @@ pub fn Mux(comptime Rt: type) type {
         }
 
         fn deinitInternal(self: *Self) void {
+            // Release sync primitives (important on ESP32/FreeRTOS where
+            // Mutex/Condition wrap OS semaphores)
+            self.output_mutex.deinit();
+            self.accept_cond.deinit();
+            self.mutex.deinit();
             self.allocator.destroy(self);
         }
 
@@ -858,14 +862,9 @@ const TestRuntime = if (@import("builtin").os.tag != .freestanding) struct {
         pub fn signal(self: *Condition) void { self.inner.signal(); }
         pub fn broadcast(self: *Condition) void { self.inner.broadcast(); }
     };
+    pub const Thread = std.Thread;
     pub fn nowMs() u64 {
         return @intCast(std.time.milliTimestamp());
-    }
-    pub fn spawn(_: [:0]const u8, func: *const fn (?*anyopaque) void, ctx: ?*anyopaque, _: anytype) !void {
-        const t = try std.Thread.spawn(.{}, struct {
-            fn run(f: *const fn (?*anyopaque) void, c: ?*anyopaque) void { f(c); }
-        }.run, .{ func, ctx });
-        t.detach();
     }
     pub fn sleepMs(ms: u32) void {
         std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);

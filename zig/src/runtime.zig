@@ -17,9 +17,6 @@ const base = std_impl.runtime;
 // ============================================================================
 
 pub const Mutex = base.Mutex;
-pub const Options = base.Options;
-pub const TaskFn = base.TaskFn;
-pub const spawn = base.spawn;
 pub const Thread = base.Thread;
 pub const nowMs = base.nowMs;
 pub const getCpuCount = base.getCpuCount;
