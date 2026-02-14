@@ -250,9 +250,11 @@ func run(cfgPath string) error {
 	// ── 12. Start RESTful API server ─────────────────────────────────────
 	apiAddr := net.JoinHostPort(tunIP.String(), "80")
 	apiSrv := api.NewServer(api.ServerConfig{
-		ListenAddr: apiAddr,
-		Host:       h,
-		ConfigMgr:  cfgMgr,
+		ListenAddr:  apiAddr,
+		Host:        h,
+		ConfigMgr:   cfgMgr,
+		DNSServer:   dnsServer,
+		ProxyServer: proxySrv,
 	})
 
 	go func() {

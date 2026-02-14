@@ -29,12 +29,15 @@ pub struct ServerConfig {
     pub host: Arc<Host>,
     /// Config manager for reading/writing config.
     pub config_mgr: Arc<config::Manager>,
+    /// DNS server for stats (optional).
+    pub dns_server: Option<Arc<crate::dns::Server>>,
 }
 
 /// The zgrnetd RESTful API server.
 pub struct Server {
     host: Arc<Host>,
     config_mgr: Arc<config::Manager>,
+    dns_server: Option<Arc<crate::dns::Server>>,
     start_time: Instant,
     listener: Option<TcpListener>,
 }
@@ -48,6 +51,7 @@ impl Server {
         Ok(Self {
             host: cfg.host,
             config_mgr: cfg.config_mgr,
+            dns_server: cfg.dns_server,
             start_time: Instant::now(),
             listener: Some(listener),
         })
@@ -69,11 +73,13 @@ impl Server {
                 Ok(conn) => {
                     let host = Arc::clone(&self.host);
                     let cfg_mgr = Arc::clone(&self.config_mgr);
+                    let dns_srv = self.dns_server.clone();
                     let start_time = self.start_time;
                     thread::spawn(move || {
                         let ctx = RequestContext {
                             host: &host,
                             config_mgr: &cfg_mgr,
+                            dns_server: dns_srv.as_deref(),
                             start_time,
                         };
                         if let Err(e) = handle_connection(conn, &ctx) {
@@ -241,6 +247,7 @@ fn parse_query(q: &str) -> HashMap<String, String> {
 struct RequestContext<'a> {
     host: &'a Host,
     config_mgr: &'a config::Manager,
+    dns_server: Option<&'a crate::dns::Server>,
     start_time: Instant,
 }
 
@@ -258,6 +265,8 @@ fn route(req: &HttpRequest, ctx: &RequestContext) -> HttpResponse {
         // Read-only
         ("GET", "/api/whoami") => handle_whoami(ctx),
         ("GET", "/api/config/net") => handle_config_net(ctx),
+        ("GET", "/api/dns/stats") => handle_dns_stats(ctx),
+        ("GET", "/api/proxy/stats") => handle_proxy_stats(),
 
         // Peers
         ("GET", "/api/peers") => handle_list_peers(ctx),
@@ -334,6 +343,22 @@ fn handle_config_net(ctx: &RequestContext) -> HttpResponse {
     let cfg = ctx.config_mgr.current();
     let json = serde_json::to_string(&cfg.net).unwrap_or_default();
     HttpResponse::ok(&json)
+}
+
+fn handle_dns_stats(ctx: &RequestContext) -> HttpResponse {
+    match ctx.dns_server {
+        Some(srv) => {
+            let stats = srv.get_stats();
+            let json = serde_json::to_string(&stats).unwrap_or_default();
+            HttpResponse::ok(&json)
+        }
+        None => HttpResponse::ok(r#"{"total_queries":0,"zigor_net_hits":0,"fake_ip_hits":0,"upstream_forwards":0,"upstream_errors":0,"errors":0}"#),
+    }
+}
+
+fn handle_proxy_stats() -> HttpResponse {
+    // Proxy stats not yet integrated — return zeros
+    HttpResponse::ok(r#"{"total_connections":0,"active_connections":0,"bytes_sent":0,"bytes_received":0,"errors":0}"#)
 }
 
 fn handle_list_peers(ctx: &RequestContext) -> HttpResponse {
@@ -888,6 +913,7 @@ mod tests {
             listen_addr: "127.0.0.1:0".to_string(),
             host: Arc::clone(&host),
             config_mgr: Arc::clone(&cfg_mgr),
+            dns_server: None,
         }).unwrap();
 
         (srv, host, cfg_mgr, dir)

@@ -56,8 +56,10 @@ import (
 	"time"
 
 	"github.com/vibing/zgrnet/pkg/config"
+	"github.com/vibing/zgrnet/pkg/dns"
 	"github.com/vibing/zgrnet/pkg/host"
 	"github.com/vibing/zgrnet/pkg/noise"
+	"github.com/vibing/zgrnet/pkg/proxy"
 )
 
 // Server is the zgrnetd RESTful API server.
@@ -67,6 +69,8 @@ import (
 type Server struct {
 	host      *host.Host
 	cfgMgr    *config.Manager
+	dnsSrv    *dns.Server
+	proxySrv  *proxy.Server
 	startTime time.Time
 	server    *http.Server
 }
@@ -81,6 +85,12 @@ type ServerConfig struct {
 
 	// ConfigMgr is the config manager for reading/writing config.
 	ConfigMgr *config.Manager
+
+	// DNSServer is the running DNS server (optional, for stats).
+	DNSServer *dns.Server
+
+	// ProxyServer is the running SOCKS5 proxy server (optional, for stats).
+	ProxyServer *proxy.Server
 }
 
 // NewServer creates a new API server with all routes registered.
@@ -88,6 +98,8 @@ func NewServer(cfg ServerConfig) *Server {
 	s := &Server{
 		host:      cfg.Host,
 		cfgMgr:    cfg.ConfigMgr,
+		dnsSrv:    cfg.DNSServer,
+		proxySrv:  cfg.ProxyServer,
 		startTime: time.Now(),
 	}
 
@@ -96,6 +108,8 @@ func NewServer(cfg ServerConfig) *Server {
 	// Read-only
 	mux.HandleFunc("GET /api/whoami", s.handleWhoAmI)
 	mux.HandleFunc("GET /api/config/net", s.handleConfigNet)
+	mux.HandleFunc("GET /api/dns/stats", s.handleDNSStats)
+	mux.HandleFunc("GET /api/proxy/stats", s.handleProxyStats)
 
 	// Peers CRUD
 	mux.HandleFunc("GET /api/peers", s.handleListPeers)
@@ -178,6 +192,26 @@ func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfigNet(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfgMgr.Current()
 	writeJSON(w, http.StatusOK, cfg.Net)
+}
+
+// ─── GET /api/dns/stats ─────────────────────────────────────────────────────
+
+func (s *Server) handleDNSStats(w http.ResponseWriter, r *http.Request) {
+	if s.dnsSrv == nil {
+		writeJSON(w, http.StatusOK, dns.Stats{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.dnsSrv.GetStats())
+}
+
+// ─── GET /api/proxy/stats ───────────────────────────────────────────────────
+
+func (s *Server) handleProxyStats(w http.ResponseWriter, r *http.Request) {
+	if s.proxySrv == nil {
+		writeJSON(w, http.StatusOK, proxy.ProxyStats{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.proxySrv.GetStats())
 }
 
 // ─── Peers ──────────────────────────────────────────────────────────────────
