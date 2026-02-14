@@ -1,91 +1,25 @@
 package config
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
-func TestRouteMatcher_ExactMatch(t *testing.T) {
+func TestRouteMatcher_SuffixMatch(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
 		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result, ok := rm.Match("google.com")
-	if !ok {
-		t.Fatal("expected match")
-	}
-	if result.Peer != "peer_us" {
-		t.Errorf("peer = %q, want peer_us", result.Peer)
-	}
-
-	_, ok = rm.Match("www.google.com")
-	if ok {
-		t.Error("exact match should not match subdomain")
-	}
-}
-
-func TestRouteMatcher_WildcardMatch(t *testing.T) {
-	cfg := &RouteConfig{Rules: []RouteRule{
-		{Domain: "*.google.com", Peer: "peer_us"},
-	}}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		domain string
-		match  bool
-	}{
-		{"www.google.com", true},
-		{"mail.google.com", true},
-		{"deep.sub.google.com", true},
-		{"google.com", true},           // *.google.com also matches google.com
-		{"notgoogle.com", false},       // should not match
-		{"google.com.evil.com", false}, // should not match
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.domain, func(t *testing.T) {
-			_, ok := rm.Match(tt.domain)
-			if ok != tt.match {
-				t.Errorf("Match(%q) = %v, want %v", tt.domain, ok, tt.match)
-			}
-		})
-	}
-}
-
-func TestRouteMatcher_DomainList(t *testing.T) {
-	dir := t.TempDir()
-	listPath := filepath.Join(dir, "domains.txt")
-	content := "# GFW list\ngoogle.com\nyoutube.com\n\n# Social\ntwitter.com\n"
-	if err := os.WriteFile(listPath, []byte(content), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &RouteConfig{Rules: []RouteRule{
-		{DomainList: listPath, Peer: "peer_us"},
-	}}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rm, _ := NewRouteMatcher(cfg)
 
 	tests := []struct {
 		domain string
 		match  bool
 	}{
 		{"google.com", true},
-		{"www.google.com", true}, // parent domain match
-		{"youtube.com", true},
-		{"m.youtube.com", true},
-		{"twitter.com", true},
-		{"facebook.com", false},
+		{"www.google.com", true},
+		{"mail.google.com", true},
+		{"deep.sub.google.com", true},
+		{"notgoogle.com", false},
+		{"google.com.evil.com", false},
 		{"example.com", false},
 	}
 
@@ -99,14 +33,84 @@ func TestRouteMatcher_DomainList(t *testing.T) {
 	}
 }
 
+func TestRouteMatcher_WildcardPrefixStripped(t *testing.T) {
+	// "*.google.com" behaves identically to "google.com"
+	cfg := &RouteConfig{Rules: []RouteRule{
+		{Domain: "*.google.com", Peer: "peer_us"},
+	}}
+	rm, _ := NewRouteMatcher(cfg)
+
+	tests := []struct {
+		domain string
+		match  bool
+	}{
+		{"google.com", true},
+		{"www.google.com", true},
+		{"notgoogle.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.domain, func(t *testing.T) {
+			_, ok := rm.Match(tt.domain)
+			if ok != tt.match {
+				t.Errorf("Match(%q) = %v, want %v", tt.domain, ok, tt.match)
+			}
+		})
+	}
+}
+
+func TestRouteMatcher_LongestSuffixWins(t *testing.T) {
+	cfg := &RouteConfig{Rules: []RouteRule{
+		{Domain: "google.com", Peer: "peer_us"},
+		{Domain: "cn.google.com", Peer: "peer_cn"},
+	}}
+	rm, _ := NewRouteMatcher(cfg)
+
+	tests := []struct {
+		domain string
+		peer   string
+	}{
+		{"www.google.com", "peer_us"},
+		{"cn.google.com", "peer_cn"},
+		{"www.cn.google.com", "peer_cn"},
+		{"google.com", "peer_us"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.domain, func(t *testing.T) {
+			result, ok := rm.Match(tt.domain)
+			if !ok {
+				t.Fatalf("Match(%q) = false, want true", tt.domain)
+			}
+			if result.Peer != tt.peer {
+				t.Errorf("Match(%q).Peer = %q, want %q", tt.domain, result.Peer, tt.peer)
+			}
+		})
+	}
+}
+
+func TestRouteMatcher_LongestSuffixWins_OrderIndependent(t *testing.T) {
+	// Order in config should not matter — longest suffix always wins
+	cfg := &RouteConfig{Rules: []RouteRule{
+		{Domain: "cn.google.com", Peer: "peer_cn"}, // more specific first
+		{Domain: "google.com", Peer: "peer_us"},
+	}}
+	rm, _ := NewRouteMatcher(cfg)
+
+	result, ok := rm.Match("www.cn.google.com")
+	if !ok {
+		t.Fatal("expected match")
+	}
+	if result.Peer != "peer_cn" {
+		t.Errorf("peer = %q, want peer_cn", result.Peer)
+	}
+}
+
 func TestRouteMatcher_CaseInsensitive(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
-		{Domain: "*.Google.COM", Peer: "peer_us"},
+		{Domain: "Google.COM", Peer: "peer_us"},
 	}}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rm, _ := NewRouteMatcher(cfg)
 
 	_, ok := rm.Match("WWW.GOOGLE.COM")
 	if !ok {
@@ -116,47 +120,21 @@ func TestRouteMatcher_CaseInsensitive(t *testing.T) {
 
 func TestRouteMatcher_TrailingDot(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
-		{Domain: "*.google.com", Peer: "peer_us"},
+		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rm, _ := NewRouteMatcher(cfg)
 
-	// DNS queries sometimes include trailing dot
 	_, ok := rm.Match("www.google.com.")
 	if !ok {
 		t.Error("expected match with trailing dot")
 	}
 }
 
-func TestRouteMatcher_Priority(t *testing.T) {
-	cfg := &RouteConfig{Rules: []RouteRule{
-		{Domain: "*.google.com", Peer: "peer_us"},
-		{Domain: "*.google.com", Peer: "peer_jp"}, // lower priority
-	}}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result, ok := rm.Match("www.google.com")
-	if !ok {
-		t.Fatal("expected match")
-	}
-	if result.Peer != "peer_us" {
-		t.Errorf("peer = %q, want peer_us (first match wins)", result.Peer)
-	}
-}
-
 func TestRouteMatcher_NoMatch(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
-		{Domain: "*.google.com", Peer: "peer_us"},
+		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rm, _ := NewRouteMatcher(cfg)
 
 	_, ok := rm.Match("example.com")
 	if ok {
@@ -166,10 +144,7 @@ func TestRouteMatcher_NoMatch(t *testing.T) {
 
 func TestRouteMatcher_EmptyRules(t *testing.T) {
 	cfg := &RouteConfig{}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rm, _ := NewRouteMatcher(cfg)
 
 	_, ok := rm.Match("google.com")
 	if ok {
@@ -177,47 +152,22 @@ func TestRouteMatcher_EmptyRules(t *testing.T) {
 	}
 }
 
-func TestRouteMatcher_Reload(t *testing.T) {
-	dir := t.TempDir()
-	listPath := filepath.Join(dir, "domains.txt")
-
-	// Initial: only google.com
-	if err := os.WriteFile(listPath, []byte("google.com\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
+func TestRouteMatcher_MatchRoute(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
-		{DomainList: listPath, Peer: "peer_us"},
+		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, err := NewRouteMatcher(cfg)
-	if err != nil {
-		t.Fatal(err)
+	rm, _ := NewRouteMatcher(cfg)
+
+	peer, ok := rm.MatchRoute("www.google.com")
+	if !ok {
+		t.Fatal("expected match")
+	}
+	if peer != "peer_us" {
+		t.Errorf("peer = %q, want peer_us", peer)
 	}
 
-	if _, ok := rm.Match("twitter.com"); ok {
-		t.Error("twitter.com should not match initially")
-	}
-
-	// Update file: add twitter.com
-	if err := os.WriteFile(listPath, []byte("google.com\ntwitter.com\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := rm.Reload(); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, ok := rm.Match("twitter.com"); !ok {
-		t.Error("twitter.com should match after reload")
-	}
-}
-
-func TestRouteMatcher_DomainListFileNotFound(t *testing.T) {
-	cfg := &RouteConfig{Rules: []RouteRule{
-		{DomainList: "/nonexistent/domains.txt", Peer: "peer_us"},
-	}}
-	_, err := NewRouteMatcher(cfg)
-	if err == nil {
-		t.Fatal("expected error for nonexistent domain list file")
+	_, ok = rm.MatchRoute("example.com")
+	if ok {
+		t.Error("expected no match")
 	}
 }

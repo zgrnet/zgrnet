@@ -123,13 +123,13 @@ func TestInterop_LoadFullConfig(t *testing.T) {
 	}
 
 	// Verify route
-	if len(cfg.Route.Rules) != 4 {
-		t.Fatalf("route rules count = %d, want 4", len(cfg.Route.Rules))
+	if len(cfg.Route.Rules) != 3 {
+		t.Fatalf("route rules count = %d, want 3", len(cfg.Route.Rules))
 	}
-	if cfg.Route.Rules[0].Domain != "*.google.com" {
+	if cfg.Route.Rules[0].Domain != "google.com" {
 		t.Errorf("route[0] domain = %q", cfg.Route.Rules[0].Domain)
 	}
-	if cfg.Route.Rules[3].Domain != "example.com" {
-		t.Errorf("route[3] domain = %q", cfg.Route.Rules[3].Domain)
+	if cfg.Route.Rules[2].Domain != "nicovideo.jp" {
+		t.Errorf("route[2] domain = %q", cfg.Route.Rules[2].Domain)
 	}
 }

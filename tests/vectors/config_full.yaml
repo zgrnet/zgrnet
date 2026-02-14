@@ -63,11 +63,9 @@ inbound_policy:
 
 route:
   rules:
-    - domain: "*.google.com"
+    - domain: "google.com"
       peer: peer_us
-    - domain: "*.youtube.com"
+    - domain: "youtube.com"
       peer: peer_us
-    - domain: "*.nicovideo.jp"
+    - domain: "nicovideo.jp"
       peer: peer_jp
-    - domain: "example.com"
-      peer: peer_us

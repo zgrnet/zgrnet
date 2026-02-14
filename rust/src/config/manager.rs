@@ -153,13 +153,10 @@ fn reload_inner(path: &Path, inner: &Arc<RwLock<ManagerInner>>) -> Result<Option
 
     if ext_changed {
         let guard = inner.read().unwrap();
-        if let Err(e) = guard.route.reload() {
-            eprintln!("config: route reload error: {e}");
-        }
+        // Only policy has external files (whitelist), route rules are inline
         if let Err(e) = guard.policy.reload() {
             eprintln!("config: policy reload error: {e}");
         }
-        d.route_changed = true;
         d.inbound_changed = true;
     }
 
@@ -244,11 +241,6 @@ fn track_external_files(cfg: &Config, ext_files: &mut HashMap<String, SystemTime
         if rule.match_config.pubkey.match_type == "whitelist" && !rule.match_config.pubkey.path.is_empty() {
             let p = &rule.match_config.pubkey.path;
             ext_files.insert(p.clone(), file_mtime(Path::new(p)));
-        }
-    }
-    for rule in &cfg.route.rules {
-        if !rule.domain_list.is_empty() {
-            ext_files.insert(rule.domain_list.clone(), file_mtime(Path::new(&rule.domain_list)));
         }
     }
 }

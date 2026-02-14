@@ -81,9 +81,10 @@ pub const RouteConfig = struct {
 };
 
 /// Defines how traffic for specific domains is routed.
+/// All domain matching is suffix-based. "*.google.com" is treated as "google.com".
+/// When multiple rules match, the longest suffix wins.
 pub const RouteRule = struct {
     domain: []const u8 = "",
-    domain_list: []const u8 = "",
     peer: []const u8 = "",
 };
 
@@ -226,7 +227,7 @@ fn validateService(svc: *const ServiceConfig) error{ValidationFailed}!void {
 
 fn validateRoute(route: *const RouteConfig) error{ValidationFailed}!void {
     for (route.rules) |*rule| {
-        if (rule.domain.len == 0 and rule.domain_list.len == 0) return error.ValidationFailed;
+        if (rule.domain.len == 0) return error.ValidationFailed;
         if (rule.peer.len == 0) return error.ValidationFailed;
     }
 }
@@ -389,7 +390,7 @@ test "validation: inbound policy invalid default" {
 
 test "validation: route missing peer" {
     const json =
-        \\{"net": {"private_key": "/tmp/k", "tun_ipv4": "100.64.0.1"}, "route": {"rules": [{"domain": "*.google.com"}]}}
+        \\{"net": {"private_key": "/tmp/k", "tun_ipv4": "100.64.0.1"}, "route": {"rules": [{"domain": "google.com"}]}}
     ;
     const result = loadFromBytes(std.testing.allocator, json);
     try std.testing.expectError(error.ValidationFailed, result);

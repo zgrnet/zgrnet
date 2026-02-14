@@ -158,8 +158,7 @@ mod tests {
         let old = Config::default();
         let mut new = Config::default();
         new.route.rules.push(super::super::RouteRule {
-            domain: "*.google.com".into(),
-            domain_list: String::new(),
+            domain: "google.com".into(),
             peer: "p".into(),
         });
 

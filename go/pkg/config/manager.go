@@ -263,13 +263,6 @@ func (m *Manager) trackExternalFiles(cfg *Config) {
 			m.extFiles[rule.Match.Pubkey.Path] = fileMtime(rule.Match.Pubkey.Path)
 		}
 	}
-
-	// Track domain list files
-	for _, rule := range cfg.Route.Rules {
-		if rule.DomainList != "" {
-			m.extFiles[rule.DomainList] = fileMtime(rule.DomainList)
-		}
-	}
 }
 
 func (m *Manager) notifyWatchers(watchers []Watcher, diff *ConfigDiff, cfg *Config) {

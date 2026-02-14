@@ -64,10 +64,9 @@ pub const RouteConfig = struct {
     rules: []const RouteRule = &.{},
 };
 
-/// Single route rule.
+/// Single route rule. All domain matching is suffix-based.
 pub const RouteRule = struct {
     domain: []const u8 = "",
-    domain_list: []const u8 = "",
     peer: []const u8 = "",
 };
 
