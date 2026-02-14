@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "kcp",
     srcs = [
+        "fec.go",
         "frame.go",
         "kcp.go",
         "mux.go",
@@ -18,6 +19,7 @@ go_library(
 go_test(
     name = "kcp_test",
     srcs = [
+        "fec_test.go",
         "frame_test.go",
         "kcp_test.go",
         "mux_test.go",
