@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "config.go",
         "diff.go",
+        "identity.go",
         "labels.go",
         "manager.go",
         "policy.go",
@@ -22,6 +23,7 @@ go_test(
     srcs = [
         "config_test.go",
         "diff_test.go",
+        "identity_test.go",
         "interop_test.go",
         "labels_test.go",
         "manager_test.go",
