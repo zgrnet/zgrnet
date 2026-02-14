@@ -42,21 +42,88 @@ import (
 )
 
 var (
-	configPath = flag.String("c", "", "Path to config file (required)")
+	contextName = flag.String("c", "", "Context name or config file path")
 )
 
 func main() {
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
-	if *configPath == "" {
-		fmt.Fprintf(os.Stderr, "Usage: zgrnetd -c <config.yaml>\n")
+	cfgPath, err := resolveConfigPath(*contextName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Usage: zgrnetd [-c <context>]\n")
 		os.Exit(1)
 	}
 
-	if err := run(*configPath); err != nil {
+	if err := run(cfgPath); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
+}
+
+// resolveConfigPath resolves a context name or file path to a config file path.
+// - Empty: use current context from ~/.config/zgrnet/current
+// - Contains '/' or ends with '.yaml'/'.json': treat as file path
+// - Otherwise: treat as context name → ~/.config/zgrnet/<name>/config.yaml
+func resolveConfigPath(input string) (string, error) {
+	if input == "" {
+		// Use current context
+		baseDir, err := defaultConfigDir()
+		if err != nil {
+			return "", err
+		}
+		name, err := readCurrentContext(baseDir)
+		if err != nil {
+			return "", fmt.Errorf("no context specified and %w", err)
+		}
+		path := filepath.Join(baseDir, name, "config.yaml")
+		if _, err := os.Stat(path); err != nil {
+			return "", fmt.Errorf("context %q config not found: %s", name, path)
+		}
+		return path, nil
+	}
+
+	// If it looks like a file path, use directly
+	if strings.Contains(input, "/") || strings.HasSuffix(input, ".yaml") || strings.HasSuffix(input, ".json") {
+		if _, err := os.Stat(input); err != nil {
+			return "", fmt.Errorf("config file not found: %s", input)
+		}
+		return input, nil
+	}
+
+	// Treat as context name
+	baseDir, err := defaultConfigDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(baseDir, input, "config.yaml")
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("context %q not found (looked for %s)", input, path)
+	}
+	return path, nil
+}
+
+func defaultConfigDir() (string, error) {
+	if dir := os.Getenv("ZGRNET_HOME"); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "zgrnet"), nil
+}
+
+func readCurrentContext(baseDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(baseDir, "current"))
+	if err != nil {
+		return "", fmt.Errorf("no current context set (run: zgrnet context create <name>)")
+	}
+	name := strings.TrimSpace(string(data))
+	if name == "" {
+		return "", fmt.Errorf("current context file is empty")
+	}
+	return name, nil
 }
 
 func run(cfgPath string) error {
