@@ -88,19 +88,21 @@ impl LabelStore {
                 Some(pk) => pk,
                 None => continue,
             };
-            if peer.labels.is_empty() {
-                continue;
-            }
 
             // Remove existing host lan labels, keep remote lan labels
             let existing = inner.entry(pubkey_hex.clone()).or_default();
             existing.retain(|l| !l.starts_with("host.zigor.net/"));
 
-            // Add config labels
+            // Add config labels (deduplicated)
             for label in &peer.labels {
                 if !existing.contains(label) {
                     existing.push(label.clone());
                 }
+            }
+
+            // Clean up empty entries
+            if existing.is_empty() {
+                inner.remove(&pubkey_hex);
             }
         }
     }

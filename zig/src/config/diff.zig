@@ -112,6 +112,12 @@ fn inboundEqual(a: *const types.InboundPolicy, b: *const types.InboundPolicy) bo
         if (!mem.eql(u8, ar.name, br.name)) return false;
         if (!mem.eql(u8, ar.action, br.action)) return false;
         if (!mem.eql(u8, ar.@"match".pubkey.@"type", br.@"match".pubkey.@"type")) return false;
+        if (!mem.eql(u8, ar.@"match".pubkey.path, br.@"match".pubkey.path)) return false;
+        if (!mem.eql(u8, ar.@"match".pubkey.peer, br.@"match".pubkey.peer)) return false;
+        if (ar.@"match".labels.len != br.@"match".labels.len) return false;
+        for (ar.@"match".labels, br.@"match".labels) |al, bl| {
+            if (!mem.eql(u8, al, bl)) return false;
+        }
     }
     return true;
 }

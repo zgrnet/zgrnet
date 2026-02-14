@@ -116,9 +116,6 @@ func (s *LabelStore) LoadFromConfig(peers map[string]PeerConfig) {
 		if pubkeyHex == "" {
 			continue
 		}
-		if len(peer.Labels) == 0 {
-			continue
-		}
 		// Remove existing host lan labels, keep remote lan labels
 		existing := s.labels[pubkeyHex]
 		var kept []string
@@ -127,9 +124,22 @@ func (s *LabelStore) LoadFromConfig(peers map[string]PeerConfig) {
 				kept = append(kept, l)
 			}
 		}
-		// Add config labels
-		kept = append(kept, peer.Labels...)
-		s.labels[pubkeyHex] = kept
+		// Add config labels (with dedup against kept remote labels)
+		set := make(map[string]bool, len(kept))
+		for _, l := range kept {
+			set[l] = true
+		}
+		for _, l := range peer.Labels {
+			if !set[l] {
+				kept = append(kept, l)
+				set[l] = true
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.labels, pubkeyHex)
+		} else {
+			s.labels[pubkeyHex] = kept
+		}
 	}
 }
 
