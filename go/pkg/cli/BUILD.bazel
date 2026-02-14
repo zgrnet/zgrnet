@@ -16,7 +16,11 @@ go_library(
 
 go_test(
     name = "cli_test",
-    srcs = ["context_test.go"],
+    srcs = [
+        "client_test.go",
+        "context_test.go",
+        "daemon_test.go",
+    ],
     embed = [":cli"],
     deps = [
         "//go:noise",

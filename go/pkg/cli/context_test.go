@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -235,6 +236,109 @@ func TestResolveAPIAddr(t *testing.T) {
 	addr = ResolveAPIAddr(dir, "", "")
 	if addr != "100.64.0.1:80" {
 		t.Fatalf("expected 100.64.0.1:80 from template config, got %q", addr)
+	}
+}
+
+func TestDefaultConfigDirEnvOverride(t *testing.T) {
+	t.Setenv("ZGRNET_HOME", "/tmp/custom-zgrnet")
+	dir, err := DefaultConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir != "/tmp/custom-zgrnet" {
+		t.Fatalf("expected /tmp/custom-zgrnet, got %q", dir)
+	}
+}
+
+func TestDefaultConfigDirDefault(t *testing.T) {
+	t.Setenv("ZGRNET_HOME", "")
+	dir, err := DefaultConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir == "" {
+		t.Fatal("empty dir")
+	}
+	// Should end with .config/zgrnet
+	if !strings.HasSuffix(dir, ".config/zgrnet") {
+		t.Fatalf("unexpected dir: %q", dir)
+	}
+}
+
+func TestCurrentContextNameEmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "current"), []byte("  \n"), 0644)
+	_, err := CurrentContextName(dir)
+	if err == nil {
+		t.Fatal("expected error for empty current file")
+	}
+}
+
+func TestListContextsEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	// Dir with subdirs but no config.yaml
+	os.MkdirAll(filepath.Join(dir, "notacontext"), 0700)
+	names, err := ListContexts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("expected 0, got %d", len(names))
+	}
+}
+
+func TestListContextsNonexistentDir(t *testing.T) {
+	names, err := ListContexts(filepath.Join(t.TempDir(), "doesnotexist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("expected 0, got %d", len(names))
+	}
+}
+
+func TestShowPublicKeyBadKey(t *testing.T) {
+	dir := t.TempDir()
+	if err := CreateContext(dir, "badkey"); err != nil {
+		t.Fatal(err)
+	}
+	// Overwrite with invalid key
+	os.WriteFile(filepath.Join(dir, "badkey", "private.key"), []byte("notahexkey\n"), 0600)
+	_, err := ShowPublicKey(dir, "badkey")
+	if err == nil {
+		t.Fatal("expected error for bad key")
+	}
+}
+
+func TestShowPublicKeyNoContext(t *testing.T) {
+	dir := t.TempDir()
+	_, err := ShowPublicKey(dir, "")
+	if err == nil {
+		t.Fatal("expected error when no current context")
+	}
+}
+
+func TestGenerateKeyNoContext(t *testing.T) {
+	dir := t.TempDir()
+	_, err := GenerateKey(dir, "")
+	if err == nil {
+		t.Fatal("expected error when no current context")
+	}
+}
+
+func TestContextConfigPathNoContext(t *testing.T) {
+	dir := t.TempDir()
+	_, err := ContextConfigPath(dir, "")
+	if err == nil {
+		t.Fatal("expected error when no current context")
+	}
+}
+
+func TestContextConfigPathNotExist(t *testing.T) {
+	dir := t.TempDir()
+	_, err := ContextConfigPath(dir, "nope")
+	if err == nil {
+		t.Fatal("expected error for nonexistent context")
 	}
 }
 
