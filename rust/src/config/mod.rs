@@ -7,11 +7,13 @@
 //! Go and Rust use YAML format; Zig uses JSON.
 
 mod diff;
+mod labels;
 mod manager;
 mod policy;
 mod route;
 
 pub use diff::{ConfigDiff, diff};
+pub use labels::{LabelStore, match_label, match_labels};
 pub use manager::Manager;
 pub use policy::{PolicyEngine, PolicyResult};
 pub use route::{RouteMatcher, RouteResult};
