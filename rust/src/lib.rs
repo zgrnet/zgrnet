@@ -31,6 +31,7 @@ pub mod host;
 pub mod proxy;
 pub mod dns;
 pub mod config;
+pub mod api;
 
 #[cfg(feature = "tun")]
 pub mod tun;

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use zgrnet::api;
 use zgrnet::config;
 use zgrnet::dns;
 use zgrnet::host::{self, Host, TunDevice};
@@ -212,7 +213,22 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── 11. Start Host forwarding + wait for signal ──────────────────
+    // ── 11. Start RESTful API server ────────────────────────────────
+    let api_addr = format!("{}:80", tun_ip);
+    let config_mgr = Arc::new(config::Manager::new(cfg_path)
+        .map_err(|e| format!("config manager: {}", e))?);
+    let mut api_srv = api::Server::new(api::ServerConfig {
+        listen_addr: api_addr.clone(),
+        host: host.clone(),
+        config_mgr,
+    }).map_err(|e| format!("api server: {}", e))?;
+
+    thread::spawn(move || {
+        eprintln!("api listening on {}", api_addr);
+        api_srv.serve();
+    });
+
+    // ── 12. Start Host forwarding + wait for signal ──────────────────
     host.run();
 
     eprintln!("zgrnetd running (pid {})", std::process::id());
@@ -220,6 +236,7 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  UDP:   {}", host.local_addr());
     eprintln!("  DNS:   {}:53", tun_ip);
     eprintln!("  Proxy: {}:1080", tun_ip);
+    eprintln!("  API:   {}:80", tun_ip);
     eprintln!("  Peers: {}", cfg.peers.len());
 
     // Wait for SIGINT / SIGTERM

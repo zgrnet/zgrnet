@@ -141,6 +141,76 @@ impl Manager {
     pub fn reload(&self) -> Result<Option<ConfigDiff>, ManagerError> {
         reload_inner(&self.path, &self.inner)
     }
+
+    /// Returns the config file path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Atomically modify the config, validate, save to disk, rebuild engines,
+    /// and notify watchers.
+    ///
+    /// The `modify` closure receives a mutable reference to a clone of the
+    /// current config. If it returns `Err`, no changes are applied.
+    pub fn modify_and_save<F>(&self, modify: F) -> Result<(), ManagerError>
+    where
+        F: FnOnce(&mut Config) -> Result<(), String>,
+    {
+        // Clone current config
+        let mut new_cfg = {
+            let guard = self.inner.read().unwrap();
+            guard.current.clone()
+        };
+
+        // Apply caller's modification
+        modify(&mut new_cfg).map_err(ConfigError::Validation)?;
+
+        // Validate the modified config
+        new_cfg.validate()?;
+
+        // Save to disk first
+        save_to_file(&self.path, &new_cfg)?;
+
+        // Compute diff
+        let diff = {
+            let guard = self.inner.read().unwrap();
+            diff(&guard.current, &new_cfg)
+        };
+
+        // Rebuild route/policy if needed
+        let new_route = if diff.route_changed {
+            Some(RouteMatcher::new(&new_cfg.route)?)
+        } else {
+            None
+        };
+        let new_policy = if diff.inbound_changed {
+            Some(PolicyEngine::new(&new_cfg.inbound_policy)?)
+        } else {
+            None
+        };
+
+        // Update inner state
+        let watchers = {
+            let mut guard = self.inner.write().unwrap();
+            guard.current = new_cfg.clone();
+            guard.config_mtime = file_mtime(&self.path);
+            track_external_files(&new_cfg, &mut guard.ext_files);
+            if let Some(r) = new_route {
+                guard.route = r;
+            }
+            if let Some(p) = new_policy {
+                guard.policy = p;
+            }
+            guard.watchers.clone()
+        };
+
+        // Notify watchers outside the lock
+        if !diff.is_empty() {
+            notify_watchers(&watchers, &diff, &new_cfg);
+        }
+
+        Ok(())
+    }
 }
 
 fn reload_inner(path: &Path, inner: &Arc<RwLock<ManagerInner>>) -> Result<Option<ConfigDiff>, ManagerError> {
@@ -267,6 +337,12 @@ fn track_external_files(cfg: &Config, ext_files: &mut HashMap<String, SystemTime
             ext_files.insert(p.clone(), file_mtime(Path::new(p)));
         }
     }
+}
+
+fn save_to_file(path: &Path, cfg: &Config) -> Result<(), ManagerError> {
+    let data = serde_yaml::to_string(cfg).map_err(|e| ConfigError::Validation(format!("marshal yaml: {e}")))?;
+    std::fs::write(path, data)?;
+    Ok(())
 }
 
 fn file_mtime(path: &Path) -> SystemTime {
