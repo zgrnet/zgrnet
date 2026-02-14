@@ -106,6 +106,9 @@ type FECEncoder struct {
 
 // NewFECEncoder creates a FEC encoder with the given group size and output callback.
 func NewFECEncoder(groupSize uint8, outputFn func([]byte)) *FECEncoder {
+	if groupSize < 1 {
+		groupSize = 1
+	}
 	if groupSize > fecMaxGroupSize {
 		groupSize = fecMaxGroupSize
 	}
@@ -224,6 +227,9 @@ func NewFECDecoder(outputFn func([]byte)) *FECDecoder {
 func (d *FECDecoder) AddPacket(data []byte) {
 	hdr, err := DecodeFECHeader(data)
 	if err != nil {
+		return
+	}
+	if hdr.PayloadLen > FECMaxMTU {
 		return
 	}
 	if len(data) < FECHeaderSize+int(hdr.PayloadLen) {

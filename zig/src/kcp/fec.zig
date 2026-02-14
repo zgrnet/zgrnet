@@ -92,7 +92,7 @@ pub const Encoder = struct {
         user_data: ?*anyopaque,
     ) Encoder {
         return .{
-            .group_size = if (group_size > max_group_size) max_group_size else group_size,
+            .group_size = if (group_size < 1) 1 else if (group_size > max_group_size) max_group_size else group_size,
             .output_fn = output_fn,
             .user_data = user_data,
         };
@@ -213,6 +213,7 @@ pub const Decoder = struct {
     /// Process a received FEC packet. Emits recovered data packets via output callback.
     pub fn addPacket(self: *Decoder, data: []const u8) void {
         const hdr = decodeHeader(data) catch return;
+        if (hdr.payload_len > MaxMtu) return;
         if (data.len < HeaderSize + hdr.payload_len) return;
 
         // Validate untrusted wire values against array bounds.

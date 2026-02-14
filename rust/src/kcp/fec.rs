@@ -121,7 +121,7 @@ impl Encoder {
     /// Create a new FEC encoder with the given group size.
     pub fn new(group_size: u8, output_fn: OutputFn) -> Self {
         Encoder {
-            group_size: if group_size > MAX_GROUP_SIZE as u8 { MAX_GROUP_SIZE as u8 } else { group_size },
+            group_size: group_size.clamp(1, MAX_GROUP_SIZE as u8),
             group_id: 0,
             buffered: 0,
             packet_buf: [[0u8; MAX_MTU]; MAX_GROUP_SIZE],
@@ -269,6 +269,9 @@ impl Decoder {
             Ok(h) => h,
             Err(_) => return,
         };
+        if hdr.payload_len as usize > MAX_MTU {
+            return;
+        }
         if data.len() < HEADER_SIZE + hdr.payload_len as usize {
             return;
         }
