@@ -536,6 +536,90 @@ fn parseArgs() ?[]const u8 {
     return null;
 }
 
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "httpResp formats correctly" {
+    const a = std.testing.allocator;
+    const resp = httpResp(a, 200, "OK", "{\"status\":\"ok\"}");
+    defer a.free(resp);
+    try std.testing.expect(mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(mem.indexOf(u8, resp, "Content-Type: application/json") != null);
+    try std.testing.expect(mem.indexOf(u8, resp, "{\"status\":\"ok\"}") != null);
+}
+
+test "httpResp 204 empty body" {
+    const a = std.testing.allocator;
+    const resp = httpResp(a, 204, "No Content", "");
+    defer a.free(resp);
+    try std.testing.expect(mem.startsWith(u8, resp, "HTTP/1.1 204 No Content\r\n"));
+    try std.testing.expect(mem.indexOf(u8, resp, "Content-Length: 0") != null);
+}
+
+test "jsonStr extracts value" {
+    const data = "{\"pubkey\":\"aabbcc\",\"alias\":\"test\"}";
+    const pk = jsonStr(data, "pubkey");
+    try std.testing.expect(pk != null);
+    try std.testing.expectEqualStrings("aabbcc", pk.?);
+
+    const alias = jsonStr(data, "alias");
+    try std.testing.expect(alias != null);
+    try std.testing.expectEqualStrings("test", alias.?);
+}
+
+test "jsonStr returns null for missing key" {
+    const data = "{\"pubkey\":\"aabbcc\"}";
+    try std.testing.expect(jsonStr(data, "missing") == null);
+}
+
+test "jsonStr returns null for empty data" {
+    try std.testing.expect(jsonStr("", "key") == null);
+    try std.testing.expect(jsonStr("{}", "key") == null);
+}
+
+test "queryParam extracts value" {
+    try std.testing.expectEqualStrings("100.64.0.2", queryParam("ip=100.64.0.2", "ip").?);
+    try std.testing.expectEqualStrings("100.64.0.2", queryParam("foo=bar&ip=100.64.0.2", "ip").?);
+    try std.testing.expectEqualStrings("bar", queryParam("ip=100.64.0.2&foo=bar", "foo").?);
+}
+
+test "queryParam returns null for missing key" {
+    try std.testing.expect(queryParam("foo=bar", "ip") == null);
+    try std.testing.expect(queryParam("", "ip") == null);
+}
+
+test "parseIp4 valid" {
+    var ip: [4]u8 = undefined;
+    parseIp4("100.64.0.1", &ip) orelse unreachable;
+    try std.testing.expectEqual([4]u8{ 100, 64, 0, 1 }, ip);
+}
+
+test "parseIp4 various addresses" {
+    var ip: [4]u8 = undefined;
+    parseIp4("0.0.0.0", &ip) orelse unreachable;
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, ip);
+
+    parseIp4("255.255.255.255", &ip) orelse unreachable;
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, ip);
+}
+
+test "parseIp4 invalid" {
+    var ip: [4]u8 = undefined;
+    try std.testing.expect(parseIp4("not-an-ip", &ip) == null);
+    try std.testing.expect(parseIp4("1.2.3", &ip) == null);
+    try std.testing.expect(parseIp4("1.2.3.4.5", &ip) == null);
+    try std.testing.expect(parseIp4("256.0.0.1", &ip) == null);
+    try std.testing.expect(parseIp4("", &ip) == null);
+}
+
+test "eql helper" {
+    try std.testing.expect(eql("GET", "GET"));
+    try std.testing.expect(!eql("GET", "POST"));
+    try std.testing.expect(!eql("GET", "GE"));
+    try std.testing.expect(eql("", ""));
+}
+
 fn loadOrGenerateKey(_: std.mem.Allocator, path: []const u8) !KeyPair {
     // Try to read existing key
     if (std.fs.cwd().openFile(path, .{})) |file| {

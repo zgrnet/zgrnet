@@ -790,34 +790,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (Server, Arc<Host>, Arc<config::Manager>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("zgrnet_api_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let cfg_path = minimal_config(&dir);
-        let cfg_mgr = Arc::new(config::Manager::new(&cfg_path).unwrap());
-
-        let kp = crate::noise::KeyPair::generate();
-        let host = Host::new(
-            crate::host::Config {
-                private_key: kp,
-                tun_ipv4: Ipv4Addr::new(100, 64, 0, 1),
-                mtu: 1400,
-                listen_port: 0,
-                peers: Vec::new(),
-            },
-            Arc::new(MockTun),
-        )
-        .unwrap();
-
-        let srv = Server::new(ServerConfig {
-            listen_addr: "127.0.0.1:0".to_string(),
-            host: Arc::clone(&host),
-            config_mgr: Arc::clone(&cfg_mgr),
-        })
-        .unwrap();
-
-        (srv, host, cfg_mgr, dir)
-    }
+    // setup_named() is used instead — each test gets a unique temp dir.
 
     fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).unwrap();
@@ -877,25 +850,84 @@ mod tests {
         (status, body)
     }
 
+    fn http_put(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        write!(
+            stream,
+            "PUT {} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            path,
+            body.len(),
+            body
+        ).unwrap();
+        stream.flush().unwrap();
+        read_response(&mut stream)
+    }
+
+    // Use unique temp dirs per test to avoid conflicts in parallel runs.
+    fn setup_named(name: &str) -> (Server, Arc<Host>, Arc<config::Manager>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("zgrnet_api_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = minimal_config(&dir);
+        let cfg_mgr = Arc::new(config::Manager::new(&cfg_path).unwrap());
+
+        let kp = crate::noise::KeyPair::generate();
+        let host = Host::new(
+            crate::host::Config {
+                private_key: kp,
+                tun_ipv4: Ipv4Addr::new(100, 64, 0, 1),
+                mtu: 1400,
+                listen_port: 0,
+                peers: Vec::new(),
+            },
+            Arc::new(MockTun),
+        ).unwrap();
+
+        let srv = Server::new(ServerConfig {
+            listen_addr: "127.0.0.1:0".to_string(),
+            host: Arc::clone(&host),
+            config_mgr: Arc::clone(&cfg_mgr),
+        }).unwrap();
+
+        (srv, host, cfg_mgr, dir)
+    }
+
     #[test]
     fn test_whoami() {
-        let (srv, _host, _cfg, _dir) = setup();
+        let (srv, _host, _cfg, dir) = setup_named("whoami");
         let addr = srv.local_addr().unwrap();
-        let handle = thread::spawn(move || srv.serve());
+        let _h = thread::spawn(move || srv.serve());
 
         let (status, body) = http_get(addr, "/api/whoami");
         assert_eq!(status, 200);
-        assert!(body.contains("pubkey"));
-        assert!(body.contains("100.64.0.1"));
+        assert!(body.contains("pubkey"), "body: {body}");
+        assert!(body.contains("100.64.0.1"), "body: {body}");
 
-        drop(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_net() {
+        let (srv, _host, _cfg, dir) = setup_named("cfgnet");
+        let addr = srv.local_addr().unwrap();
+        let _h = thread::spawn(move || srv.serve());
+
+        let (status, body) = http_get(addr, "/api/config/net");
+        assert_eq!(status, 200);
+        assert!(body.contains("tun_ipv4"), "body: {body}");
+        assert!(body.contains("100.64.0.1"), "body: {body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_peers_crud() {
-        let (srv, _host, _cfg, _dir) = setup();
+        let (srv, _host, _cfg, dir) = setup_named("peers_crud");
         let addr = srv.local_addr().unwrap();
-        let _handle = thread::spawn(move || srv.serve());
+        let _h = thread::spawn(move || srv.serve());
+
+        let pk = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
         // List — empty
         let (status, body) = http_get(addr, "/api/peers");
@@ -903,14 +935,10 @@ mod tests {
         assert_eq!(body.trim(), "[]");
 
         // Add peer
-        let pk = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let (status, body) = http_post(
-            addr,
-            "/api/peers",
-            &format!(r#"{{"pubkey":"{}","alias":"test","endpoint":"127.0.0.1:51820"}}"#, pk),
-        );
+        let (status, body) = http_post(addr, "/api/peers",
+            &format!(r#"{{"pubkey":"{}","alias":"peer1","endpoint":"127.0.0.1:51820"}}"#, pk));
         assert_eq!(status, 201, "body: {body}");
-        assert!(body.contains("test"));
+        assert!(body.contains("peer1"));
 
         // List — has 1
         let (status, body) = http_get(addr, "/api/peers");
@@ -920,7 +948,23 @@ mod tests {
         // Get single
         let (status, body) = http_get(addr, &format!("/api/peers/{pk}"));
         assert_eq!(status, 200);
-        assert!(body.contains("test"));
+        assert!(body.contains("peer1"));
+
+        // Update peer
+        let (status, body) = http_put(addr, &format!("/api/peers/{pk}"),
+            r#"{"alias":"updated"}"#);
+        assert_eq!(status, 200, "body: {body}");
+        assert!(body.contains("updated"));
+
+        // Verify update persisted
+        let (status, body) = http_get(addr, &format!("/api/peers/{pk}"));
+        assert_eq!(status, 200);
+        assert!(body.contains("updated"));
+
+        // Add duplicate should fail
+        let (status, _) = http_post(addr, "/api/peers",
+            &format!(r#"{{"pubkey":"{}","alias":"dup"}}"#, pk));
+        assert_eq!(status, 409);
 
         // Delete
         let (status, _) = http_delete(addr, &format!("/api/peers/{pk}"));
@@ -930,16 +974,246 @@ mod tests {
         let (status, body) = http_get(addr, "/api/peers");
         assert_eq!(status, 200);
         assert_eq!(body.trim(), "[]");
+
+        // Get deleted — 404
+        let (status, _) = http_get(addr, &format!("/api/peers/{pk}"));
+        assert_eq!(status, 404);
+
+        // Delete nonexistent — 404
+        let (status, _) = http_delete(addr, &format!("/api/peers/{pk}"));
+        assert_eq!(status, 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_peers_bad_requests() {
+        let (srv, _host, _cfg, dir) = setup_named("peers_bad");
+        let addr = srv.local_addr().unwrap();
+        let _h = thread::spawn(move || srv.serve());
+
+        // Missing pubkey
+        let (status, _) = http_post(addr, "/api/peers", r#"{"alias":"no-key"}"#);
+        assert_eq!(status, 400);
+
+        // Invalid pubkey
+        let (status, _) = http_post(addr, "/api/peers", r#"{"pubkey":"xyz"}"#);
+        assert_eq!(status, 400);
+
+        // Invalid JSON
+        let (status, _) = http_post(addr, "/api/peers", "{bad");
+        assert_eq!(status, 400);
+
+        // Update nonexistent
+        let fake = "0000000000000000000000000000000000000000000000000000000000000000";
+        let (status, _) = http_put(addr, &format!("/api/peers/{fake}"), r#"{"alias":"x"}"#);
+        assert_eq!(status, 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lans_crud() {
+        let (srv, _host, _cfg, dir) = setup_named("lans_crud");
+        let addr = srv.local_addr().unwrap();
+        let _h = thread::spawn(move || srv.serve());
+
+        let lan_pk = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        // List — empty
+        let (status, body) = http_get(addr, "/api/lans");
+        assert_eq!(status, 200);
+        assert_eq!(body.trim(), "[]");
+
+        // Add
+        let (status, body) = http_post(addr, "/api/lans",
+            &format!(r#"{{"domain":"test.zigor.net","pubkey":"{}","endpoint":"1.2.3.4:51820"}}"#, lan_pk));
+        assert_eq!(status, 201, "body: {body}");
+        assert!(body.contains("test.zigor.net"));
+
+        // List — has 1
+        let (status, body) = http_get(addr, "/api/lans");
+        assert_eq!(status, 200);
+        assert!(body.contains("test.zigor.net"));
+
+        // Add duplicate
+        let (status, _) = http_post(addr, "/api/lans",
+            &format!(r#"{{"domain":"test.zigor.net","pubkey":"{}","endpoint":"5.6.7.8:51820"}}"#, lan_pk));
+        assert_eq!(status, 409);
+
+        // Delete
+        let (status, _) = http_delete(addr, "/api/lans/test.zigor.net");
+        assert_eq!(status, 204);
+
+        // Delete nonexistent
+        let (status, _) = http_delete(addr, "/api/lans/nope.zigor.net");
+        assert_eq!(status, 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_policy_crud() {
+        let (srv, _host, _cfg, dir) = setup_named("policy_crud");
+        let addr = srv.local_addr().unwrap();
+        let _h = thread::spawn(move || srv.serve());
+
+        // Show — empty
+        let (status, body) = http_get(addr, "/api/policy");
+        assert_eq!(status, 200);
+        assert!(body.contains("rules"));
+
+        // Add rule
+        let rule = r#"{"name":"open","match":{"pubkey":{"type":"any"}},"services":[{"proto":"*","port":"*"}],"action":"allow"}"#;
+        let (status, body) = http_post(addr, "/api/policy/rules", rule);
+        assert_eq!(status, 201, "body: {body}");
+        assert!(body.contains("open"));
+
+        // Show — has rule
+        let (status, body) = http_get(addr, "/api/policy");
+        assert_eq!(status, 200);
+        assert!(body.contains("open"));
+
+        // Add duplicate
+        let (status, _) = http_post(addr, "/api/policy/rules", rule);
+        assert_eq!(status, 409);
+
+        // Delete
+        let (status, _) = http_delete(addr, "/api/policy/rules/open");
+        assert_eq!(status, 204);
+
+        // Delete nonexistent
+        let (status, _) = http_delete(addr, "/api/policy/rules/nope");
+        assert_eq!(status, 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_routes_crud() {
+        let (srv, _host, _cfg, dir) = setup_named("routes_crud");
+        let addr = srv.local_addr().unwrap();
+        let _h = thread::spawn(move || srv.serve());
+
+        // List — empty
+        let (status, body) = http_get(addr, "/api/routes");
+        assert_eq!(status, 200);
+        assert_eq!(body.trim(), "[]");
+
+        // Add
+        let (status, body) = http_post(addr, "/api/routes",
+            r#"{"domain":"*.google.com","peer":"us"}"#);
+        assert_eq!(status, 201, "body: {body}");
+        assert!(body.contains("google.com"));
+
+        // Add another
+        let (status, _) = http_post(addr, "/api/routes",
+            r#"{"domain":"*.example.com","peer":"jp"}"#);
+        assert_eq!(status, 201);
+
+        // List — has 2
+        let (status, body) = http_get(addr, "/api/routes");
+        assert_eq!(status, 200);
+        assert!(body.contains("google.com"));
+        assert!(body.contains("example.com"));
+
+        // Delete index 0
+        let (status, _) = http_delete(addr, "/api/routes/0");
+        assert_eq!(status, 204);
+
+        // List — has 1 (example.com)
+        let (status, body) = http_get(addr, "/api/routes");
+        assert_eq!(status, 200);
+        assert!(body.contains("example.com"));
+        assert!(!body.contains("google.com"));
+
+        // Delete out of range
+        let (status, _) = http_delete(addr, "/api/routes/99");
+        assert_eq!(status, 404);
+
+        // Delete invalid id
+        let (status, _) = http_delete(addr, "/api/routes/abc");
+        assert_eq!(status, 400);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_identity() {
+        let (srv, host, _cfg, dir) = setup_named("identity");
+        let addr = srv.local_addr().unwrap();
+        let _h = thread::spawn(move || srv.serve());
+
+        let pk = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        // Add peer to get IP allocated
+        let (status, _) = http_post(addr, "/api/peers",
+            &format!(r#"{{"pubkey":"{}","alias":"id-test"}}"#, pk));
+        assert_eq!(status, 201);
+
+        // Look up peer's IP
+        let pk_key = crate::noise::Key::from_hex(pk).unwrap();
+        let ip = host.ip_alloc().lookup_by_pubkey(&pk_key).unwrap();
+
+        // Identity lookup
+        let (status, body) = http_get(addr, &format!("/internal/identity?ip={}", ip));
+        assert_eq!(status, 200);
+        assert!(body.contains(pk), "body: {body}");
+
+        // Missing ip param
+        let (status, _) = http_get(addr, "/internal/identity");
+        assert_eq!(status, 400);
+
+        // Unknown IP
+        let (status, _) = http_get(addr, "/internal/identity?ip=100.64.99.99");
+        assert_eq!(status, 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_config_reload() {
-        let (srv, _host, _cfg, _dir) = setup();
+        let (srv, _host, _cfg, dir) = setup_named("reload");
         let addr = srv.local_addr().unwrap();
-        let _handle = thread::spawn(move || srv.serve());
+        let _h = thread::spawn(move || srv.serve());
 
         let (status, body) = http_post(addr, "/api/config/reload", "");
         assert_eq!(status, 200);
         assert!(body.contains("no changes"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_not_found() {
+        let (srv, _host, _cfg, dir) = setup_named("notfound");
+        let addr = srv.local_addr().unwrap();
+        let _h = thread::spawn(move || srv.serve());
+
+        let (status, _) = http_get(addr, "/api/nonexistent");
+        assert_eq!(status, 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_peers_persistence() {
+        let (srv, _host, cfg_mgr, dir) = setup_named("persist");
+        let addr = srv.local_addr().unwrap();
+        let _h = thread::spawn(move || srv.serve());
+
+        let pk = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let (status, _) = http_post(addr, "/api/peers",
+            &format!(r#"{{"pubkey":"{}","alias":"saved","endpoint":"1.2.3.4:51820"}}"#, pk));
+        assert_eq!(status, 201);
+
+        // Read config from disk
+        let saved = cfg_mgr.current();
+        let domain = format!("{}.zigor.net", pk);
+        let peer = saved.peers.get(&domain);
+        assert!(peer.is_some(), "peer not found in saved config");
+        assert_eq!(peer.unwrap().alias, "saved");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
