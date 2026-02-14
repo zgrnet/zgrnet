@@ -112,6 +112,7 @@ func NewServer(cfg ServerConfig) *Server {
 	// Read-only
 	mux.HandleFunc("GET /api/whoami", s.handleWhoAmI)
 	mux.HandleFunc("GET /api/config/net", s.handleConfigNet)
+	mux.HandleFunc("GET /api/config/raw", s.handleConfigRaw)
 	mux.HandleFunc("GET /api/dns/stats", s.handleDNSStats)
 	mux.HandleFunc("GET /api/proxy/stats", s.handleProxyStats)
 
@@ -210,6 +211,18 @@ func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfigNet(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfgMgr.Current()
 	writeJSON(w, http.StatusOK, cfg.Net)
+}
+
+// ─── GET /api/config/raw ────────────────────────────────────────────────────
+
+func (s *Server) handleConfigRaw(w http.ResponseWriter, r *http.Request) {
+	cfg := s.cfgMgr.Current()
+	data, err := cfg.Marshal()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "marshal config: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"content": string(data)})
 }
 
 // ─── GET /api/dns/stats ─────────────────────────────────────────────────────

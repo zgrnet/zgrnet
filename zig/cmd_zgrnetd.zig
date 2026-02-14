@@ -300,6 +300,30 @@ fn apiRoute(ctx: *ApiContext, method: []const u8, path: []const u8, query: []con
         return jsonSection(a, ctx.config_path, "net");
     }
 
+    // GET /api/config/raw
+    if (eql(method, "GET") and eql(path, "/api/config/raw")) {
+        const cfg_data = std.fs.cwd().readFileAlloc(a, ctx.config_path, 10 * 1024 * 1024) catch
+            return httpResp(a, 500, "{\"error\":\"read config\"}");
+        defer a.free(cfg_data);
+        // Escape for JSON string
+        var escaped = std.ArrayList(u8).init(a);
+        defer escaped.deinit();
+        escaped.appendSlice("{\"content\":\"") catch return httpResp(a, 500, "");
+        for (cfg_data) |c| {
+            switch (c) {
+                '\\' => escaped.appendSlice("\\\\") catch {},
+                '"' => escaped.appendSlice("\\\"") catch {},
+                '\n' => escaped.appendSlice("\\n") catch {},
+                '\t' => escaped.appendSlice("\\t") catch {},
+                '\r' => escaped.appendSlice("\\r") catch {},
+                else => escaped.append(c) catch {},
+            }
+        }
+        escaped.appendSlice("\"}") catch {};
+        const result = escaped.toOwnedSlice() catch return httpResp(a, 500, "");
+        return httpResp(a, 200, result);
+    }
+
     // GET /api/peers
     if (eql(method, "GET") and eql(path, "/api/peers")) {
         return jsonSection(a, ctx.config_path, "peers");

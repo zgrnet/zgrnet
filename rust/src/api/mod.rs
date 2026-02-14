@@ -272,6 +272,7 @@ fn route(req: &HttpRequest, ctx: &RequestContext) -> HttpResponse {
         // Read-only
         ("GET", "/api/whoami") => handle_whoami(ctx),
         ("GET", "/api/config/net") => handle_config_net(ctx),
+        ("GET", "/api/config/raw") => handle_config_raw(ctx),
         ("GET", "/api/dns/stats") => handle_dns_stats(ctx),
         ("GET", "/api/proxy/stats") => handle_proxy_stats(),
 
@@ -359,6 +360,13 @@ fn handle_config_net(ctx: &RequestContext) -> HttpResponse {
     let cfg = ctx.config_mgr.current();
     let json = serde_json::to_string(&cfg.net).unwrap_or_default();
     HttpResponse::ok(&json)
+}
+
+fn handle_config_raw(ctx: &RequestContext) -> HttpResponse {
+    let cfg = ctx.config_mgr.current();
+    let yaml = serde_yaml::to_string(&cfg).unwrap_or_default();
+    let escaped = yaml.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\t', "\\t");
+    HttpResponse::ok(&format!(r#"{{"content":"{}"}}"#, escaped))
 }
 
 fn handle_dns_stats(ctx: &RequestContext) -> HttpResponse {
