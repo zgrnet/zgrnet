@@ -30,6 +30,8 @@ const IPAllocator = noise.IPAllocator;
 const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 
+const admin_html = @embedFile("admin.html");
+
 // ============================================================================
 // RealTun wrapper: adapts tun.Tun to TunDevice interface
 // ============================================================================
@@ -360,6 +362,14 @@ fn apiRoute(ctx: *ApiContext, method: []const u8, path: []const u8, query: []con
     // POST /api/config/reload
     if (eql(method, "POST") and eql(path, "/api/config/reload")) {
         return httpResp(a, 200, "{\"status\":\"no changes\"}");
+    }
+
+    // Admin Web UI
+    if (eql(method, "GET") and eql(path, "/")) {
+        return fmt.allocPrint(a,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+            admin_html.len, admin_html,
+        }) catch return httpResp(a, 500, "");
     }
 
     return httpResp(a, 404, "{\"error\":\"not found\"}");

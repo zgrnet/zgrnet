@@ -17,6 +17,8 @@ use crate::config;
 use crate::host::Host;
 use crate::noise::Key;
 
+const ADMIN_HTML: &str = include_str!("admin.html");
+
 // ============================================================================
 // Server
 // ============================================================================
@@ -161,9 +163,14 @@ impl HttpResponse {
     }
 
     fn write_to(&self, stream: &mut TcpStream) -> io::Result<()> {
+        let content_type = if self.body.starts_with(b"<!DOCTYPE") || self.body.starts_with(b"<html") {
+            "text/html; charset=utf-8"
+        } else {
+            "application/json"
+        };
         let header = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            self.status, self.status_text, self.body.len()
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.status, self.status_text, content_type, self.body.len()
         );
         stream.write_all(header.as_bytes())?;
         if !self.body.is_empty() {
@@ -289,6 +296,15 @@ fn route(req: &HttpRequest, ctx: &RequestContext) -> HttpResponse {
 
         // Config
         ("POST", "/api/config/reload") => handle_config_reload(ctx),
+
+        // Admin Web UI
+        ("GET", "/") => {
+            HttpResponse {
+                status: 200,
+                status_text: "OK",
+                body: ADMIN_HTML.as_bytes().to_vec(),
+            }
+        }
 
         _ => {
             // Check for path-parameter routes

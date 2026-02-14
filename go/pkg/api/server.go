@@ -45,6 +45,7 @@
 package api
 
 import (
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -61,6 +62,9 @@ import (
 	"github.com/vibing/zgrnet/pkg/noise"
 	"github.com/vibing/zgrnet/pkg/proxy"
 )
+
+//go:embed admin.html
+var adminHTML []byte
 
 // Server is the zgrnetd RESTful API server.
 // It provides HTTP endpoints for managing peers, lans, policy, routes,
@@ -139,6 +143,9 @@ func NewServer(cfg ServerConfig) *Server {
 	// Config operations
 	mux.HandleFunc("POST /api/config/reload", s.handleConfigReload)
 
+	// Admin Web UI
+	mux.HandleFunc("GET /", s.handleAdminUI)
+
 	s.server = &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           mux,
@@ -156,6 +163,17 @@ func (s *Server) ListenAndServe() error {
 // Close gracefully shuts down the HTTP server.
 func (s *Server) Close() error {
 	return s.server.Close()
+}
+
+// ─── Admin Web UI ───────────────────────────────────────────────────────────
+
+func (s *Server) handleAdminUI(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(adminHTML)
 }
 
 // ─── JSON helpers ───────────────────────────────────────────────────────────
