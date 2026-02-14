@@ -68,6 +68,8 @@ pub struct PeerConfig {
     pub direct: Vec<String>,
     #[serde(default)]
     pub relay: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Controls who can connect and what services they can access.
@@ -96,9 +98,16 @@ pub struct InboundRule {
 }
 
 /// Defines how to match a peer's identity.
+/// A rule can match by pubkey, by labels, or both.
+/// When both are specified, the peer must match the pubkey condition AND have matching labels.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MatchConfig {
     pub pubkey: PubkeyMatch,
+    /// Label patterns the peer must have at least one of.
+    /// Supports exact match ("host.zigor.net/trusted") and
+    /// wildcard match ("company.zigor.net/*").
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Defines the pubkey matching strategy.
@@ -401,10 +410,14 @@ peers:
     alias: peer_us
     direct:
       - "us.example.com:51820"
+    labels:
+      - "host.zigor.net/trusted"
   "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567bb.zigor.net":
     alias: peer_jp
     relay:
       - "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567aa.zigor.net"
+    labels:
+      - "host.zigor.net/friend"
 inbound_policy:
   default: deny
   revalidate_interval: "5m"

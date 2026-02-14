@@ -33,6 +33,7 @@ pub const PeerConfig = struct {
     alias: []const u8 = "",
     direct: []const []const u8 = &.{},
     relay: []const []const u8 = &.{},
+    labels: []const []const u8 = &.{},
 };
 
 /// Controls who can connect and what services they can access.
@@ -52,8 +53,12 @@ pub const InboundRule = struct {
 };
 
 /// Defines how to match a peer's identity.
+/// A rule can match by pubkey, by labels, or both.
 pub const MatchConfig = struct {
     pubkey: PubkeyMatch = .{},
+    /// Label patterns the peer must have at least one of.
+    /// Supports exact ("host.zigor.net/trusted") and wildcard ("company.zigor.net/*").
+    labels: []const []const u8 = &.{},
 };
 
 /// Defines the pubkey matching strategy.

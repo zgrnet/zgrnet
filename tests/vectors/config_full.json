@@ -15,11 +15,13 @@
   "peers": {
     "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567aa.zigor.net": {
       "alias": "peer_us",
-      "direct": ["us.example.com:51820", "1.2.3.4:51820"]
+      "direct": ["us.example.com:51820", "1.2.3.4:51820"],
+      "labels": ["host.zigor.net/trusted", "host.zigor.net/exit-node"]
     },
     "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567bb.zigor.net": {
       "alias": "peer_jp",
-      "relay": ["abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567aa.zigor.net"]
+      "relay": ["abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567aa.zigor.net"],
+      "labels": ["host.zigor.net/friend"]
     }
   },
   "inbound_policy": {
@@ -35,6 +37,19 @@
         },
         "services": [
           {"proto": "*", "port": "*"}
+        ],
+        "action": "allow"
+      },
+      {
+        "name": "trusted-label",
+        "match": {
+          "pubkey": {
+            "type": "any"
+          },
+          "labels": ["host.zigor.net/trusted"]
+        },
+        "services": [
+          {"proto": "tcp", "port": "80,443"}
         ],
         "action": "allow"
       },

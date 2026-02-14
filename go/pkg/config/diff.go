@@ -98,6 +98,9 @@ func peerConfigEqual(a, b *PeerConfig) bool {
 	if !slices.Equal(a.Relay, b.Relay) {
 		return false
 	}
+	if !slices.Equal(a.Labels, b.Labels) {
+		return false
+	}
 	return true
 }
 
@@ -126,6 +129,9 @@ func inboundRuleEqual(a, b *InboundRule) bool {
 	if a.Match.Pubkey.Type != b.Match.Pubkey.Type ||
 		a.Match.Pubkey.Path != b.Match.Pubkey.Path ||
 		a.Match.Pubkey.Peer != b.Match.Pubkey.Peer {
+		return false
+	}
+	if !slices.Equal(a.Match.Labels, b.Match.Labels) {
 		return false
 	}
 	if len(a.Services) != len(b.Services) {

@@ -54,6 +54,7 @@ type PeerConfig struct {
 	Alias  string   `yaml:"alias" json:"alias"`
 	Direct []string `yaml:"direct" json:"direct"`
 	Relay  []string `yaml:"relay" json:"relay"`
+	Labels []string `yaml:"labels" json:"labels"`
 }
 
 // InboundPolicy controls who can connect and what services they can access.
@@ -78,8 +79,16 @@ type InboundRule struct {
 }
 
 // MatchConfig defines how to match a peer's identity.
+// A rule can match by pubkey (existing), by labels, or both.
+// When both are specified, the peer must match the pubkey condition AND have matching labels.
 type MatchConfig struct {
 	Pubkey PubkeyMatch `yaml:"pubkey" json:"pubkey"`
+
+	// Labels is a list of label patterns the peer must have at least one of.
+	// Supports exact match ("host.zigor.net/trusted") and
+	// wildcard match ("company.zigor.net/*").
+	// Empty means no label matching (pubkey match only).
+	Labels []string `yaml:"labels,omitempty" json:"labels,omitempty"`
 }
 
 // PubkeyMatch defines the pubkey matching strategy.
