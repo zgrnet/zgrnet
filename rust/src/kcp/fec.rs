@@ -11,7 +11,9 @@
 //!
 //! Each FEC-wrapped packet has a 6-byte header:
 //!
-//!     [group_id: u16 LE][index: u8][count: u8][payload_len: u16 LE][payload...]
+//! ```text
+//! [group_id: u16 LE][index: u8][count: u8][payload_len: u16 LE][payload...]
+//! ```
 //!
 //! - group_id: Monotonically increasing group counter (wraps at u16 max)
 //! - index: Packet index within the group (0..count-1 for data, count for parity)
