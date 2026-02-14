@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vibing/zgrnet/pkg/api"
 	"github.com/vibing/zgrnet/pkg/config"
 	"github.com/vibing/zgrnet/pkg/dns"
 	"github.com/vibing/zgrnet/pkg/dnsmgr"
@@ -59,13 +60,14 @@ func main() {
 }
 
 func run(cfgPath string) error {
-	// ── 1. Load and validate config ──────────────────────────────────────
+	// ── 1. Load and validate config via Manager ─────────────────────────
 	log.Printf("loading config: %s", cfgPath)
 
-	cfg, err := config.Load(cfgPath)
+	cfgMgr, err := config.NewManager(cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	cfg := cfgMgr.Current()
 
 	// Apply defaults for optional fields
 	if cfg.Net.TunMTU == 0 {
@@ -245,7 +247,27 @@ func run(cfgPath string) error {
 		go acceptTCPProxyStreams(udpTransport, pk)
 	}
 
-	// ── 12. Start Host forwarding + wait for signal ──────────────────────
+	// ── 12. Start RESTful API server ─────────────────────────────────────
+	apiAddr := net.JoinHostPort(tunIP.String(), "80")
+	apiSrv := api.NewServer(api.ServerConfig{
+		ListenAddr: apiAddr,
+		Host:       h,
+		ConfigMgr:  cfgMgr,
+	})
+
+	go func() {
+		log.Printf("api listening on %s", apiAddr)
+		if err := apiSrv.ListenAndServe(); err != nil {
+			log.Printf("api error: %v", err)
+		}
+	}()
+	defer apiSrv.Close()
+
+	// Start config hot-reload watcher (check every 30s)
+	cfgMgr.Start(30 * time.Second)
+	defer cfgMgr.Stop()
+
+	// ── 13. Start Host forwarding + wait for signal ──────────────────────
 	go func() {
 		if err := h.Run(); err != nil {
 			log.Printf("host error: %v", err)
@@ -257,6 +279,7 @@ func run(cfgPath string) error {
 	log.Printf("  UDP:   %s", h.LocalAddr())
 	log.Printf("  DNS:   %s", dnsAddr)
 	log.Printf("  Proxy: %s", proxyAddr)
+	log.Printf("  API:   %s", apiAddr)
 	log.Printf("  Peers: %d", len(cfg.Peers))
 
 	// Wait for SIGINT or SIGTERM

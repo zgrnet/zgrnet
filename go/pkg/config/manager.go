@@ -6,6 +6,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Watcher receives notifications when configuration changes.
@@ -131,6 +133,86 @@ func (m *Manager) Stop() {
 		close(m.stopChan)
 	}
 	m.mu.Unlock()
+}
+
+// ModifyAndSave atomically modifies the config, validates, saves to disk,
+// rebuilds route/policy engines, and notifies watchers.
+//
+// The modify function receives a mutable deep copy of the current config.
+// If validation or saving fails, the in-memory config is not modified.
+func (m *Manager) ModifyAndSave(modify func(cfg *Config) error) error {
+	m.mu.Lock()
+
+	// Clone current config
+	newCfg := m.current.DeepCopy()
+
+	// Apply caller's modification
+	if err := modify(newCfg); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+
+	// Validate the modified config
+	if err := newCfg.Validate(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+
+	// Save to disk first — if this fails, don't update in-memory state
+	if err := m.saveToFile(newCfg); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+
+	// Compute diff
+	diff := Diff(m.current, newCfg)
+
+	// Rebuild route/policy if needed
+	if diff.RouteChanged {
+		r, err := NewRouteMatcher(&newCfg.Route)
+		if err != nil {
+			m.mu.Unlock()
+			return fmt.Errorf("config: rebuild route matcher: %w", err)
+		}
+		m.route = r
+	}
+	if diff.InboundChanged {
+		p, err := NewPolicyEngine(&newCfg.InboundPolicy)
+		if err != nil {
+			m.mu.Unlock()
+			return fmt.Errorf("config: rebuild policy engine: %w", err)
+		}
+		m.policy = p
+	}
+
+	// Swap current config
+	m.current = newCfg
+	m.configMtime = fileMtime(m.path)
+	m.trackExternalFiles(newCfg)
+	watchers := make([]Watcher, len(m.watchers))
+	copy(watchers, m.watchers)
+	m.mu.Unlock()
+
+	// Notify watchers outside the lock
+	if !diff.IsEmpty() {
+		m.notifyWatchers(watchers, diff, newCfg)
+	}
+
+	return nil
+}
+
+// saveToFile writes the config to disk as YAML.
+func (m *Manager) saveToFile(cfg *Config) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("config: marshal yaml: %w", err)
+	}
+	return os.WriteFile(m.path, data, 0644)
+}
+
+// Path returns the config file path.
+func (m *Manager) Path() string {
+	return m.path
 }
 
 // Reload manually reloads the configuration from disk.

@@ -210,6 +210,16 @@ func (h *Host) AddPeerWithIP(pk noise.PublicKey, endpoint string, ipv4 net.IP) e
 	return h.addPeerLocked(p)
 }
 
+// RemovePeer removes a peer from the host, disconnects it, and releases its IP.
+func (h *Host) RemovePeer(pk noise.PublicKey) {
+	h.mu.Lock()
+	delete(h.peers, pk)
+	h.mu.Unlock()
+
+	h.ipAlloc.Remove(pk)
+	h.udp.RemovePeer(pk)
+}
+
 // Connect initiates a Noise handshake with the specified peer.
 // The peer must have an endpoint set. This call blocks until the
 // handshake completes or times out (5 seconds).
