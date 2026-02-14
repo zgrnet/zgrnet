@@ -207,7 +207,7 @@ mod tests {
             name: name.into(),
             match_config: MatchConfig { pubkey: PubkeyMatch {
                 match_type: "any".into(), path: String::new(), peer: String::new(),
-            }},
+            }, labels: vec![] },
             services: vec![ServiceConfig { proto: "*".into(), port: "*".into() }],
             action: action.into(),
         }
@@ -237,7 +237,7 @@ mod tests {
                 match_type: "whitelist".into(),
                 path: list_path.to_str().unwrap().into(),
                 peer: String::new(),
-            }},
+            }, labels: vec![] },
             services: vec![ServiceConfig { proto: "tcp".into(), port: "80,443".into() }],
             action: "allow".into(),
         }]);
@@ -261,7 +261,7 @@ mod tests {
                 match_type: "zgrlan".into(),
                 path: String::new(),
                 peer: "company.zigor.net".into(),
-            }},
+            }, labels: vec![] },
             services: vec![ServiceConfig { proto: "tcp".into(), port: "80,443".into() }],
             action: "allow".into(),
         }]);
@@ -304,7 +304,7 @@ mod tests {
                     match_type: "whitelist".into(),
                     path: list_path.to_str().unwrap().into(),
                     peer: String::new(),
-                }},
+                }, labels: vec![] },
                 services: vec![ServiceConfig { proto: "*".into(), port: "*".into() }],
                 action: "allow".into(),
             },
@@ -407,7 +407,7 @@ mod tests {
                 match_type: "whitelist".into(),
                 path: list_path.to_str().unwrap().into(),
                 peer: String::new(),
-            }},
+            }, labels: vec![] },
             services: vec![ServiceConfig { proto: "*".into(), port: "*".into() }],
             action: "allow".into(),
         }]);
