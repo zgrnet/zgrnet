@@ -243,6 +243,14 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_signal();
     eprintln!("shutting down...");
 
+    // Force exit on second signal or after timeout.
+    // Close() calls may block on active connections with in-flight io::copy.
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(5));
+        eprintln!("shutdown timeout (5s), force exit");
+        std::process::exit(1);
+    });
+
     // Graceful shutdown
     host.close();
     Ok(())
@@ -548,7 +556,14 @@ fn ctrlc_register(running: Arc<std::sync::atomic::AtomicBool>) {
 static SIGNAL_FLAG: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>> =
     std::sync::Mutex::new(None);
 
+static SIGNAL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 extern "C" fn signal_handler(_sig: libc::c_int) {
+    let count = SIGNAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if count >= 1 {
+        // Second signal — force exit immediately
+        std::process::exit(1);
+    }
     if let Ok(guard) = SIGNAL_FLAG.lock() {
         if let Some(flag) = guard.as_ref() {
             flag.store(false, std::sync::atomic::Ordering::SeqCst);

@@ -357,6 +357,20 @@ func run(cfgPath string) error {
 	sig := <-sigCh
 	log.Printf("received %s, shutting down...", sig)
 
+	// Force exit on second signal or after timeout.
+	// Deferred Close() calls (proxy, dns, host) may block on wg.Wait()
+	// if there are active connections with in-flight io.Copy.
+	go func() {
+		select {
+		case s := <-sigCh:
+			log.Printf("received %s again, force exit", s)
+			os.Exit(1)
+		case <-time.After(5 * time.Second):
+			log.Printf("shutdown timeout (5s), force exit")
+			os.Exit(1)
+		}
+	}()
+
 	// Graceful shutdown order: Proxy → DNS → Host → TUN
 	// (deferred calls execute in reverse order)
 	return nil

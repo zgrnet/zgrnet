@@ -535,13 +535,28 @@ fn waitForSignal() void {
         std.Thread.sleep(100 * std.time.ns_per_ms);
     }
     print("[zgrnetd] received signal, stopping\n", .{});
+
+    // Spawn a watchdog thread: force exit after 5s if graceful shutdown hangs.
+    _ = std.Thread.spawn(.{}, struct {
+        fn run() void {
+            std.Thread.sleep(5 * std.time.ns_per_s);
+            print("[zgrnetd] shutdown timeout (5s), force exit\n", .{});
+            std.process.exit(1);
+        }
+    }.run, .{}) catch {};
 }
 
 var signal_received = std.atomic.Value(bool).init(false);
+var signal_count = std.atomic.Value(u32).init(0);
 
 fn setupSignalHandler() void {
     const handler = struct {
         fn h(_: c_int) callconv(.c) void {
+            const count = signal_count.fetchAdd(1, .seq_cst);
+            if (count >= 1) {
+                // Second signal — force exit immediately
+                std.process.exit(1);
+            }
             signal_received.store(true, .seq_cst);
         }
     }.h;
