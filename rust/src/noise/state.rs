@@ -6,6 +6,10 @@ use super::keypair::{Key, KEY_SIZE};
 use ring::aead::{LessSafeKey, UnboundKey, Nonce, Aad, CHACHA20_POLY1305};
 
 /// Manages encryption for one direction of communication.
+///
+/// **WARNING**: Uses auto-incrementing nonces. Only suitable for ordered,
+/// reliable transport (like TCP or within Noise handshake).
+/// For unreliable transport (UDP), use Session with explicit nonces.
 pub struct CipherState {
     key: Key,
     nonce: u64,

@@ -18,6 +18,10 @@ pub fn State(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite) type
 
     return struct {
         /// Manages encryption for one direction of communication.
+        ///
+        /// WARNING: Uses auto-incrementing nonces. Only suitable for ordered,
+        /// reliable transport (like TCP or within Noise handshake).
+        /// For unreliable transport (UDP), use Session with explicit nonces.
         pub const CipherState = struct {
             key: Key,
             nonce: u64,

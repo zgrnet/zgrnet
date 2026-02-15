@@ -11,6 +11,10 @@ import (
 
 // CipherState manages encryption for one direction of communication.
 // It tracks the key and nonce (counter) for ChaCha20-Poly1305.
+//
+// WARNING: Uses auto-incrementing nonces. Only suitable for ordered,
+// reliable transport (like TCP or within Noise handshake).
+// For unreliable transport (UDP), use Session with explicit nonces.
 type CipherState struct {
 	key   Key
 	nonce uint64

@@ -20,6 +20,7 @@
 //! ```
 
 pub const kcp = @import("kcp.zig");
+pub const fec = @import("fec.zig");
 pub const stream_mod = @import("stream.zig");
 pub const ring_buffer = @import("ring_buffer.zig");
 
@@ -29,6 +30,11 @@ pub const Frame = kcp.Frame;
 pub const Cmd = kcp.Cmd;
 pub const FrameError = kcp.FrameError;
 pub const FrameHeaderSize = kcp.FrameHeaderSize;
+
+// FEC
+pub const FecEncoder = fec.Encoder;
+pub const FecDecoder = fec.Decoder;
+pub const FecHeaderSize = fec.HeaderSize;
 
 // Stream/Mux - generic over Runtime
 pub const Stream = stream_mod.Stream;
