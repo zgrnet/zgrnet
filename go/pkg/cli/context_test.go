@@ -259,9 +259,10 @@ func TestDefaultConfigDirDefault(t *testing.T) {
 	if dir == "" {
 		t.Fatal("empty dir")
 	}
-	// Should end with .config/zgrnet
-	if !strings.HasSuffix(dir, ".config/zgrnet") {
-		t.Fatalf("unexpected dir: %q", dir)
+	// Should end with .config/zgrnet (or .config\zgrnet on Windows)
+	expected := filepath.Join(".config", "zgrnet")
+	if !strings.HasSuffix(dir, expected) {
+		t.Fatalf("unexpected dir: %q (expected suffix %q)", dir, expected)
 	}
 }
 

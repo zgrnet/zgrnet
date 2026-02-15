@@ -356,8 +356,8 @@ fn runConfig(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_a
         defer allocator.free(path);
         const data = try fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
         defer allocator.free(data);
-        const stdout = std.io.getStdOut().writer();
-        try stdout.writeAll(data);
+        // Write config data to stdout
+        print("{s}", .{data});
     } else if (mem.eql(u8, args[0], "path")) {
         const path = try contextConfigPath(allocator, base_dir, ctx);
         defer allocator.free(path);
@@ -685,9 +685,7 @@ fn httpRequest(allocator: Allocator, addr: []const u8, method: []const u8, path:
 fn printJsonOutput(data: []const u8, raw: bool) void {
     _ = raw;
     // For now just print as-is; Zig doesn't have a JSON pretty-printer in std
-    const stdout = std.io.getStdOut().writer();
-    stdout.writeAll(data) catch {};
-    stdout.writeAll("\n") catch {};
+    print("{s}\n", .{data});
 }
 
 fn printUsage() void {
