@@ -1,0 +1,13 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "apitest_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/vibing/zgrnet/cmd/apitest",
+)
+
+go_binary(
+    name = "apitest",
+    embed = [":apitest_lib"],
+    visibility = ["//visibility:public"],
+)

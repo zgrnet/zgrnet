@@ -315,9 +315,20 @@ func run(cfgPath string) error {
 	}
 
 	// ── 12. Start RESTful API server ─────────────────────────────────────
+	// Listen on both TUN IP (for peer access) and localhost (for local access).
+	// macOS point-to-point TUN devices don't create a host route for the local
+	// IP, so localhost binding ensures the admin UI is always reachable.
 	apiAddr := net.JoinHostPort(tunIP.String(), "80")
+	apiLocalAddr := "127.0.0.1:19280"
 	apiSrv := api.NewServer(api.ServerConfig{
 		ListenAddr:  apiAddr,
+		Host:        h,
+		ConfigMgr:   cfgMgr,
+		DNSServer:   dnsServer,
+		ProxyServer: proxySrv,
+	})
+	apiSrvLocal := api.NewServer(api.ServerConfig{
+		ListenAddr:  apiLocalAddr,
 		Host:        h,
 		ConfigMgr:   cfgMgr,
 		DNSServer:   dnsServer,
@@ -331,6 +342,14 @@ func run(cfgPath string) error {
 		}
 	}()
 	defer apiSrv.Close()
+
+	go func() {
+		log.Printf("api listening on %s (local)", apiLocalAddr)
+		if err := apiSrvLocal.ListenAndServe(); err != nil {
+			log.Printf("api local error: %v", err)
+		}
+	}()
+	defer apiSrvLocal.Close()
 
 	// Start config hot-reload watcher (check every 30s)
 	cfgMgr.Start(30 * time.Second)
@@ -348,7 +367,7 @@ func run(cfgPath string) error {
 	log.Printf("  UDP:   %s", h.LocalAddr())
 	log.Printf("  DNS:   %s", dnsAddr)
 	log.Printf("  Proxy: %s", proxyAddr)
-	log.Printf("  API:   %s", apiAddr)
+	log.Printf("  API:   %s, %s", apiAddr, apiLocalAddr)
 	log.Printf("  Peers: %d", len(cfg.Peers))
 
 	// Wait for SIGINT or SIGTERM
