@@ -37,6 +37,7 @@ import (
 	"github.com/vibing/zgrnet/pkg/dns"
 	"github.com/vibing/zgrnet/pkg/dnsmgr"
 	"github.com/vibing/zgrnet/pkg/host"
+	"github.com/vibing/zgrnet/pkg/lan"
 	znet "github.com/vibing/zgrnet/pkg/net"
 	"github.com/vibing/zgrnet/pkg/noise"
 	"github.com/vibing/zgrnet/pkg/proxy"
@@ -331,7 +332,26 @@ func run(cfgPath string) error {
 		go acceptTCPProxyStreams(udpTransport, pk)
 	}
 
-	// ── 12. Start RESTful API server ─────────────────────────────────────
+	// ── 12. Start LAN service + RESTful API server ─────────────────────
+	lanStore, err := lan.NewFileStore(filepath.Join(dataDir, "lan"))
+	if err != nil {
+		return fmt.Errorf("create lan store: %w", err)
+	}
+
+	ipAlloc := h.IPAlloc()
+	lanServer := lan.NewServer(lan.Config{
+		Domain:      "host.zigor.net",
+		Description: "Local LAN",
+		IdentityFn: func(ip net.IP) (noise.PublicKey, []string, error) {
+			pk, ok := ipAlloc.LookupByIP(ip)
+			if !ok {
+				return noise.PublicKey{}, nil, fmt.Errorf("unknown IP: %s", ip)
+			}
+			return pk, nil, nil
+		},
+	}, lanStore)
+	lanServer.RegisterAuth(lan.NewOpenAuth())
+
 	apiAddr := net.JoinHostPort(tunIP.String(), "80")
 	apiSrv := api.NewServer(api.ServerConfig{
 		ListenAddr:  apiAddr,
@@ -339,6 +359,7 @@ func run(cfgPath string) error {
 		ConfigMgr:   cfgMgr,
 		DNSServer:   dnsServer,
 		ProxyServer: proxySrv,
+		LanHandler:  lanServer.Handler(),
 	})
 
 	go func() {

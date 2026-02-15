@@ -95,6 +95,10 @@ type ServerConfig struct {
 
 	// ProxyServer is the running SOCKS5 proxy server (optional, for stats).
 	ProxyServer *proxy.Server
+
+	// LanHandler is an optional HTTP handler for LAN service API (/api/lan/*).
+	// If nil, LAN endpoints are not registered.
+	LanHandler http.Handler
 }
 
 // NewServer creates a new API server with all routes registered.
@@ -143,6 +147,11 @@ func NewServer(cfg ServerConfig) *Server {
 
 	// Config operations
 	mux.HandleFunc("POST /api/config/reload", s.handleConfigReload)
+
+	// LAN service (mounted from external handler)
+	if cfg.LanHandler != nil {
+		mux.Handle("/api/lan/", cfg.LanHandler)
+	}
 
 	// Admin Web UI
 	mux.HandleFunc("GET /", s.handleAdminUI)

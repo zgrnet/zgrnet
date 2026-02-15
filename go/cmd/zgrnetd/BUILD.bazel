@@ -11,6 +11,7 @@ go_binary(
         "//go/pkg/dns",
         "//go/pkg/dnsmgr",
         "//go/pkg/host",
+        "//go/pkg/lan",
         "//go/pkg/net",
         "//go:noise",
         "//go/pkg/proxy",
