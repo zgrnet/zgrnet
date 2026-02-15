@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net"
 	"net/http"
 )
@@ -54,7 +55,10 @@ func IdentityHandler(ipAlloc IPAllocator, labelStore *LabelStore) http.HandlerFu
 		}
 
 		pubkeyHex := hex.EncodeToString(pubkey[:])
-		labels := labelStore.Labels(pubkeyHex)
+		var labels []string
+		if labelStore != nil {
+			labels = labelStore.Labels(pubkeyHex)
+		}
 		if labels == nil {
 			labels = []string{}
 		}
@@ -65,6 +69,8 @@ func IdentityHandler(ipAlloc IPAllocator, labelStore *LabelStore) http.HandlerFu
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("identity: encode response: %v", err)
+		}
 	}
 }

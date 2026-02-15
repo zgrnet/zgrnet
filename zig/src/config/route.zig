@@ -33,9 +33,10 @@ pub const RouteMatcher = struct {
 
             var domain = rule.domain;
             // Strip "*." prefix — all matches are suffix-based
-            if (domain.len > 2 and domain[0] == '*' and domain[1] == '.') {
+            if (domain.len >= 2 and domain[0] == '*' and domain[1] == '.') {
                 domain = domain[2..];
             }
+            if (domain.len == 0) continue; // skip bare "*." without a domain component
 
             const lower = try allocator.alloc(u8, domain.len);
             for (domain, 0..) |c, i| {

@@ -43,6 +43,9 @@ func (rm *RouteMatcher) build(cfg *RouteConfig) {
 		domain := strings.ToLower(r.Domain)
 		// Strip "*." prefix if present — all matches are suffix-based
 		domain = strings.TrimPrefix(domain, "*.")
+		if domain == "" {
+			continue // skip bare "*." without a domain component
+		}
 		rules = append(rules, compiledRouteRule{
 			peer:   r.Peer,
 			suffix: domain,

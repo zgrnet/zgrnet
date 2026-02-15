@@ -136,7 +136,7 @@ pub fn match_labels(peer_labels: &[String], patterns: &[String]) -> bool {
 
 /// Extract the hex pubkey from a peer domain.
 /// Format: "{hex}.zigor.net" -> lowercase hex string.
-fn pubkey_hex_from_domain(domain: &str) -> Option<String> {
+pub fn pubkey_hex_from_domain(domain: &str) -> Option<String> {
     let prefix = domain.strip_suffix(".zigor.net")?;
     if prefix.is_empty() || prefix.len() > 64 {
         return None;

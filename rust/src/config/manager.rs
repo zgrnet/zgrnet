@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 use super::{
     Config, ConfigError, InboundPolicy, LanConfig, PeerConfig, RouteConfig,
     diff::{ConfigDiff, diff},
+    labels::LabelStore,
     policy::{PolicyEngine, PolicyResult},
     route::{RouteMatcher, RouteResult},
 };
@@ -35,6 +36,7 @@ struct ManagerInner {
     current: Config,
     route: RouteMatcher,
     policy: PolicyEngine,
+    label_store: Arc<LabelStore>,
     watchers: Vec<Arc<dyn Watcher>>,
     config_mtime: SystemTime,
     ext_files: HashMap<String, SystemTime>,
@@ -55,7 +57,12 @@ impl Manager {
         let path = path.as_ref().to_path_buf();
         let cfg = super::load(&path)?;
         let route = RouteMatcher::new(&cfg.route)?;
-        let policy = PolicyEngine::new(&cfg.inbound_policy)?;
+
+        let label_store = Arc::new(LabelStore::new());
+        label_store.load_from_config(&cfg.peers);
+
+        let policy = PolicyEngine::with_label_store(
+            &cfg.inbound_policy, Arc::clone(&label_store))?;
 
         let mut ext_files = HashMap::new();
         track_external_files(&cfg, &mut ext_files);
@@ -64,6 +71,7 @@ impl Manager {
             current: cfg,
             route,
             policy,
+            label_store,
             watchers: Vec::new(),
             config_mtime: file_mtime(&path),
             ext_files,
@@ -170,8 +178,26 @@ fn reload_inner(path: &Path, inner: &Arc<RwLock<ManagerInner>>) -> Result<Option
     } else {
         None
     };
+
+    // Refresh labels from config peers on any peer change
+    let peers_changed = !d.peers_added.is_empty() || !d.peers_removed.is_empty() || !d.peers_changed.is_empty();
+    let label_store = {
+        let guard = inner.read().unwrap();
+        Arc::clone(&guard.label_store)
+    };
+    if peers_changed {
+        // Clean up host labels for removed peers
+        for domain in &d.peers_removed {
+            if let Some(pk) = super::labels::pubkey_hex_from_domain(domain) {
+                label_store.remove_labels(&pk, "host.zigor.net");
+            }
+        }
+        label_store.load_from_config(&new_cfg.peers);
+    }
+
     let new_policy = if d.inbound_changed {
-        Some(PolicyEngine::new(&new_cfg.inbound_policy)?)
+        Some(PolicyEngine::with_label_store(
+            &new_cfg.inbound_policy, Arc::clone(&label_store))?)
     } else {
         None
     };

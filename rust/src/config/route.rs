@@ -45,6 +45,9 @@ impl RouteMatcher {
             if let Some(stripped) = domain.strip_prefix("*.") {
                 domain = stripped.to_string();
             }
+            if domain.is_empty() {
+                return None; // skip bare "*." without a domain component
+            }
             Some(CompiledRule {
                 peer: r.peer.clone(),
                 suffix: domain,
