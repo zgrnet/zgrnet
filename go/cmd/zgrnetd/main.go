@@ -24,8 +24,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -183,6 +185,17 @@ func run(cfgPath string) error {
 	if err := tunDev.Up(); err != nil {
 		return fmt.Errorf("bring TUN up: %w", err)
 	}
+
+	// Add host route so the TUN IP is locally reachable.
+	// macOS utun is point-to-point: the OS only creates a route for the peer
+	// address, not the local address. Without this, TCP connections to our own
+	// TUN IP go out the default route (physical NIC) instead of staying local.
+	if err := addLocalRoute(tunIP); err != nil {
+		log.Printf("warning: add local route for %s: %v", tunIP, err)
+	} else {
+		defer removeLocalRoute(tunIP)
+	}
+
 	log.Printf("TUN %s: %s/10, MTU %d", tunDev.Name(), tunIP, cfg.Net.TunMTU)
 
 	// ── 5-6. Create Host (TUN + UDP + IP Allocator) ─────────────────────
@@ -315,20 +328,9 @@ func run(cfgPath string) error {
 	}
 
 	// ── 12. Start RESTful API server ─────────────────────────────────────
-	// Listen on both TUN IP (for peer access) and localhost (for local access).
-	// macOS point-to-point TUN devices don't create a host route for the local
-	// IP, so localhost binding ensures the admin UI is always reachable.
 	apiAddr := net.JoinHostPort(tunIP.String(), "80")
-	apiLocalAddr := "127.0.0.1:19280"
 	apiSrv := api.NewServer(api.ServerConfig{
 		ListenAddr:  apiAddr,
-		Host:        h,
-		ConfigMgr:   cfgMgr,
-		DNSServer:   dnsServer,
-		ProxyServer: proxySrv,
-	})
-	apiSrvLocal := api.NewServer(api.ServerConfig{
-		ListenAddr:  apiLocalAddr,
 		Host:        h,
 		ConfigMgr:   cfgMgr,
 		DNSServer:   dnsServer,
@@ -342,14 +344,6 @@ func run(cfgPath string) error {
 		}
 	}()
 	defer apiSrv.Close()
-
-	go func() {
-		log.Printf("api listening on %s (local)", apiLocalAddr)
-		if err := apiSrvLocal.ListenAndServe(); err != nil {
-			log.Printf("api local error: %v", err)
-		}
-	}()
-	defer apiSrvLocal.Close()
 
 	// Start config hot-reload watcher (check every 30s)
 	cfgMgr.Start(30 * time.Second)
@@ -367,7 +361,7 @@ func run(cfgPath string) error {
 	log.Printf("  UDP:   %s", h.LocalAddr())
 	log.Printf("  DNS:   %s", dnsAddr)
 	log.Printf("  Proxy: %s", proxyAddr)
-	log.Printf("  API:   %s, %s", apiAddr, apiLocalAddr)
+	log.Printf("  API:   %s", apiAddr)
 	log.Printf("  Peers: %d", len(cfg.Peers))
 
 	// Wait for SIGINT or SIGTERM
@@ -494,4 +488,41 @@ func trimKey(s string) string {
 		}
 	}
 	return string(result)
+}
+
+// addLocalRoute adds a host route so the TUN IP is locally reachable.
+//
+// On macOS, utun devices are point-to-point: the kernel only creates a route
+// for the peer address, not the local address. Without an explicit host route,
+// packets to our own TUN IP follow the default route out the physical NIC.
+//
+// On Linux, the kernel automatically treats addresses assigned to local
+// interfaces as local, so this is a no-op.
+func addLocalRoute(ip net.IP) error {
+	switch runtime.GOOS {
+	case "darwin":
+		out, err := exec.Command("/sbin/route", "add", "-host", ip.String(), "-interface", "lo0").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
+		}
+		log.Printf("route: added host route %s → lo0", ip)
+		return nil
+	case "linux":
+		// Linux handles local addresses automatically via the "local" routing table.
+		return nil
+	default:
+		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+	}
+}
+
+// removeLocalRoute removes the host route added by addLocalRoute.
+func removeLocalRoute(ip net.IP) {
+	switch runtime.GOOS {
+	case "darwin":
+		if out, err := exec.Command("/sbin/route", "delete", "-host", ip.String(), "-interface", "lo0").CombinedOutput(); err != nil {
+			log.Printf("warning: remove local route %s: %s: %v", ip, strings.TrimSpace(string(out)), err)
+		} else {
+			log.Printf("route: removed host route %s → lo0", ip)
+		}
+	}
 }

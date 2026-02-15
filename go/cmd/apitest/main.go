@@ -23,7 +23,7 @@ import (
 )
 
 var (
-	addr = flag.String("addr", "http://127.0.0.1:19280", "zgrnetd API address")
+	addr = flag.String("addr", "http://100.64.0.1:80", "zgrnetd API address")
 )
 
 // result tracks a single test outcome.

@@ -100,6 +100,28 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         let name = dev.name().to_string();
         eprintln!("TUN {}: {}/10, MTU {}", name, tun_ip, tun_mtu);
+
+        // Add host route so the TUN IP is locally reachable.
+        // macOS utun is point-to-point: the OS only creates a route for the
+        // peer address, not the local address.
+        if cfg!(target_os = "macos") {
+            match std::process::Command::new("/sbin/route")
+                .args(["add", "-host", &tun_ip.to_string(), "-interface", "lo0"])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    eprintln!("route: added host route {} → lo0", tun_ip);
+                }
+                Ok(out) => {
+                    eprintln!("warning: add local route {}: {}",
+                        tun_ip, String::from_utf8_lossy(&out.stderr).trim());
+                }
+                Err(e) => {
+                    eprintln!("warning: add local route {}: {}", tun_ip, e);
+                }
+            }
+        }
+
         (dev, name)
     };
 
@@ -253,6 +275,15 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful shutdown
     host.close();
+
+    // Remove local route on macOS
+    if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("/sbin/route")
+            .args(["delete", "-host", &tun_ip.to_string(), "-interface", "lo0"])
+            .output();
+        eprintln!("route: removed host route {} → lo0", tun_ip);
+    }
+
     Ok(())
 }
 

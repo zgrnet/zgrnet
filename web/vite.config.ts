@@ -13,10 +13,14 @@ export default defineConfig({
   },
   server: {
     // Proxy /api/* to zgrnetd during development.
-    // Change target to your TUN IP if different from 100.64.0.1.
+    // Requires zgrnetd to be running (sudo zgrnetd -c default).
     proxy: {
       '/api': {
-        target: 'http://100.64.0.1:80',
+        target: 'http://100.64.0.1',
+        changeOrigin: true,
+      },
+      '/internal': {
+        target: 'http://100.64.0.1',
         changeOrigin: true,
       },
     },
