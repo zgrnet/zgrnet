@@ -76,11 +76,11 @@ type NewUDPRelayFunc func() (UDPRelay, error)
 
 // ProxyStats holds proxy connection statistics.
 type ProxyStats struct {
-	TotalConnections uint64 `json:"total_connections"`
-	ActiveConnections int64 `json:"active_connections"`
-	BytesSent        uint64 `json:"bytes_sent"`
-	BytesReceived    uint64 `json:"bytes_received"`
-	Errors           uint64 `json:"errors"`
+	TotalConnections  uint64 `json:"total_connections"`
+	ActiveConnections int64  `json:"active_connections"`
+	BytesSent         uint64 `json:"bytes_sent"`
+	BytesReceived     uint64 `json:"bytes_received"`
+	Errors            uint64 `json:"errors"`
 }
 
 // Server is a SOCKS5 proxy server.

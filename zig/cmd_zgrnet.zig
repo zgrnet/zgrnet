@@ -687,7 +687,7 @@ fn httpRequest(allocator: Allocator, addr: []const u8, method: []const u8, path:
 // Helpers
 // ============================================================================
 
-fn printJsonOutput(data: []const u8, raw: bool) {
+fn printJsonOutput(data: []const u8, raw: bool) void {
     _ = raw;
     // For now just print as-is; Zig doesn't have a JSON pretty-printer in std
     const stdout = std.io.getStdOut().writer();
@@ -695,7 +695,7 @@ fn printJsonOutput(data: []const u8, raw: bool) {
     stdout.writeAll("\n") catch {};
 }
 
-fn printUsage() {
+fn printUsage() void {
     print(
         \\zgrnet — zgrnet management tool (Zig)
         \\

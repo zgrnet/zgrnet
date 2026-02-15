@@ -813,7 +813,6 @@ fn escape_json(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
 
     fn minimal_config(dir: &std::path::Path) -> String {

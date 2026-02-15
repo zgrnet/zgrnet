@@ -9,7 +9,6 @@
 //! Online operations (calls zgrnetd REST API):
 //! - status, peers, lans, policy, routes, config net/reload
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;

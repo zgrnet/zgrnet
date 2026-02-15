@@ -230,9 +230,21 @@ fn run_down(base_dir: &PathBuf, ctx: &str) -> Result<(), String> {
     let pid: i32 = data.trim().parse()
         .map_err(|_| "invalid pid file".to_string())?;
 
+    #[cfg(unix)]
     unsafe {
         if libc::kill(pid, libc::SIGTERM) != 0 {
             return Err(format!("send SIGTERM to pid {pid}: {}", std::io::Error::last_os_error()));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // On Windows, use taskkill to terminate the process
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status()
+            .map_err(|e| format!("taskkill failed: {e}"))?;
+        if !status.success() {
+            return Err(format!("taskkill failed for pid {pid}"));
         }
     }
     let _ = std::fs::remove_file(&pid_path);

@@ -308,10 +308,10 @@ func (s *Server) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAddPeer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PublicKey string   `json:"pubkey"`
-		Alias    string   `json:"alias"`
-		Endpoint string   `json:"endpoint"`
-		Direct   []string `json:"direct"`
-		Relay    []string `json:"relay"`
+		Alias     string   `json:"alias"`
+		Endpoint  string   `json:"endpoint"`
+		Direct    []string `json:"direct"`
+		Relay     []string `json:"relay"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

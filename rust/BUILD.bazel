@@ -6,6 +6,7 @@ load("@crates//:defs.bzl", "all_crate_deps")
 rust_library(
     name = "zgrnet",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["src/api/admin.html"],
     crate_name = "zgrnet",
     edition = "2021",
     visibility = ["//visibility:public"],
@@ -15,6 +16,7 @@ rust_library(
 rust_test(
     name = "zgrnet_test",
     crate = ":zgrnet",
+    compile_data = ["src/api/admin.html"],
     deps = all_crate_deps(normal_dev = True) + ["//third_party/kcp"],
 )
 
@@ -22,6 +24,7 @@ rust_test(
 rust_library(
     name = "zgrnet_tun",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = ["src/api/admin.html"],
     crate_name = "zgrnet",
     edition = "2021",
     crate_features = ["tun"],
@@ -33,6 +36,7 @@ rust_library(
 rust_test(
     name = "tun_test",
     crate = ":zgrnet_tun",
+    compile_data = ["src/api/admin.html"],
     deps = all_crate_deps(normal_dev = True) + ["//third_party/kcp", "//zig/tun:lib"],
     env = {"RUST_TEST_THREADS": "1"},
     args = ["tun::"],
@@ -43,6 +47,7 @@ rust_test(
 rust_library(
     name = "zgrnet_full",
     srcs = glob(["src/**/*.rs"], exclude = ["src/bin/**"]),
+    compile_data = ["src/api/admin.html"],
     crate_name = "zgrnet",
     edition = "2021",
     crate_features = ["tun", "dnsmgr"],

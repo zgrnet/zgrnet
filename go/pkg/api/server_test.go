@@ -59,7 +59,7 @@ func (m *mockTUN) Close() error {
 type testEnv struct {
 	Server  *Server
 	Host    *host.Host
-	CfgMgr *config.Manager
+	CfgMgr  *config.Manager
 	CfgPath string
 	TmpDir  string
 	KeyA    *noise.KeyPair // local host key
