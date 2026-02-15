@@ -112,12 +112,25 @@ func run() error {
 	log.Printf("Host A on %s, Host B on %s", hostA.LocalAddr(), hostB.LocalAddr())
 
 	// ── 4. Add peers ────────────────────────────────────────────────────
-	hostA.AddPeerWithIP(kpB.Public, hostB.LocalAddr().String(), ipB)
-	hostB.AddPeerWithIP(kpA.Public, hostA.LocalAddr().String(), ipA)
+	// Use 127.0.0.1 explicitly — [::] may not route on macOS loopback.
+	aPort := hostA.LocalAddr().(*net.UDPAddr).Port
+	bPort := hostB.LocalAddr().(*net.UDPAddr).Port
+
+	aEndpoint := fmt.Sprintf("127.0.0.1:%d", aPort)
+	bEndpoint := fmt.Sprintf("127.0.0.1:%d", bPort)
+
+	if err := hostA.AddPeerWithIP(kpB.Public, bEndpoint, ipB); err != nil {
+		return fmt.Errorf("A add peer B: %w", err)
+	}
+	if err := hostB.AddPeerWithIP(kpA.Public, aEndpoint, ipA); err != nil {
+		return fmt.Errorf("B add peer A: %w", err)
+	}
+	log.Printf("peers added: A→B=%s, B→A=%s", bEndpoint, aEndpoint)
 
 	// ── 5. Start forwarding loops ───────────────────────────────────────
 	go hostA.Run()
 	go hostB.Run()
+	time.Sleep(100 * time.Millisecond) // let goroutines start
 
 	// ── 6. Noise handshake B → A ────────────────────────────────────────
 	log.Printf("connecting B → A...")
