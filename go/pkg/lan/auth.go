@@ -2,6 +2,7 @@ package lan
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -235,5 +236,40 @@ func (a *PubkeyWhitelistAuth) RemoveKey(pk noise.PublicKey) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.allowed, pk)
+}
+
+// ── BearerTokenAuth ─────────────────────────────────────────────────────────
+
+// BearerTokenAuth validates join requests against a static bearer token.
+// Simple and deterministic — ideal for e2e tests, internal services,
+// and machine-to-machine authentication.
+type BearerTokenAuth struct {
+	token string
+}
+
+// NewBearerTokenAuth creates a bearer token authenticator.
+func NewBearerTokenAuth(token string) *BearerTokenAuth {
+	return &BearerTokenAuth{token: token}
+}
+
+func (a *BearerTokenAuth) Method() string { return "bearer_token" }
+
+// bearerTokenCredential is the expected JSON credential.
+type bearerTokenCredential struct {
+	Token string `json:"token"`
+}
+
+func (a *BearerTokenAuth) Authenticate(_ noise.PublicKey, credential json.RawMessage) error {
+	var cred bearerTokenCredential
+	if err := json.Unmarshal(credential, &cred); err != nil {
+		return fmt.Errorf("invalid credential: expected {\"token\": \"...\"}")
+	}
+	if cred.Token == "" {
+		return fmt.Errorf("token is required")
+	}
+	if subtle.ConstantTimeCompare([]byte(a.token), []byte(cred.Token)) != 1 {
+		return fmt.Errorf("invalid token")
+	}
+	return nil
 }
 
