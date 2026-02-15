@@ -2,13 +2,19 @@
 //!
 //! Provides membership management, pluggable authentication, and event
 //! notification for zgrnet LANs. This is a library — callers create a
-//! Server, register Authenticator implementations, and handle HTTP
-//! requests through the provided dispatch function.
+//! Server, register Authenticator implementations, and mount handlers
+//! on their HTTP infrastructure.
 //!
-//! Identity resolution (IP → pubkey) is injected via IdentityFn callback,
-//! so this module has no dependency on the host or transport layer.
+//! ## embed-zig integration
+//!
+//! - **Authenticator**: Runtime vtable dispatch (auth methods are registered
+//!   dynamically, so comptime traits don't apply).
+//! - **Events**: Uses embed-zig `Channel(Event, N, Rt)` for Go-style event
+//!   subscription. Subscribers receive events via blocking `recv()`.
+//! - **Identity**: Injected via `IdentityFn` callback — no host dependency.
 
 const std = @import("std");
+const channel_mod = @import("channel");
 const noise = @import("../noise/mod.zig");
 const Key = noise.Key;
 
@@ -40,13 +46,13 @@ pub const IdentityError = error{
 /// Event pushed to subscribers on LAN changes.
 pub const Event = struct {
     /// Event kind.
-    type: EventType,
+    kind: EventKind,
     /// Affected member pubkey.
     pubkey: Key,
     /// New labels (for .labels events).
     labels: ?[]const []const u8,
 
-    pub const EventType = enum {
+    pub const EventKind = enum {
         join,
         leave,
         labels,
@@ -61,167 +67,207 @@ pub const Config = struct {
     identity_fn: ?IdentityFn,
 };
 
-/// LAN server. Holds store, authenticators, and event subscribers.
+/// Event channel capacity per subscriber.
+const event_channel_capacity = 64;
+
+/// LAN server, parameterized by Runtime (for Channel sync primitives).
 ///
 /// Thread-safe: all methods can be called from any thread.
-pub const Server = struct {
-    config: Config,
-    st: *Store,
-    allocator: std.mem.Allocator,
+///
+/// Usage:
+/// ```zig
+/// const Rt = @import("runtime.zig");
+/// const LanServer = lan.Server(Rt);
+/// var srv = LanServer.init(allocator, config, &store);
+/// srv.registerAuth(&open_auth.iface);
+///
+/// // Subscribe to events (in another thread):
+/// var ch = srv.subscribe();
+/// defer srv.unsubscribe(ch);
+/// while (ch.recv()) |event| { ... }
+/// ```
+pub fn Server(comptime Rt: type) type {
+    const EventChannel = channel_mod.Channel(Event, event_channel_capacity, Rt);
 
-    mutex: std.Thread.Mutex,
-    auths: std.StringHashMap(*const Authenticator),
+    return struct {
+        config: Config,
+        st: *Store,
+        allocator: std.mem.Allocator,
 
-    sub_mutex: std.Thread.Mutex,
-    next_sub_id: u64,
-    subs: std.AutoHashMap(u64, *EventCallback),
+        mutex: std.Thread.Mutex,
+        auths: std.StringHashMap(*const Authenticator),
 
-    pub const EventCallback = struct {
-        callback: *const fn (ctx: *anyopaque, event: Event) void,
-        ctx: *anyopaque,
+        sub_mutex: std.Thread.Mutex,
+        next_sub_id: u64,
+        subs: std.AutoHashMap(u64, *EventChannel),
+
+        const Self = @This();
+
+        pub fn init(allocator: std.mem.Allocator, config: Config, st: *Store) Self {
+            return .{
+                .config = config,
+                .st = st,
+                .allocator = allocator,
+                .mutex = .{},
+                .auths = std.StringHashMap(*const Authenticator).init(allocator),
+                .sub_mutex = .{},
+                .next_sub_id = 0,
+                .subs = std.AutoHashMap(u64, *EventChannel).init(allocator),
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            // Close and free all subscriber channels.
+            var it = self.subs.valueIterator();
+            while (it.next()) |ch_ptr| {
+                ch_ptr.*.close();
+                self.allocator.destroy(ch_ptr.*);
+            }
+            self.subs.deinit();
+            self.auths.deinit();
+        }
+
+        /// Registers an authenticator for the given method.
+        pub fn registerAuth(self: *Self, a: *const Authenticator) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.auths.put(a.method(), a) catch {};
+        }
+
+        /// Returns registered auth method names.
+        pub fn authMethods(self: *Self, buf: [][]const u8) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            var i: usize = 0;
+            var it = self.auths.keyIterator();
+            while (it.next()) |key| {
+                if (i >= buf.len) break;
+                buf[i] = key.*;
+                i += 1;
+            }
+            return i;
+        }
+
+        /// Resolves IP to pubkey using configured identity function.
+        pub fn identify(self: *Self, ip: [4]u8) IdentityError!Key {
+            const id_fn = self.config.identity_fn orelse return IdentityError.NotConfigured;
+            const result = try id_fn(ip);
+            return result.pubkey;
+        }
+
+        /// Authenticates a join request.
+        pub fn authenticate(self: *Self, pubkey: Key, method: []const u8, credential: []const u8) ServerAuthError!void {
+            self.mutex.lock();
+            const a = self.auths.get(method);
+            self.mutex.unlock();
+
+            if (a == null) return ServerAuthError.UnsupportedMethod;
+            try a.?.authenticate(pubkey, credential);
+        }
+
+        pub const ServerAuthError = error{
+            UnsupportedMethod,
+        } || auth.AuthError;
+
+        /// Joins a peer after authentication. Returns true if newly added.
+        pub fn join(self: *Self, pubkey: Key, method: []const u8, credential: []const u8) (ServerAuthError || Store.StoreError)!bool {
+            try self.authenticate(pubkey, method, credential);
+
+            const added = try self.st.add(pubkey);
+            if (added) {
+                self.broadcast(.{
+                    .kind = .join,
+                    .pubkey = pubkey,
+                    .labels = null,
+                });
+            }
+            return added;
+        }
+
+        /// Removes a peer. Returns true if the peer was a member.
+        pub fn leave(self: *Self, pubkey: Key) Store.StoreError!bool {
+            const removed = try self.st.remove(pubkey);
+            if (removed) {
+                self.broadcast(.{
+                    .kind = .leave,
+                    .pubkey = pubkey,
+                    .labels = null,
+                });
+            }
+            return removed;
+        }
+
+        /// Sets labels for a member.
+        pub fn setLabels(self: *Self, pubkey: Key, labels_val: []const []const u8) Store.StoreError!void {
+            try self.st.setLabels(pubkey, labels_val);
+            self.broadcast(.{
+                .kind = .labels,
+                .pubkey = pubkey,
+                .labels = labels_val,
+            });
+        }
+
+        /// Removes specific labels from a member.
+        pub fn removeLabels(self: *Self, pubkey: Key, to_remove: []const []const u8) Store.StoreError!void {
+            try self.st.removeLabels(pubkey, to_remove);
+            self.broadcast(.{
+                .kind = .labels,
+                .pubkey = pubkey,
+                .labels = null, // caller can re-fetch if needed
+            });
+        }
+
+        /// Subscribes to events. Returns a Channel that the caller can
+        /// recv() from. Call unsubscribe() when done.
+        pub fn subscribe(self: *Self) !*EventChannel {
+            const ch = try self.allocator.create(EventChannel);
+            ch.* = EventChannel.init();
+
+            self.sub_mutex.lock();
+            defer self.sub_mutex.unlock();
+            self.next_sub_id += 1;
+            try self.subs.put(self.next_sub_id, ch);
+            return ch;
+        }
+
+        /// Unsubscribes and closes the event channel.
+        pub fn unsubscribe(self: *Self, ch: *EventChannel) void {
+            self.sub_mutex.lock();
+            defer self.sub_mutex.unlock();
+
+            var it = self.subs.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* == ch) {
+                    _ = self.subs.remove(entry.key_ptr.*);
+                    break;
+                }
+            }
+
+            ch.close();
+            self.allocator.destroy(ch);
+        }
+
+        /// Broadcasts an event to all subscribers via trySend (non-blocking).
+        fn broadcast(self: *Self, event: Event) void {
+            self.sub_mutex.lock();
+            defer self.sub_mutex.unlock();
+
+            var it = self.subs.valueIterator();
+            while (it.next()) |ch_ptr| {
+                // Non-blocking: drop if subscriber is slow.
+                _ = ch_ptr.*.trySend(event);
+            }
+        }
     };
-
-    pub fn init(allocator: std.mem.Allocator, config: Config, st: *Store) Server {
-        return .{
-            .config = config,
-            .st = st,
-            .allocator = allocator,
-            .mutex = .{},
-            .auths = std.StringHashMap(*const Authenticator).init(allocator),
-            .sub_mutex = .{},
-            .next_sub_id = 0,
-            .subs = std.AutoHashMap(u64, *EventCallback).init(allocator),
-        };
-    }
-
-    pub fn deinit(self: *Server) void {
-        self.auths.deinit();
-        self.subs.deinit();
-    }
-
-    /// Registers an authenticator for the given method.
-    pub fn registerAuth(self: *Server, a: *const Authenticator) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.auths.put(a.method(), a) catch {};
-    }
-
-    /// Returns registered auth method names.
-    pub fn authMethods(self: *Server, buf: [][]const u8) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        var i: usize = 0;
-        var it = self.auths.keyIterator();
-        while (it.next()) |key| {
-            if (i >= buf.len) break;
-            buf[i] = key.*;
-            i += 1;
-        }
-        return i;
-    }
-
-    /// Resolves IP to pubkey using configured identity function.
-    pub fn identify(self: *Server, ip: [4]u8) IdentityError!Key {
-        const id_fn = self.config.identity_fn orelse return IdentityError.NotConfigured;
-        const result = try id_fn(ip);
-        return result.pubkey;
-    }
-
-    /// Authenticates a join request.
-    pub fn authenticate(self: *Server, pubkey: Key, method: []const u8, credential: []const u8) ServerAuthError!void {
-        self.mutex.lock();
-        const a = self.auths.get(method);
-        self.mutex.unlock();
-
-        if (a == null) return ServerAuthError.UnsupportedMethod;
-        try a.?.authenticate(pubkey, credential);
-    }
-
-    pub const ServerAuthError = error{
-        UnsupportedMethod,
-    } || auth.AuthError;
-
-    /// Joins a peer after authentication. Returns true if newly added.
-    pub fn join(self: *Server, pubkey: Key, method: []const u8, credential: []const u8) (ServerAuthError || Store.StoreError)!bool {
-        try self.authenticate(pubkey, method, credential);
-
-        const added = try self.st.add(pubkey);
-        if (added) {
-            self.broadcast(.{
-                .type = .join,
-                .pubkey = pubkey,
-                .labels = null,
-            });
-        }
-        return added;
-    }
-
-    /// Removes a peer. Returns true if the peer was a member.
-    pub fn leave(self: *Server, pubkey: Key) Store.StoreError!bool {
-        const removed = try self.st.remove(pubkey);
-        if (removed) {
-            self.broadcast(.{
-                .type = .leave,
-                .pubkey = pubkey,
-                .labels = null,
-            });
-        }
-        return removed;
-    }
-
-    /// Sets labels for a member.
-    pub fn setLabels(self: *Server, pubkey: Key, labels: []const []const u8) Store.StoreError!void {
-        try self.st.setLabels(pubkey, labels);
-        self.broadcast(.{
-            .type = .labels,
-            .pubkey = pubkey,
-            .labels = labels,
-        });
-    }
-
-    /// Removes specific labels from a member.
-    pub fn removeLabels(self: *Server, pubkey: Key, to_remove: []const []const u8) Store.StoreError!void {
-        try self.st.removeLabels(pubkey, to_remove);
-        self.broadcast(.{
-            .type = .labels,
-            .pubkey = pubkey,
-            .labels = null, // caller can re-fetch if needed
-        });
-    }
-
-    /// Subscribes to events. Returns a subscription ID.
-    pub fn subscribe(self: *Server, cb: *EventCallback) u64 {
-        self.sub_mutex.lock();
-        defer self.sub_mutex.unlock();
-        self.next_sub_id += 1;
-        const id = self.next_sub_id;
-        self.subs.put(id, cb) catch {};
-        return id;
-    }
-
-    /// Unsubscribes from events.
-    pub fn unsubscribe(self: *Server, id: u64) void {
-        self.sub_mutex.lock();
-        defer self.sub_mutex.unlock();
-        _ = self.subs.remove(id);
-    }
-
-    /// Broadcasts an event to all subscribers.
-    fn broadcast(self: *Server, event: Event) void {
-        self.sub_mutex.lock();
-        defer self.sub_mutex.unlock();
-
-        var it = self.subs.valueIterator();
-        while (it.next()) |cb_ptr| {
-            cb_ptr.*.callback(cb_ptr.*.ctx, event);
-        }
-    }
-};
+}
 
 // ============================================================================
-// Tests
+// Tests — use std runtime shim
 // ============================================================================
+
+const TestRt = @import("../runtime.zig");
+const TestServer = Server(TestRt);
 
 test "server join and leave" {
     const allocator = std.testing.allocator;
@@ -229,7 +275,7 @@ test "server join and leave" {
     var st = Store.init(allocator, null);
     defer st.deinit();
 
-    var srv = Server.init(allocator, .{
+    var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
@@ -241,22 +287,18 @@ test "server join and leave" {
     const open_iface = open.authenticator();
     srv.registerAuth(&open_iface);
 
-    // Generate a test key.
     var seed: [32]u8 = undefined;
     std.crypto.random.bytes(&seed);
     const pk = Key.fromBytes(seed);
 
-    // Join.
     const added = try srv.join(pk, "open", "");
     try std.testing.expect(added);
 
-    // Join again — no-op.
     const added2 = try srv.join(pk, "open", "");
     try std.testing.expect(!added2);
 
     try std.testing.expectEqual(@as(usize, 1), srv.st.count());
 
-    // Leave.
     const removed = try srv.leave(pk);
     try std.testing.expect(removed);
     try std.testing.expectEqual(@as(usize, 0), srv.st.count());
@@ -268,7 +310,7 @@ test "server auth methods" {
     var st = Store.init(allocator, null);
     defer st.deinit();
 
-    var srv = Server.init(allocator, .{
+    var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
@@ -292,7 +334,7 @@ test "server unsupported auth" {
     var st = Store.init(allocator, null);
     defer st.deinit();
 
-    var srv = Server.init(allocator, .{
+    var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
@@ -305,7 +347,7 @@ test "server unsupported auth" {
     const pk = Key.fromBytes(seed);
 
     const result = srv.join(pk, "oauth", "");
-    try std.testing.expectError(Server.ServerAuthError.UnsupportedMethod, result);
+    try std.testing.expectError(TestServer.ServerAuthError.UnsupportedMethod, result);
 }
 
 test "server labels" {
@@ -314,7 +356,7 @@ test "server labels" {
     var st = Store.init(allocator, null);
     defer st.deinit();
 
-    var srv = Server.init(allocator, .{
+    var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
@@ -332,8 +374,8 @@ test "server labels" {
 
     _ = try srv.join(pk, "open", "");
 
-    const labels = [_][]const u8{ "admin", "dev" };
-    try srv.setLabels(pk, &labels);
+    const set_labels = [_][]const u8{ "admin", "dev" };
+    try srv.setLabels(pk, &set_labels);
 
     const m = srv.st.get(pk) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 2), m.labels.items.len);
@@ -345,13 +387,13 @@ test "server labels" {
     try std.testing.expectEqual(@as(usize, 1), m2.labels.items.len);
 }
 
-test "server events" {
+test "server events via channel" {
     const allocator = std.testing.allocator;
 
     var st = Store.init(allocator, null);
     defer st.deinit();
 
-    var srv = Server.init(allocator, .{
+    var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
@@ -363,18 +405,8 @@ test "server events" {
     const open_iface = open.authenticator();
     srv.registerAuth(&open_iface);
 
-    // Subscribe.
-    var received_event: ?Event = null;
-    var cb = Server.EventCallback{
-        .callback = struct {
-            fn f(ctx: *anyopaque, event: Event) void {
-                const ptr: *?Event = @ptrCast(@alignCast(ctx));
-                ptr.* = event;
-            }
-        }.f,
-        .ctx = @ptrCast(&received_event),
-    };
-    const sub_id = srv.subscribe(&cb);
+    // Subscribe — get a Channel.
+    const ch = try srv.subscribe();
 
     var seed: [32]u8 = undefined;
     std.crypto.random.bytes(&seed);
@@ -382,10 +414,10 @@ test "server events" {
 
     _ = try srv.join(pk, "open", "");
 
-    // Check event was received.
-    try std.testing.expect(received_event != null);
-    try std.testing.expectEqual(Event.EventType.join, received_event.?.type);
-    try std.testing.expect(received_event.?.pubkey.eql(pk));
+    // Non-blocking receive — event should be there.
+    const event = ch.tryRecv() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(Event.EventKind.join, event.kind);
+    try std.testing.expect(event.pubkey.eql(pk));
 
-    srv.unsubscribe(sub_id);
+    srv.unsubscribe(ch);
 }

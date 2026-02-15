@@ -177,7 +177,7 @@ pub const config = config_mod;
 
 pub const lan = lan_mod;
 pub const LanStore = lan_mod.Store;
-pub const LanServer = lan_mod.Server;
+pub const LanServer = lan_mod.Server(StdRt);
 pub const LanEvent = lan_mod.Event;
 
 test {
