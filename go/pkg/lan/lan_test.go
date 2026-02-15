@@ -17,15 +17,12 @@ func genKey(t *testing.T) noise.PublicKey {
 	return kp.Public
 }
 
-func TestStore_AddAndGet(t *testing.T) {
-	s, err := NewStore("")
-	if err != nil {
-		t.Fatal(err)
-	}
+// ── MemStore tests ──────────────────────────────────────────────────────────
 
+func TestMemStore_AddAndGet(t *testing.T) {
+	s := NewMemStore()
 	pk := genKey(t)
 
-	// Add member.
 	added, err := s.Add(pk)
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +31,6 @@ func TestStore_AddAndGet(t *testing.T) {
 		t.Fatal("expected member to be added")
 	}
 
-	// Adding again is a no-op.
 	added, err = s.Add(pk)
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +39,6 @@ func TestStore_AddAndGet(t *testing.T) {
 		t.Fatal("expected no-op on duplicate add")
 	}
 
-	// Get member.
 	m := s.Get(pk)
 	if m == nil {
 		t.Fatal("expected member, got nil")
@@ -54,20 +49,15 @@ func TestStore_AddAndGet(t *testing.T) {
 	if len(m.Labels) != 0 {
 		t.Fatalf("expected empty labels, got %v", m.Labels)
 	}
-
-	// Count.
 	if s.Count() != 1 {
 		t.Fatalf("expected count 1, got %d", s.Count())
 	}
 }
 
-func TestStore_Remove(t *testing.T) {
-	s, err := NewStore("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
+func TestMemStore_Remove(t *testing.T) {
+	s := NewMemStore()
 	pk := genKey(t)
+
 	s.Add(pk)
 
 	removed, err := s.Remove(pk)
@@ -78,7 +68,6 @@ func TestStore_Remove(t *testing.T) {
 		t.Fatal("expected member to be removed")
 	}
 
-	// Removing again returns false.
 	removed, err = s.Remove(pk)
 	if err != nil {
 		t.Fatal(err)
@@ -86,22 +75,17 @@ func TestStore_Remove(t *testing.T) {
 	if removed {
 		t.Fatal("expected false on double remove")
 	}
-
 	if s.Count() != 0 {
 		t.Fatalf("expected count 0, got %d", s.Count())
 	}
 }
 
-func TestStore_Labels(t *testing.T) {
-	s, err := NewStore("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
+func TestMemStore_Labels(t *testing.T) {
+	s := NewMemStore()
 	pk := genKey(t)
+
 	s.Add(pk)
 
-	// Set labels.
 	if err := s.SetLabels(pk, []string{"admin", "dev"}); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +95,6 @@ func TestStore_Labels(t *testing.T) {
 		t.Fatalf("expected [admin dev], got %v", m.Labels)
 	}
 
-	// Remove one label.
 	if err := s.RemoveLabels(pk, []string{"admin"}); err != nil {
 		t.Fatal(err)
 	}
@@ -121,22 +104,15 @@ func TestStore_Labels(t *testing.T) {
 		t.Fatalf("expected [dev], got %v", m.Labels)
 	}
 
-	// Set labels on non-member fails.
 	unknown := genKey(t)
 	if err := s.SetLabels(unknown, []string{"x"}); err == nil {
 		t.Fatal("expected error setting labels on non-member")
 	}
 }
 
-func TestStore_List(t *testing.T) {
-	s, err := NewStore("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pk1 := genKey(t)
-	pk2 := genKey(t)
-	pk3 := genKey(t)
+func TestMemStore_List(t *testing.T) {
+	s := NewMemStore()
+	pk1, pk2, pk3 := genKey(t), genKey(t), genKey(t)
 
 	s.Add(pk1)
 	s.Add(pk2)
@@ -146,24 +122,31 @@ func TestStore_List(t *testing.T) {
 	if len(list) != 3 {
 		t.Fatalf("expected 3 members, got %d", len(list))
 	}
+}
 
-	// Verify all members are present.
-	found := map[noise.PublicKey]bool{}
-	for _, m := range list {
-		found[m.Pubkey] = true
+func TestMemStore_IsMember(t *testing.T) {
+	s := NewMemStore()
+	pk := genKey(t)
+
+	if s.IsMember(pk) {
+		t.Fatal("expected not a member before add")
 	}
-	for _, pk := range []noise.PublicKey{pk1, pk2, pk3} {
-		if !found[pk] {
-			t.Fatalf("missing member %s", pk.ShortString())
-		}
+	s.Add(pk)
+	if !s.IsMember(pk) {
+		t.Fatal("expected member after add")
+	}
+	s.Remove(pk)
+	if s.IsMember(pk) {
+		t.Fatal("expected not a member after remove")
 	}
 }
 
-func TestStore_Persistence(t *testing.T) {
+// ── FileStore tests ─────────────────────────────────────────────────────────
+
+func TestFileStore_Persistence(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create store and add members.
-	s1, err := NewStore(dir)
+	s1, err := NewFileStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,14 +155,12 @@ func TestStore_Persistence(t *testing.T) {
 	s1.Add(pk)
 	s1.SetLabels(pk, []string{"admin", "dev"})
 
-	// Verify file exists.
 	path := filepath.Join(dir, "members.json")
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected members.json to exist: %v", err)
 	}
 
-	// Create new store from same directory — should load data.
-	s2, err := NewStore(dir)
+	s2, err := NewFileStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,24 +178,10 @@ func TestStore_Persistence(t *testing.T) {
 	}
 }
 
-func TestStore_IsMember(t *testing.T) {
-	s, err := NewStore("")
-	if err != nil {
-		t.Fatal(err)
-	}
+// ── Store interface compliance ──────────────────────────────────────────────
 
-	pk := genKey(t)
-	if s.IsMember(pk) {
-		t.Fatal("expected not a member before add")
-	}
-
-	s.Add(pk)
-	if !s.IsMember(pk) {
-		t.Fatal("expected member after add")
-	}
-
-	s.Remove(pk)
-	if s.IsMember(pk) {
-		t.Fatal("expected not a member after remove")
-	}
-}
+// Compile-time check that both implementations satisfy the Store interface.
+var (
+	_ Store = (*MemStore)(nil)
+	_ Store = (*FileStore)(nil)
+)

@@ -23,16 +23,11 @@ func testIdentity(pk noise.PublicKey) IdentityFunc {
 func testServer(t *testing.T, pk noise.PublicKey) *Server {
 	t.Helper()
 
-	store, err := NewStore("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	srv := NewServer(Config{
 		Domain:      "test.zigor.net",
 		Description: "Test LAN",
 		IdentityFn:  testIdentity(pk),
-	}, store)
+	}, NewMemStore())
 
 	srv.RegisterAuth(NewOpenAuth())
 	return srv
@@ -127,15 +122,10 @@ func TestHandler_JoinAndPeers(t *testing.T) {
 func TestHandler_JoinWithPassword(t *testing.T) {
 	pk := genKey(t)
 
-	store, err := NewStore("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	srv := NewServer(Config{
 		Domain:     "pw.zigor.net",
 		IdentityFn: testIdentity(pk),
-	}, store)
+	}, NewMemStore())
 
 	pwAuth, err := NewPasswordAuthFromPlaintext("secret", 4)
 	if err != nil {
@@ -274,11 +264,10 @@ func TestHandler_Labels(t *testing.T) {
 }
 
 func TestHandler_NoIdentity(t *testing.T) {
-	store, _ := NewStore("")
 	srv := NewServer(Config{
 		Domain: "test.zigor.net",
 		// No IdentityFn — should fail.
-	}, store)
+	}, NewMemStore())
 	srv.RegisterAuth(NewOpenAuth())
 	h := srv.Handler()
 

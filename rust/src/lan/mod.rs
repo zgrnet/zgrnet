@@ -18,7 +18,7 @@ pub mod store;
 pub use auth::{
     Authenticator, AuthRequest, InviteCodeAuth, OpenAuth, PasswordAuth, PubkeyWhitelistAuth,
 };
-pub use store::{Member, Store};
+pub use store::{Member, Store, MemStore, FileStore};
 
 use crate::noise::Key;
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,7 @@ pub struct Event {
 /// Thread-safe — all methods can be called from any thread.
 pub struct Server {
     pub(crate) config: Config,
-    pub(crate) store: Arc<Store>,
+    pub(crate) store: Arc<dyn Store>,
     pub(crate) auths: RwLock<HashMap<String, Box<dyn Authenticator>>>,
     pub(crate) subs: Mutex<Subscribers>,
 }
@@ -79,7 +79,7 @@ pub(crate) struct Subscribers {
 
 impl Server {
     /// Creates a new LAN server with the given config and store.
-    pub fn new(config: Config, store: Arc<Store>) -> Self {
+    pub fn new(config: Config, store: Arc<dyn Store>) -> Self {
         Server {
             config,
             store,
@@ -98,7 +98,7 @@ impl Server {
     }
 
     /// Returns the underlying store.
-    pub fn store(&self) -> &Arc<Store> {
+    pub fn store(&self) -> &Arc<dyn Store> {
         &self.store
     }
 
@@ -237,7 +237,7 @@ mod tests {
     }
 
     fn test_server(pk: Key) -> Server {
-        let store = Arc::new(Store::new_memory());
+        let store: Arc<dyn Store> = Arc::new(MemStore::new());
         let srv = Server::new(
             Config {
                 domain: "test.zigor.net".to_string(),

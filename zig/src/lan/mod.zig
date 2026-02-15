@@ -22,6 +22,8 @@ pub const store = @import("store.zig");
 pub const auth = @import("auth.zig");
 
 pub const Store = store.Store;
+pub const StoreError = store.StoreError;
+pub const MemStore = store.MemStore;
 pub const Member = store.Member;
 pub const Authenticator = auth.Authenticator;
 pub const AuthError = auth.AuthError;
@@ -91,7 +93,7 @@ pub fn Server(comptime Rt: type) type {
 
     return struct {
         config: Config,
-        st: *Store,
+        st: Store,
         allocator: std.mem.Allocator,
 
         mutex: std.Thread.Mutex,
@@ -103,7 +105,7 @@ pub fn Server(comptime Rt: type) type {
 
         const Self = @This();
 
-        pub fn init(allocator: std.mem.Allocator, config: Config, st: *Store) Self {
+        pub fn init(allocator: std.mem.Allocator, config: Config, st: Store) Self {
             return .{
                 .config = config,
                 .st = st,
@@ -170,8 +172,10 @@ pub fn Server(comptime Rt: type) type {
             UnsupportedMethod,
         } || auth.AuthError;
 
+        pub const JoinError = ServerAuthError || StoreError;
+
         /// Joins a peer after authentication. Returns true if newly added.
-        pub fn join(self: *Self, pubkey: Key, method: []const u8, credential: []const u8) (ServerAuthError || Store.StoreError)!bool {
+        pub fn join(self: *Self, pubkey: Key, method: []const u8, credential: []const u8) JoinError!bool {
             try self.authenticate(pubkey, method, credential);
 
             const added = try self.st.add(pubkey);
@@ -186,7 +190,7 @@ pub fn Server(comptime Rt: type) type {
         }
 
         /// Removes a peer. Returns true if the peer was a member.
-        pub fn leave(self: *Self, pubkey: Key) Store.StoreError!bool {
+        pub fn leave(self: *Self, pubkey: Key) StoreError!bool {
             const removed = try self.st.remove(pubkey);
             if (removed) {
                 self.broadcast(.{
@@ -199,7 +203,7 @@ pub fn Server(comptime Rt: type) type {
         }
 
         /// Sets labels for a member.
-        pub fn setLabels(self: *Self, pubkey: Key, labels_val: []const []const u8) Store.StoreError!void {
+        pub fn setLabels(self: *Self, pubkey: Key, labels_val: []const []const u8) StoreError!void {
             try self.st.setLabels(pubkey, labels_val);
             self.broadcast(.{
                 .kind = .labels,
@@ -209,7 +213,7 @@ pub fn Server(comptime Rt: type) type {
         }
 
         /// Removes specific labels from a member.
-        pub fn removeLabels(self: *Self, pubkey: Key, to_remove: []const []const u8) Store.StoreError!void {
+        pub fn removeLabels(self: *Self, pubkey: Key, to_remove: []const []const u8) StoreError!void {
             try self.st.removeLabels(pubkey, to_remove);
             self.broadcast(.{
                 .kind = .labels,
@@ -272,15 +276,15 @@ const TestServer = Server(TestRt);
 test "server join and leave" {
     const allocator = std.testing.allocator;
 
-    var st = Store.init(allocator, null);
-    defer st.deinit();
+    var ms = MemStore.init(allocator);
+    defer ms.deinit();
 
     var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
         .identity_fn = null,
-    }, &st);
+    }, ms.store());
     defer srv.deinit();
 
     var open = OpenAuth.init();
@@ -307,15 +311,15 @@ test "server join and leave" {
 test "server auth methods" {
     const allocator = std.testing.allocator;
 
-    var st = Store.init(allocator, null);
-    defer st.deinit();
+    var ms = MemStore.init(allocator);
+    defer ms.deinit();
 
     var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
         .identity_fn = null,
-    }, &st);
+    }, ms.store());
     defer srv.deinit();
 
     var open = OpenAuth.init();
@@ -331,15 +335,15 @@ test "server auth methods" {
 test "server unsupported auth" {
     const allocator = std.testing.allocator;
 
-    var st = Store.init(allocator, null);
-    defer st.deinit();
+    var ms = MemStore.init(allocator);
+    defer ms.deinit();
 
     var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
         .identity_fn = null,
-    }, &st);
+    }, ms.store());
     defer srv.deinit();
 
     var seed: [32]u8 = undefined;
@@ -353,15 +357,15 @@ test "server unsupported auth" {
 test "server labels" {
     const allocator = std.testing.allocator;
 
-    var st = Store.init(allocator, null);
-    defer st.deinit();
+    var ms = MemStore.init(allocator);
+    defer ms.deinit();
 
     var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
         .identity_fn = null,
-    }, &st);
+    }, ms.store());
     defer srv.deinit();
 
     var open = OpenAuth.init();
@@ -390,15 +394,15 @@ test "server labels" {
 test "server events via channel" {
     const allocator = std.testing.allocator;
 
-    var st = Store.init(allocator, null);
-    defer st.deinit();
+    var ms = MemStore.init(allocator);
+    defer ms.deinit();
 
     var srv = TestServer.init(allocator, .{
         .domain = "test.zigor.net",
         .description = "Test",
         .data_dir = "",
         .identity_fn = null,
-    }, &st);
+    }, ms.store());
     defer srv.deinit();
 
     var open = OpenAuth.init();

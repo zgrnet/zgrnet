@@ -6,6 +6,7 @@ go_library(
         "auth.go",
         "handler.go",
         "lan.go",
+        "store.go",
     ],
     importpath = "github.com/vibing/zgrnet/pkg/lan",
     visibility = ["//visibility:public"],

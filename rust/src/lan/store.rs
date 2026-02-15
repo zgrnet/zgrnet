@@ -1,4 +1,8 @@
-//! LAN membership store with optional JSON persistence.
+//! LAN membership storage — trait + built-in implementations.
+//!
+//! [`Store`] is the abstract interface. Two implementations:
+//! - [`MemStore`]: in-memory, no persistence (good for testing)
+//! - [`FileStore`]: wraps MemStore + JSON file persistence
 
 use crate::noise::Key;
 use serde::{Deserialize, Serialize};
@@ -11,76 +15,47 @@ use std::sync::RwLock;
 pub struct Member {
     /// Hex-encoded public key.
     pub pubkey: String,
-
     /// Assigned labels.
     pub labels: Vec<String>,
-
     /// When the member joined (RFC 3339).
     pub joined_at: String,
 }
 
-/// JSON structure for persistence.
-#[derive(Serialize, Deserialize)]
-struct StoreFile {
-    members: Vec<Member>,
+/// Abstract store interface for LAN membership.
+/// Implementations must be Send + Sync for multi-threaded HTTP servers.
+pub trait Store: Send + Sync {
+    fn add(&self, pk: Key) -> Result<bool, String>;
+    fn remove(&self, pk: Key) -> Result<bool, String>;
+    fn get(&self, pk: Key) -> Option<Member>;
+    fn is_member(&self, pk: Key) -> bool;
+    fn list(&self) -> Vec<Member>;
+    fn count(&self) -> usize;
+    fn set_labels(&self, pk: Key, labels: Vec<String>) -> Result<(), String>;
+    fn remove_labels(&self, pk: Key, to_remove: &[String]) -> Result<(), String>;
 }
 
-/// Thread-safe membership store.
-pub struct Store {
-    inner: RwLock<StoreInner>,
+// ── MemStore ────────────────────────────────────────────────────────────────
+
+/// In-memory store. Fast, no I/O, data lost on process exit.
+pub struct MemStore {
+    inner: RwLock<HashMap<Key, Member>>,
 }
 
-struct StoreInner {
-    members: HashMap<Key, Member>,
-    path: Option<PathBuf>,
-}
-
-impl Store {
-    /// Creates an in-memory store (no persistence).
-    pub fn new_memory() -> Self {
-        Store {
-            inner: RwLock::new(StoreInner {
-                members: HashMap::new(),
-                path: None,
-            }),
+impl MemStore {
+    pub fn new() -> Self {
+        MemStore {
+            inner: RwLock::new(HashMap::new()),
         }
     }
+}
 
-    /// Creates a store backed by a JSON file in `data_dir`.
-    /// Loads existing data if the file exists.
-    pub fn new(data_dir: &str) -> Result<Self, String> {
-        let path = PathBuf::from(data_dir).join("members.json");
-        let mut members = HashMap::new();
-
-        if path.exists() {
-            let data = std::fs::read_to_string(&path)
-                .map_err(|e| format!("lan: read {:?}: {}", path, e))?;
-            let sf: StoreFile = serde_json::from_str(&data)
-                .map_err(|e| format!("lan: parse {:?}: {}", path, e))?;
-            for m in sf.members {
-                if let Ok(pk) = Key::from_hex(&m.pubkey) {
-                    members.insert(pk, m);
-                }
-            }
-        }
-
-        Ok(Store {
-            inner: RwLock::new(StoreInner {
-                members,
-                path: Some(path),
-            }),
-        })
-    }
-
-    /// Adds a member. Returns true if newly added.
-    pub fn add(&self, pk: Key) -> Result<bool, String> {
+impl Store for MemStore {
+    fn add(&self, pk: Key) -> Result<bool, String> {
         let mut inner = self.inner.write().unwrap();
-
-        if inner.members.contains_key(&pk) {
+        if inner.contains_key(&pk) {
             return Ok(false);
         }
-
-        inner.members.insert(
+        inner.insert(
             pk,
             Member {
                 pubkey: pk.to_hex(),
@@ -88,96 +63,147 @@ impl Store {
                 joined_at: now_rfc3339(),
             },
         );
-
-        self.save_locked(&inner)?;
         Ok(true)
     }
 
-    /// Removes a member. Returns true if the member existed.
-    pub fn remove(&self, pk: Key) -> Result<bool, String> {
+    fn remove(&self, pk: Key) -> Result<bool, String> {
         let mut inner = self.inner.write().unwrap();
-
-        if inner.members.remove(&pk).is_none() {
-            return Ok(false);
-        }
-
-        self.save_locked(&inner)?;
-        Ok(true)
+        Ok(inner.remove(&pk).is_some())
     }
 
-    /// Gets a member by pubkey.
-    pub fn get(&self, pk: Key) -> Option<Member> {
-        self.inner.read().unwrap().members.get(&pk).cloned()
+    fn get(&self, pk: Key) -> Option<Member> {
+        self.inner.read().unwrap().get(&pk).cloned()
     }
 
-    /// Checks if a pubkey is a member.
-    pub fn is_member(&self, pk: Key) -> bool {
-        self.inner.read().unwrap().members.contains_key(&pk)
+    fn is_member(&self, pk: Key) -> bool {
+        self.inner.read().unwrap().contains_key(&pk)
     }
 
-    /// Lists all members.
-    pub fn list(&self) -> Vec<Member> {
-        self.inner.read().unwrap().members.values().cloned().collect()
+    fn list(&self) -> Vec<Member> {
+        self.inner.read().unwrap().values().cloned().collect()
     }
 
-    /// Returns member count.
-    pub fn count(&self) -> usize {
-        self.inner.read().unwrap().members.len()
+    fn count(&self) -> usize {
+        self.inner.read().unwrap().len()
     }
 
-    /// Replaces labels for a member.
-    pub fn set_labels(&self, pk: Key, labels: Vec<String>) -> Result<(), String> {
+    fn set_labels(&self, pk: Key, labels: Vec<String>) -> Result<(), String> {
         let mut inner = self.inner.write().unwrap();
         let m = inner
-            .members
             .get_mut(&pk)
             .ok_or_else(|| format!("lan: pubkey {} is not a member", pk.short_hex()))?;
         m.labels = labels;
-        self.save_locked(&inner)?;
         Ok(())
     }
 
-    /// Removes specific labels from a member.
-    pub fn remove_labels(&self, pk: Key, to_remove: &[String]) -> Result<(), String> {
+    fn remove_labels(&self, pk: Key, to_remove: &[String]) -> Result<(), String> {
         let mut inner = self.inner.write().unwrap();
         let m = inner
-            .members
             .get_mut(&pk)
             .ok_or_else(|| format!("lan: pubkey {} is not a member", pk.short_hex()))?;
         m.labels.retain(|l| !to_remove.contains(l));
-        self.save_locked(&inner)?;
         Ok(())
     }
+}
 
-    /// Persists to disk. Caller must hold the write lock via inner.
-    fn save_locked(&self, inner: &StoreInner) -> Result<(), String> {
-        let path = match &inner.path {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+// ── FileStore ───────────────────────────────────────────────────────────────
 
+/// JSON structure for persistence.
+#[derive(Serialize, Deserialize)]
+struct StoreFile {
+    members: Vec<Member>,
+}
+
+/// File-backed store. Wraps MemStore and persists every mutation to JSON.
+pub struct FileStore {
+    mem: MemStore,
+    path: PathBuf,
+}
+
+impl FileStore {
+    /// Creates a file-backed store. Loads existing data if the file exists.
+    pub fn new(data_dir: &str) -> Result<Self, String> {
+        let path = PathBuf::from(data_dir).join("members.json");
+        let mem = MemStore::new();
+
+        if path.exists() {
+            let data = std::fs::read_to_string(&path)
+                .map_err(|e| format!("lan: read {:?}: {}", path, e))?;
+            let sf: StoreFile = serde_json::from_str(&data)
+                .map_err(|e| format!("lan: parse {:?}: {}", path, e))?;
+            let mut inner = mem.inner.write().unwrap();
+            for m in sf.members {
+                if let Ok(pk) = Key::from_hex(&m.pubkey) {
+                    inner.insert(pk, m);
+                }
+            }
+        }
+
+        Ok(FileStore { mem, path })
+    }
+
+    fn save(&self) -> Result<(), String> {
+        let inner = self.mem.inner.read().unwrap();
         let sf = StoreFile {
-            members: inner.members.values().cloned().collect(),
+            members: inner.values().cloned().collect(),
         };
+        drop(inner);
 
         let data = serde_json::to_string_pretty(&sf)
             .map_err(|e| format!("lan: marshal: {}", e))?;
 
-        if let Some(dir) = path.parent() {
+        if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("lan: mkdir {:?}: {}", dir, e))?;
         }
 
-        // Atomic write: temp file → rename.
-        let tmp = path.with_extension("json.tmp");
+        let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &data)
             .map_err(|e| format!("lan: write {:?}: {}", tmp, e))?;
-        std::fs::rename(&tmp, path)
-            .map_err(|e| format!("lan: rename {:?} → {:?}: {}", tmp, path, e))?;
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| format!("lan: rename {:?} → {:?}: {}", tmp, self.path, e))?;
 
         Ok(())
     }
 }
+
+impl Store for FileStore {
+    fn add(&self, pk: Key) -> Result<bool, String> {
+        let added = self.mem.add(pk)?;
+        if added {
+            if let Err(e) = self.save() {
+                self.mem.remove(pk).ok();
+                return Err(e);
+            }
+        }
+        Ok(added)
+    }
+
+    fn remove(&self, pk: Key) -> Result<bool, String> {
+        let removed = self.mem.remove(pk)?;
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    fn get(&self, pk: Key) -> Option<Member> { self.mem.get(pk) }
+    fn is_member(&self, pk: Key) -> bool { self.mem.is_member(pk) }
+    fn list(&self) -> Vec<Member> { self.mem.list() }
+    fn count(&self) -> usize { self.mem.count() }
+
+    fn set_labels(&self, pk: Key, labels: Vec<String>) -> Result<(), String> {
+        self.mem.set_labels(pk, labels)?;
+        self.save()
+    }
+
+    fn remove_labels(&self, pk: Key, to_remove: &[String]) -> Result<(), String> {
+        self.mem.remove_labels(pk, to_remove)?;
+        self.save()
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn now_rfc3339() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -185,20 +211,16 @@ fn now_rfc3339() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let secs = dur.as_secs();
-    // Days since epoch for date calculation.
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let mins = (time_of_day % 3600) / 60;
     let s = time_of_day % 60;
-
-    // Gregorian calendar from days since epoch.
     let (y, m, d) = days_to_date(days);
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hours, mins, s)
 }
 
 fn days_to_date(days: u64) -> (u64, u64, u64) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
@@ -212,6 +234,8 @@ fn days_to_date(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+// ── Tests ───────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,40 +246,37 @@ mod tests {
     }
 
     #[test]
-    fn test_add_and_get() {
-        let store = Store::new_memory();
+    fn test_mem_add_and_get() {
+        let store = MemStore::new();
         let pk = test_key();
 
         assert!(store.add(pk).unwrap());
-        assert!(!store.add(pk).unwrap()); // duplicate
+        assert!(!store.add(pk).unwrap());
 
         let m = store.get(pk).unwrap();
         assert_eq!(m.pubkey, pk.to_hex());
         assert!(m.labels.is_empty());
-
         assert_eq!(store.count(), 1);
     }
 
     #[test]
-    fn test_remove() {
-        let store = Store::new_memory();
+    fn test_mem_remove() {
+        let store = MemStore::new();
         let pk = test_key();
 
         store.add(pk).unwrap();
         assert!(store.remove(pk).unwrap());
-        assert!(!store.remove(pk).unwrap()); // already removed
+        assert!(!store.remove(pk).unwrap());
         assert_eq!(store.count(), 0);
     }
 
     #[test]
-    fn test_labels() {
-        let store = Store::new_memory();
+    fn test_mem_labels() {
+        let store = MemStore::new();
         let pk = test_key();
 
         store.add(pk).unwrap();
-        store
-            .set_labels(pk, vec!["admin".into(), "dev".into()])
-            .unwrap();
+        store.set_labels(pk, vec!["admin".into(), "dev".into()]).unwrap();
 
         let m = store.get(pk).unwrap();
         assert_eq!(m.labels, vec!["admin", "dev"]);
@@ -266,20 +287,16 @@ mod tests {
     }
 
     #[test]
-    fn test_list() {
-        let store = Store::new_memory();
-        let pk1 = test_key();
-        let pk2 = test_key();
-
-        store.add(pk1).unwrap();
-        store.add(pk2).unwrap();
-
+    fn test_mem_list() {
+        let store = MemStore::new();
+        store.add(test_key()).unwrap();
+        store.add(test_key()).unwrap();
         assert_eq!(store.list().len(), 2);
     }
 
     #[test]
-    fn test_is_member() {
-        let store = Store::new_memory();
+    fn test_mem_is_member() {
+        let store = MemStore::new();
         let pk = test_key();
 
         assert!(!store.is_member(pk));
@@ -290,24 +307,20 @@ mod tests {
     }
 
     #[test]
-    fn test_persistence() {
+    fn test_file_persistence() {
         let dir = tempfile::tempdir().unwrap();
         let dir_str = dir.path().to_str().unwrap();
 
         let pk = test_key();
 
-        // Create, add, save.
         {
-            let store = Store::new(dir_str).unwrap();
+            let store = FileStore::new(dir_str).unwrap();
             store.add(pk).unwrap();
-            store
-                .set_labels(pk, vec!["admin".into()])
-                .unwrap();
+            store.set_labels(pk, vec!["admin".into()]).unwrap();
         }
 
-        // Reload.
         {
-            let store = Store::new(dir_str).unwrap();
+            let store = FileStore::new(dir_str).unwrap();
             assert_eq!(store.count(), 1);
             let m = store.get(pk).unwrap();
             assert_eq!(m.labels, vec!["admin"]);

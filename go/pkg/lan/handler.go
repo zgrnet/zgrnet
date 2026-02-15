@@ -17,7 +17,7 @@ import (
 // [Server.RegisterAuth], then mount [Server.Handler] on an HTTP mux.
 type Server struct {
 	cfg   Config
-	store *Store
+	store Store
 
 	mu    sync.RWMutex
 	auths map[string]Authenticator
@@ -28,9 +28,9 @@ type Server struct {
 	nextSub uint64
 }
 
-// NewServer creates a new LAN server. The store is initialized from
-// cfg.DataDir (or in-memory if empty). cfg.IdentityFn is required.
-func NewServer(cfg Config, store *Store) *Server {
+// NewServer creates a new LAN server with the given Store implementation.
+// cfg.IdentityFn is required.
+func NewServer(cfg Config, store Store) *Server {
 	return &Server{
 		cfg:   cfg,
 		store: store,
@@ -49,7 +49,7 @@ func (s *Server) RegisterAuth(auth Authenticator) {
 }
 
 // Store returns the underlying store for direct access.
-func (s *Server) Store() *Store {
+func (s *Server) Store() Store {
 	return s.store
 }
 
