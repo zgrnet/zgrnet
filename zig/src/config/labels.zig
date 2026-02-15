@@ -7,8 +7,6 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
-const types = @import("types.zig");
-const PeerConfig = types.PeerConfig;
 
 /// Thread-safe store mapping pubkey hex strings to labels.
 pub const LabelStore = struct {

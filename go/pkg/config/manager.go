@@ -154,8 +154,7 @@ func (m *Manager) Reload() (*ConfigDiff, error) {
 	// Also check if external files changed
 	extChanged := m.checkExternalFilesChanged()
 	if extChanged {
-		// Mark these sections as changed so watchers get notified
-		diff.RouteChanged = true
+		// Only policy has external files (whitelist), route rules are inline
 		diff.InboundChanged = true
 	}
 
