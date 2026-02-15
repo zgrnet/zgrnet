@@ -73,13 +73,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create TUN A: %w", err)
 	}
-	defer tunA.Close()
-
 	tunB, err := tun.Create("")
 	if err != nil {
+		tunA.Close()
 		return fmt.Errorf("create TUN B: %w", err)
 	}
-	defer tunB.Close()
 
 	ipA := net.ParseIP(tunIPa).To4()
 	tunA.SetMTU(mtu)
@@ -100,15 +98,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("create host A: %w", err)
 	}
-	defer hostA.Close()
-
 	hostB, err := host.New(host.Config{
 		PrivateKey: kpB, TunIPv4: ipB, MTU: mtu, ListenPort: 0,
 	}, tunB)
 	if err != nil {
+		hostA.Close()
 		return fmt.Errorf("create host B: %w", err)
 	}
-	defer hostB.Close()
 	log.Printf("Host A on %s, Host B on %s", hostA.LocalAddr(), hostB.LocalAddr())
 
 	// ── 4. Add peers ────────────────────────────────────────────────────
@@ -161,7 +157,6 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", httpAddr, err)
 	}
-	defer httpLn.Close()
 	go http.Serve(httpLn, httpMux)
 	log.Printf("LAN server on %s", httpAddr)
 	time.Sleep(200 * time.Millisecond)
@@ -315,6 +310,12 @@ func run() error {
 
 	log.Printf("────────────────────────────────")
 	log.Printf("RESULT: %d/%d passed", passed, total)
+
+	// Clean shutdown — close hosts to terminate Run() goroutines and HTTP listener.
+	httpLn.Close()
+	hostA.Close()
+	hostB.Close()
+
 	if passed < total {
 		return fmt.Errorf("%d tests failed", total-passed)
 	}
