@@ -1,0 +1,24 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "node",
+    srcs = ["node.go"],
+    importpath = "github.com/vibing/zgrnet/pkg/node",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go:noise",
+        "//go/pkg/kcp",
+        "//go/pkg/net",
+    ],
+)
+
+go_test(
+    name = "node_test",
+    srcs = ["node_test.go"],
+    embed = [":node"],
+    tags = ["local"],  # Needs loopback network
+    deps = [
+        "//go:noise",
+        "//go/pkg/net",
+    ],
+)
