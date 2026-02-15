@@ -313,6 +313,13 @@ func (h *Host) handleOutbound(ipPkt []byte) {
 		return
 	}
 
+	// Loopback: if dst is our own TUN IP, write back to TUN so the kernel
+	// does local delivery (e.g. local process accessing our API server).
+	if info.DstIP.Equal(h.tunIPv4) {
+		h.tun.Write(ipPkt)
+		return
+	}
+
 	// Check if destination is a Fake IP (route-matched domain)
 	if h.fakeIPLookup != nil {
 		if domain, peer, ok := h.fakeIPLookup.LookupFakeIP(info.DstIP); ok {

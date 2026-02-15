@@ -497,35 +497,24 @@ func trimKey(s string) string {
 // addTUNRoutes sets up macOS routing for the TUN device.
 //
 // macOS utun is point-to-point: the kernel only creates a host route for the
-// peer address, ignoring the /10 subnet mask. We add two routes:
+// peer address, ignoring the /10 subnet mask. We add a subnet route so all
+// CGNAT traffic (including traffic to our own TUN IP) goes through the TUN.
 //
-//  1. Host route: TUN_IP → lo0 (local TCP connections to our own IP)
-//  2. Subnet route: 100.64.0.0/10 → utunN (peer traffic through TUN)
+// Traffic to our own TUN IP enters TUN and is written back by the Host's
+// outbound loop (loopback detection), which triggers kernel local delivery.
 //
-// On Linux, the kernel handles both automatically, so this is a no-op.
+// On Linux, the kernel handles this automatically, so this is a no-op.
+// On shutdown, the route is automatically cleaned up when the TUN device
+// is destroyed — no explicit removal needed.
 func addTUNRoutes(ip net.IP, tunName string) error {
 	if runtime.GOOS != "darwin" {
 		return nil
 	}
 
-	// 1. Host route for local IP → lo0
-	if out, err := exec.Command("/sbin/route", "add", "-host", ip.String(), "-interface", "lo0").CombinedOutput(); err != nil {
-		return fmt.Errorf("host route %s → lo0: %s: %w", ip, strings.TrimSpace(string(out)), err)
-	}
-	log.Printf("route: %s → lo0 (local)", ip)
-
-	// 2. Subnet route for CGNAT range → utun
-	// The /10 mask covers 100.64.0.0 – 100.127.255.255 (all peer IPs).
 	if out, err := exec.Command("/sbin/route", "add", "-net", "100.64.0.0/10", "-interface", tunName).CombinedOutput(); err != nil {
-		log.Printf("warning: subnet route 100.64.0.0/10 → %s: %s: %v", tunName, strings.TrimSpace(string(out)), err)
-		// Non-fatal: local access still works via host route
-	} else {
-		log.Printf("route: 100.64.0.0/10 → %s (peers)", tunName)
+		return fmt.Errorf("subnet route 100.64.0.0/10 → %s: %s: %w", tunName, strings.TrimSpace(string(out)), err)
 	}
+	log.Printf("route: 100.64.0.0/10 → %s", tunName)
 
 	return nil
 }
-
-// TUN routes are not explicitly removed on shutdown: when the TUN device
-// is destroyed (process exit), the kernel automatically cleans up all
-// routes bound to that interface.
