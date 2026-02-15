@@ -101,24 +101,39 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let name = dev.name().to_string();
         eprintln!("TUN {}: {}/10, MTU {}", name, tun_ip, tun_mtu);
 
-        // Add host route so the TUN IP is locally reachable.
-        // macOS utun is point-to-point: the OS only creates a route for the
-        // peer address, not the local address.
+        // Fix macOS utun routing.
+        // macOS utun is point-to-point: the kernel only creates a host route
+        // for the peer address, ignoring the /10 subnet mask. We add:
+        //   1. Host route: TUN_IP → lo0 (local TCP connections)
+        //   2. Subnet route: 100.64.0.0/10 → utun (peer traffic)
         if cfg!(target_os = "macos") {
+            // 1. Host route for local IP
             match std::process::Command::new("/sbin/route")
                 .args(["add", "-host", &tun_ip.to_string(), "-interface", "lo0"])
                 .output()
             {
                 Ok(out) if out.status.success() => {
-                    eprintln!("route: added host route {} → lo0", tun_ip);
+                    eprintln!("route: {} → lo0 (local)", tun_ip);
                 }
                 Ok(out) => {
-                    eprintln!("warning: add local route {}: {}",
+                    eprintln!("warning: host route {}: {}",
                         tun_ip, String::from_utf8_lossy(&out.stderr).trim());
                 }
-                Err(e) => {
-                    eprintln!("warning: add local route {}: {}", tun_ip, e);
+                Err(e) => eprintln!("warning: host route {}: {}", tun_ip, e),
+            }
+            // 2. Subnet route for CGNAT range
+            match std::process::Command::new("/sbin/route")
+                .args(["add", "-net", "100.64.0.0/10", "-interface", &name])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    eprintln!("route: 100.64.0.0/10 → {} (peers)", name);
                 }
+                Ok(out) => {
+                    eprintln!("warning: subnet route: {}",
+                        String::from_utf8_lossy(&out.stderr).trim());
+                }
+                Err(e) => eprintln!("warning: subnet route: {}", e),
             }
         }
 
@@ -276,12 +291,13 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Graceful shutdown
     host.close();
 
-    // Remove local route on macOS
+    // Remove TUN routes on macOS
     if cfg!(target_os = "macos") {
         let _ = std::process::Command::new("/sbin/route")
-            .args(["delete", "-host", &tun_ip.to_string(), "-interface", "lo0"])
-            .output();
-        eprintln!("route: removed host route {} → lo0", tun_ip);
+            .args(["delete", "-net", "100.64.0.0/10"]).output();
+        let _ = std::process::Command::new("/sbin/route")
+            .args(["delete", "-host", &tun_ip.to_string()]).output();
+        eprintln!("route: cleaned up TUN routes");
     }
 
     Ok(())

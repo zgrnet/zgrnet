@@ -135,20 +135,35 @@ pub fn main() !void {
         tun_dev.getName(), tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3], cfg.net.tun_mtu,
     });
 
-    // Add host route so the TUN IP is locally reachable (macOS only).
-    // macOS utun is point-to-point: the OS only creates a route for the peer
-    // address, not the local address.
+    // Fix macOS utun routing.
+    // macOS utun is point-to-point: the kernel only creates a host route for
+    // the peer address, ignoring the /10 subnet mask. We add:
+    //   1. Host route: TUN_IP → lo0 (local TCP connections)
+    //   2. Subnet route: 100.64.0.0/10 → utun (peer traffic)
     if (comptime @import("builtin").os.tag == .macos) {
         var ip_buf: [16]u8 = undefined;
         const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3] }) catch unreachable;
-        var child = std.process.Child.init(
+        const tun_name = tun_dev.getName();
+
+        // 1. Host route for local IP → lo0
+        var c1 = std.process.Child.init(
             &.{ "/sbin/route", "add", "-host", ip_str, "-interface", "lo0" },
             allocator,
         );
-        _ = child.spawnAndWait() catch |err| {
-            print("[zgrnetd] warning: add local route: {}\n", .{err});
+        _ = c1.spawnAndWait() catch |err| {
+            print("[zgrnetd] warning: host route: {}\n", .{err});
         };
-        print("[zgrnetd] route: added host route {s} -> lo0\n", .{ip_str});
+        print("[zgrnetd] route: {s} -> lo0 (local)\n", .{ip_str});
+
+        // 2. Subnet route for CGNAT range → utun
+        var c2 = std.process.Child.init(
+            &.{ "/sbin/route", "add", "-net", "100.64.0.0/10", "-interface", tun_name },
+            allocator,
+        );
+        _ = c2.spawnAndWait() catch |err| {
+            print("[zgrnetd] warning: subnet route: {}\n", .{err});
+        };
+        print("[zgrnetd] route: 100.64.0.0/10 -> {s} (peers)\n", .{tun_name});
     }
 
     // 5-6. Create Host
@@ -235,16 +250,21 @@ pub fn main() !void {
 
     print("[zgrnetd] shutting down...\n", .{});
 
-    // Remove local route on macOS
+    // Remove TUN routes on macOS
     if (comptime @import("builtin").os.tag == .macos) {
-        var ip_buf: [16]u8 = undefined;
-        const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3] }) catch unreachable;
-        var child = std.process.Child.init(
-            &.{ "/sbin/route", "delete", "-host", ip_str, "-interface", "lo0" },
+        var c1 = std.process.Child.init(
+            &.{ "/sbin/route", "delete", "-net", "100.64.0.0/10" },
             allocator,
         );
-        _ = child.spawnAndWait() catch {};
-        print("[zgrnetd] route: removed host route {s} -> lo0\n", .{ip_str});
+        _ = c1.spawnAndWait() catch {};
+        var ip_buf: [16]u8 = undefined;
+        const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ tun_ip[0], tun_ip[1], tun_ip[2], tun_ip[3] }) catch unreachable;
+        var c2 = std.process.Child.init(
+            &.{ "/sbin/route", "delete", "-host", ip_str },
+            allocator,
+        );
+        _ = c2.spawnAndWait() catch {};
+        print("[zgrnetd] route: cleaned up TUN routes\n", .{});
     }
 
     host.close();

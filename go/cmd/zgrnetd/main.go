@@ -186,14 +186,20 @@ func run(cfgPath string) error {
 		return fmt.Errorf("bring TUN up: %w", err)
 	}
 
-	// Add host route so the TUN IP is locally reachable.
-	// macOS utun is point-to-point: the OS only creates a route for the peer
-	// address, not the local address. Without this, TCP connections to our own
-	// TUN IP go out the default route (physical NIC) instead of staying local.
-	if err := addLocalRoute(tunIP); err != nil {
-		log.Printf("warning: add local route for %s: %v", tunIP, err)
+	// Fix macOS utun routing.
+	//
+	// macOS utun is point-to-point: the OS only creates a host route for the
+	// peer address, ignoring the subnet mask. We need two explicit routes:
+	//
+	//   1. Host route for our own TUN IP → lo0 (so local TCP connections work)
+	//   2. Subnet route for the CGNAT /10 range → utun (so peer traffic goes
+	//      through TUN instead of the default route)
+	//
+	// On Linux, the kernel handles both automatically.
+	if err := addTUNRoutes(tunIP, tunDev.Name()); err != nil {
+		log.Printf("warning: add TUN routes: %v", err)
 	} else {
-		defer removeLocalRoute(tunIP)
+		defer removeTUNRoutes(tunIP)
 	}
 
 	log.Printf("TUN %s: %s/10, MTU %d", tunDev.Name(), tunIP, cfg.Net.TunMTU)
@@ -490,39 +496,44 @@ func trimKey(s string) string {
 	return string(result)
 }
 
-// addLocalRoute adds a host route so the TUN IP is locally reachable.
+// addTUNRoutes sets up macOS routing for the TUN device.
 //
-// On macOS, utun devices are point-to-point: the kernel only creates a route
-// for the peer address, not the local address. Without an explicit host route,
-// packets to our own TUN IP follow the default route out the physical NIC.
+// macOS utun is point-to-point: the kernel only creates a host route for the
+// peer address, ignoring the /10 subnet mask. We add two routes:
 //
-// On Linux, the kernel automatically treats addresses assigned to local
-// interfaces as local, so this is a no-op.
-func addLocalRoute(ip net.IP) error {
-	switch runtime.GOOS {
-	case "darwin":
-		out, err := exec.Command("/sbin/route", "add", "-host", ip.String(), "-interface", "lo0").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
-		}
-		log.Printf("route: added host route %s → lo0", ip)
+//  1. Host route: TUN_IP → lo0 (local TCP connections to our own IP)
+//  2. Subnet route: 100.64.0.0/10 → utunN (peer traffic through TUN)
+//
+// On Linux, the kernel handles both automatically, so this is a no-op.
+func addTUNRoutes(ip net.IP, tunName string) error {
+	if runtime.GOOS != "darwin" {
 		return nil
-	case "linux":
-		// Linux handles local addresses automatically via the "local" routing table.
-		return nil
-	default:
-		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
+
+	// 1. Host route for local IP → lo0
+	if out, err := exec.Command("/sbin/route", "add", "-host", ip.String(), "-interface", "lo0").CombinedOutput(); err != nil {
+		return fmt.Errorf("host route %s → lo0: %s: %w", ip, strings.TrimSpace(string(out)), err)
+	}
+	log.Printf("route: %s → lo0 (local)", ip)
+
+	// 2. Subnet route for CGNAT range → utun
+	// The /10 mask covers 100.64.0.0 – 100.127.255.255 (all peer IPs).
+	if out, err := exec.Command("/sbin/route", "add", "-net", "100.64.0.0/10", "-interface", tunName).CombinedOutput(); err != nil {
+		log.Printf("warning: subnet route 100.64.0.0/10 → %s: %s: %v", tunName, strings.TrimSpace(string(out)), err)
+		// Non-fatal: local access still works via host route
+	} else {
+		log.Printf("route: 100.64.0.0/10 → %s (peers)", tunName)
+	}
+
+	return nil
 }
 
-// removeLocalRoute removes the host route added by addLocalRoute.
-func removeLocalRoute(ip net.IP) {
-	switch runtime.GOOS {
-	case "darwin":
-		if out, err := exec.Command("/sbin/route", "delete", "-host", ip.String(), "-interface", "lo0").CombinedOutput(); err != nil {
-			log.Printf("warning: remove local route %s: %s: %v", ip, strings.TrimSpace(string(out)), err)
-		} else {
-			log.Printf("route: removed host route %s → lo0", ip)
-		}
+// removeTUNRoutes removes routes added by addTUNRoutes.
+func removeTUNRoutes(ip net.IP) {
+	if runtime.GOOS != "darwin" {
+		return
 	}
+	exec.Command("/sbin/route", "delete", "-net", "100.64.0.0/10").CombinedOutput()
+	exec.Command("/sbin/route", "delete", "-host", ip.String()).CombinedOutput()
+	log.Printf("route: cleaned up TUN routes")
 }
