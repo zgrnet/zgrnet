@@ -65,6 +65,10 @@ func run(args []string) error {
 		}
 	}
 	args = filtered
+	if len(args) == 0 {
+		printUsage()
+		return nil
+	}
 
 	baseDir, err := cli.DefaultConfigDir()
 	if err != nil {

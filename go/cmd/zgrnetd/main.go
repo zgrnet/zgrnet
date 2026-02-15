@@ -198,8 +198,6 @@ func run(cfgPath string) error {
 	// On Linux, the kernel handles both automatically.
 	if err := addTUNRoutes(tunIP, tunDev.Name()); err != nil {
 		log.Printf("warning: add TUN routes: %v", err)
-	} else {
-		defer removeTUNRoutes(tunIP)
 	}
 
 	log.Printf("TUN %s: %s/10, MTU %d", tunDev.Name(), tunIP, cfg.Net.TunMTU)
@@ -528,12 +526,6 @@ func addTUNRoutes(ip net.IP, tunName string) error {
 	return nil
 }
 
-// removeTUNRoutes removes routes added by addTUNRoutes.
-func removeTUNRoutes(ip net.IP) {
-	if runtime.GOOS != "darwin" {
-		return
-	}
-	exec.Command("/sbin/route", "delete", "-net", "100.64.0.0/10").CombinedOutput()
-	exec.Command("/sbin/route", "delete", "-host", ip.String()).CombinedOutput()
-	log.Printf("route: cleaned up TUN routes")
-}
+// TUN routes are not explicitly removed on shutdown: when the TUN device
+// is destroyed (process exit), the kernel automatically cleans up all
+// routes bound to that interface.
