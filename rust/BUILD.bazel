@@ -56,6 +56,15 @@ rust_library(
     deps = all_crate_deps() + ["//third_party/kcp", "//zig/tun:lib", "//zig/dnsmgr:lib"],
 )
 
+# zgrnet CLI — offline management tool
+rust_binary(
+    name = "zgrnet_bin",
+    srcs = ["src/bin/zgrnet.rs"],
+    edition = "2021",
+    deps = [":zgrnet"] + all_crate_deps(),
+    visibility = ["//visibility:public"],
+)
+
 # zgrnetd daemon (macOS only — requires TUN device support)
 rust_binary(
     name = "zgrnetd",
