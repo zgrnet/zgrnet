@@ -3,7 +3,7 @@
 //! Provides offline context/config management and online API commands
 //! for interacting with a running zgrnetd daemon.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use zgrnet::cli;
 
 fn main() {

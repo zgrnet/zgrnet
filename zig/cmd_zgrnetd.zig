@@ -355,21 +355,21 @@ fn apiRoute(ctx: *ApiContext, method: []const u8, path: []const u8, query: []con
             return httpResp(a, 500, "{\"error\":\"read config\"}");
         defer a.free(cfg_data);
         // Escape for JSON string
-        var escaped = std.ArrayList(u8).init(a);
-        defer escaped.deinit();
-        escaped.appendSlice("{\"content\":\"") catch return httpResp(a, 500, "");
+        var escaped: std.ArrayListUnmanaged(u8) = .{};
+        defer escaped.deinit(a);
+        escaped.appendSlice(a, "{\"content\":\"") catch return httpResp(a, 500, "");
         for (cfg_data) |c| {
             switch (c) {
-                '\\' => escaped.appendSlice("\\\\") catch {},
-                '"' => escaped.appendSlice("\\\"") catch {},
-                '\n' => escaped.appendSlice("\\n") catch {},
-                '\t' => escaped.appendSlice("\\t") catch {},
-                '\r' => escaped.appendSlice("\\r") catch {},
-                else => escaped.append(c) catch {},
+                '\\' => escaped.appendSlice(a, "\\\\") catch {},
+                '"' => escaped.appendSlice(a, "\\\"") catch {},
+                '\n' => escaped.appendSlice(a, "\\n") catch {},
+                '\t' => escaped.appendSlice(a, "\\t") catch {},
+                '\r' => escaped.appendSlice(a, "\\r") catch {},
+                else => escaped.append(a, c) catch {},
             }
         }
-        escaped.appendSlice("\"}") catch {};
-        const result = escaped.toOwnedSlice() catch return httpResp(a, 500, "");
+        escaped.appendSlice(a, "\"}") catch {};
+        const result = escaped.toOwnedSlice(a) catch return httpResp(a, 500, "");
         return httpResp(a, 200, result);
     }
 
@@ -477,9 +477,9 @@ fn jsonSection(a: Allocator, config_path: []const u8, key: []const u8) []const u
 
     const val = parsed.value.object.get(key) orelse return httpResp(a, 200, "{}");
 
-    var buf = std.ArrayList(u8).init(a);
-    std.json.stringify(val, .{}, buf.writer()) catch return httpResp(a, 500, "");
-    const result = buf.toOwnedSlice() catch return httpResp(a, 500, "");
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    std.json.stringify(val, .{}, buf.writer(a)) catch return httpResp(a, 500, "");
+    const result = buf.toOwnedSlice(a) catch return httpResp(a, 500, "");
     return httpResp(a, 200, result);
 }
 

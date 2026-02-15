@@ -51,9 +51,8 @@ pub fn main() !void {
     var api_addr: ?[]const u8 = null;
     var ctx_override: ?[]const u8 = null;
     var json_output = false;
-    var filtered: std.ArrayList([]const u8) = .empty;
-    filtered.allocator = allocator;
-    defer filtered.deinit();
+    var filtered: std.ArrayListUnmanaged([]const u8) = .{};
+    defer filtered.deinit(allocator);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -66,7 +65,7 @@ pub fn main() !void {
         } else if (mem.eql(u8, args[i], "--json")) {
             json_output = true;
         } else {
-            try filtered.append(args[i]);
+            try filtered.append(allocator, args[i]);
         }
     }
 
@@ -176,10 +175,10 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
         const current = currentContextName(allocator, base_dir) catch null;
         defer if (current) |c| allocator.free(c);
 
-        var names = std.ArrayList([]const u8).init(allocator);
+        var names: std.ArrayListUnmanaged([]const u8) = .{};
         defer {
             for (names.items) |n| allocator.free(n);
-            names.deinit();
+            names.deinit(allocator);
         }
 
         var iter = dir.iterate();
@@ -188,7 +187,7 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
             const cfg_path = try fmt.allocPrint(allocator, "{s}/{s}/config.json", .{ base_dir, entry.name });
             defer allocator.free(cfg_path);
             if (fs.cwd().access(cfg_path, .{})) |_| {
-                try names.append(try allocator.dupe(u8, entry.name));
+                try names.append(allocator, try allocator.dupe(u8, entry.name));
             } else |_| {}
         }
 
@@ -651,14 +650,14 @@ fn httpRequest(allocator: Allocator, addr: []const u8, method: []const u8, path:
     }
 
     // Read response
-    var resp_buf = std.ArrayList(u8).init(allocator);
-    defer resp_buf.deinit();
+    var resp_buf: std.ArrayListUnmanaged(u8) = .{};
+    defer resp_buf.deinit(allocator);
 
     var read_buf: [4096]u8 = undefined;
     while (true) {
         const n = stream.read(&read_buf) catch break;
         if (n == 0) break;
-        try resp_buf.appendSlice(read_buf[0..n]);
+        try resp_buf.appendSlice(allocator, read_buf[0..n]);
     }
 
     const resp = resp_buf.items;
