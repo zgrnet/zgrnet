@@ -398,7 +398,7 @@ fn runUp(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, args: []c
         try child.spawn();
         print("zgrnetd started in background (pid {d})\n", .{child.id});
     } else {
-        const err = std.process.execve(allocator, &[_][]const u8{ "zgrnetd", "-c", cfg_path }, null, null);
+        const err = std.process.execve(allocator, &[_][]const u8{ "zgrnetd", "-c", cfg_path }, null);
         print("error: exec zgrnetd: {}\n", .{err});
         std.process.exit(1);
     }
