@@ -7,11 +7,15 @@
 //! Go and Rust use YAML format; Zig uses JSON.
 
 mod diff;
+pub mod identity;
+mod labels;
 mod manager;
 mod policy;
 mod route;
 
 pub use diff::{ConfigDiff, diff};
+pub use identity::{IdentityResponse, lookup_identity};
+pub use labels::{LabelStore, match_label, match_labels};
 pub use manager::Manager;
 pub use policy::{PolicyEngine, PolicyResult};
 pub use route::{RouteMatcher, RouteResult};
@@ -68,6 +72,8 @@ pub struct PeerConfig {
     pub direct: Vec<String>,
     #[serde(default)]
     pub relay: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Controls who can connect and what services they can access.
@@ -96,9 +102,16 @@ pub struct InboundRule {
 }
 
 /// Defines how to match a peer's identity.
+/// A rule can match by pubkey, by labels, or both.
+/// When both are specified, the peer must match the pubkey condition AND have matching labels.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MatchConfig {
     pub pubkey: PubkeyMatch,
+    /// Label patterns the peer must have at least one of.
+    /// Supports exact match ("host.zigor.net/trusted") and
+    /// wildcard match ("company.zigor.net/*").
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 /// Defines the pubkey matching strategy.
@@ -132,14 +145,13 @@ pub struct RouteConfig {
 }
 
 /// Defines how traffic for specific domains is routed.
+/// All domain matching is suffix-based: "google.com" matches google.com
+/// and all its subdomains. "*.google.com" is accepted and treated identically.
+/// When multiple rules match, the longest suffix wins.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteRule {
-    /// Glob pattern: "*.google.com", "google.com".
-    #[serde(default)]
+    /// Domain suffix: "google.com" or "*.google.com" (equivalent).
     pub domain: String,
-    /// File path containing one domain per line.
-    #[serde(default)]
-    pub domain_list: String,
     /// Target peer alias or domain.
     pub peer: String,
 }
@@ -322,8 +334,8 @@ impl RouteConfig {
 
 impl RouteRule {
     fn validate(&self) -> Result<(), String> {
-        if self.domain.is_empty() && self.domain_list.is_empty() {
-            return Err("at least one of domain or domain_list is required".into());
+        if self.domain.is_empty() {
+            return Err("domain is required".into());
         }
         if self.peer.is_empty() {
             return Err("peer is required".into());
@@ -401,10 +413,14 @@ peers:
     alias: peer_us
     direct:
       - "us.example.com:51820"
+    labels:
+      - "host.zigor.net/trusted"
   "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567bb.zigor.net":
     alias: peer_jp
     relay:
       - "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567aa.zigor.net"
+    labels:
+      - "host.zigor.net/friend"
 inbound_policy:
   default: deny
   revalidate_interval: "5m"
@@ -419,9 +435,9 @@ inbound_policy:
       action: allow
 route:
   rules:
-    - domain: "*.google.com"
+    - domain: "google.com"
       peer: peer_us
-    - domain: "*.nicovideo.jp"
+    - domain: "nicovideo.jp"
       peer: peer_jp
 "#;
 
@@ -492,7 +508,8 @@ route:
     fn test_validation_route_missing_domain() {
         let yaml = b"net:\n  private_key: /tmp/k\n  tun_ipv4: \"100.64.0.1\"\nroute:\n  rules:\n    - peer: peer_us";
         let err = load_from_bytes(yaml).unwrap_err().to_string();
-        assert!(err.contains("at least one of domain or domain_list"), "got: {err}");
+        // serde catches missing required `domain` field
+        assert!(err.contains("domain"), "got: {err}");
     }
 
     #[test]

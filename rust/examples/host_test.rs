@@ -117,6 +117,8 @@ fn run_test() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         Arc::new(RealTun { dev: tun_a }),
     )
@@ -129,6 +131,8 @@ fn run_test() {
             mtu: 1400,
             listen_port: 0,
             peers: vec![],
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         },
         Arc::new(RealTun { dev: tun_b }),
     )

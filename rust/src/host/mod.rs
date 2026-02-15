@@ -48,6 +48,18 @@ pub trait TunDevice: Send + Sync {
 // Config
 // ============================================================================
 
+/// Provides Fake IP → domain + peer resolution.
+pub trait FakeIPLookup: Send + Sync {
+    /// Check if the IP is a Fake IP and return the domain + peer.
+    fn lookup_fake_ip(&self, ip: Ipv4Addr) -> Option<(String, String)>;
+}
+
+/// Handles outbound traffic destined for Fake IPs (route-matched domains).
+pub trait FakeIPHandler: Send + Sync {
+    /// Called when an outbound IP packet's destination matches a Fake IP.
+    fn handle_fake_ip(&self, domain: &str, peer: &str, ip_pkt: &[u8]);
+}
+
 /// Configuration for creating a Host.
 pub struct Config {
     /// Local keypair for Noise Protocol handshakes.
@@ -60,6 +72,10 @@ pub struct Config {
     pub listen_port: u16,
     /// Initial peers.
     pub peers: Vec<PeerConfig>,
+    /// Fake IP lookup (optional).
+    pub fake_ip_lookup: Option<Arc<dyn FakeIPLookup>>,
+    /// Fake IP handler (optional).
+    pub fake_ip_handler: Option<Arc<dyn FakeIPHandler>>,
 }
 
 /// Configuration for a peer.
@@ -86,6 +102,8 @@ pub struct Host {
     ip_alloc: Arc<IPAllocator>,
     tun_ipv4: Ipv4Addr,
     mtu: usize,
+    fake_ip_lookup: Option<Arc<dyn FakeIPLookup>>,
+    fake_ip_handler: Option<Arc<dyn FakeIPHandler>>,
     closed: Arc<AtomicBool>,
     peers: RwLock<HashMap<Key, PeerConfig>>,
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
@@ -115,6 +133,8 @@ impl Host {
             ip_alloc: Arc::new(IPAllocator::new()),
             tun_ipv4: cfg.tun_ipv4,
             mtu,
+            fake_ip_lookup: cfg.fake_ip_lookup,
+            fake_ip_handler: cfg.fake_ip_handler,
             closed: Arc::new(AtomicBool::new(false)),
             peers: RwLock::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
@@ -292,6 +312,16 @@ impl Host {
             Some(ip) => ip,
             None => return,
         };
+
+        // Check if destination is a Fake IP (route-matched domain)
+        if let Some(ref lookup) = self.fake_ip_lookup {
+            if let Some((domain, peer)) = lookup.lookup_fake_ip(dst_ipv4) {
+                if let Some(ref handler) = self.fake_ip_handler {
+                    handler.handle_fake_ip(&domain, &peer, ip_pkt);
+                }
+                return;
+            }
+        }
 
         let pk = match self.ip_alloc.lookup_by_ip(dst_ipv4) {
             Some(pk) => pk,

@@ -28,8 +28,9 @@ type Manager struct {
 	current  *Config
 	watchers []Watcher
 
-	route  *RouteMatcher
-	policy *PolicyEngine
+	route      *RouteMatcher
+	policy     *PolicyEngine
+	labelStore *LabelStore
 
 	// File modification tracking
 	configMtime time.Time
@@ -47,23 +48,24 @@ func NewManager(path string) (*Manager, error) {
 		return nil, err
 	}
 
-	route, err := NewRouteMatcher(&cfg.Route)
-	if err != nil {
-		return nil, fmt.Errorf("config: build route matcher: %w", err)
-	}
+	route := NewRouteMatcher(&cfg.Route)
 
-	policy, err := NewPolicyEngine(&cfg.InboundPolicy)
+	labelStore := NewLabelStore()
+	labelStore.LoadFromConfig(cfg.Peers)
+
+	policy, err := NewPolicyEngine(&cfg.InboundPolicy, labelStore)
 	if err != nil {
 		return nil, fmt.Errorf("config: build policy engine: %w", err)
 	}
 
 	m := &Manager{
-		path:     path,
-		current:  cfg,
-		route:    route,
-		policy:   policy,
-		extFiles: make(map[string]time.Time),
-		stopChan: make(chan struct{}),
+		path:       path,
+		current:    cfg,
+		route:      route,
+		policy:     policy,
+		labelStore: labelStore,
+		extFiles:   make(map[string]time.Time),
+		stopChan:   make(chan struct{}),
 	}
 
 	// Track config file mtime
@@ -97,6 +99,13 @@ func (m *Manager) CheckInbound(pubkey [32]byte) *PolicyResult {
 	policy := m.policy
 	m.mu.RUnlock()
 	return policy.Check(pubkey)
+}
+
+// LabelStore returns the label store used for label-based policy matching.
+func (m *Manager) LabelStore() *LabelStore {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.labelStore
 }
 
 // Watch registers a watcher to receive change notifications.
@@ -142,8 +151,7 @@ func (m *Manager) Reload() (*ConfigDiff, error) {
 	// Also check if external files changed
 	extChanged := m.checkExternalFilesChanged()
 	if extChanged {
-		// Mark these sections as changed so watchers get notified
-		diff.RouteChanged = true
+		// Only policy has external files (whitelist), route rules are inline
 		diff.InboundChanged = true
 	}
 
@@ -156,14 +164,24 @@ func (m *Manager) Reload() (*ConfigDiff, error) {
 	var newRoute *RouteMatcher
 	var newPolicy *PolicyEngine
 	if diff.RouteChanged {
-		r, err := NewRouteMatcher(&newCfg.Route)
-		if err != nil {
-			return nil, fmt.Errorf("config: rebuild route matcher: %w", err)
-		}
-		newRoute = r
+		newRoute = NewRouteMatcher(&newCfg.Route)
 	}
+
+	// Refresh labels from config peers on any peer or inbound change
+	peersChanged := len(diff.PeersAdded) > 0 || len(diff.PeersRemoved) > 0 || len(diff.PeersChanged) > 0
+	if peersChanged {
+		// Clean up host labels for removed peers
+		for _, domain := range diff.PeersRemoved {
+			pubkeyHex := pubkeyHexFromDomain(domain)
+			if pubkeyHex != "" {
+				m.labelStore.RemoveLabels(pubkeyHex, "host.zigor.net")
+			}
+		}
+		m.labelStore.LoadFromConfig(newCfg.Peers)
+	}
+
 	if diff.InboundChanged {
-		p, err := NewPolicyEngine(&newCfg.InboundPolicy)
+		p, err := NewPolicyEngine(&newCfg.InboundPolicy, m.labelStore)
 		if err != nil {
 			return nil, fmt.Errorf("config: rebuild policy engine: %w", err)
 		}
@@ -242,13 +260,6 @@ func (m *Manager) trackExternalFiles(cfg *Config) {
 	for _, rule := range cfg.InboundPolicy.Rules {
 		if rule.Match.Pubkey.Type == "whitelist" && rule.Match.Pubkey.Path != "" {
 			m.extFiles[rule.Match.Pubkey.Path] = fileMtime(rule.Match.Pubkey.Path)
-		}
-	}
-
-	// Track domain list files
-	for _, rule := range cfg.Route.Rules {
-		if rule.DomainList != "" {
-			m.extFiles[rule.DomainList] = fileMtime(rule.DomainList)
 		}
 	}
 }

@@ -85,6 +85,7 @@ mod tests {
             alias: "new".into(),
             direct: vec!["1.2.3.4:51820".into()],
             relay: vec![],
+            labels: vec![],
         });
 
         let d = diff(&old, &new);
@@ -97,7 +98,7 @@ mod tests {
     fn test_peers_removed() {
         let mut old = Config::default();
         old.peers.insert("aabb.zigor.net".into(), PeerConfig {
-            alias: "old".into(), direct: vec![], relay: vec!["r".into()],
+            alias: "old".into(), direct: vec![], relay: vec!["r".into()], labels: vec![],
         });
         let new = Config::default();
 
@@ -109,11 +110,11 @@ mod tests {
     fn test_peers_changed() {
         let mut old = Config::default();
         old.peers.insert("aabb.zigor.net".into(), PeerConfig {
-            alias: "p".into(), direct: vec!["1.1.1.1:51820".into()], relay: vec![],
+            alias: "p".into(), direct: vec!["1.1.1.1:51820".into()], relay: vec![], labels: vec![],
         });
         let mut new = Config::default();
         new.peers.insert("aabb.zigor.net".into(), PeerConfig {
-            alias: "p".into(), direct: vec!["2.2.2.2:51820".into()], relay: vec![],
+            alias: "p".into(), direct: vec!["2.2.2.2:51820".into()], relay: vec![], labels: vec![],
         });
 
         let d = diff(&old, &new);
@@ -157,8 +158,7 @@ mod tests {
         let old = Config::default();
         let mut new = Config::default();
         new.route.rules.push(super::super::RouteRule {
-            domain: "*.google.com".into(),
-            domain_list: String::new(),
+            domain: "google.com".into(),
             peer: "p".into(),
         });
 

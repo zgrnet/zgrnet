@@ -54,6 +54,7 @@ type PeerConfig struct {
 	Alias  string   `yaml:"alias" json:"alias"`
 	Direct []string `yaml:"direct" json:"direct"`
 	Relay  []string `yaml:"relay" json:"relay"`
+	Labels []string `yaml:"labels" json:"labels"`
 }
 
 // InboundPolicy controls who can connect and what services they can access.
@@ -78,8 +79,16 @@ type InboundRule struct {
 }
 
 // MatchConfig defines how to match a peer's identity.
+// A rule can match by pubkey (existing), by labels, or both.
+// When both are specified, the peer must match the pubkey condition AND have matching labels.
 type MatchConfig struct {
 	Pubkey PubkeyMatch `yaml:"pubkey" json:"pubkey"`
+
+	// Labels is a list of label patterns the peer must have at least one of.
+	// Supports exact match ("host.zigor.net/trusted") and
+	// wildcard match ("company.zigor.net/*").
+	// Empty means no label matching (pubkey match only).
+	Labels []string `yaml:"labels,omitempty" json:"labels,omitempty"`
 }
 
 // PubkeyMatch defines the pubkey matching strategy.
@@ -111,12 +120,12 @@ type RouteConfig struct {
 }
 
 // RouteRule defines how traffic for specific domains is routed.
+// All domain matching is suffix-based: "google.com" matches google.com
+// and all its subdomains. "*.google.com" is accepted and treated identically.
+// When multiple rules match, the longest suffix wins.
 type RouteRule struct {
-	// Domain is a glob pattern: "*.google.com", "google.com".
-	Domain string `yaml:"domain,omitempty" json:"domain,omitempty"`
-
-	// DomainList is a file path containing one domain per line.
-	DomainList string `yaml:"domain_list,omitempty" json:"domain_list,omitempty"`
+	// Domain is a domain suffix: "google.com", "*.google.com" (equivalent).
+	Domain string `yaml:"domain" json:"domain"`
 
 	// Peer is the target peer alias or domain.
 	Peer string `yaml:"peer" json:"peer"`
@@ -311,8 +320,8 @@ func (r *RouteConfig) validate() error {
 }
 
 func (r *RouteRule) validate() error {
-	if r.Domain == "" && r.DomainList == "" {
-		return fmt.Errorf("at least one of domain or domain_list is required")
+	if r.Domain == "" {
+		return fmt.Errorf("domain is required")
 	}
 	if r.Peer == "" {
 		return fmt.Errorf("peer is required")

@@ -28,12 +28,15 @@ type PolicyResult struct {
 	ZgrlanPeer string
 }
 
-// PolicyEngine evaluates inbound policy rules against peer public keys.
+// PolicyEngine evaluates inbound policy rules against peer public keys and labels.
 // Thread-safe for concurrent reads after Build().
 type PolicyEngine struct {
 	mu      sync.RWMutex
 	policy  *InboundPolicy
 	entries []compiledPolicyEntry
+
+	// labelStore is optional. When set, label-based matching is enabled.
+	labelStore *LabelStore
 }
 
 type compiledPolicyEntry struct {
@@ -45,9 +48,12 @@ type compiledPolicyEntry struct {
 }
 
 // NewPolicyEngine creates a PolicyEngine from an InboundPolicy.
-// Whitelist files are loaded eagerly.
-func NewPolicyEngine(policy *InboundPolicy) (*PolicyEngine, error) {
+// Whitelist files are loaded eagerly. LabelStore is optional (nil = no label matching).
+func NewPolicyEngine(policy *InboundPolicy, labelStore ...*LabelStore) (*PolicyEngine, error) {
 	pe := &PolicyEngine{policy: policy}
+	if len(labelStore) > 0 {
+		pe.labelStore = labelStore[0]
+	}
 	if err := pe.build(); err != nil {
 		return nil, err
 	}
@@ -86,24 +92,30 @@ func (pe *PolicyEngine) Check(pubkey [32]byte) *PolicyResult {
 	pe.mu.RLock()
 	defer pe.mu.RUnlock()
 
+	// Look up labels once (only if any rule uses label matching)
+	var peerLabels []string
+	if pe.labelStore != nil {
+		peerLabels = pe.labelStore.Labels(pubkeyHex)
+	}
+
 	for i := range pe.entries {
 		entry := &pe.entries[i]
 		rule := entry.rule
 
-		matched := false
+		pubkeyMatched := false
 		needsZgrlan := false
 		zgrlanPeer := ""
 
 		switch rule.Match.Pubkey.Type {
 		case "any":
-			matched = true
+			pubkeyMatched = true
 
 		case "whitelist":
-			matched = entry.whitelist[pubkeyHex]
+			pubkeyMatched = entry.whitelist[pubkeyHex]
 
 		case "zgrlan":
 			// Can't verify locally — tell caller to do RPC
-			matched = true
+			pubkeyMatched = true
 			needsZgrlan = true
 			zgrlanPeer = rule.Match.Pubkey.Peer
 
@@ -112,18 +124,27 @@ func (pe *PolicyEngine) Check(pubkey [32]byte) *PolicyResult {
 			continue
 		}
 
-		if matched {
-			result := &PolicyResult{
-				Action:   rule.Action,
-				Services: rule.Services,
-				RuleName: rule.Name,
-			}
-			if needsZgrlan {
-				result.NeedsZgrlanVerify = true
-				result.ZgrlanPeer = zgrlanPeer
-			}
-			return result
+		if !pubkeyMatched {
+			continue
 		}
+
+		// If the rule has label patterns, the peer must also match at least one
+		if len(rule.Match.Labels) > 0 {
+			if !MatchLabels(peerLabels, rule.Match.Labels) {
+				continue
+			}
+		}
+
+		result := &PolicyResult{
+			Action:   rule.Action,
+			Services: rule.Services,
+			RuleName: rule.Name,
+		}
+		if needsZgrlan {
+			result.NeedsZgrlanVerify = true
+			result.ZgrlanPeer = zgrlanPeer
+		}
+		return result
 	}
 
 	// No rule matched — use default

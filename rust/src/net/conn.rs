@@ -646,7 +646,13 @@ impl<T: Transport + 'static> Conn<T> {
     /// - `HandshakeTimeout`: handshake attempt exceeded RekeyAttemptTime (90s)
     /// - `SessionExpired`: session expired (too many messages)
     pub fn tick(&self) -> Result<()> {
-        let now = Instant::now();
+        self.tick_at(Instant::now())
+    }
+
+    /// Tick with an explicit time point. Used by tests to avoid
+    /// `Instant::now() - Duration` overflow on Windows where Instant
+    /// starts from process creation time.
+    pub fn tick_at(&self, now: Instant) -> Result<()> {
         let state = *self.state.read().unwrap();
 
         match state {
@@ -1060,14 +1066,17 @@ mod tests {
             remote_addr: None,
         }).unwrap();
 
-        // Manually set established state with old lastReceived
+        // Manually set established state with current time for lastReceived,
+        // then tick_at a future time that exceeds REJECT_AFTER_TIME.
+        let base = Instant::now();
         *conn.state.write().unwrap() = ConnState::Established;
         *conn.current.write().unwrap() = Some(session);
-        *conn.last_sent.write().unwrap() = Some(Instant::now());
-        *conn.last_received.write().unwrap() = Some(Instant::now() - REJECT_AFTER_TIME - std::time::Duration::from_secs(1));
-        *conn.session_created.write().unwrap() = Some(Instant::now());
+        *conn.last_sent.write().unwrap() = Some(base);
+        *conn.last_received.write().unwrap() = Some(base);
+        *conn.session_created.write().unwrap() = Some(base);
 
-        let err = conn.tick().unwrap_err();
+        let future = base + REJECT_AFTER_TIME + std::time::Duration::from_secs(1);
+        let err = conn.tick_at(future).unwrap_err();
         assert!(matches!(err, ConnError::ConnTimeout));
     }
 
@@ -1083,11 +1092,14 @@ mod tests {
             remote_addr: None,
         }).unwrap();
 
-        // Manually set handshaking state with expired attempt
+        // Manually set handshaking state with current time for attempt start,
+        // then tick_at a future time that exceeds REKEY_ATTEMPT_TIME.
+        let base = Instant::now();
         *conn.state.write().unwrap() = ConnState::Handshaking;
-        *conn.handshake_attempt_start.write().unwrap() = Some(Instant::now() - REKEY_ATTEMPT_TIME - std::time::Duration::from_secs(1));
+        *conn.handshake_attempt_start.write().unwrap() = Some(base);
 
-        let err = conn.tick().unwrap_err();
+        let future = base + REKEY_ATTEMPT_TIME + std::time::Duration::from_secs(1);
+        let err = conn.tick_at(future).unwrap_err();
         assert!(matches!(err, ConnError::HandshakeTimeout));
     }
 

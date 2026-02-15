@@ -97,6 +97,10 @@ fn peerEqual(a: *const PeerConfig, b: *const PeerConfig) bool {
     for (a.relay, b.relay) |ar, br| {
         if (!mem.eql(u8, ar, br)) return false;
     }
+    if (a.labels.len != b.labels.len) return false;
+    for (a.labels, b.labels) |al, bl| {
+        if (!mem.eql(u8, al, bl)) return false;
+    }
     return true;
 }
 
@@ -108,6 +112,12 @@ fn inboundEqual(a: *const types.InboundPolicy, b: *const types.InboundPolicy) bo
         if (!mem.eql(u8, ar.name, br.name)) return false;
         if (!mem.eql(u8, ar.action, br.action)) return false;
         if (!mem.eql(u8, ar.@"match".pubkey.@"type", br.@"match".pubkey.@"type")) return false;
+        if (!mem.eql(u8, ar.@"match".pubkey.path, br.@"match".pubkey.path)) return false;
+        if (!mem.eql(u8, ar.@"match".pubkey.peer, br.@"match".pubkey.peer)) return false;
+        if (ar.@"match".labels.len != br.@"match".labels.len) return false;
+        for (ar.@"match".labels, br.@"match".labels) |al, bl| {
+            if (!mem.eql(u8, al, bl)) return false;
+        }
     }
     return true;
 }
@@ -116,7 +126,6 @@ fn routeEqual(a: *const types.RouteConfig, b: *const types.RouteConfig) bool {
     if (a.rules.len != b.rules.len) return false;
     for (a.rules, b.rules) |ar, br| {
         if (!mem.eql(u8, ar.domain, br.domain)) return false;
-        if (!mem.eql(u8, ar.domain_list, br.domain_list)) return false;
         if (!mem.eql(u8, ar.peer, br.peer)) return false;
     }
     return true;
@@ -138,7 +147,7 @@ test "diff: inbound changed" {
 
 test "diff: route changed" {
     const old = Config{};
-    const rules = [_]types.RouteRule{.{ .domain = "*.google.com", .peer = "p" }};
+    const rules = [_]types.RouteRule{.{ .domain = "google.com", .peer = "p" }};
     const new = Config{ .route = .{ .rules = &rules } };
     var d = try diff(std.testing.allocator, &old, &new);
     defer d.deinit(std.testing.allocator);

@@ -19,10 +19,15 @@ peers:
     direct:
       - "us.example.com:51820"
       - "1.2.3.4:51820"
+    labels:
+      - "host.zigor.net/trusted"
+      - "host.zigor.net/exit-node"
   "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567bb.zigor.net":
     alias: peer_jp
     relay:
       - "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567aa.zigor.net"
+    labels:
+      - "host.zigor.net/friend"
 
 inbound_policy:
   default: deny
@@ -36,6 +41,16 @@ inbound_policy:
         - proto: "*"
           port: "*"
       action: allow
+    - name: "trusted-label"
+      match:
+        pubkey:
+          type: any
+        labels:
+          - "host.zigor.net/trusted"
+      services:
+        - proto: tcp
+          port: "80,443"
+      action: allow
     - name: "web-only"
       match:
         pubkey:
@@ -48,11 +63,9 @@ inbound_policy:
 
 route:
   rules:
-    - domain: "*.google.com"
+    - domain: "google.com"
       peer: peer_us
-    - domain: "*.youtube.com"
+    - domain: "youtube.com"
       peer: peer_us
-    - domain: "*.nicovideo.jp"
+    - domain: "nicovideo.jp"
       peer: peer_jp
-    - domain: "example.com"
-      peer: peer_us

@@ -10,6 +10,7 @@ const std = @import("std");
 
 pub const types = @import("types.zig");
 pub const diff_mod = @import("diff.zig");
+pub const labels_mod = @import("labels.zig");
 pub const route_mod = @import("route.zig");
 pub const policy_mod = @import("policy.zig");
 pub const manager_mod = @import("manager.zig");
@@ -30,6 +31,10 @@ pub const ConfigError = types.ConfigError;
 
 pub const ConfigDiff = diff_mod.ConfigDiff;
 
+pub const LabelStore = labels_mod.LabelStore;
+pub const matchLabel = labels_mod.matchLabel;
+pub const matchLabels = labels_mod.matchLabels;
+
 pub const RouteMatcher = route_mod.RouteMatcher;
 pub const RouteResult = route_mod.RouteResult;
 
@@ -42,6 +47,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = types;
     _ = diff_mod;
+    _ = labels_mod;
     _ = route_mod;
     _ = policy_mod;
     _ = manager_mod;

@@ -7,6 +7,12 @@ import (
 	"sync"
 )
 
+// FakeIPEntry holds the mapping data for a single domain in the FakeIP pool.
+type FakeIPEntry struct {
+	Domain string
+	Peer   string // target peer alias (from RouteMatcher)
+}
+
 // FakeIPPool manages a pool of fake IPs for route-matched domains.
 // Range: 198.18.0.0/15 (RFC 5737 benchmarking range, 131072 IPs).
 // Provides bidirectional domain <-> IP mapping with O(1) LRU eviction.
@@ -15,8 +21,8 @@ type FakeIPPool struct {
 
 	// Forward mapping: domain -> IP
 	domainToIP map[string]net.IP
-	// Reverse mapping: IP (as uint32) -> domain
-	ipToDomain map[uint32]string
+	// Reverse mapping: IP (as uint32) -> entry (domain + peer)
+	ipToEntry map[uint32]FakeIPEntry
 
 	// O(1) LRU: doubly linked list (front=LRU, back=MRU) + element map
 	lruList    *list.List
@@ -39,7 +45,7 @@ func NewFakeIPPool(maxSize int) *FakeIPPool {
 	}
 	return &FakeIPPool{
 		domainToIP: make(map[string]net.IP),
-		ipToDomain: make(map[uint32]string),
+		ipToEntry:  make(map[uint32]FakeIPEntry),
 		lruList:    list.New(),
 		lruElement: make(map[string]*list.Element),
 		maxSize:    maxSize,
@@ -53,11 +59,23 @@ func NewFakeIPPool(maxSize int) *FakeIPPool {
 // If the domain already has an IP, it's returned and the entry is moved to
 // the back of the LRU list. Otherwise, a new IP is allocated.
 func (p *FakeIPPool) Assign(domain string) net.IP {
+	return p.AssignWithPeer(domain, "")
+}
+
+// AssignWithPeer returns the Fake IP for the given domain and stores the
+// associated peer name. This is used when a RouteMatcher determines which
+// peer should handle the traffic.
+func (p *FakeIPPool) AssignWithPeer(domain, peer string) net.IP {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	// Already assigned?
 	if ip, ok := p.domainToIP[domain]; ok {
+		// Update peer if provided
+		if peer != "" {
+			ipKey := ipToUint32(ip)
+			p.ipToEntry[ipKey] = FakeIPEntry{Domain: domain, Peer: peer}
+		}
 		p.touchLRU(domain)
 		return ip
 	}
@@ -72,7 +90,7 @@ func (p *FakeIPPool) Assign(domain string) net.IP {
 	ipKey := ipToUint32(ip)
 
 	p.domainToIP[domain] = ip
-	p.ipToDomain[ipKey] = domain
+	p.ipToEntry[ipKey] = FakeIPEntry{Domain: domain, Peer: peer}
 	// Push to back (MRU end)
 	elem := p.lruList.PushBack(domain)
 	p.lruElement[domain] = elem
@@ -82,16 +100,25 @@ func (p *FakeIPPool) Assign(domain string) net.IP {
 
 // Lookup returns the domain associated with the given Fake IP.
 func (p *FakeIPPool) Lookup(ip net.IP) (string, bool) {
+	entry, ok := p.LookupEntry(ip)
+	if !ok {
+		return "", false
+	}
+	return entry.Domain, true
+}
+
+// LookupEntry returns the full entry (domain + peer) for the given Fake IP.
+func (p *FakeIPPool) LookupEntry(ip net.IP) (FakeIPEntry, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	ip4 := ip.To4()
 	if ip4 == nil {
-		return "", false
+		return FakeIPEntry{}, false
 	}
 
-	domain, ok := p.ipToDomain[ipToUint32(ip4)]
-	return domain, ok
+	entry, ok := p.ipToEntry[ipToUint32(ip4)]
+	return entry, ok
 }
 
 // LookupDomain returns the Fake IP for the given domain without allocating.
@@ -122,13 +149,13 @@ func (p *FakeIPPool) allocIP() net.IP {
 	}
 
 	// Check for IP collision from wrap-around
-	if oldDomain, ok := p.ipToDomain[ipVal]; ok {
+	if entry, ok := p.ipToEntry[ipVal]; ok {
 		// Evict the old domain holding this IP
-		delete(p.ipToDomain, ipVal)
-		delete(p.domainToIP, oldDomain)
-		if elem, ok := p.lruElement[oldDomain]; ok {
+		delete(p.ipToEntry, ipVal)
+		delete(p.domainToIP, entry.Domain)
+		if elem, ok := p.lruElement[entry.Domain]; ok {
 			p.lruList.Remove(elem)
-			delete(p.lruElement, oldDomain)
+			delete(p.lruElement, entry.Domain)
 		}
 	}
 
@@ -155,7 +182,7 @@ func (p *FakeIPPool) evictLRU() {
 	delete(p.lruElement, victim)
 
 	if ip, ok := p.domainToIP[victim]; ok {
-		delete(p.ipToDomain, ipToUint32(ip))
+		delete(p.ipToEntry, ipToUint32(ip))
 		delete(p.domainToIP, victim)
 	}
 }

@@ -258,13 +258,13 @@ func TestValidation_Route(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "missing domain and domain_list",
+			name: "missing domain",
 			yaml: `
 net: {private_key: "/tmp/k", tun_ipv4: "100.64.0.1"}
 route:
   rules:
     - peer: peer_us`,
-			wantErr: "at least one of domain or domain_list",
+			wantErr: "domain is required",
 		},
 		{
 			name: "missing peer",
@@ -272,7 +272,7 @@ route:
 net: {private_key: "/tmp/k", tun_ipv4: "100.64.0.1"}
 route:
   rules:
-    - domain: "*.google.com"`,
+    - domain: "google.com"`,
 			wantErr: "peer is required",
 		},
 	}

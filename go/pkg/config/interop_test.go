@@ -76,6 +76,16 @@ func TestInterop_LoadFullConfig(t *testing.T) {
 	if len(us.Direct) != 2 {
 		t.Errorf("peer_us direct count = %d, want 2", len(us.Direct))
 	}
+	if len(us.Labels) != 2 {
+		t.Errorf("peer_us labels count = %d, want 2", len(us.Labels))
+	} else {
+		if us.Labels[0] != "host.zigor.net/trusted" {
+			t.Errorf("peer_us labels[0] = %q", us.Labels[0])
+		}
+		if us.Labels[1] != "host.zigor.net/exit-node" {
+			t.Errorf("peer_us labels[1] = %q", us.Labels[1])
+		}
+	}
 
 	jp := cfg.Peers["abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567bb.zigor.net"]
 	if jp.Alias != "peer_jp" {
@@ -83,6 +93,9 @@ func TestInterop_LoadFullConfig(t *testing.T) {
 	}
 	if len(jp.Relay) != 1 {
 		t.Errorf("peer_jp relay count = %d, want 1", len(jp.Relay))
+	}
+	if len(jp.Labels) != 1 || jp.Labels[0] != "host.zigor.net/friend" {
+		t.Errorf("peer_jp labels = %v, want [host.zigor.net/friend]", jp.Labels)
 	}
 
 	// Verify inbound policy
@@ -92,24 +105,31 @@ func TestInterop_LoadFullConfig(t *testing.T) {
 	if cfg.InboundPolicy.RevalidateInterval != "5m" {
 		t.Errorf("revalidate_interval = %q", cfg.InboundPolicy.RevalidateInterval)
 	}
-	if len(cfg.InboundPolicy.Rules) != 2 {
-		t.Fatalf("inbound rules count = %d, want 2", len(cfg.InboundPolicy.Rules))
+	if len(cfg.InboundPolicy.Rules) != 3 {
+		t.Fatalf("inbound rules count = %d, want 3", len(cfg.InboundPolicy.Rules))
 	}
 	if cfg.InboundPolicy.Rules[0].Name != "trusted-users" {
 		t.Errorf("rule[0] name = %q", cfg.InboundPolicy.Rules[0].Name)
 	}
-	if cfg.InboundPolicy.Rules[1].Match.Pubkey.Type != "zgrlan" {
-		t.Errorf("rule[1] match type = %q", cfg.InboundPolicy.Rules[1].Match.Pubkey.Type)
+	// rule[1] is label-based
+	if cfg.InboundPolicy.Rules[1].Name != "trusted-label" {
+		t.Errorf("rule[1] name = %q", cfg.InboundPolicy.Rules[1].Name)
+	}
+	if len(cfg.InboundPolicy.Rules[1].Match.Labels) != 1 || cfg.InboundPolicy.Rules[1].Match.Labels[0] != "host.zigor.net/trusted" {
+		t.Errorf("rule[1] labels = %v", cfg.InboundPolicy.Rules[1].Match.Labels)
+	}
+	if cfg.InboundPolicy.Rules[2].Match.Pubkey.Type != "zgrlan" {
+		t.Errorf("rule[2] match type = %q", cfg.InboundPolicy.Rules[2].Match.Pubkey.Type)
 	}
 
 	// Verify route
-	if len(cfg.Route.Rules) != 4 {
-		t.Fatalf("route rules count = %d, want 4", len(cfg.Route.Rules))
+	if len(cfg.Route.Rules) != 3 {
+		t.Fatalf("route rules count = %d, want 3", len(cfg.Route.Rules))
 	}
-	if cfg.Route.Rules[0].Domain != "*.google.com" {
+	if cfg.Route.Rules[0].Domain != "google.com" {
 		t.Errorf("route[0] domain = %q", cfg.Route.Rules[0].Domain)
 	}
-	if cfg.Route.Rules[3].Domain != "example.com" {
-		t.Errorf("route[3] domain = %q", cfg.Route.Rules[3].Domain)
+	if cfg.Route.Rules[2].Domain != "nicovideo.jp" {
+		t.Errorf("route[2] domain = %q", cfg.Route.Rules[2].Domain)
 	}
 }

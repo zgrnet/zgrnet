@@ -33,6 +33,7 @@ pub const PeerConfig = struct {
     alias: []const u8 = "",
     direct: []const []const u8 = &.{},
     relay: []const []const u8 = &.{},
+    labels: []const []const u8 = &.{},
 };
 
 /// Controls who can connect and what services they can access.
@@ -52,8 +53,12 @@ pub const InboundRule = struct {
 };
 
 /// Defines how to match a peer's identity.
+/// A rule can match by pubkey, by labels, or both.
 pub const MatchConfig = struct {
     pubkey: PubkeyMatch = .{},
+    /// Label patterns the peer must have at least one of.
+    /// Supports exact ("host.zigor.net/trusted") and wildcard ("company.zigor.net/*").
+    labels: []const []const u8 = &.{},
 };
 
 /// Defines the pubkey matching strategy.
@@ -76,9 +81,10 @@ pub const RouteConfig = struct {
 };
 
 /// Defines how traffic for specific domains is routed.
+/// All domain matching is suffix-based. "*.google.com" is treated as "google.com".
+/// When multiple rules match, the longest suffix wins.
 pub const RouteRule = struct {
     domain: []const u8 = "",
-    domain_list: []const u8 = "",
     peer: []const u8 = "",
 };
 
@@ -221,7 +227,7 @@ fn validateService(svc: *const ServiceConfig) error{ValidationFailed}!void {
 
 fn validateRoute(route: *const RouteConfig) error{ValidationFailed}!void {
     for (route.rules) |*rule| {
-        if (rule.domain.len == 0 and rule.domain_list.len == 0) return error.ValidationFailed;
+        if (rule.domain.len == 0) return error.ValidationFailed;
         if (rule.peer.len == 0) return error.ValidationFailed;
     }
 }
@@ -384,7 +390,7 @@ test "validation: inbound policy invalid default" {
 
 test "validation: route missing peer" {
     const json =
-        \\{"net": {"private_key": "/tmp/k", "tun_ipv4": "100.64.0.1"}, "route": {"rules": [{"domain": "*.google.com"}]}}
+        \\{"net": {"private_key": "/tmp/k", "tun_ipv4": "100.64.0.1"}, "route": {"rules": [{"domain": "google.com"}]}}
     ;
     const result = loadFromBytes(std.testing.allocator, json);
     try std.testing.expectError(error.ValidationFailed, result);

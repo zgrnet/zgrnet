@@ -117,6 +117,8 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             mtu: tun_mtu as usize,
             listen_port,
             peers: Vec::new(),
+            fake_ip_lookup: None,
+            fake_ip_handler: None,
         };
         Host::new(host_cfg, tun_wrapper.clone())
             .map_err(|e| format!("create host: {}", e))?
