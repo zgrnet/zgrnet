@@ -179,7 +179,7 @@ impl Manager {
 
         // Rebuild route/policy if needed
         let new_route = if diff.route_changed {
-            Some(RouteMatcher::new(&new_cfg.route)?)
+            Some(RouteMatcher::new(&new_cfg.route))
         } else {
             None
         };

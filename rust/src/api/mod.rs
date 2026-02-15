@@ -441,6 +441,7 @@ fn handle_add_peer(req: &HttpRequest, ctx: &RequestContext) -> HttpResponse {
         alias: alias.clone(),
         direct: direct.clone(),
         relay: relay.clone(),
+        labels: Vec::new(),
     };
 
     // Persist to config
@@ -928,6 +929,8 @@ mod tests {
                 mtu: 1400,
                 listen_port: 0,
                 peers: Vec::new(),
+                fake_ip_lookup: None,
+                fake_ip_handler: None,
             },
             Arc::new(MockTun),
         ).unwrap();

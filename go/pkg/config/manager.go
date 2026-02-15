@@ -169,15 +169,12 @@ func (m *Manager) ModifyAndSave(modify func(cfg *Config) error) error {
 
 	// Rebuild route/policy if needed
 	if diff.RouteChanged {
-		r, err := NewRouteMatcher(&newCfg.Route)
-		if err != nil {
-			m.mu.Unlock()
-			return fmt.Errorf("config: rebuild route matcher: %w", err)
-		}
-		m.route = r
+		m.route = NewRouteMatcher(&newCfg.Route)
 	}
 	if diff.InboundChanged {
-		p, err := NewPolicyEngine(&newCfg.InboundPolicy)
+		// Refresh labels before rebuilding policy
+		m.labelStore.LoadFromConfig(newCfg.Peers)
+		p, err := NewPolicyEngine(&newCfg.InboundPolicy, m.labelStore)
 		if err != nil {
 			m.mu.Unlock()
 			return fmt.Errorf("config: rebuild policy engine: %w", err)
