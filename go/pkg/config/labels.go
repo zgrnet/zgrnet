@@ -162,7 +162,7 @@ func (s *LabelStore) Count() int {
 //   - Exact match: "host.zigor.net/trusted"
 //   - Wildcard match: "company.zigor.net/*" (matches any label under that domain)
 func MatchLabel(peerLabels []string, pattern string) bool {
-	if strings.HasSuffix(pattern, "/*") {
+	if strings.HasSuffix(pattern, "/*") && len(pattern) > 2 {
 		prefix := pattern[:len(pattern)-1] // "company.zigor.net/" from "company.zigor.net/*"
 		for _, l := range peerLabels {
 			if strings.HasPrefix(l, prefix) {

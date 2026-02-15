@@ -121,6 +121,9 @@ impl LabelStore {
 /// - Wildcard match: "company.zigor.net/*" (matches any label under that domain)
 pub fn match_label(peer_labels: &[String], pattern: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix("/*") {
+        if prefix.is_empty() {
+            return false; // bare "/*" is not a valid pattern
+        }
         let prefix_with_slash = format!("{}/", prefix);
         peer_labels.iter().any(|l| l.starts_with(&prefix_with_slash))
     } else {
