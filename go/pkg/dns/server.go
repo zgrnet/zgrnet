@@ -321,13 +321,9 @@ func (s *Server) forwardUpstream(queryData []byte) ([]byte, error) {
 	return buf[:n], nil
 }
 
-// shouldAssignFakeIP checks if the domain should get a Fake IP.
-// Prefers RouteMatcher, falls back to legacy MatchDomains.
+// shouldAssignFakeIP checks if the domain matches the legacy MatchDomains
+// suffix list. Only called when RouteMatcher is nil (line 176).
 func (s *Server) shouldAssignFakeIP(name string) bool {
-	if s.config.RouteMatcher != nil {
-		_, matched := s.config.RouteMatcher.MatchRoute(name)
-		return matched
-	}
 	for _, suffix := range s.config.MatchDomains {
 		if strings.HasSuffix(name, suffix) {
 			return true

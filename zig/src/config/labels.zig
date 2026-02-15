@@ -141,7 +141,7 @@ pub const LabelStore = struct {
 /// Supports exact match and wildcard ("company.zigor.net/*").
 pub fn matchLabel(peer_labels: []const []const u8, pattern: []const u8) bool {
     // Check for wildcard: ends with "/*"
-    if (pattern.len >= 2 and mem.endsWith(u8, pattern, "/*")) {
+    if (pattern.len > 2 and mem.endsWith(u8, pattern, "/*")) {
         const domain_prefix = pattern[0 .. pattern.len - 1]; // "company.zigor.net/"
         for (peer_labels) |label| {
             if (mem.startsWith(u8, label, domain_prefix)) {
