@@ -2,6 +2,8 @@ module github.com/vibing/zgrnet
 
 go 1.25
 
+toolchain go1.25.5
+
 require (
 	github.com/chromedp/chromedp v0.14.2
 	golang.org/x/crypto v0.32.0

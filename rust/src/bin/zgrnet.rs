@@ -3,7 +3,7 @@
 //! Provides offline context/config management and online API commands
 //! for interacting with a running zgrnetd daemon.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zgrnet::cli;
 
 fn main() {
@@ -77,7 +77,7 @@ fn run(args: &[String]) -> Result<(), String> {
 
 // ── Context ─────────────────────────────────────────────────────────────────
 
-fn run_context(base_dir: &PathBuf, args: &[String]) -> Result<(), String> {
+fn run_context(base_dir: &Path, args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: zgrnet context <list|use|create|current|delete>".into());
     }
@@ -129,7 +129,7 @@ fn run_context(base_dir: &PathBuf, args: &[String]) -> Result<(), String> {
 
 // ── Key ─────────────────────────────────────────────────────────────────────
 
-fn run_key(base_dir: &PathBuf, ctx: &str, args: &[String]) -> Result<(), String> {
+fn run_key(base_dir: &Path, ctx: &str, args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: zgrnet key <generate|show>".into());
     }
@@ -150,7 +150,7 @@ fn run_key(base_dir: &PathBuf, ctx: &str, args: &[String]) -> Result<(), String>
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-fn run_config(base_dir: &PathBuf, ctx: &str, api_addr: &str, json_output: bool, args: &[String]) -> Result<(), String> {
+fn run_config(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: zgrnet config <show|path|edit|net|reload>".into());
     }
@@ -186,7 +186,7 @@ fn run_config(base_dir: &PathBuf, ctx: &str, api_addr: &str, json_output: bool, 
 
 // ── Up / Down ───────────────────────────────────────────────────────────────
 
-fn run_up(base_dir: &PathBuf, ctx: &str, args: &[String]) -> Result<(), String> {
+fn run_up(base_dir: &Path, ctx: &str, args: &[String]) -> Result<(), String> {
     let daemon = args.iter().any(|a| a == "-d" || a == "--daemon");
     let cfg_path = cli::context_config_path(base_dir, ctx)?;
 
@@ -217,7 +217,7 @@ fn run_up(base_dir: &PathBuf, ctx: &str, args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
-fn run_down(base_dir: &PathBuf, ctx: &str) -> Result<(), String> {
+fn run_down(base_dir: &Path, ctx: &str) -> Result<(), String> {
     let ctx_name = if ctx.is_empty() {
         cli::current_context_name(base_dir)?
     } else {
@@ -292,7 +292,7 @@ fn exec_replace(program: &str, args: &[&str]) -> String {
 
 // ── Online commands ─────────────────────────────────────────────────────────
 
-fn run_online(base_dir: &PathBuf, ctx: &str, api_addr: &str, json_output: bool, args: &[String]) -> Result<(), String> {
+fn run_online(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args: &[String]) -> Result<(), String> {
     let addr = cli::resolve_api_addr(base_dir, ctx, api_addr);
     let c = cli::Client::new(&addr);
 

@@ -51,7 +51,8 @@ pub fn main() !void {
     var api_addr: ?[]const u8 = null;
     var ctx_override: ?[]const u8 = null;
     var json_output = false;
-    var filtered = std.ArrayList([]const u8).init(allocator);
+    var filtered: std.ArrayList([]const u8) = .empty;
+    filtered.allocator = allocator;
     defer filtered.deinit();
 
     var i: usize = 1;
