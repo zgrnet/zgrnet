@@ -28,12 +28,13 @@ bazel_dep(name = "rules_go", version = "0.59.0")
 bazel_dep(name = "gazelle", version = "0.47.0")
 
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
-go_sdk.download(version = "1.23.4")
+go_sdk.download(version = "1.25.5")
 
 go_deps = use_extension("@gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//go:go.mod")
 use_repo(
     go_deps,
+    "com_github_chromedp_chromedp",
     "in_gopkg_yaml_v3",
     "org_golang_x_crypto",
 )
@@ -115,4 +116,33 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 """,
+)
+
+# Lightpanda headless browser — for e2e UI testing via CDP
+# https://github.com/lightpanda-io/browser/releases/tag/v0.2.3
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+http_file(
+    name = "lightpanda_macos_arm64",
+    urls = ["https://github.com/lightpanda-io/browser/releases/download/v0.2.3/lightpanda-aarch64-macos"],
+    sha256 = "f7567fd7cd252d32c12e6302ebb66acf8e19fd5a944184814c2f1d048b7cd847",
+    downloaded_file_path = "lightpanda",
+    executable = True,
+)
+http_file(
+    name = "lightpanda_macos_x86_64",
+    urls = ["https://github.com/lightpanda-io/browser/releases/download/v0.2.3/lightpanda-x86_64-macos"],
+    downloaded_file_path = "lightpanda",
+    executable = True,
+)
+http_file(
+    name = "lightpanda_linux_x86_64",
+    urls = ["https://github.com/lightpanda-io/browser/releases/download/v0.2.3/lightpanda-x86_64-linux"],
+    downloaded_file_path = "lightpanda",
+    executable = True,
+)
+http_file(
+    name = "lightpanda_linux_arm64",
+    urls = ["https://github.com/lightpanda-io/browser/releases/download/v0.2.3/lightpanda-aarch64-linux"],
+    downloaded_file_path = "lightpanda",
+    executable = True,
 )

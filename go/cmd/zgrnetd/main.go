@@ -24,12 +24,15 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/vibing/zgrnet/pkg/api"
 	"github.com/vibing/zgrnet/pkg/config"
 	"github.com/vibing/zgrnet/pkg/dns"
 	"github.com/vibing/zgrnet/pkg/dnsmgr"
@@ -41,31 +44,99 @@ import (
 )
 
 var (
-	configPath = flag.String("c", "", "Path to config file (required)")
+	contextName = flag.String("c", "", "Context name or config file path")
 )
 
 func main() {
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
-	if *configPath == "" {
-		fmt.Fprintf(os.Stderr, "Usage: zgrnetd -c <config.yaml>\n")
+	cfgPath, err := resolveConfigPath(*contextName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Usage: zgrnetd [-c <context>]\n")
 		os.Exit(1)
 	}
 
-	if err := run(*configPath); err != nil {
+	if err := run(cfgPath); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
 }
 
+// resolveConfigPath resolves a context name or file path to a config file path.
+// - Empty: use current context from ~/.config/zgrnet/current
+// - Contains '/' or ends with '.yaml'/'.json': treat as file path
+// - Otherwise: treat as context name → ~/.config/zgrnet/<name>/config.yaml
+func resolveConfigPath(input string) (string, error) {
+	if input == "" {
+		// Use current context
+		baseDir, err := defaultConfigDir()
+		if err != nil {
+			return "", err
+		}
+		name, err := readCurrentContext(baseDir)
+		if err != nil {
+			return "", fmt.Errorf("no context specified and %w", err)
+		}
+		path := filepath.Join(baseDir, name, "config.yaml")
+		if _, err := os.Stat(path); err != nil {
+			return "", fmt.Errorf("context %q config not found: %s", name, path)
+		}
+		return path, nil
+	}
+
+	// If it looks like a file path, use directly
+	if strings.Contains(input, "/") || strings.HasSuffix(input, ".yaml") || strings.HasSuffix(input, ".json") {
+		if _, err := os.Stat(input); err != nil {
+			return "", fmt.Errorf("config file not found: %s", input)
+		}
+		return input, nil
+	}
+
+	// Treat as context name
+	baseDir, err := defaultConfigDir()
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(baseDir, input, "config.yaml")
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("context %q not found (looked for %s)", input, path)
+	}
+	return path, nil
+}
+
+func defaultConfigDir() (string, error) {
+	if dir := os.Getenv("ZGRNET_HOME"); dir != "" {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	return filepath.Join(home, ".config", "zgrnet"), nil
+}
+
+func readCurrentContext(baseDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(baseDir, "current"))
+	if err != nil {
+		return "", fmt.Errorf("no current context set (run: zgrnet context create <name>)")
+	}
+	name := strings.TrimSpace(string(data))
+	if name == "" {
+		return "", fmt.Errorf("current context file is empty")
+	}
+	return name, nil
+}
+
 func run(cfgPath string) error {
-	// ── 1. Load and validate config ──────────────────────────────────────
+	// ── 1. Load and validate config via Manager ─────────────────────────
 	log.Printf("loading config: %s", cfgPath)
 
-	cfg, err := config.Load(cfgPath)
+	cfgMgr, err := config.NewManager(cfgPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	cfg := cfgMgr.Current()
 
 	// Apply defaults for optional fields
 	if cfg.Net.TunMTU == 0 {
@@ -114,6 +185,21 @@ func run(cfgPath string) error {
 	if err := tunDev.Up(); err != nil {
 		return fmt.Errorf("bring TUN up: %w", err)
 	}
+
+	// Fix macOS utun routing.
+	//
+	// macOS utun is point-to-point: the OS only creates a host route for the
+	// peer address, ignoring the subnet mask. We need two explicit routes:
+	//
+	//   1. Host route for our own TUN IP → lo0 (so local TCP connections work)
+	//   2. Subnet route for the CGNAT /10 range → utun (so peer traffic goes
+	//      through TUN instead of the default route)
+	//
+	// On Linux, the kernel handles both automatically.
+	if err := addTUNRoutes(tunIP, tunDev.Name()); err != nil {
+		log.Printf("warning: add TUN routes: %v", err)
+	}
+
 	log.Printf("TUN %s: %s/10, MTU %d", tunDev.Name(), tunIP, cfg.Net.TunMTU)
 
 	// ── 5-6. Create Host (TUN + UDP + IP Allocator) ─────────────────────
@@ -245,7 +331,29 @@ func run(cfgPath string) error {
 		go acceptTCPProxyStreams(udpTransport, pk)
 	}
 
-	// ── 12. Start Host forwarding + wait for signal ──────────────────────
+	// ── 12. Start RESTful API server ─────────────────────────────────────
+	apiAddr := net.JoinHostPort(tunIP.String(), "80")
+	apiSrv := api.NewServer(api.ServerConfig{
+		ListenAddr:  apiAddr,
+		Host:        h,
+		ConfigMgr:   cfgMgr,
+		DNSServer:   dnsServer,
+		ProxyServer: proxySrv,
+	})
+
+	go func() {
+		log.Printf("api listening on %s", apiAddr)
+		if err := apiSrv.ListenAndServe(); err != nil {
+			log.Printf("api error: %v", err)
+		}
+	}()
+	defer apiSrv.Close()
+
+	// Start config hot-reload watcher (check every 30s)
+	cfgMgr.Start(30 * time.Second)
+	defer cfgMgr.Stop()
+
+	// ── 13. Start Host forwarding + wait for signal ──────────────────────
 	go func() {
 		if err := h.Run(); err != nil {
 			log.Printf("host error: %v", err)
@@ -257,6 +365,7 @@ func run(cfgPath string) error {
 	log.Printf("  UDP:   %s", h.LocalAddr())
 	log.Printf("  DNS:   %s", dnsAddr)
 	log.Printf("  Proxy: %s", proxyAddr)
+	log.Printf("  API:   %s", apiAddr)
 	log.Printf("  Peers: %d", len(cfg.Peers))
 
 	// Wait for SIGINT or SIGTERM
@@ -264,6 +373,20 @@ func run(cfgPath string) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh
 	log.Printf("received %s, shutting down...", sig)
+
+	// Force exit on second signal or after timeout.
+	// Deferred Close() calls (proxy, dns, host) may block on wg.Wait()
+	// if there are active connections with in-flight io.Copy.
+	go func() {
+		select {
+		case s := <-sigCh:
+			log.Printf("received %s again, force exit", s)
+			os.Exit(1)
+		case <-time.After(5 * time.Second):
+			log.Printf("shutdown timeout (5s), force exit")
+			os.Exit(1)
+		}
+	}()
 
 	// Graceful shutdown order: Proxy → DNS → Host → TUN
 	// (deferred calls execute in reverse order)
@@ -369,4 +492,29 @@ func trimKey(s string) string {
 		}
 	}
 	return string(result)
+}
+
+// addTUNRoutes sets up macOS routing for the TUN device.
+//
+// macOS utun is point-to-point: the kernel only creates a host route for the
+// peer address, ignoring the /10 subnet mask. We add a subnet route so all
+// CGNAT traffic (including traffic to our own TUN IP) goes through the TUN.
+//
+// Traffic to our own TUN IP enters TUN and is written back by the Host's
+// outbound loop (loopback detection), which triggers kernel local delivery.
+//
+// On Linux, the kernel handles this automatically, so this is a no-op.
+// On shutdown, the route is automatically cleaned up when the TUN device
+// is destroyed — no explicit removal needed.
+func addTUNRoutes(ip net.IP, tunName string) error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+
+	if out, err := exec.Command("/sbin/route", "add", "-net", "100.64.0.0/10", "-interface", tunName).CombinedOutput(); err != nil {
+		return fmt.Errorf("subnet route 100.64.0.0/10 → %s: %s: %w", tunName, strings.TrimSpace(string(out)), err)
+	}
+	log.Printf("route: 100.64.0.0/10 → %s", tunName)
+
+	return nil
 }

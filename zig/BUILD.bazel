@@ -107,3 +107,19 @@ zig_binary(
     target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
 )
+
+# =============================================================================
+# zgrnet CLI tool
+# =============================================================================
+
+zig_binary(
+    name = "zgrnet",
+    main = "cmd_zgrnet.zig",
+    srcs = ["cmd_zgrnet.zig"],
+    deps = [":noise"],
+    c_srcs = _KCP_C_SRCS,
+    c_includes = _KCP_C_INCLUDES,
+    c_flags = _C_FLAGS,
+    link_libc = True,
+    visibility = ["//visibility:public"],
+)

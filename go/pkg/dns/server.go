@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,6 +58,16 @@ type ServerConfig struct {
 	MatchDomains []string
 }
 
+// Stats holds DNS query statistics.
+type Stats struct {
+	TotalQueries   uint64 `json:"total_queries"`
+	ZigorNetHits   uint64 `json:"zigor_net_hits"`
+	FakeIPHits     uint64 `json:"fake_ip_hits"`
+	UpstreamFwds   uint64 `json:"upstream_forwards"`
+	UpstreamErrors uint64 `json:"upstream_errors"`
+	Errors         uint64 `json:"errors"`
+}
+
 // Server is a Magic DNS server.
 type Server struct {
 	config ServerConfig
@@ -64,6 +75,26 @@ type Server struct {
 	mu     sync.RWMutex
 	closed bool
 	wg     sync.WaitGroup
+
+	// Atomic stats counters
+	totalQueries   atomic.Uint64
+	zigorNetHits   atomic.Uint64
+	fakeIPHits     atomic.Uint64
+	upstreamFwds   atomic.Uint64
+	upstreamErrors atomic.Uint64
+	errors         atomic.Uint64
+}
+
+// GetStats returns a snapshot of DNS query statistics.
+func (s *Server) GetStats() Stats {
+	return Stats{
+		TotalQueries:   s.totalQueries.Load(),
+		ZigorNetHits:   s.zigorNetHits.Load(),
+		FakeIPHits:     s.fakeIPHits.Load(),
+		UpstreamFwds:   s.upstreamFwds.Load(),
+		UpstreamErrors: s.upstreamErrors.Load(),
+		Errors:         s.errors.Load(),
+	}
 }
 
 // NewServer creates a new DNS server with the given configuration.
@@ -149,12 +180,16 @@ func (s *Server) Close() error {
 // HandleQuery processes a DNS query and returns the response bytes.
 // This is the core resolution logic, exported for testing.
 func (s *Server) HandleQuery(queryData []byte) ([]byte, error) {
+	s.totalQueries.Add(1)
+
 	msg, err := DecodeMessage(queryData)
 	if err != nil {
+		s.errors.Add(1)
 		return nil, err
 	}
 
 	if len(msg.Questions) == 0 {
+		s.errors.Add(1)
 		resp := NewResponse(msg, RCodeFormErr)
 		return EncodeMessage(resp)
 	}
@@ -164,6 +199,7 @@ func (s *Server) HandleQuery(queryData []byte) ([]byte, error) {
 
 	// Try zigor.net resolution first
 	if strings.HasSuffix(name, ZigorNetSuffix) || name == "zigor.net" {
+		s.zigorNetHits.Add(1)
 		return s.resolveZigorNet(msg, name, q.Type)
 	}
 
@@ -171,15 +207,23 @@ func (s *Server) HandleQuery(queryData []byte) ([]byte, error) {
 	if s.config.FakePool != nil {
 		if s.config.RouteMatcher != nil {
 			if peer, matched := s.config.RouteMatcher.MatchRoute(name); matched {
+				s.fakeIPHits.Add(1)
 				return s.resolveFakeIPWithPeer(msg, name, peer, q.Type)
 			}
 		} else if s.shouldAssignFakeIP(name) {
+			s.fakeIPHits.Add(1)
 			return s.resolveFakeIPWithPeer(msg, name, "", q.Type)
 		}
 	}
 
 	// Forward to upstream
-	return s.forwardUpstream(queryData)
+	s.upstreamFwds.Add(1)
+	resp, err := s.forwardUpstream(queryData)
+	if err != nil {
+		s.upstreamErrors.Add(1)
+		return nil, err
+	}
+	return resp, nil
 }
 
 // resolveZigorNet handles *.zigor.net queries.

@@ -245,9 +245,9 @@ impl LanConfig {
 
 impl PeerConfig {
     fn validate(&self) -> Result<(), String> {
-        if self.direct.is_empty() && self.relay.is_empty() {
-            return Err("at least one of direct or relay is required".into());
-        }
+        // Peers with no endpoints are valid — they are responder-only
+        // (we can't initiate connections but they can connect to us).
+        // The API allows adding peers without known endpoints.
         Ok(())
     }
 }

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -229,9 +230,9 @@ func (l *LanConfig) validate() error {
 }
 
 func (p *PeerConfig) validate() error {
-	if len(p.Direct) == 0 && len(p.Relay) == 0 {
-		return fmt.Errorf("at least one of direct or relay is required")
-	}
+	// Peers with no endpoints are valid — they are responder-only
+	// (we can't initiate connections but they can connect to us).
+	// The API allows adding peers without known endpoints.
 	return nil
 }
 
@@ -346,6 +347,46 @@ func validatePeerDomain(domain string) error {
 		return fmt.Errorf("peer domain prefix is too long (%d > 64)", len(prefix))
 	}
 	return nil
+}
+
+// DeepCopy returns a deep copy of the config.
+// All maps and slices are duplicated to avoid shared references.
+func (c *Config) DeepCopy() *Config {
+	cp := *c
+
+	// Deep copy peers map
+	if c.Peers != nil {
+		cp.Peers = make(map[string]PeerConfig, len(c.Peers))
+		for k, v := range c.Peers {
+			p := v
+			p.Direct = slices.Clone(v.Direct)
+			p.Relay = slices.Clone(v.Relay)
+			cp.Peers[k] = p
+		}
+	}
+
+	// Deep copy lans
+	cp.Lans = slices.Clone(c.Lans)
+
+	// Deep copy inbound policy rules (and nested services)
+	if len(c.InboundPolicy.Rules) > 0 {
+		cp.InboundPolicy.Rules = make([]InboundRule, len(c.InboundPolicy.Rules))
+		for i, r := range c.InboundPolicy.Rules {
+			r2 := r
+			r2.Services = slices.Clone(r.Services)
+			cp.InboundPolicy.Rules[i] = r2
+		}
+	}
+
+	// Deep copy route rules
+	cp.Route.Rules = slices.Clone(c.Route.Rules)
+
+	return &cp
+}
+
+// Marshal serializes the config to YAML bytes.
+func (c *Config) Marshal() ([]byte, error) {
+	return yaml.Marshal(c)
 }
 
 // validatePubkeyHex checks that a string is valid hex-encoded 32-byte public key.

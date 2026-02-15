@@ -208,6 +208,16 @@ impl Host {
         Ok(())
     }
 
+    /// Removes a peer from the host, disconnects it, and releases its IP.
+    pub fn remove_peer(&self, pk: &Key) {
+        {
+            let mut peers = self.peers.write().unwrap();
+            peers.remove(pk);
+        }
+        self.ip_alloc.remove(pk);
+        self.udp.remove_peer(pk);
+    }
+
     /// Initiates a Noise handshake with the specified peer.
     pub fn connect(&self, pk: &Key) -> Result<(), String> {
         self.udp

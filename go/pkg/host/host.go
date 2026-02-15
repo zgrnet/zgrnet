@@ -210,6 +210,16 @@ func (h *Host) AddPeerWithIP(pk noise.PublicKey, endpoint string, ipv4 net.IP) e
 	return h.addPeerLocked(p)
 }
 
+// RemovePeer removes a peer from the host, disconnects it, and releases its IP.
+func (h *Host) RemovePeer(pk noise.PublicKey) {
+	h.mu.Lock()
+	delete(h.peers, pk)
+	h.mu.Unlock()
+
+	h.ipAlloc.Remove(pk)
+	h.udp.RemovePeer(pk)
+}
+
 // Connect initiates a Noise handshake with the specified peer.
 // The peer must have an endpoint set. This call blocks until the
 // handshake completes or times out (5 seconds).
@@ -300,6 +310,13 @@ func (h *Host) outboundLoop() {
 func (h *Host) handleOutbound(ipPkt []byte) {
 	info, err := ParseIPPacket(ipPkt)
 	if err != nil {
+		return
+	}
+
+	// Loopback: if dst is our own TUN IP, write back to TUN so the kernel
+	// does local delivery (e.g. local process accessing our API server).
+	if info.DstIP.Equal(h.tunIPv4) {
+		h.tun.Write(ipPkt)
 		return
 	}
 

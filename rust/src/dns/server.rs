@@ -1,6 +1,7 @@
 //! Magic DNS server with zigor.net resolution and upstream forwarding.
 
 use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::protocol::*;
@@ -55,19 +56,58 @@ impl Default for ServerConfig {
     }
 }
 
+/// DNS query statistics.
+#[derive(Debug, Default)]
+pub struct DnsStats {
+    pub total_queries: AtomicU64,
+    pub zigor_net_hits: AtomicU64,
+    pub fake_ip_hits: AtomicU64,
+    pub upstream_forwards: AtomicU64,
+    pub upstream_errors: AtomicU64,
+    pub errors: AtomicU64,
+}
+
+/// Statistics snapshot (for serialization).
+#[derive(Debug, serde::Serialize)]
+pub struct DnsStatsSnapshot {
+    pub total_queries: u64,
+    pub zigor_net_hits: u64,
+    pub fake_ip_hits: u64,
+    pub upstream_forwards: u64,
+    pub upstream_errors: u64,
+    pub errors: u64,
+}
+
 /// Magic DNS server.
 pub struct Server {
     config: ServerConfig,
+    pub stats: DnsStats,
 }
 
 impl Server {
     /// Create a new DNS server.
     pub fn new(config: ServerConfig) -> Self {
-        Server { config }
+        Server {
+            config,
+            stats: DnsStats::default(),
+        }
+    }
+
+    /// Returns a snapshot of DNS statistics.
+    pub fn get_stats(&self) -> DnsStatsSnapshot {
+        DnsStatsSnapshot {
+            total_queries: self.stats.total_queries.load(Ordering::Relaxed),
+            zigor_net_hits: self.stats.zigor_net_hits.load(Ordering::Relaxed),
+            fake_ip_hits: self.stats.fake_ip_hits.load(Ordering::Relaxed),
+            upstream_forwards: self.stats.upstream_forwards.load(Ordering::Relaxed),
+            upstream_errors: self.stats.upstream_errors.load(Ordering::Relaxed),
+            errors: self.stats.errors.load(Ordering::Relaxed),
+        }
     }
 
     /// Handle a DNS query and return the response bytes.
     pub fn handle_query(&self, query_data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.stats.total_queries.fetch_add(1, Ordering::Relaxed);
         let msg = Message::decode(query_data)?;
 
         if msg.questions.is_empty() {
@@ -80,6 +120,7 @@ impl Server {
 
         // Try zigor.net resolution
         if name.ends_with(ZIGOR_NET_SUFFIX) || name == "zigor.net" {
+            self.stats.zigor_net_hits.fetch_add(1, Ordering::Relaxed);
             return self.resolve_zigor_net(&msg, &name, q.qtype);
         }
 
@@ -88,15 +129,24 @@ impl Server {
             if let Some(ref matcher) = self.config.route_matcher {
                 let (peer, matched) = matcher.match_route(&name);
                 if matched {
+                    self.stats.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
                     return self.resolve_fake_ip_with_peer(&msg, &name, &peer, q.qtype);
                 }
             } else if self.matches_domain(&name) {
+                self.stats.fake_ip_hits.fetch_add(1, Ordering::Relaxed);
                 return self.resolve_fake_ip_with_peer(&msg, &name, "", q.qtype);
             }
         }
 
         // Forward to upstream
-        self.forward_upstream(query_data)
+        self.stats.upstream_forwards.fetch_add(1, Ordering::Relaxed);
+        match self.forward_upstream(query_data) {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                self.stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 
     fn resolve_zigor_net(

@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "api",
+    srcs = ["server.go"],
+    embedsrcs = ["admin.html"],
+    importpath = "github.com/vibing/zgrnet/pkg/api",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go:noise",
+        "//go/pkg/config",
+        "//go/pkg/dns",
+        "//go/pkg/host",
+        "//go/pkg/net",
+        "//go/pkg/proxy",
+    ],
+)
+
+go_test(
+    name = "api_test",
+    srcs = ["server_test.go"],
+    embed = [":api"],
+    deps = [
+        "//go:noise",
+        "//go/pkg/config",
+        "//go/pkg/host",
+    ],
+)
