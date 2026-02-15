@@ -94,6 +94,9 @@ pub const PolicyEngine = struct {
             store.getLabels(pubkey_hex)
         else
             &.{};
+        defer if (self.label_store) |store| {
+            store.freeLabels(peer_labels);
+        };
 
         for (self.entries.items) |*entry| {
             const rule = entry.rule;

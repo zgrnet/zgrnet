@@ -34,11 +34,23 @@ pub const LabelStore = struct {
     }
 
     /// Returns all labels for the given pubkey hex.
+    /// The returned slice is a copy — safe to use even if the store is modified.
+    /// Caller must free the returned slice with `self.allocator.free(result)`.
+    /// Returns an empty slice (not allocated) if the pubkey has no labels.
     pub fn getLabels(self: *const LabelStore, pubkey_hex: []const u8) []const []const u8 {
         if (self.labels.get(pubkey_hex)) |list| {
-            return list.items;
+            if (list.items.len == 0) return &.{};
+            const copy = self.allocator.dupe([]const u8, list.items) catch return &.{};
+            return copy;
         }
         return &.{};
+    }
+
+    /// Free a slice returned by getLabels.
+    pub fn freeLabels(self: *const LabelStore, labels: []const []const u8) void {
+        if (labels.len > 0) {
+            self.allocator.free(labels);
+        }
     }
 
     /// Add labels to the given pubkey. Duplicates are ignored.
@@ -181,12 +193,15 @@ test "LabelStore basic operations" {
     const pk = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     // Initially empty
-    try std.testing.expectEqual(@as(usize, 0), store.getLabels(pk).len);
+    const empty = store.getLabels(pk);
+    defer store.freeLabels(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
     try std.testing.expectEqual(@as(usize, 0), store.count());
 
     // Add labels
     try store.addLabels(pk, &.{ "host.zigor.net/trusted", "host.zigor.net/friend" });
     const labels = store.getLabels(pk);
+    defer store.freeLabels(labels);
     try std.testing.expectEqual(@as(usize, 2), labels.len);
     try std.testing.expectEqualStrings("host.zigor.net/trusted", labels[0]);
     try std.testing.expectEqualStrings("host.zigor.net/friend", labels[1]);
@@ -201,7 +216,9 @@ test "LabelStore add duplicates" {
     try store.addLabels(pk, &.{"host.zigor.net/trusted"});
     try store.addLabels(pk, &.{ "host.zigor.net/trusted", "host.zigor.net/friend" });
 
-    try std.testing.expectEqual(@as(usize, 2), store.getLabels(pk).len);
+    const dup_labels = store.getLabels(pk);
+    defer store.freeLabels(dup_labels);
+    try std.testing.expectEqual(@as(usize, 2), dup_labels.len);
 }
 
 test "LabelStore remove peer" {
@@ -212,7 +229,9 @@ test "LabelStore remove peer" {
     try store.addLabels(pk, &.{"host.zigor.net/trusted"});
     store.removePeer(pk);
 
-    try std.testing.expectEqual(@as(usize, 0), store.getLabels(pk).len);
+    const removed = store.getLabels(pk);
+    defer store.freeLabels(removed);
+    try std.testing.expectEqual(@as(usize, 0), removed.len);
     try std.testing.expectEqual(@as(usize, 0), store.count());
 }
 
