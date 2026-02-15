@@ -8,7 +8,7 @@ func TestRouteMatcher_SuffixMatch(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
 		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	tests := []struct {
 		domain string
@@ -38,7 +38,7 @@ func TestRouteMatcher_WildcardPrefixStripped(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
 		{Domain: "*.google.com", Peer: "peer_us"},
 	}}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	tests := []struct {
 		domain string
@@ -64,7 +64,7 @@ func TestRouteMatcher_LongestSuffixWins(t *testing.T) {
 		{Domain: "google.com", Peer: "peer_us"},
 		{Domain: "cn.google.com", Peer: "peer_cn"},
 	}}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	tests := []struct {
 		domain string
@@ -95,7 +95,7 @@ func TestRouteMatcher_LongestSuffixWins_OrderIndependent(t *testing.T) {
 		{Domain: "cn.google.com", Peer: "peer_cn"}, // more specific first
 		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	result, ok := rm.Match("www.cn.google.com")
 	if !ok {
@@ -110,7 +110,7 @@ func TestRouteMatcher_CaseInsensitive(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
 		{Domain: "Google.COM", Peer: "peer_us"},
 	}}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	_, ok := rm.Match("WWW.GOOGLE.COM")
 	if !ok {
@@ -122,7 +122,7 @@ func TestRouteMatcher_TrailingDot(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
 		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	_, ok := rm.Match("www.google.com.")
 	if !ok {
@@ -134,7 +134,7 @@ func TestRouteMatcher_NoMatch(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
 		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	_, ok := rm.Match("example.com")
 	if ok {
@@ -144,7 +144,7 @@ func TestRouteMatcher_NoMatch(t *testing.T) {
 
 func TestRouteMatcher_EmptyRules(t *testing.T) {
 	cfg := &RouteConfig{}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	_, ok := rm.Match("google.com")
 	if ok {
@@ -156,7 +156,7 @@ func TestRouteMatcher_MatchRoute(t *testing.T) {
 	cfg := &RouteConfig{Rules: []RouteRule{
 		{Domain: "google.com", Peer: "peer_us"},
 	}}
-	rm, _ := NewRouteMatcher(cfg)
+	rm := NewRouteMatcher(cfg)
 
 	peer, ok := rm.MatchRoute("www.google.com")
 	if !ok {

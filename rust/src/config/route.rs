@@ -30,9 +30,9 @@ pub struct RouteMatcher {
 
 impl RouteMatcher {
     /// Create a RouteMatcher from a RouteConfig.
-    pub fn new(cfg: &RouteConfig) -> std::io::Result<Self> {
+    pub fn new(cfg: &RouteConfig) -> Self {
         let rules = Self::compile(cfg);
-        Ok(Self { rules: RwLock::new(rules) })
+        Self { rules: RwLock::new(rules) }
     }
 
     fn compile(cfg: &RouteConfig) -> Vec<CompiledRule> {
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn test_suffix_match() {
         let cfg = cfg_with_rules(vec![rule("google.com", "peer_us")]);
-        let rm = RouteMatcher::new(&cfg).unwrap();
+        let rm = RouteMatcher::new(&cfg);
 
         assert!(rm.match_domain("google.com").is_some());
         assert!(rm.match_domain("www.google.com").is_some());
@@ -129,7 +129,7 @@ mod tests {
     fn test_wildcard_prefix_stripped() {
         // "*.google.com" behaves identically to "google.com"
         let cfg = cfg_with_rules(vec![rule("*.google.com", "peer_us")]);
-        let rm = RouteMatcher::new(&cfg).unwrap();
+        let rm = RouteMatcher::new(&cfg);
 
         assert!(rm.match_domain("google.com").is_some());
         assert!(rm.match_domain("www.google.com").is_some());
@@ -142,7 +142,7 @@ mod tests {
             rule("google.com", "peer_us"),
             rule("cn.google.com", "peer_cn"),
         ]);
-        let rm = RouteMatcher::new(&cfg).unwrap();
+        let rm = RouteMatcher::new(&cfg);
 
         assert_eq!(rm.match_domain("www.google.com").unwrap().peer, "peer_us");
         assert_eq!(rm.match_domain("cn.google.com").unwrap().peer, "peer_cn");
@@ -157,7 +157,7 @@ mod tests {
             rule("cn.google.com", "peer_cn"),
             rule("google.com", "peer_us"),
         ]);
-        let rm = RouteMatcher::new(&cfg).unwrap();
+        let rm = RouteMatcher::new(&cfg);
 
         assert_eq!(rm.match_domain("www.cn.google.com").unwrap().peer, "peer_cn");
     }
@@ -165,28 +165,28 @@ mod tests {
     #[test]
     fn test_case_insensitive() {
         let cfg = cfg_with_rules(vec![rule("Google.COM", "p")]);
-        let rm = RouteMatcher::new(&cfg).unwrap();
+        let rm = RouteMatcher::new(&cfg);
         assert!(rm.match_domain("WWW.GOOGLE.COM").is_some());
     }
 
     #[test]
     fn test_trailing_dot() {
         let cfg = cfg_with_rules(vec![rule("google.com", "p")]);
-        let rm = RouteMatcher::new(&cfg).unwrap();
+        let rm = RouteMatcher::new(&cfg);
         assert!(rm.match_domain("www.google.com.").is_some());
     }
 
     #[test]
     fn test_no_match() {
         let cfg = cfg_with_rules(vec![rule("google.com", "p")]);
-        let rm = RouteMatcher::new(&cfg).unwrap();
+        let rm = RouteMatcher::new(&cfg);
         assert!(rm.match_domain("example.com").is_none());
     }
 
     #[test]
     fn test_empty_rules() {
         let cfg = RouteConfig::default();
-        let rm = RouteMatcher::new(&cfg).unwrap();
+        let rm = RouteMatcher::new(&cfg);
         assert!(rm.match_domain("google.com").is_none());
     }
 }

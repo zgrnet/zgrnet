@@ -28,10 +28,10 @@ type compiledRouteRule struct {
 }
 
 // NewRouteMatcher creates a RouteMatcher from a RouteConfig.
-func NewRouteMatcher(cfg *RouteConfig) (*RouteMatcher, error) {
+func NewRouteMatcher(cfg *RouteConfig) *RouteMatcher {
 	rm := &RouteMatcher{}
 	rm.build(cfg)
-	return rm, nil
+	return rm
 }
 
 func (rm *RouteMatcher) build(cfg *RouteConfig) {

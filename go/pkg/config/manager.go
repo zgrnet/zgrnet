@@ -48,10 +48,7 @@ func NewManager(path string) (*Manager, error) {
 		return nil, err
 	}
 
-	route, err := NewRouteMatcher(&cfg.Route)
-	if err != nil {
-		return nil, fmt.Errorf("config: build route matcher: %w", err)
-	}
+	route := NewRouteMatcher(&cfg.Route)
 
 	labelStore := NewLabelStore()
 	labelStore.LoadFromConfig(cfg.Peers)
@@ -167,11 +164,7 @@ func (m *Manager) Reload() (*ConfigDiff, error) {
 	var newRoute *RouteMatcher
 	var newPolicy *PolicyEngine
 	if diff.RouteChanged {
-		r, err := NewRouteMatcher(&newCfg.Route)
-		if err != nil {
-			return nil, fmt.Errorf("config: rebuild route matcher: %w", err)
-		}
-		newRoute = r
+		newRoute = NewRouteMatcher(&newCfg.Route)
 	}
 
 	// Refresh labels from config peers on any peer or inbound change

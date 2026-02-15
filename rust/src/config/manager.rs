@@ -56,7 +56,7 @@ impl Manager {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, ManagerError> {
         let path = path.as_ref().to_path_buf();
         let cfg = super::load(&path)?;
-        let route = RouteMatcher::new(&cfg.route)?;
+        let route = RouteMatcher::new(&cfg.route);
 
         let label_store = Arc::new(LabelStore::new());
         label_store.load_from_config(&cfg.peers);
@@ -174,7 +174,7 @@ fn reload_inner(path: &Path, inner: &Arc<RwLock<ManagerInner>>) -> Result<Option
 
     // Rebuild route/policy if sections changed
     let new_route = if d.route_changed {
-        Some(RouteMatcher::new(&new_cfg.route)?)
+        Some(RouteMatcher::new(&new_cfg.route))
     } else {
         None
     };

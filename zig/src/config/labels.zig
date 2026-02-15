@@ -34,23 +34,34 @@ pub const LabelStore = struct {
     }
 
     /// Returns all labels for the given pubkey hex.
-    /// The returned slice is a copy — safe to use even if the store is modified.
-    /// Caller must free the returned slice with `self.allocator.free(result)`.
+    /// The returned slice is a deep copy — both the pointer array and each
+    /// string are duplicated. Safe to use even if the store is modified or freed.
+    /// Caller must free with `freeLabels`.
     /// Returns an empty slice (not allocated) if the pubkey has no labels.
     pub fn getLabels(self: *const LabelStore, pubkey_hex: []const u8) []const []const u8 {
-        if (self.labels.get(pubkey_hex)) |list| {
-            if (list.items.len == 0) return &.{};
-            const copy = self.allocator.dupe([]const u8, list.items) catch return &.{};
-            return copy;
+        const list = self.labels.get(pubkey_hex) orelse return &.{};
+        if (list.items.len == 0) return &.{};
+
+        const copy = self.allocator.alloc([]const u8, list.items.len) catch return &.{};
+        var i: usize = 0;
+        while (i < list.items.len) : (i += 1) {
+            copy[i] = self.allocator.dupe(u8, list.items[i]) catch {
+                // Roll back already-duped strings
+                for (copy[0..i]) |s| self.allocator.free(s);
+                self.allocator.free(copy);
+                return &.{};
+            };
         }
-        return &.{};
+        return copy;
     }
 
-    /// Free a slice returned by getLabels.
+    /// Free a deep-copied slice returned by getLabels.
     pub fn freeLabels(self: *const LabelStore, labels: []const []const u8) void {
-        if (labels.len > 0) {
-            self.allocator.free(labels);
+        if (labels.len == 0) return;
+        for (labels) |s| {
+            self.allocator.free(s);
         }
+        self.allocator.free(labels);
     }
 
     /// Add labels to the given pubkey. Duplicates are ignored.
