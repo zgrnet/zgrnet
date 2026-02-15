@@ -23,23 +23,26 @@ func echoServer(t *testing.T) (string, func()) {
 	}
 
 	var wg sync.WaitGroup
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
 			wg.Add(1)
-			go func() {
+			go func(c net.Conn) {
 				defer wg.Done()
-				defer conn.Close()
-				io.Copy(conn, conn)
-			}()
+				defer c.Close()
+				io.Copy(c, c)
+			}(conn)
 		}
 	}()
 
 	return ln.Addr().String(), func() {
 		ln.Close()
+		<-done // wait for accept loop to exit before wg.Wait
 		wg.Wait()
 	}
 }

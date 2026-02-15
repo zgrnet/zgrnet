@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use zgrnet::api;
 use zgrnet::config;
 use zgrnet::dns;
 use zgrnet::host::{self, Host, TunDevice};
@@ -99,6 +100,43 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         let name = dev.name().to_string();
         eprintln!("TUN {}: {}/10, MTU {}", name, tun_ip, tun_mtu);
+
+        // Fix macOS utun routing.
+        // macOS utun is point-to-point: the kernel only creates a host route
+        // for the peer address, ignoring the /10 subnet mask. We add:
+        //   1. Host route: TUN_IP → lo0 (local TCP connections)
+        //   2. Subnet route: 100.64.0.0/10 → utun (peer traffic)
+        if cfg!(target_os = "macos") {
+            // 1. Host route for local IP
+            match std::process::Command::new("/sbin/route")
+                .args(["add", "-host", &tun_ip.to_string(), "-interface", "lo0"])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    eprintln!("route: {} → lo0 (local)", tun_ip);
+                }
+                Ok(out) => {
+                    eprintln!("warning: host route {}: {}",
+                        tun_ip, String::from_utf8_lossy(&out.stderr).trim());
+                }
+                Err(e) => eprintln!("warning: host route {}: {}", tun_ip, e),
+            }
+            // 2. Subnet route for CGNAT range
+            match std::process::Command::new("/sbin/route")
+                .args(["add", "-net", "100.64.0.0/10", "-interface", &name])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    eprintln!("route: 100.64.0.0/10 → {} (peers)", name);
+                }
+                Ok(out) => {
+                    eprintln!("warning: subnet route: {}",
+                        String::from_utf8_lossy(&out.stderr).trim());
+                }
+                Err(e) => eprintln!("warning: subnet route: {}", e),
+            }
+        }
+
         (dev, name)
     };
 
@@ -212,7 +250,22 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── 11. Start Host forwarding + wait for signal ──────────────────
+    // ── 11. Start RESTful API server ────────────────────────────────
+    let api_addr = format!("{}:80", tun_ip);
+    let config_mgr = Arc::new(config::Manager::new(cfg_path)
+        .map_err(|e| format!("config manager: {}", e))?);
+    let mut api_srv = api::Server::new(api::ServerConfig {
+        listen_addr: api_addr.clone(),
+        host: host.clone(),
+        config_mgr,
+    }).map_err(|e| format!("api server: {}", e))?;
+
+    thread::spawn(move || {
+        eprintln!("api listening on {}", api_addr);
+        api_srv.serve();
+    });
+
+    // ── 12. Start Host forwarding + wait for signal ──────────────────
     host.run();
 
     eprintln!("zgrnetd running (pid {})", std::process::id());
@@ -220,14 +273,33 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  UDP:   {}", host.local_addr());
     eprintln!("  DNS:   {}:53", tun_ip);
     eprintln!("  Proxy: {}:1080", tun_ip);
+    eprintln!("  API:   {}:80", tun_ip);
     eprintln!("  Peers: {}", cfg.peers.len());
 
     // Wait for SIGINT / SIGTERM
     wait_for_signal();
     eprintln!("shutting down...");
 
+    // Force exit on second signal or after timeout.
+    // Close() calls may block on active connections with in-flight io::copy.
+    thread::spawn(|| {
+        thread::sleep(Duration::from_secs(5));
+        eprintln!("shutdown timeout (5s), force exit");
+        std::process::exit(1);
+    });
+
     // Graceful shutdown
     host.close();
+
+    // Remove TUN routes on macOS
+    if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("/sbin/route")
+            .args(["delete", "-net", "100.64.0.0/10"]).output();
+        let _ = std::process::Command::new("/sbin/route")
+            .args(["delete", "-host", &tun_ip.to_string()]).output();
+        eprintln!("route: cleaned up TUN routes");
+    }
+
     Ok(())
 }
 
@@ -531,7 +603,14 @@ fn ctrlc_register(running: Arc<std::sync::atomic::AtomicBool>) {
 static SIGNAL_FLAG: std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>> =
     std::sync::Mutex::new(None);
 
+static SIGNAL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 extern "C" fn signal_handler(_sig: libc::c_int) {
+    let count = SIGNAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if count >= 1 {
+        // Second signal — force exit immediately
+        std::process::exit(1);
+    }
     if let Ok(guard) = SIGNAL_FLAG.lock() {
         if let Some(flag) = guard.as_ref() {
             flag.store(false, std::sync::atomic::Ordering::SeqCst);

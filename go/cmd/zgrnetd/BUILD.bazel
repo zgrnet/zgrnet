@@ -6,6 +6,7 @@ go_binary(
     importpath = "github.com/vibing/zgrnet/cmd/zgrnetd",
     visibility = ["//visibility:public"],
     deps = [
+        "//go/pkg/api",
         "//go/pkg/config",
         "//go/pkg/dns",
         "//go/pkg/dnsmgr",

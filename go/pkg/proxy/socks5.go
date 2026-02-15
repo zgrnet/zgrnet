@@ -74,6 +74,15 @@ type UDPRelay interface {
 // Each UDP ASSOCIATE connection gets its own relay instance.
 type NewUDPRelayFunc func() (UDPRelay, error)
 
+// ProxyStats holds proxy connection statistics.
+type ProxyStats struct {
+	TotalConnections  uint64 `json:"total_connections"`
+	ActiveConnections int64  `json:"active_connections"`
+	BytesSent         uint64 `json:"bytes_sent"`
+	BytesReceived     uint64 `json:"bytes_received"`
+	Errors            uint64 `json:"errors"`
+}
+
 // Server is a SOCKS5 proxy server.
 type Server struct {
 	listenAddr string
@@ -86,6 +95,24 @@ type Server struct {
 
 	closed atomic.Bool
 	wg     sync.WaitGroup
+
+	// Atomic stats counters
+	totalConns  atomic.Uint64
+	activeConns atomic.Int64
+	bytesSent   atomic.Uint64
+	bytesRecv   atomic.Uint64
+	errors      atomic.Uint64
+}
+
+// GetStats returns a snapshot of proxy connection statistics.
+func (s *Server) GetStats() ProxyStats {
+	return ProxyStats{
+		TotalConnections:  s.totalConns.Load(),
+		ActiveConnections: s.activeConns.Load(),
+		BytesSent:         s.bytesSent.Load(),
+		BytesReceived:     s.bytesRecv.Load(),
+		Errors:            s.errors.Load(),
+	}
 }
 
 // SetPolicy sets the policy for target address validation.
@@ -129,8 +156,11 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 
 		s.wg.Add(1)
+		s.totalConns.Add(1)
+		s.activeConns.Add(1)
 		go func() {
 			defer s.wg.Done()
+			defer s.activeConns.Add(-1)
 			s.handleConn(conn)
 		}()
 	}

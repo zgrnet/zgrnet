@@ -234,6 +234,13 @@ pub fn Host(comptime UDPType: type, comptime Rt: type) type {
             return self.addPeerWithIp(pk, ep, null);
         }
 
+        /// Remove a peer: release its IP allocation.
+        pub fn removePeer(self: *Self, pk: Key) void {
+            self.ip_alloc.remove(pk);
+            // Note: UDP peer removal not yet implemented in Zig UDP module.
+            // The peer will be cleaned up on next session timeout.
+        }
+
         /// Initiate a Noise handshake with the specified peer.
         pub fn connect(self: *Self, pk: *const Key) !void {
             self.udp.connect(pk) catch return error.InitFailed;
