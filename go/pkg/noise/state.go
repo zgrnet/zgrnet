@@ -49,6 +49,18 @@ func (cs *CipherState) Decrypt(ciphertext, ad []byte) ([]byte, error) {
 	return cs.aead.Open(nil, nonce[:], ciphertext, ad)
 }
 
+// DecryptWithNonce decrypts ciphertext using an explicit nonce.
+// The internal nonce counter is NOT modified.
+//
+// Use this for unreliable transport (UDP) where packets may arrive
+// out of order or be lost, causing the auto-incrementing nonce to desync.
+// The caller is responsible for obtaining the nonce from the packet header.
+func (cs *CipherState) DecryptWithNonce(ciphertext, ad []byte, nonce uint64) ([]byte, error) {
+	var nonceBytes [12]byte
+	binary.LittleEndian.PutUint64(nonceBytes[:], nonce)
+	return cs.aead.Open(nil, nonceBytes[:], ciphertext, ad)
+}
+
 // Nonce returns the current nonce value.
 func (cs *CipherState) Nonce() uint64 {
 	return cs.nonce

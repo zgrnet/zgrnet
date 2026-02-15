@@ -97,6 +97,87 @@ func TestCipherStateDecryptWrongNonce(t *testing.T) {
 	}
 }
 
+func TestCipherStateDecryptWithNonce(t *testing.T) {
+	var key Key
+	copy(key[:], []byte("test key 32 bytes long here!!!!"))
+
+	cs1, _ := NewCipherState(key)
+	cs2, _ := NewCipherState(key)
+
+	// Encrypt 3 messages (nonces 0, 1, 2)
+	ct0 := cs1.Encrypt([]byte("message 0"), nil)
+	ct1 := cs1.Encrypt([]byte("message 1"), nil)
+	ct2 := cs1.Encrypt([]byte("message 2"), nil)
+
+	// Simulate packet loss: receiver only gets ct0 and ct2 (ct1 lost).
+	// Normal Decrypt works for ct0.
+	pt0, err := cs2.Decrypt(ct0, nil)
+	if err != nil {
+		t.Fatalf("Decrypt ct0: %v", err)
+	}
+	if !bytes.Equal(pt0, []byte("message 0")) {
+		t.Errorf("ct0 = %q, want %q", pt0, "message 0")
+	}
+
+	// Normal Decrypt of ct2 fails because receiver nonce is 1, but ct2 was encrypted with nonce 2.
+	_, err = cs2.Decrypt(ct2, nil)
+	if err == nil {
+		t.Fatal("Decrypt ct2 with auto-nonce should fail (nonce desync)")
+	}
+
+	// DecryptWithNonce succeeds with the correct explicit nonce.
+	// Note: cs2 auto-nonce is now 2 (incremented by the failed attempt), but that's irrelevant.
+	pt2, err := cs2.DecryptWithNonce(ct2, nil, 2)
+	if err != nil {
+		t.Fatalf("DecryptWithNonce ct2: %v", err)
+	}
+	if !bytes.Equal(pt2, []byte("message 2")) {
+		t.Errorf("ct2 = %q, want %q", pt2, "message 2")
+	}
+
+	// DecryptWithNonce can also recover the lost ct1.
+	pt1, err := cs2.DecryptWithNonce(ct1, nil, 1)
+	if err != nil {
+		t.Fatalf("DecryptWithNonce ct1: %v", err)
+	}
+	if !bytes.Equal(pt1, []byte("message 1")) {
+		t.Errorf("ct1 = %q, want %q", pt1, "message 1")
+	}
+
+	// Verify DecryptWithNonce does not modify the internal nonce.
+	nonceBeforeCall := cs2.Nonce()
+	_, _ = cs2.DecryptWithNonce(ct0, nil, 0)
+	if cs2.Nonce() != nonceBeforeCall {
+		t.Errorf("DecryptWithNonce modified nonce: got %d, want %d", cs2.Nonce(), nonceBeforeCall)
+	}
+}
+
+func TestCipherStateDecryptWithNonceAD(t *testing.T) {
+	var key Key
+	copy(key[:], []byte("test key 32 bytes long here!!!!"))
+
+	cs1, _ := NewCipherState(key)
+	cs2, _ := NewCipherState(key)
+
+	ad := []byte("additional data")
+	ct := cs1.Encrypt([]byte("hello"), ad)
+
+	// Wrong AD fails.
+	_, err := cs2.DecryptWithNonce(ct, []byte("wrong ad"), 0)
+	if err == nil {
+		t.Fatal("DecryptWithNonce with wrong AD should fail")
+	}
+
+	// Correct AD + nonce succeeds.
+	pt, err := cs2.DecryptWithNonce(ct, ad, 0)
+	if err != nil {
+		t.Fatalf("DecryptWithNonce: %v", err)
+	}
+	if !bytes.Equal(pt, []byte("hello")) {
+		t.Errorf("plaintext = %q, want %q", pt, "hello")
+	}
+}
+
 func TestSymmetricStateNew(t *testing.T) {
 	// Short protocol name (< 32 bytes)
 	ss1 := NewSymmetricState("Noise_IK")
