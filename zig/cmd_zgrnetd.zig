@@ -338,8 +338,7 @@ fn apiRoute(ctx: *ApiContext, method: []const u8, path: []const u8, query: []con
 
     // GET /api/whoami
     if (eql(method, "GET") and eql(path, "/api/whoami")) {
-        var hex: [64]u8 = undefined;
-        _ = fmt.bufPrint(&hex, "{}", .{std.fmt.fmtSliceHexLower(&ctx.public_key.data)}) catch return httpResp(a, 500, "");
+        const hex = std.fmt.bytesToHex(ctx.public_key.data, .lower);
         return httpResp(a, 200, fmt.allocPrint(a,
             "{{\"pubkey\":\"{s}\",\"tun_ip\":\"{s}\"}}", .{ &hex, ctx.tun_ipv4 }) catch return httpResp(a, 500, ""));
     }
@@ -426,8 +425,7 @@ fn apiRoute(ctx: *ApiContext, method: []const u8, path: []const u8, query: []con
             return httpResp(a, 400, "{\"error\":\"invalid IP\"}");
         const pk = ctx.host.ip_alloc.lookupByIp(ip) orelse
             return httpResp(a, 404, "{\"error\":\"no peer for IP\"}");
-        var hex: [64]u8 = undefined;
-        _ = fmt.bufPrint(&hex, "{}", .{std.fmt.fmtSliceHexLower(&pk.data)}) catch return httpResp(a, 500, "");
+        const hex = std.fmt.bytesToHex(pk.data, .lower);
         return httpResp(a, 200, fmt.allocPrint(a,
             "{{\"pubkey\":\"{s}\",\"ip\":\"{s}\"}}", .{ &hex, ip_str }) catch return httpResp(a, 500, ""));
     }

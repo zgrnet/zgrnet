@@ -255,8 +255,7 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
         {
             const kf = try fs.cwd().createFile(key_path, .{ .mode = 0o600 });
             defer kf.close();
-            var hex_buf: [64]u8 = undefined;
-            _ = fmt.bufPrint(&hex_buf, "{}", .{std.fmt.fmtSliceHexLower(&kp.private.data)}) catch unreachable;
+            const hex_buf = std.fmt.bytesToHex(kp.private.data, .lower);
             try kf.writeAll(&hex_buf);
             try kf.writeAll("\n");
         }
@@ -271,8 +270,7 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
         }
 
         // Show result
-        var pub_hex: [64]u8 = undefined;
-        _ = fmt.bufPrint(&pub_hex, "{}", .{std.fmt.fmtSliceHexLower(&kp.public.data)}) catch unreachable;
+        const pub_hex = std.fmt.bytesToHex(kp.public.data, .lower);
         print("created context \"{s}\"\n", .{name});
         print("public key: {s}\n", .{&pub_hex});
     } else if (mem.eql(u8, args[0], "delete")) {
@@ -324,8 +322,7 @@ fn runKey(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, args: []
             std.process.exit(1);
         };
         const kp = KeyPair.fromPrivate(priv_key);
-        var pub_hex: [64]u8 = undefined;
-        _ = fmt.bufPrint(&pub_hex, "{}", .{std.fmt.fmtSliceHexLower(&kp.public.data)}) catch unreachable;
+        const pub_hex = std.fmt.bytesToHex(kp.public.data, .lower);
         print("{s}\n", .{&pub_hex});
     } else if (mem.eql(u8, args[0], "generate")) {
         const kp = KeyPair.generate();
@@ -333,12 +330,10 @@ fn runKey(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, args: []
         defer allocator.free(key_path);
         const kf = try fs.cwd().createFile(key_path, .{ .mode = 0o600 });
         defer kf.close();
-        var hex_buf: [64]u8 = undefined;
-        _ = fmt.bufPrint(&hex_buf, "{}", .{std.fmt.fmtSliceHexLower(&kp.private.data)}) catch unreachable;
+        const hex_buf = std.fmt.bytesToHex(kp.private.data, .lower);
         try kf.writeAll(&hex_buf);
         try kf.writeAll("\n");
-        var pub_hex: [64]u8 = undefined;
-        _ = fmt.bufPrint(&pub_hex, "{}", .{std.fmt.fmtSliceHexLower(&kp.public.data)}) catch unreachable;
+        const pub_hex = std.fmt.bytesToHex(kp.public.data, .lower);
         print("new public key: {s}\n", .{&pub_hex});
     } else {
         print("error: unknown key subcommand \"{s}\"\n", .{args[0]});

@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 // ShowConfig prints the config.yaml contents for the current context.
@@ -61,7 +60,7 @@ func Up(baseDir, ctxName string, daemon bool) error {
 	}
 
 	// Foreground: exec replaces current process
-	return syscall.Exec(zgrnetd, []string{"zgrnetd", "-c", cfgPath}, os.Environ())
+	return execProcess(zgrnetd, cfgPath)
 }
 
 // Down sends SIGTERM to the running zgrnetd process.
@@ -93,8 +92,8 @@ func Down(baseDir, ctxName string) error {
 		return fmt.Errorf("find process %d: %w", pid, err)
 	}
 
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("send SIGTERM to pid %d: %w", pid, err)
+	if err := signalTerminate(proc); err != nil {
+		return fmt.Errorf("terminate pid %d: %w", pid, err)
 	}
 
 	// Clean up pid file
@@ -136,7 +135,7 @@ func startDaemon(zgrnetd, cfgPath, baseDir, ctxName string) error {
 	cmd := exec.Command(zgrnetd, "-c", cfgPath)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	setSysProcAttr(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start zgrnetd: %w", err)
