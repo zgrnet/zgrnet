@@ -5,6 +5,7 @@ go_binary(
     srcs = ["main.go"],
     importpath = "github.com/vibing/zgrnet/examples/host_test/go",
     visibility = ["//visibility:public"],
+    tags = ["requires-root"],
     deps = [
         "//go:noise",
         "//go/pkg/host",
