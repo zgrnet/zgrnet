@@ -154,13 +154,6 @@ func (pe *PolicyEngine) Check(pubkey [32]byte) *PolicyResult {
 	}
 }
 
-// SetLabelStore sets or replaces the label store used for label-based matching.
-func (pe *PolicyEngine) SetLabelStore(store *LabelStore) {
-	pe.mu.Lock()
-	pe.labelStore = store
-	pe.mu.Unlock()
-}
-
 // Reload reloads whitelist files from disk.
 func (pe *PolicyEngine) Reload() error {
 	pe.mu.Lock()

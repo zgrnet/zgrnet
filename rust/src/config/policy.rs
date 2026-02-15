@@ -54,11 +54,6 @@ impl PolicyEngine {
         Ok(pe)
     }
 
-    /// Set or replace the label store.
-    pub fn set_label_store(&self, store: Arc<LabelStore>) {
-        *self.label_store.write().unwrap() = Some(store);
-    }
-
     fn compile(rules: &[InboundRule]) -> io::Result<Vec<CompiledEntry>> {
         let mut entries = Vec::with_capacity(rules.len());
         for rule in rules {

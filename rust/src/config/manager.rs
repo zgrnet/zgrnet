@@ -160,11 +160,9 @@ fn reload_inner(path: &Path, inner: &Arc<RwLock<ManagerInner>>) -> Result<Option
     };
 
     if ext_changed {
-        let guard = inner.read().unwrap();
-        // Only policy has external files (whitelist), route rules are inline
-        if let Err(e) = guard.policy.reload() {
-            eprintln!("config: policy reload error: {e}");
-        }
+        // Only policy has external files (whitelist), route rules are inline.
+        // Just mark inbound changed — a new PolicyEngine will be created below
+        // which loads the updated whitelist files.
         d.inbound_changed = true;
     }
 
