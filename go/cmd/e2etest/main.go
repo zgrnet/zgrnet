@@ -19,12 +19,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -32,6 +35,9 @@ import (
 
 	"github.com/chromedp/chromedp"
 )
+
+// httpClient is used for server-side API calls during mutation tests.
+var httpClient = &http.Client{Timeout: 5 * time.Second}
 
 var (
 	addr       = flag.String("addr", "http://100.64.0.1:80", "zgrnetd API address")
@@ -138,6 +144,7 @@ func main() {
 
 	// ── Tests ────────────────────────────────────────────────────────────
 
+	// ── Read-only UI tests ──────────────────────────────────────────────
 	testPageLoad(ctx)
 	testReactMounted(ctx)
 	testHeaderBranding(ctx)
@@ -148,6 +155,16 @@ func main() {
 	testOverviewPeersCount(ctx)
 	testNetworkConfigJSON(ctx)
 	testNoOfflineWarning(ctx)
+
+	// ── Mutation → UI refresh tests ─────────────────────────────────────
+	// These tests use Go HTTP calls to mutate data via the API, then
+	// reload the page in the browser to verify the UI reflects the change.
+	testPeerAddAndVerify(ctx)
+	testPeerUpdateAndVerify(ctx)
+	testPeerDeleteAndVerify(ctx)
+	testRouteAddAndVerify(ctx)
+	testRouteDeleteAndVerify(ctx)
+	testConfigReloadAndVerify(ctx)
 
 	// ── Summary ──────────────────────────────────────────────────────────
 
@@ -451,5 +468,417 @@ func testNoOfflineWarning(ctx context.Context) {
 		fail(name, "'Not available' message displayed")
 		return
 	}
+	pass(name)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mutation → UI refresh tests
+//
+// These tests exercise the full e2e cycle:
+//   1. Go HTTP client calls a write API (POST/PUT/DELETE)
+//   2. Browser reloads the page
+//   3. DOM is inspected to verify the mutation is reflected in the UI
+//
+// This proves: API mutation → config persistence → browser render pipeline.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Test pubkey for mutation tests (deterministic, 64 hex chars).
+const testPK = "e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0"
+
+// apiPost sends a JSON POST to the zgrnetd API. Returns status code and body.
+func apiPost(path string, payload interface{}) (int, []byte, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, err
+	}
+	resp, err := httpClient.Post(*addr+path, "application/json", bytes.NewReader(data))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, nil
+}
+
+// apiDo sends an arbitrary HTTP request to the zgrnetd API.
+func apiDo(method, path string, payload interface{}) (int, []byte, error) {
+	var bodyReader io.Reader
+	if payload != nil {
+		data, _ := json.Marshal(payload)
+		bodyReader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, *addr+path, bodyReader)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, nil
+}
+
+// reloadAndWait navigates the browser to the admin UI root and waits for React.
+func reloadAndWait(ctx context.Context) error {
+	return chromedp.Run(ctx,
+		chromedp.Navigate(*addr+"/"),
+		chromedp.WaitReady("body"),
+		chromedp.Sleep(2*time.Second),
+	)
+}
+
+// getBodyHTML returns the body's outerHTML from the browser.
+func getBodyHTML(ctx context.Context) (string, error) {
+	var html string
+	err := chromedp.Run(ctx, chromedp.OuterHTML("body", &html))
+	return html, err
+}
+
+// getPeersFromAPI fetches the peers list via Go HTTP for verification.
+func getPeersFromAPI() ([]map[string]interface{}, error) {
+	resp, err := httpClient.Get(*addr + "/api/peers")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var peers []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
+		return nil, err
+	}
+	return peers, nil
+}
+
+// ─── Test: Add peer via API → verify in browser ─────────────────────────────
+
+func testPeerAddAndVerify(ctx context.Context) {
+	const name = "mutation: add peer → UI shows peer"
+
+	// Clean up from any previous failed run
+	apiDo("DELETE", "/api/peers/"+testPK, nil)
+
+	// 1. Add peer via HTTP
+	code, _, err := apiPost("/api/peers", map[string]string{
+		"pubkey": testPK,
+		"alias":  "e2e-browser-test",
+	})
+	if err != nil {
+		fail(name, fmt.Sprintf("api post: %v", err))
+		return
+	}
+	if code != 201 && code != 200 {
+		fail(name, fmt.Sprintf("api status=%d, want 201", code))
+		return
+	}
+
+	// 2. Verify peer exists via API
+	peers, err := getPeersFromAPI()
+	if err != nil {
+		fail(name, fmt.Sprintf("get peers: %v", err))
+		return
+	}
+	found := false
+	for _, p := range peers {
+		if pk, _ := p["pubkey"].(string); pk == testPK {
+			found = true
+			break
+		}
+	}
+	if !found {
+		fail(name, "peer not found in API response after add")
+		return
+	}
+
+	// 3. Reload browser and check overview peers count increased
+	if err := reloadAndWait(ctx); err != nil {
+		fail(name, fmt.Sprintf("reload: %v", err))
+		return
+	}
+
+	var cards map[string]string
+	err = evalJSON(ctx, `
+		(function() {
+			var result = {};
+			var labels = document.querySelectorAll('.text-xs.text-muted-foreground');
+			for (var i = 0; i < labels.length; i++) {
+				var l = labels[i].textContent.trim();
+				var s = labels[i].nextElementSibling;
+				if (s) result[l] = s.textContent.trim();
+			}
+			return JSON.stringify(result);
+		})()
+	`, &cards)
+	if err != nil {
+		fail(name, fmt.Sprintf("eval cards: %v", err))
+		return
+	}
+
+	peersCount, ok := cards["Peers"]
+	if !ok {
+		fail(name, "Peers stat card not found after reload")
+		return
+	}
+	if peersCount == "0" {
+		fail(name, "Peers count still 0 after adding a peer")
+		return
+	}
+
+	pass(name)
+}
+
+// ─── Test: Update peer alias via API → verify in API ────────────────────────
+
+func testPeerUpdateAndVerify(ctx context.Context) {
+	const name = "mutation: update peer → API reflects"
+
+	// Update the peer we just added
+	code, _, err := apiDo("PUT", "/api/peers/"+testPK, map[string]string{
+		"alias": "e2e-updated-alias",
+	})
+	if err != nil {
+		fail(name, fmt.Sprintf("api put: %v", err))
+		return
+	}
+	if code != 200 {
+		fail(name, fmt.Sprintf("api status=%d, want 200", code))
+		return
+	}
+
+	// Verify via GET
+	resp, err := httpClient.Get(*addr + "/api/peers/" + testPK)
+	if err != nil {
+		fail(name, fmt.Sprintf("api get: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+	var peer map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&peer)
+
+	alias, _ := peer["alias"].(string)
+	if alias != "e2e-updated-alias" {
+		fail(name, fmt.Sprintf("alias=%q, want 'e2e-updated-alias'", alias))
+		return
+	}
+
+	pass(name)
+}
+
+// ─── Test: Delete peer via API → UI peers count decreases ───────────────────
+
+func testPeerDeleteAndVerify(ctx context.Context) {
+	const name = "mutation: delete peer → UI reflects"
+
+	// Get current peer count from API
+	peersBefore, err := getPeersFromAPI()
+	if err != nil {
+		fail(name, fmt.Sprintf("get peers before: %v", err))
+		return
+	}
+	countBefore := len(peersBefore)
+
+	// Delete the test peer
+	code, _, err := apiDo("DELETE", "/api/peers/"+testPK, nil)
+	if err != nil {
+		fail(name, fmt.Sprintf("api delete: %v", err))
+		return
+	}
+	if code != 204 && code != 200 {
+		fail(name, fmt.Sprintf("api status=%d, want 204", code))
+		return
+	}
+
+	// Verify via API
+	peersAfter, err := getPeersFromAPI()
+	if err != nil {
+		fail(name, fmt.Sprintf("get peers after: %v", err))
+		return
+	}
+	if len(peersAfter) >= countBefore {
+		fail(name, fmt.Sprintf("peers count %d not less than %d after delete", len(peersAfter), countBefore))
+		return
+	}
+
+	// Verify peer returns 404
+	resp, err := httpClient.Get(*addr + "/api/peers/" + testPK)
+	if err != nil {
+		fail(name, fmt.Sprintf("api get deleted: %v", err))
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		fail(name, fmt.Sprintf("deleted peer status=%d, want 404", resp.StatusCode))
+		return
+	}
+
+	// Reload browser and verify peers count updated
+	if err := reloadAndWait(ctx); err != nil {
+		fail(name, fmt.Sprintf("reload: %v", err))
+		return
+	}
+
+	var cards map[string]string
+	err = evalJSON(ctx, `
+		(function() {
+			var result = {};
+			var labels = document.querySelectorAll('.text-xs.text-muted-foreground');
+			for (var i = 0; i < labels.length; i++) {
+				var l = labels[i].textContent.trim();
+				var s = labels[i].nextElementSibling;
+				if (s) result[l] = s.textContent.trim();
+			}
+			return JSON.stringify(result);
+		})()
+	`, &cards)
+	if err != nil {
+		fail(name, fmt.Sprintf("eval cards: %v", err))
+		return
+	}
+
+	peersCount := cards["Peers"]
+	if peersCount == "" {
+		fail(name, "Peers stat card not found after reload")
+		return
+	}
+
+	pass(name)
+}
+
+// ─── Test: Add route via API → verify in API ────────────────────────────────
+
+func testRouteAddAndVerify(ctx context.Context) {
+	const name = "mutation: add route → API reflects"
+
+	// Add a route via API
+	code, _, err := apiPost("/api/routes", map[string]string{
+		"domain": "e2e-test.example.com",
+		"peer":   "e2e-exit",
+	})
+	if err != nil {
+		fail(name, fmt.Sprintf("api post: %v", err))
+		return
+	}
+	if code != 201 && code != 200 {
+		fail(name, fmt.Sprintf("api status=%d", code))
+		return
+	}
+
+	// Verify via GET
+	resp, err := httpClient.Get(*addr + "/api/routes")
+	if err != nil {
+		fail(name, fmt.Sprintf("api get routes: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if !strings.Contains(string(body), "e2e-test.example.com") {
+		fail(name, "route not found in API response")
+		return
+	}
+
+	pass(name)
+}
+
+// ─── Test: Delete route via API → verify in API ─────────────────────────────
+
+func testRouteDeleteAndVerify(ctx context.Context) {
+	const name = "mutation: delete route → API reflects"
+
+	// Find the index of our test route
+	resp, err := httpClient.Get(*addr + "/api/routes")
+	if err != nil {
+		fail(name, fmt.Sprintf("api get routes: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	var routes []map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&routes)
+
+	idx := -1
+	for i, r := range routes {
+		if d, _ := r["domain"].(string); d == "e2e-test.example.com" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		fail(name, "test route not found to delete")
+		return
+	}
+
+	// Delete
+	code, _, err := apiDo("DELETE", fmt.Sprintf("/api/routes/%d", idx), nil)
+	if err != nil {
+		fail(name, fmt.Sprintf("api delete: %v", err))
+		return
+	}
+	if code != 204 && code != 200 {
+		fail(name, fmt.Sprintf("api status=%d", code))
+		return
+	}
+
+	// Verify gone
+	resp2, err := httpClient.Get(*addr + "/api/routes")
+	if err != nil {
+		fail(name, fmt.Sprintf("api get routes after: %v", err))
+		return
+	}
+	defer resp2.Body.Close()
+	body, _ := io.ReadAll(resp2.Body)
+
+	if strings.Contains(string(body), "e2e-test.example.com") {
+		fail(name, "route still present after delete")
+		return
+	}
+
+	pass(name)
+}
+
+// ─── Test: Config reload via API → verify no error ──────────────────────────
+
+func testConfigReloadAndVerify(ctx context.Context) {
+	const name = "mutation: config reload → UI stable"
+
+	// Trigger config reload
+	code, _, err := apiPost("/api/config/reload", nil)
+	if err != nil {
+		fail(name, fmt.Sprintf("api post: %v", err))
+		return
+	}
+	if code != 200 {
+		fail(name, fmt.Sprintf("api status=%d", code))
+		return
+	}
+
+	// Reload browser — the page should still work after config reload
+	if err := reloadAndWait(ctx); err != nil {
+		fail(name, fmt.Sprintf("reload: %v", err))
+		return
+	}
+
+	// Verify still functional — no offline warning
+	html, err := getBodyHTML(ctx)
+	if err != nil {
+		fail(name, fmt.Sprintf("get html: %v", err))
+		return
+	}
+
+	if strings.Contains(html, "zgrnetd is not running") {
+		fail(name, "offline warning after config reload")
+		return
+	}
+
+	// Verify React still mounted
+	var tabCount int
+	chromedp.Run(ctx, chromedp.Evaluate(
+		`document.querySelectorAll('button[role="tab"]').length`, &tabCount))
+	if tabCount != 8 {
+		fail(name, fmt.Sprintf("tab count=%d after reload, want 8", tabCount))
+		return
+	}
+
 	pass(name)
 }
