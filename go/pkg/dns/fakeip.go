@@ -23,8 +23,6 @@ type FakeIPPool struct {
 	domainToIP map[string]net.IP
 	// Reverse mapping: IP (as uint32) -> entry (domain + peer)
 	ipToEntry map[uint32]FakeIPEntry
-	// Forward peer mapping: domain -> peer
-	domainToPeer map[string]string
 
 	// O(1) LRU: doubly linked list (front=LRU, back=MRU) + element map
 	lruList    *list.List
@@ -46,15 +44,14 @@ func NewFakeIPPool(maxSize int) *FakeIPPool {
 		maxSize = 65536
 	}
 	return &FakeIPPool{
-		domainToIP:   make(map[string]net.IP),
-		ipToEntry:    make(map[uint32]FakeIPEntry),
-		domainToPeer: make(map[string]string),
-		lruList:      list.New(),
-		lruElement:   make(map[string]*list.Element),
-		maxSize:      maxSize,
-		baseIP:       0xC6120000, // 198.18.0.0
-		nextOff:      1,          // Skip .0.0
-		maxOff:       131072 - 1, // 198.19.255.255
+		domainToIP: make(map[string]net.IP),
+		ipToEntry:  make(map[uint32]FakeIPEntry),
+		lruList:    list.New(),
+		lruElement: make(map[string]*list.Element),
+		maxSize:    maxSize,
+		baseIP:     0xC6120000, // 198.18.0.0
+		nextOff:    1,          // Skip .0.0
+		maxOff:     131072 - 1, // 198.19.255.255
 	}
 }
 
@@ -76,7 +73,6 @@ func (p *FakeIPPool) AssignWithPeer(domain, peer string) net.IP {
 	if ip, ok := p.domainToIP[domain]; ok {
 		// Update peer if provided
 		if peer != "" {
-			p.domainToPeer[domain] = peer
 			ipKey := ipToUint32(ip)
 			p.ipToEntry[ipKey] = FakeIPEntry{Domain: domain, Peer: peer}
 		}
@@ -94,7 +90,6 @@ func (p *FakeIPPool) AssignWithPeer(domain, peer string) net.IP {
 	ipKey := ipToUint32(ip)
 
 	p.domainToIP[domain] = ip
-	p.domainToPeer[domain] = peer
 	p.ipToEntry[ipKey] = FakeIPEntry{Domain: domain, Peer: peer}
 	// Push to back (MRU end)
 	elem := p.lruList.PushBack(domain)
@@ -158,7 +153,6 @@ func (p *FakeIPPool) allocIP() net.IP {
 		// Evict the old domain holding this IP
 		delete(p.ipToEntry, ipVal)
 		delete(p.domainToIP, entry.Domain)
-		delete(p.domainToPeer, entry.Domain)
 		if elem, ok := p.lruElement[entry.Domain]; ok {
 			p.lruList.Remove(elem)
 			delete(p.lruElement, entry.Domain)
@@ -190,7 +184,6 @@ func (p *FakeIPPool) evictLRU() {
 	if ip, ok := p.domainToIP[victim]; ok {
 		delete(p.ipToEntry, ipToUint32(ip))
 		delete(p.domainToIP, victim)
-		delete(p.domainToPeer, victim)
 	}
 }
 

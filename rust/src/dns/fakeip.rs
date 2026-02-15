@@ -23,7 +23,6 @@ pub struct FakeIPEntry {
 pub struct FakeIPPool {
     domain_to_ip: HashMap<String, Ipv4Addr>,
     ip_to_entry: HashMap<u32, FakeIPEntry>,
-    domain_to_peer: HashMap<String, String>,
     /// Generation counter per domain (incremented on each touch).
     domain_gen: HashMap<String, u64>,
     /// LRU queue: (domain, generation_at_insert). Stale entries are skipped.
@@ -41,7 +40,6 @@ impl FakeIPPool {
         FakeIPPool {
             domain_to_ip: HashMap::new(),
             ip_to_entry: HashMap::new(),
-            domain_to_peer: HashMap::new(),
             domain_gen: HashMap::new(),
             lru_queue: VecDeque::new(),
             max_size,
@@ -60,7 +58,6 @@ impl FakeIPPool {
     pub fn assign_with_peer(&mut self, domain: &str, peer: &str) -> Ipv4Addr {
         if let Some(&ip) = self.domain_to_ip.get(domain) {
             if !peer.is_empty() {
-                self.domain_to_peer.insert(domain.to_string(), peer.to_string());
                 let ip_key = u32::from(ip);
                 self.ip_to_entry.insert(ip_key, FakeIPEntry {
                     domain: domain.to_string(), peer: peer.to_string(),
@@ -78,7 +75,6 @@ impl FakeIPPool {
         let ip_key = u32::from(ip);
 
         self.domain_to_ip.insert(domain.to_string(), ip);
-        self.domain_to_peer.insert(domain.to_string(), peer.to_string());
         self.ip_to_entry.insert(ip_key, FakeIPEntry {
             domain: domain.to_string(), peer: peer.to_string(),
         });
@@ -120,7 +116,6 @@ impl FakeIPPool {
         // by an active domain, evict it first.
         if let Some(old_entry) = self.ip_to_entry.remove(&ip_val) {
             self.domain_to_ip.remove(&old_entry.domain);
-            self.domain_to_peer.remove(&old_entry.domain);
             self.domain_gen.remove(&old_entry.domain);
         }
 
@@ -144,7 +139,6 @@ impl FakeIPPool {
                     self.domain_gen.remove(&domain);
                     if let Some(ip) = self.domain_to_ip.remove(&domain) {
                         self.ip_to_entry.remove(&u32::from(ip));
-                        self.domain_to_peer.remove(&domain);
                     }
                     return;
                 }

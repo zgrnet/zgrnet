@@ -178,6 +178,13 @@ func (m *Manager) Reload() (*ConfigDiff, error) {
 	// Refresh labels from config peers on any peer or inbound change
 	peersChanged := len(diff.PeersAdded) > 0 || len(diff.PeersRemoved) > 0 || len(diff.PeersChanged) > 0
 	if peersChanged {
+		// Clean up host labels for removed peers
+		for _, domain := range diff.PeersRemoved {
+			pubkeyHex := pubkeyHexFromDomain(domain)
+			if pubkeyHex != "" {
+				m.labelStore.RemoveLabels(pubkeyHex, "host.zigor.net")
+			}
+		}
 		m.labelStore.LoadFromConfig(newCfg.Peers)
 	}
 

@@ -25,10 +25,17 @@ func NewLabelStore() *LabelStore {
 
 // Labels returns all labels for the given pubkey (hex-encoded, lowercase).
 // Returns nil if the pubkey has no labels.
+// The returned slice is a copy — safe to use after the lock is released.
 func (s *LabelStore) Labels(pubkeyHex string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.labels[pubkeyHex]
+	src := s.labels[pubkeyHex]
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]string, len(src))
+	copy(dst, src)
+	return dst
 }
 
 // AddLabels adds labels to the given pubkey. Duplicates are ignored.
