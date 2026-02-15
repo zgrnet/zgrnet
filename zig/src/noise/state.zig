@@ -42,6 +42,16 @@ pub fn State(comptime Crypto: type, comptime suite: crypto_mod.CipherSuite) type
                 self.nonce += 1;
             }
 
+            /// Decrypts ciphertext using an explicit nonce.
+            /// The internal nonce counter is NOT modified.
+            ///
+            /// Use this for unreliable transport (UDP) where packets may arrive
+            /// out of order or be lost, causing the auto-incrementing nonce to desync.
+            /// The caller is responsible for obtaining the nonce from the packet header.
+            pub fn decryptWithNonce(self: *const CipherState, nonce: u64, ciphertext: []const u8, ad: []const u8, out: []u8) !void {
+                try cipher.decrypt(self.key.asBytes(), nonce, ciphertext, ad, out);
+            }
+
             /// Returns current nonce.
             pub fn getNonce(self: CipherState) u64 {
                 return self.nonce;
@@ -181,6 +191,70 @@ test "cipher state set nonce" {
     var cs = TestCipherState.init(key);
     cs.setNonce(100);
     try std.testing.expectEqual(@as(u64, 100), cs.getNonce());
+}
+
+test "decrypt with nonce packet loss" {
+    const key = Key.fromBytes([_]u8{42} ** key_size);
+    var cs1 = TestCipherState.init(key);
+    var cs2 = TestCipherState.init(key);
+
+    // Encrypt 3 messages (nonces 0, 1, 2)
+    const msg0 = "message 0";
+    const msg1 = "message 1";
+    const msg2 = "message 2";
+    var ct0: [msg0.len + tag_size]u8 = undefined;
+    var ct1: [msg1.len + tag_size]u8 = undefined;
+    var ct2: [msg2.len + tag_size]u8 = undefined;
+    cs1.encrypt(msg0, "", &ct0);
+    cs1.encrypt(msg1, "", &ct1);
+    cs1.encrypt(msg2, "", &ct2);
+
+    // Receiver gets ct0 normally.
+    var pt0: [msg0.len]u8 = undefined;
+    try cs2.decrypt(&ct0, "", &pt0);
+    try std.testing.expectEqualSlices(u8, msg0, &pt0);
+
+    // ct1 lost — receiver tries ct2 with auto-nonce (1), fails.
+    var pt_fail: [msg2.len]u8 = undefined;
+    try std.testing.expectError(error.DecryptionFailed, cs2.decrypt(&ct2, "", &pt_fail));
+
+    // decryptWithNonce recovers ct2 with explicit nonce 2.
+    var pt2: [msg2.len]u8 = undefined;
+    try cs2.decryptWithNonce(2, &ct2, "", &pt2);
+    try std.testing.expectEqualSlices(u8, msg2, &pt2);
+
+    // Also recover lost ct1.
+    var pt1: [msg1.len]u8 = undefined;
+    try cs2.decryptWithNonce(1, &ct1, "", &pt1);
+    try std.testing.expectEqualSlices(u8, msg1, &pt1);
+}
+
+test "decrypt with nonce does not modify counter" {
+    const key = Key.fromBytes([_]u8{42} ** key_size);
+    var cs1 = TestCipherState.init(key);
+    const cs2 = TestCipherState.init(key);
+
+    var ct: [4 + tag_size]u8 = undefined;
+    cs1.encrypt("test", "", &ct);
+
+    const nonce_before = cs2.getNonce();
+    var pt: [4]u8 = undefined;
+    try cs2.decryptWithNonce(0, &ct, "", &pt);
+    try std.testing.expectEqual(nonce_before, cs2.getNonce());
+}
+
+test "decrypt with nonce wrong ad" {
+    const key = Key.fromBytes([_]u8{42} ** key_size);
+    var cs1 = TestCipherState.init(key);
+    const cs2 = TestCipherState.init(key);
+
+    var ct: [5 + tag_size]u8 = undefined;
+    cs1.encrypt("hello", "correct ad", &ct);
+
+    var pt: [5]u8 = undefined;
+    try std.testing.expectError(error.DecryptionFailed, cs2.decryptWithNonce(0, &ct, "wrong ad", &pt));
+    try cs2.decryptWithNonce(0, &ct, "correct ad", &pt);
+    try std.testing.expectEqualSlices(u8, "hello", &pt);
 }
 
 test "symmetric state new" {

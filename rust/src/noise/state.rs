@@ -86,6 +86,25 @@ impl CipherState {
         Ok(())
     }
 
+    /// Decrypts ciphertext using an explicit nonce.
+    /// The internal nonce counter is NOT modified.
+    ///
+    /// Use this for unreliable transport (UDP) where packets may arrive
+    /// out of order or be lost, causing the auto-incrementing nonce to desync.
+    /// The caller is responsible for obtaining the nonce from the packet header.
+    pub fn decrypt_with_nonce(&self, ciphertext: &[u8], ad: &[u8], nonce: u64) -> Result<Vec<u8>, cipher::DecryptError> {
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[..8].copy_from_slice(&nonce.to_le_bytes());
+        let nonce_obj = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut buffer = ciphertext.to_vec();
+        let plaintext = self.cipher.open_in_place(nonce_obj, Aad::from(ad), &mut buffer)
+            .map_err(|_| cipher::DecryptError)?;
+        let len = plaintext.len();
+        buffer.truncate(len);
+        Ok(buffer)
+    }
+
     /// Decrypts ciphertext to output buffer (no allocation).
     /// Output buffer must be at least ciphertext.len() - 16.
     pub fn decrypt_to(&mut self, ciphertext: &[u8], ad: &[u8], out: &mut [u8]) -> Result<usize, cipher::DecryptError> {
@@ -335,6 +354,56 @@ mod tests {
 
         ss.mix_hash(b"more");
         assert_ne!(ss.hash(), cloned.hash());
+    }
+
+    #[test]
+    fn test_decrypt_with_nonce_packet_loss() {
+        let key = Key::new([42u8; KEY_SIZE]);
+        let mut cs1 = CipherState::new(key);
+        let mut cs2 = CipherState::new(key);
+
+        // Encrypt 3 messages (nonces 0, 1, 2)
+        let ct0 = cs1.encrypt(b"message 0", &[]);
+        let ct1 = cs1.encrypt(b"message 1", &[]);
+        let ct2 = cs1.encrypt(b"message 2", &[]);
+
+        // Receiver gets ct0 normally.
+        let pt0 = cs2.decrypt(&ct0, &[]).unwrap();
+        assert_eq!(pt0, b"message 0");
+
+        // ct1 lost — receiver tries ct2 with auto-nonce (1), fails.
+        assert!(cs2.decrypt(&ct2, &[]).is_err());
+
+        // decrypt_with_nonce recovers ct2 with explicit nonce 2.
+        let pt2 = cs2.decrypt_with_nonce(&ct2, &[], 2).unwrap();
+        assert_eq!(pt2, b"message 2");
+
+        // Also recover lost ct1.
+        let pt1 = cs2.decrypt_with_nonce(&ct1, &[], 1).unwrap();
+        assert_eq!(pt1, b"message 1");
+    }
+
+    #[test]
+    fn test_decrypt_with_nonce_does_not_modify_counter() {
+        let key = Key::new([42u8; KEY_SIZE]);
+        let mut cs1 = CipherState::new(key);
+        let cs2 = CipherState::new(key);
+
+        let ct = cs1.encrypt(b"test", &[]);
+        let nonce_before = cs2.nonce();
+        let _ = cs2.decrypt_with_nonce(&ct, &[], 0);
+        assert_eq!(cs2.nonce(), nonce_before);
+    }
+
+    #[test]
+    fn test_decrypt_with_nonce_wrong_ad() {
+        let key = Key::new([42u8; KEY_SIZE]);
+        let mut cs1 = CipherState::new(key);
+        let cs2 = CipherState::new(key);
+
+        let ct = cs1.encrypt(b"hello", b"correct ad");
+        assert!(cs2.decrypt_with_nonce(&ct, b"wrong ad", 0).is_err());
+        assert!(cs2.decrypt_with_nonce(&ct, b"correct ad", 0).is_ok());
     }
 
     #[test]
