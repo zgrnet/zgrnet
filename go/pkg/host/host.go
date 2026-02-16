@@ -20,6 +20,13 @@ type TunDevice interface {
 	Close() error
 }
 
+// TunDestroyer is an optional interface for TUN devices that separate
+// shutdown (Close) from memory release (Destroy). Close unblocks
+// blocked readers; Destroy frees memory after all readers have exited.
+type TunDestroyer interface {
+	Destroy()
+}
+
 // FakeIPLookup provides Fake IP → domain + peer resolution.
 // This interface decouples the host from the DNS/FakeIP package.
 type FakeIPLookup interface {
@@ -240,17 +247,32 @@ func (h *Host) Run() error {
 }
 
 // Close gracefully shuts down the host.
-// Signals the forwarding loops to exit and closes TUN and UDP to unblock them.
-// Run() will wait for the goroutines to finish before returning.
+//
+// 1. Signals forwarding loops to exit (closeChan)
+// 2. Closes TUN fd and UDP socket to unblock blocked reads
+// 3. Waits for forwarding loops to finish
+// 4. Destroys TUN memory (if the device supports it)
+//
+// This ordering guarantees no use-after-free: the TUN struct memory
+// is only freed after all goroutines that may reference it have exited.
 func (h *Host) Close() error {
 	if h.closed.Swap(true) {
 		return nil
 	}
 	close(h.closeChan)
 
-	// Close TUN and UDP to unblock the loops
+	// Step 2: Close fd/socket to unblock read loops.
+	// TUN Close only closes the fd — memory stays valid.
 	h.tun.Close()
 	h.udp.Close()
+
+	// Step 3: Wait for outboundLoop and inboundLoop to exit.
+	h.wg.Wait()
+
+	// Step 4: Now safe to free TUN memory — no concurrent users.
+	if d, ok := h.tun.(TunDestroyer); ok {
+		d.Destroy()
+	}
 
 	return nil
 }

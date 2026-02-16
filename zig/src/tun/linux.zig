@@ -94,7 +94,7 @@ pub fn create(name: ?[]const u8) TunError!Tun {
         .handle = fd,
         .name_buf = ifr.ifr_name,
         .name_len = name_len,
-        .closed = false,
+        .closed = std.atomic.Value(bool).init(false),
     };
 }
 

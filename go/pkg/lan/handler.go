@@ -244,7 +244,10 @@ type labelsRequest struct {
 	Labels []string `json:"labels"`
 }
 
-// handleSetLabels sets labels for a member (admin only).
+// handleSetLabels sets labels for a member.
+//
+// Authorization is the caller's responsibility (e.g., via HTTP middleware
+// or inbound policy). This handler only verifies the requester's identity.
 //
 //	POST /api/lan/labels/{pubkey}
 //	{"labels": ["admin", "dev-team"]}
@@ -285,7 +288,10 @@ func (s *Server) handleSetLabels(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDeleteLabels removes labels from a member (admin only).
+// handleDeleteLabels removes labels from a member.
+//
+// Authorization is the caller's responsibility (e.g., via HTTP middleware
+// or inbound policy). This handler only verifies the requester's identity.
 //
 //	DELETE /api/lan/labels/{pubkey}
 //	{"labels": ["admin"]}

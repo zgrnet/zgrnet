@@ -180,9 +180,17 @@ impl Store for FileStore {
     }
 
     fn remove(&self, pk: Key) -> Result<bool, String> {
+        let snapshot = self.mem.get(pk);
         let removed = self.mem.remove(pk)?;
         if removed {
-            self.save()?;
+            if let Err(e) = self.save() {
+                // Rollback: re-add member with original data.
+                if let Some(m) = snapshot {
+                    self.mem.add(pk).ok();
+                    self.mem.set_labels(pk, m.labels).ok();
+                }
+                return Err(e);
+            }
         }
         Ok(removed)
     }
@@ -193,19 +201,34 @@ impl Store for FileStore {
     fn count(&self) -> usize { self.mem.count() }
 
     fn set_labels(&self, pk: Key, labels: Vec<String>) -> Result<(), String> {
+        let old = self.mem.get(pk).map(|m| m.labels);
         self.mem.set_labels(pk, labels)?;
-        self.save()
+        if let Err(e) = self.save() {
+            // Rollback to old labels.
+            if let Some(old_labels) = old {
+                self.mem.set_labels(pk, old_labels).ok();
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn remove_labels(&self, pk: Key, to_remove: &[String]) -> Result<(), String> {
+        let old = self.mem.get(pk).map(|m| m.labels);
         self.mem.remove_labels(pk, to_remove)?;
-        self.save()
+        if let Err(e) = self.save() {
+            if let Some(old_labels) = old {
+                self.mem.set_labels(pk, old_labels).ok();
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -220,7 +243,7 @@ fn now_rfc3339() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hours, mins, s)
 }
 
-fn days_to_date(days: u64) -> (u64, u64, u64) {
+pub(crate) fn days_to_date(days: u64) -> (u64, u64, u64) {
     let z = days + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;

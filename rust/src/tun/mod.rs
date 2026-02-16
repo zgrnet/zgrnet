@@ -222,14 +222,26 @@ impl Device {
         &self.name
     }
 
-    /// Close the TUN device explicitly.
+    /// Close the TUN device (shutdown).
     ///
-    /// Idempotent. Closes the fd, which unblocks any blocked read/write.
+    /// Closes the fd, which unblocks any blocked read/write. The device
+    /// memory remains valid — Drop calls tun_destroy() to free it after
+    /// the Device is no longer referenced.
+    ///
+    /// Safe to call concurrently with read/write. Idempotent.
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return; // already closed
         }
         unsafe { ffi::tun_close(self.handle) };
+    }
+
+    /// Destroy the TUN device (free memory).
+    ///
+    /// The caller MUST ensure no concurrent read/write calls are in progress.
+    /// Normally you don't call this directly — Drop handles it.
+    pub fn destroy(&self) {
+        unsafe { ffi::tun_destroy(self.handle) };
     }
 
     /// Get the underlying file descriptor (Unix) or HANDLE (Windows).
@@ -322,7 +334,10 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        // Close fd if not already closed, then free memory.
+        // Drop has &mut self, so no concurrent readers exist.
         self.close();
+        unsafe { ffi::tun_destroy(self.handle) };
     }
 }
 

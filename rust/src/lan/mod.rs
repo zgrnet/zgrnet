@@ -214,13 +214,7 @@ impl Server {
 }
 
 fn now_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-    // Simple ISO 8601 format without external crate.
-    format!("1970-01-01T00:00:00Z+{}s", secs)
+    store::now_rfc3339()
 }
 
 #[cfg(test)]

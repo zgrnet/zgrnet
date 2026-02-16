@@ -110,21 +110,29 @@ func Create(name string) (*Device, error) {
 	}, nil
 }
 
-// Close closes the TUN device.
+// Close shuts down the TUN device (closes the fd).
 //
-// Marks the device as closed (atomic), then closes the fd. The fd close
-// unblocks any goroutine stuck in C.tun_read/C.tun_write. Those calls
-// return an error, and the caller sees d.closed == true.
+// This unblocks any goroutine blocked in Read/Write. The device memory
+// remains valid — call Destroy() separately after all readers/writers
+// have exited.
 //
-// No mutex — Read/Write may be blocked in a kernel syscall holding a
-// lock, so acquiring any lock here would deadlock.
+// Safe to call concurrently with Read/Write. Idempotent.
 func (d *Device) Close() error {
 	if !d.closed.CompareAndSwap(false, true) {
 		return ErrAlreadyClosed
 	}
-	// Close the fd. This unblocks blocked Read/Write C calls.
 	C.tun_close(d.handle)
 	return nil
+}
+
+// Destroy frees the TUN device memory.
+//
+// The caller MUST ensure no concurrent Read/Write calls are in progress.
+// Typically called after the host's forwarding loops have exited.
+//
+// If Close() was not called before Destroy(), it is called implicitly.
+func (d *Device) Destroy() {
+	C.tun_destroy(d.handle)
 }
 
 // Read reads a packet from the TUN device.
