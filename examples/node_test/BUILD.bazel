@@ -1,0 +1,47 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# Re-export language-specific binaries
+alias(
+    name = "go",
+    actual = "//examples/node_test/go:node_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "rust",
+    actual = "//examples/node_test/rust:node_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "zig",
+    actual = "//examples/node_test/zig:node_test",
+    visibility = ["//visibility:public"],
+)
+
+# Test data files
+filegroup(
+    name = "configs",
+    srcs = ["config.json"],
+    visibility = ["//visibility:public"],
+)
+
+# Cross-language Node SDK interop test
+sh_test(
+    name = "interop_test",
+    srcs = ["run_bazel.sh"],
+    data = [
+        ":configs",
+        "//examples/node_test/go:node_test",
+        "//examples/node_test/rust:node_test",
+    ] + select({
+        "@platforms//os:macos": ["//examples/node_test/zig:node_test"],
+        "//conditions:default": [],
+    }),
+    tags = [
+        "local",      # Needs loopback network
+        "exclusive",  # Don't run in parallel (uses fixed ports)
+    ],
+    timeout = "long",
+    visibility = ["//visibility:public"],
+)

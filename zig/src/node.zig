@@ -27,8 +27,10 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
     const UdpError = net_mod.UdpError;
     const P = noise.Protocol(Crypto);
     const KeyPair = P.KeyPair;
-    const Allocator = @import("std").mem.Allocator;
+    const mem = @import("std").mem;
+    const Allocator = mem.Allocator;
     const Atomic = @import("std").atomic.Value;
+    const fmt = @import("std").fmt;
 
     return struct {
         const Self = @This();
@@ -113,11 +115,13 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
 
         /// Initialize a new Node. Call deinit() to release resources.
         pub fn init(cfg: Config) !*Self {
+            // Format bind address string on the stack.
+            var addr_buf: [32]u8 = undefined;
+            const bind_addr = fmt.bufPrint(&addr_buf, "127.0.0.1:{}", .{cfg.listen_port}) catch "127.0.0.1:0";
+
             const udp_opts = net_mod.UdpOptions{
-                .bind_addr = [4]u8{ 127, 0, 0, 1 },
-                .bind_port = cfg.listen_port,
+                .bind_addr = bind_addr,
                 .allow_unknown = cfg.allow_unknown,
-                .num_workers = 0,
             };
 
             const udp = UDPType.init(cfg.allocator, cfg.key, udp_opts) catch return error.UdpInitFailed;
@@ -146,19 +150,33 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             }
 
             // Start background receive loop.
-            self.recv_thread = Rt.Thread.spawn(recvLoopEntry, self) catch null;
+            self.recv_thread = Rt.Thread.spawn(.{}, recvLoop, .{self}) catch null;
 
             return self;
         }
 
         /// Shut down and release all resources.
         pub fn deinit(self: *Self) void {
-            self.stop();
+            // Signal all loops to stop.
+            self.state.store(@intFromEnum(State.stopped), .release);
 
+            self.peer_mutex.lock();
+            const count = self.peer_count;
+            self.peer_mutex.unlock();
+            for (0..count) |i| {
+                self.peer_stops[i].store(true, .release);
+            }
+            self.accept_cond.broadcast();
+
+            // Close UDP (unblocks IO threads).
+            self.udp.close();
+
+            // Join recv thread.
             if (self.recv_thread) |t| {
                 t.join();
             }
 
+            // Now safe to deallocate.
             self.udp.deinit();
             self.accept_mutex.deinit();
             self.accept_cond.deinit();
@@ -166,23 +184,17 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             self.allocator.destroy(self);
         }
 
-        /// Stop the node (signal shutdown, but don't join threads yet — deinit does that).
+        /// Stop the node (signals shutdown without joining/deallocating).
         pub fn stop(self: *Self) void {
             self.state.store(@intFromEnum(State.stopped), .release);
 
-            // Stop all per-peer accept loops.
             self.peer_mutex.lock();
             const count = self.peer_count;
             self.peer_mutex.unlock();
-
             for (0..count) |i| {
                 self.peer_stops[i].store(true, .release);
             }
-
-            // Wake blocked accepters.
             self.accept_cond.broadcast();
-
-            self.udp.close();
         }
 
         /// Returns the current lifecycle state.
@@ -209,18 +221,16 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             self.startAcceptLoop(cfg.public_key);
         }
 
-        /// Remove a peer.
+        /// Remove a peer (stops the accept forwarder).
         pub fn removePeer(self: *Self, pk: Key) void {
             self.peer_mutex.lock();
             for (0..self.peer_count) |i| {
-                if (std.mem.eql(u8, &self.peer_keys[i].data, &pk.data)) {
+                if (mem.eql(u8, &self.peer_keys[i].data, &pk.data)) {
                     self.peer_stops[i].store(true, .release);
                     break;
                 }
             }
             self.peer_mutex.unlock();
-
-            self.udp.removePeer(pk);
         }
 
         /// Connect to a peer (initiate handshake).
@@ -234,12 +244,9 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             if (self.getState() != .running) return error.NotRunning;
 
             // Ensure connected.
-            self.udp.connect(pk) catch |err| switch (err) {
-                UdpError.AlreadyConnected => {}, // OK
-                else => return err,
-            };
+            self.udp.connect(pk) catch {};
 
-            // Build metadata.
+            // Build metadata: ATYP_IPV4(1) + IPv4(4 bytes) + port(2 bytes big-endian).
             var meta_buf: [7]u8 = undefined;
             meta_buf[0] = 0x01; // ATYP_IPV4
             meta_buf[1] = 127;
@@ -249,7 +256,7 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             meta_buf[5] = @intCast(port >> 8);
             meta_buf[6] = @intCast(port & 0xff);
 
-            const stream = self.udp.openStream(pk, message.protocol.tcp_proxy, &meta_buf) catch
+            const stream = self.udp.openStream(pk, @intFromEnum(message.Protocol.tcp_proxy), &meta_buf) catch
                 return error.OpenStreamFailed;
 
             return NodeStream{
@@ -262,10 +269,7 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
         pub fn openStream(self: *Self, pk: *const Key, proto_byte: u8, meta: []const u8) !NodeStream {
             if (self.getState() != .running) return error.NotRunning;
 
-            self.udp.connect(pk) catch |err| switch (err) {
-                UdpError.AlreadyConnected => {},
-                else => return err,
-            };
+            self.udp.connect(pk) catch {};
 
             const stream = self.udp.openStream(pk, proto_byte, meta) catch
                 return error.OpenStreamFailed;
@@ -306,11 +310,6 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
 
         // ── Internal ──────────────────────────────────────────────────
 
-        fn recvLoopEntry(self_ptr: *anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(self_ptr));
-            self.recvLoop();
-        }
-
         fn recvLoop(self: *Self) void {
             var buf: [65535]u8 = undefined;
             while (self.getState() != .stopped) {
@@ -333,47 +332,20 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             self.peer_count += 1;
 
             // Spawn accept forwarder thread.
-            const ctx = self.allocator.create(AcceptCtx) catch return;
-            ctx.* = .{ .self = self, .pk = pk, .idx = idx };
-            _ = Rt.Thread.spawn(acceptLoopEntry, ctx) catch {
-                self.allocator.destroy(ctx);
-            };
+            _ = Rt.Thread.spawn(.{}, acceptLoopFn, .{ self, pk, idx }) catch return;
         }
 
-        const AcceptCtx = struct {
-            self: *Self,
-            pk: Key,
-            idx: usize,
-        };
-
-        fn acceptLoopEntry(ctx_ptr: *anyopaque) void {
-            const ctx: *AcceptCtx = @ptrCast(@alignCast(ctx_ptr));
-            const self = ctx.self;
-            const pk = ctx.pk;
-            const idx = ctx.idx;
-            self.allocator.destroy(ctx);
-
-            // Phase 1: Wait for peer to be established.
+        fn acceptLoopFn(self: *Self, pk: Key, idx: usize) void {
             while (!self.peer_stops[idx].load(.acquire) and self.getState() != .stopped) {
-                if (self.udp.tryAcceptStream(&pk)) |_| {
-                    // Peer is connected — but we got a stream, push it.
-                    // Actually tryAcceptStream returns null if no mux, so
-                    // reaching here means mux exists. Rare but handle it.
-                    break;
-                }
-                // Not yet established.
-                Rt.sleepMs(50);
-            }
-
-            // Phase 2: Accept streams.
-            while (!self.peer_stops[idx].load(.acquire) and self.getState() != .stopped) {
+                // acceptStream blocks until a stream arrives or returns null
+                // if the peer has no mux yet (not established).
                 if (self.udp.acceptStream(&pk)) |stream| {
                     self.pushAccept(NodeStream{
                         .stream = stream,
                         .remote_pk = pk,
                     });
                 } else {
-                    // No mux or peer removed — wait and retry.
+                    // Peer not established yet or no stream — poll.
                     Rt.sleepMs(50);
                 }
             }
