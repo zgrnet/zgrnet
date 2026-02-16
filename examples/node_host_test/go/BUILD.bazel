@@ -1,14 +1,16 @@
 load("@rules_go//go:def.bzl", "go_binary")
 
 go_binary(
-    name = "host_test",
+    name = "run",
     srcs = ["main.go"],
-    importpath = "github.com/vibing/zgrnet/examples/host_test/go",
+    importpath = "github.com/vibing/zgrnet/examples/node_host_test/go",
     visibility = ["//visibility:public"],
     tags = ["requires-root"],
     deps = [
         "//go:noise",
         "//go/pkg/host",
+        "//go/pkg/net",
+        "//go/pkg/node",
         "//go/pkg/tun",
     ],
 )

@@ -28,6 +28,7 @@ pub mod net;
 pub mod kcp;
 pub mod relay;
 pub mod host;
+pub mod node;
 pub mod proxy;
 pub mod dns;
 pub mod config;

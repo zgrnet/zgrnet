@@ -16,6 +16,7 @@ pub const net = @import("net/mod.zig");
 pub const kcp_mod = @import("kcp/mod.zig");
 pub const relay_mod = @import("relay/mod.zig");
 pub const host = @import("host/mod.zig");
+pub const node_mod = @import("node.zig");
 pub const proxy_mod = @import("proxy/mod.zig");
 pub const dns_mod = @import("dns/mod.zig");
 pub const dnsmgr_mod = @import("dnsmgr/mod.zig");
@@ -155,6 +156,15 @@ pub const PeerConfig = host.PeerConfig;
 pub const HostEndpoint = host.Endpoint;
 
 // ============================================================================
+// Node types (embeddable network node, no TUN)
+// ============================================================================
+
+pub const NodeType = node_mod.Node(StdCrypto, StdRt, KqueueIO, StdUdpSocket);
+pub const NodeConfig = NodeType.Config;
+pub const NodePeerConfig = NodeType.PeerConfig;
+pub const NodeStream = NodeType.NodeStream;
+
+// ============================================================================
 // Config types
 // ============================================================================
 
@@ -168,6 +178,7 @@ test {
     _ = kcp_mod;
     _ = relay_mod;
     _ = host;
+    _ = node_mod;
     _ = proxy_mod;
     _ = dns_mod;
     _ = dnsmgr_mod;

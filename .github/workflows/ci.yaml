@@ -64,9 +64,9 @@ jobs:
           echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|examples/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
           echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|examples/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
           
-          # Detect TUN-specific changes (requires root privileges to test)
-          # Includes host package since its integration test uses real TUN devices
-          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          # Detect changes requiring root (TUN, host, node-host tests)
+          # All targets tagged "requires-root" in BUILD.bazel need sudo to run
+          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test|go/pkg/node/|rust/src/node|examples/node_host_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
           echo "has_dns=$(echo "$changed" | grep -qE '^(go/pkg/dns/|rust/src/dns/|zig/src/dns/|zig/src/dnsmgr/|go/pkg/dnsmgr/|rust/src/dnsmgr/|examples/dns_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build and test affected targets with Bazel
@@ -87,12 +87,14 @@ jobs:
       - name: Build affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Filter out targets that can't run in normal CI
+          # Filter out targets that can't run in normal CI:
+          # - requires-root: TUN/host/node-host tests (run in tun-test job with sudo)
+          # - KCP interop: Zig KCP times out on Linux CI
           FILTERED=""
           for t in $TARGETS; do
             case "$t" in
-              *tun_test*) echo "Skipping TUN test: $t (requires root)" ;;
-              *kcp_test*interop*) echo "Skipping KCP interop test: $t (Zig KCP timeout on Linux)" ;;
+              *tun_test*|*host_test*|*node_host_test*|*smoketest*) echo "Skipping: $t (requires-root)" ;;
+              *kcp_test*interop*) echo "Skipping: $t (Zig KCP timeout on Linux)" ;;
               *) FILTERED="$FILTERED $t" ;;
             esac
           done
@@ -106,12 +108,12 @@ jobs:
       - name: Test affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Filter out targets that can't run in normal CI
+          # Same filter as build step
           FILTERED=""
           for t in $TARGETS; do
             case "$t" in
-              *tun_test*) echo "Skipping TUN test: $t (requires root)" ;;
-              *kcp_test*interop*) echo "Skipping KCP interop test: $t (Zig KCP timeout on Linux)" ;;
+              *tun_test*|*host_test*|*node_host_test*|*smoketest*) echo "Skipping: $t (requires-root)" ;;
+              *kcp_test*interop*) echo "Skipping: $t (Zig KCP timeout on Linux)" ;;
               *) FILTERED="$FILTERED $t" ;;
             esac
           done
@@ -291,6 +293,14 @@ jobs:
           # Uses zgrnet_tun library variant with TUN feature enabled
           bazel build //rust:host_test
           sudo bazel-bin/rust/host_test
+
+      - name: Test Node-Host (TUN integration)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Build Node-Host integration test (Node dials Host with TUN)
+          bazel build //examples/node_host_test/go:run
+          sudo bazel-bin/examples/node_host_test/go/run_/run
 
   # DNS integration test (requires elevated privileges)
   # Tests Magic DNS server + OS resolver integration
