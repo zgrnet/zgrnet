@@ -50,11 +50,8 @@ func main() {
 	}
 
 	if err := run(); err != nil {
-		log.Printf("FAIL: %v", err)
-		os.Exit(1)
+		log.Fatalf("FAIL: %v", err)
 	}
-	log.Printf("ALL TESTS PASSED")
-	os.Exit(0)
 }
 
 func run() error {
@@ -313,15 +310,13 @@ func run() error {
 	log.Printf("────────────────────────────────")
 	log.Printf("RESULT: %d/%d passed", passed, total)
 
-	// Clean shutdown — close hosts to terminate Run() goroutines and HTTP listener.
-	httpLn.Close()
-	hostA.Close()
-	hostB.Close()
-
 	if passed < total {
-		return fmt.Errorf("%d tests failed", total-passed)
+		log.Printf("FAIL: %d tests failed", total-passed)
+		os.Exit(1)
 	}
-	return nil
+	log.Printf("ALL TESTS PASSED")
+	os.Exit(0)
+	return nil // unreachable
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
