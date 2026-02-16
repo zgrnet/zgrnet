@@ -102,7 +102,7 @@ func (a *PasswordAuth) Authenticate(_ noise.PublicKey, credential json.RawMessag
 // InviteCode represents a generated invite code.
 type InviteCode struct {
 	Code     string `json:"code"`
-	MaxUses  int    `json:"max_uses"`  // 0 = unlimited
+	MaxUses  int    `json:"max_uses"` // 0 = unlimited
 	UseCount int    `json:"use_count"`
 }
 
@@ -272,4 +272,3 @@ func (a *BearerTokenAuth) Authenticate(_ noise.PublicKey, credential json.RawMes
 	}
 	return nil
 }
-

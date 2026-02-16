@@ -191,10 +191,10 @@ func (fs *FileStore) Remove(pk noise.PublicKey) (bool, error) {
 	return true, nil
 }
 
-func (fs *FileStore) Get(pk noise.PublicKey) *Member        { return fs.mem.Get(pk) }
-func (fs *FileStore) IsMember(pk noise.PublicKey) bool       { return fs.mem.IsMember(pk) }
-func (fs *FileStore) List() []*Member                        { return fs.mem.List() }
-func (fs *FileStore) Count() int                             { return fs.mem.Count() }
+func (fs *FileStore) Get(pk noise.PublicKey) *Member   { return fs.mem.Get(pk) }
+func (fs *FileStore) IsMember(pk noise.PublicKey) bool { return fs.mem.IsMember(pk) }
+func (fs *FileStore) List() []*Member                  { return fs.mem.List() }
+func (fs *FileStore) Count() int                       { return fs.mem.Count() }
 
 func (fs *FileStore) SetLabels(pk noise.PublicKey, labels []string) error {
 	old := fs.mem.Get(pk)

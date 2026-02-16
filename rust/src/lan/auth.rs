@@ -101,6 +101,12 @@ pub struct InviteCodeAuth {
     codes: Mutex<HashMap<String, InviteCode>>,
 }
 
+impl Default for InviteCodeAuth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InviteCodeAuth {
     pub fn new() -> Self {
         InviteCodeAuth {

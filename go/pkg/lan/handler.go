@@ -225,8 +225,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	m := s.store.Get(pk)
 	if m == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"member":    false,
-			"pubkey":    hexPK,
+			"member": false,
+			"pubkey": hexPK,
 		})
 		return
 	}
@@ -460,4 +460,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
-

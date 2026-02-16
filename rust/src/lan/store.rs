@@ -41,6 +41,12 @@ pub struct MemStore {
     inner: RwLock<HashMap<Key, Member>>,
 }
 
+impl Default for MemStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemStore {
     pub fn new() -> Self {
         MemStore {
