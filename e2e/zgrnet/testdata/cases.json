@@ -80,6 +80,15 @@
     ]
   },
   {
+    "name": "config_template_pubkey_on_same_line",
+    "description": "Config template has '# Public key: <hex>' on the same line across all languages",
+    "seed_key": true,
+    "steps": [
+      {"args": ["context", "create", "tpl"],  "expect_exit": 0},
+      {"args": ["config", "show"],            "expect_exit": 0, "expect_stdout_match_seed_config": true}
+    ]
+  },
+  {
     "name": "version",
     "description": "Version command outputs version string",
     "steps": [

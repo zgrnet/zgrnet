@@ -33,12 +33,13 @@ type TestCase struct {
 }
 
 type Step struct {
-	Args                     []string `json:"args"`
-	ExpectExit               int      `json:"expect_exit"`
-	ExpectStdout             string   `json:"expect_stdout"`
-	ExpectStdoutContains     []string `json:"expect_stdout_contains"`
-	ExpectStdoutNotContains  []string `json:"expect_stdout_not_contains"`
-	ExpectStdoutMatchSeedPK  bool     `json:"expect_stdout_match_seed_pubkey"`
+	Args                       []string `json:"args"`
+	ExpectExit                 int      `json:"expect_exit"`
+	ExpectStdout               string   `json:"expect_stdout"`
+	ExpectStdoutContains       []string `json:"expect_stdout_contains"`
+	ExpectStdoutNotContains    []string `json:"expect_stdout_not_contains"`
+	ExpectStdoutMatchSeedPK    bool     `json:"expect_stdout_match_seed_pubkey"`
+	ExpectStdoutMatchSeedCfg   bool     `json:"expect_stdout_match_seed_config"`
 }
 
 // ── Binary registry ─────────────────────────────────────────────────────
@@ -237,6 +238,16 @@ func TestCrossLanguage(t *testing.T) {
 							}
 						}
 					}
+					if step.ExpectStdoutMatchSeedCfg {
+						if i < len(ref.outputs) && i < len(other.outputs) {
+							refNorm := normalizeConfig(ref.outputs[i])
+							otherNorm := normalizeConfig(other.outputs[i])
+							if refNorm != otherNorm {
+								t.Errorf("step %d config template mismatch: %s vs %s\n--- %s ---\n%s\n--- %s ---\n%s",
+									i, ref.lang, other.lang, ref.lang, refNorm, other.lang, otherNorm)
+							}
+						}
+					}
 				}
 
 				// Compare filesystem structure
@@ -311,6 +322,28 @@ func runTestCase(t *testing.T, bin Binary, tc TestCase, seedPriv, seedPub string
 			}
 		}
 
+		if step.ExpectStdoutMatchSeedCfg {
+			// Verify "# Public key: <64 hex chars>" is on a single line (not split)
+			found := false
+			for _, line := range strings.Split(stdout, "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "# Public key: ") {
+					hexPart := strings.TrimPrefix(trimmed, "# Public key: ")
+					if len(hexPart) == 64 && isHex(hexPart) {
+						found = true
+					} else {
+						t.Errorf("step %d %v: malformed public key line: %q (hex part len=%d)",
+							i, step.Args, line, len(hexPart))
+					}
+					break
+				}
+			}
+			if !found {
+				t.Errorf("step %d %v: config missing '# Public key: <64 hex>' on single line\nstdout:\n%s",
+					i, step.Args, stdout)
+			}
+		}
+
 		outputs = append(outputs, stdout)
 	}
 
@@ -370,4 +403,28 @@ func loadTestSuite(t *testing.T) TestSuite {
 		t.Fatalf("parse test cases: %v", err)
 	}
 	return suite
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeConfig replaces the public key hex in the config template with
+// a placeholder so configs from different languages can be compared byte-for-byte.
+func normalizeConfig(s string) string {
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "# Public key: ") {
+			lines = append(lines, "# Public key: <NORMALIZED>")
+		} else {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
