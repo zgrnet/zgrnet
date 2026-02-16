@@ -50,9 +50,11 @@ func main() {
 	}
 
 	if err := run(); err != nil {
-		log.Fatalf("FAIL: %v", err)
+		log.Printf("FAIL: %v", err)
+		os.Exit(1)
 	}
 	log.Printf("ALL TESTS PASSED")
+	os.Exit(0)
 }
 
 func run() error {
