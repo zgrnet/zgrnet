@@ -52,6 +52,7 @@ func main() {
 	if err := run(); err != nil {
 		log.Fatalf("FAIL: %v", err)
 	}
+	log.Printf("ALL TESTS PASSED")
 }
 
 func run() error {
@@ -310,13 +311,16 @@ func run() error {
 	log.Printf("────────────────────────────────")
 	log.Printf("RESULT: %d/%d passed", passed, total)
 
+	// Clean shutdown
+	httpLn.Close()
+	hostB.Close()
+	hostA.Close()
+	log.Printf("shutdown complete")
+
 	if passed < total {
-		log.Printf("FAIL: %d tests failed", total-passed)
-		os.Exit(1)
+		return fmt.Errorf("%d tests failed", total-passed)
 	}
-	log.Printf("ALL TESTS PASSED")
-	os.Exit(0)
-	return nil // unreachable
+	return nil
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
