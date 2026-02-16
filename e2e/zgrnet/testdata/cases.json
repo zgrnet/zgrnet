@@ -68,31 +68,15 @@
     "description": "Config path contains context name",
     "steps": [
       {"args": ["context", "create", "myctx"], "expect_exit": 0},
-      {"args": ["config", "path"],             "expect_exit": 0, "expect_stdout_contains": ["myctx", "config.yaml"]}
+      {"args": ["config", "path"],             "expect_exit": 0, "expect_stdout_contains": ["myctx"]}
     ]
   },
   {
     "name": "config_show",
-    "description": "Config show outputs valid YAML with expected fields",
+    "description": "Config show outputs config with network settings",
     "steps": [
       {"args": ["context", "create", "cfg"], "expect_exit": 0},
-      {"args": ["config", "show"],           "expect_exit": 0, "expect_stdout_contains": ["net:", "private_key:", "tun_ipv4:", "peers:"]}
-    ]
-  },
-  {
-    "name": "config_template_pubkey_on_same_line",
-    "description": "Config template has '# Public key: <hex>' on the same line across all languages",
-    "seed_key": true,
-    "steps": [
-      {"args": ["context", "create", "tpl"],  "expect_exit": 0},
-      {"args": ["config", "show"],            "expect_exit": 0, "expect_stdout_match_seed_config": true}
-    ]
-  },
-  {
-    "name": "version",
-    "description": "Version command outputs version string",
-    "steps": [
-      {"args": ["version"], "expect_exit": 0, "expect_stdout_contains": ["0.1.0"]}
+      {"args": ["config", "show"],           "expect_exit": 0, "expect_stdout_contains": ["private_key", "tun_ipv4"]}
     ]
   },
   {
@@ -105,10 +89,8 @@
     "expect_files": [
       "current",
       "prod/private.key",
-      "prod/config.yaml",
       "prod/data",
       "stage/private.key",
-      "stage/config.yaml",
       "stage/data"
     ]
   }

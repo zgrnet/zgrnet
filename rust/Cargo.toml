@@ -66,9 +66,5 @@ name = "zgrnetd"
 path = "src/bin/zgrnetd.rs"
 required-features = ["tun", "dnsmgr"]
 
-[[bin]]
-name = "zgrnet"
-path = "src/bin/zgrnet.rs"
-
 # Note: stream_test and kcp_interop moved to examples/stream_test/rust/ and examples/kcp_test/rust/
 # Note: async_bench removed — async module migrated to embed-zig (#22)

@@ -27,8 +27,23 @@ const noise = @import("noise");
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
 
-const print = std.debug.print;
 const Allocator = std.mem.Allocator;
+
+/// Write pre-formatted data directly to stdout, handling partial writes.
+fn writeStdout(data: []const u8) void {
+    var remaining = data;
+    while (remaining.len > 0) {
+        const n = posix.write(posix.STDOUT_FILENO, remaining) catch return;
+        if (n == 0) return;
+        remaining = remaining[n..];
+    }
+}
+
+fn print(comptime format: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const slice = fmt.bufPrint(&buf, format, args) catch return;
+    writeStdout(slice);
+}
 
 // ============================================================================
 // Main
@@ -269,6 +284,18 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
             try cf.writeAll(config_template);
         }
 
+        // If this is the first context, set it as current
+        const cur_path = try fmt.allocPrint(allocator, "{s}/current", .{base_dir});
+        defer allocator.free(cur_path);
+        const has_current = if (fs.cwd().access(cur_path, .{})) |_| true else |_| false;
+        if (!has_current) {
+            if (fs.cwd().createFile(cur_path, .{})) |f| {
+                defer f.close();
+                f.writeAll(name) catch {};
+                f.writeAll("\n") catch {};
+            } else |_| {}
+        }
+
         // Show result
         const pub_hex = std.fmt.bytesToHex(kp.public.data, .lower);
         print("created context \"{s}\"\n", .{name});
@@ -356,8 +383,8 @@ fn runConfig(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_a
         defer allocator.free(path);
         const data = try fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
         defer allocator.free(data);
-        // Write config data to stdout
-        print("{s}", .{data});
+        // Write directly to stdout (bypasses print's 4KB buffer limit)
+        writeStdout(data);
     } else if (mem.eql(u8, args[0], "path")) {
         const path = try contextConfigPath(allocator, base_dir, ctx);
         defer allocator.free(path);
