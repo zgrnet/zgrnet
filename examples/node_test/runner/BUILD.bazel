@@ -1,0 +1,8 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "runner",
+    srcs = ["main.go"],
+    importpath = "github.com/vibing/zgrnet/examples/node_test/runner",
+    visibility = ["//visibility:public"],
+)
