@@ -34,7 +34,7 @@ import (
 type State int32
 
 const (
-	StateStopped  State = iota
+	StateStopped State = iota
 	StateRunning
 	StateSuspended
 )
@@ -54,11 +54,11 @@ func (s State) String() string {
 
 // Errors returned by Node operations.
 var (
-	ErrNotRunning    = errors.New("node: not running")
+	ErrNotRunning     = errors.New("node: not running")
 	ErrAlreadyRunning = errors.New("node: already running")
-	ErrPeerNotFound  = errors.New("node: peer not found")
-	ErrNotConnected  = errors.New("node: peer not connected")
-	ErrStopped       = errors.New("node: stopped")
+	ErrPeerNotFound   = errors.New("node: peer not found")
+	ErrNotConnected   = errors.New("node: peer not connected")
+	ErrStopped        = errors.New("node: stopped")
 )
 
 // Config holds the configuration for creating a Node.
@@ -96,13 +96,13 @@ type Node struct {
 	acceptCh chan *Stream
 
 	// Tracks per-peer accept goroutines.
-	peerMu    sync.Mutex
-	peerDone  map[noise.PublicKey]chan struct{} // signal to stop per-peer accept loop
+	peerMu   sync.Mutex
+	peerDone map[noise.PublicKey]chan struct{} // signal to stop per-peer accept loop
 
 	// Lifecycle
-	state   atomic.Int32
-	done    chan struct{}
-	wg      sync.WaitGroup
+	state atomic.Int32
+	done  chan struct{}
+	wg    sync.WaitGroup
 }
 
 // New creates a new Node but does not start it.
