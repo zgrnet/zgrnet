@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/vibing/zgrnet/pkg/host"
@@ -311,11 +312,19 @@ func run() error {
 	log.Printf("────────────────────────────────")
 	log.Printf("RESULT: %d/%d passed", passed, total)
 
-	// Clean shutdown
+	// Shutdown: close HTTP first, then hosts.
+	log.Printf("shutdown: goroutines=%d", runtime.NumGoroutine())
+	log.Printf("shutdown: closing HTTP...")
 	httpLn.Close()
-	hostB.Close()
-	hostA.Close()
-	log.Printf("shutdown complete")
+	client.CloseIdleConnections()
+
+	log.Printf("shutdown: goroutines=%d, closing host B...", runtime.NumGoroutine())
+	closeWithTimeout("hostB", func() { hostB.Close() }, 3*time.Second)
+
+	log.Printf("shutdown: goroutines=%d, closing host A...", runtime.NumGoroutine())
+	closeWithTimeout("hostA", func() { hostA.Close() }, 3*time.Second)
+
+	log.Printf("shutdown complete, goroutines=%d", runtime.NumGoroutine())
 
 	if passed < total {
 		return fmt.Errorf("%d tests failed", total-passed)
@@ -366,6 +375,19 @@ func httpDo(c *http.Client, method, url, body string) (string, int, error) {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return string(b), resp.StatusCode, nil
+}
+
+func closeWithTimeout(name string, fn func(), timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("  TIMEOUT: %s blocked for %v — forcing continue", name, timeout)
+	}
 }
 
 func parse(s string) map[string]any {

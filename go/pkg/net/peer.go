@@ -94,10 +94,7 @@ func (u *UDP) muxUpdateLoop(m *mux) {
 				return
 			}
 			m.Update(uint32(time.Now().UnixMilli()))
-		}
-
-		// Check if UDP is closed
-		if u.closed.Load() {
+		case <-u.closeChan:
 			return
 		}
 	}

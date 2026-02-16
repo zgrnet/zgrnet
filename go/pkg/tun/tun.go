@@ -107,29 +107,47 @@ func Create(name string) (*Device, error) {
 }
 
 // Close closes the TUN device.
+//
+// This first marks the device as closed (so concurrent Read/Write calls
+// will see ErrClosedPipe on their next attempt), then closes the underlying
+// handle. The C.tun_close call closes the file descriptor, which unblocks
+// any goroutine blocked in C.tun_read or C.tun_write.
+//
+// We must NOT hold the write lock while calling C.tun_close, because
+// Read/Write hold the read lock across blocking C calls. Acquiring the
+// write lock would deadlock waiting for those reads to finish — but they
+// can't finish until the fd is closed.
 func (d *Device) Close() error {
+	// Atomically mark as closed. Subsequent Read/Write calls will see this
+	// before acquiring the read lock and return early.
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	if d.closed {
+		d.mu.Unlock()
 		return ErrAlreadyClosed
 	}
-	// Note: d.handle == nil check removed as redundant - if d.closed is false,
-	// the handle should always be valid (set by constructor, cleared only by Close)
-
-	C.tun_close(d.handle)
-	d.handle = nil
 	d.closed = true
+	handle := d.handle
+	d.handle = nil
+	d.mu.Unlock()
+
+	// Close the fd outside the lock. This unblocks any goroutine in
+	// C.tun_read/C.tun_write, which will then release its RLock and
+	// see d.closed == true.
+	C.tun_close(handle)
 	return nil
 }
 
 // Read reads a packet from the TUN device.
 // The packet is a raw IP packet (IPv4 or IPv6).
 func (d *Device) Read(buf []byte) (int, error) {
+	if d.closed {
+		return 0, io.ErrClosedPipe
+	}
+
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed {
+	if d.closed || d.handle == nil {
 		return 0, io.ErrClosedPipe
 	}
 
@@ -147,10 +165,14 @@ func (d *Device) Read(buf []byte) (int, error) {
 // Write writes a packet to the TUN device.
 // The packet should be a valid IP packet (IPv4 or IPv6).
 func (d *Device) Write(buf []byte) (int, error) {
+	if d.closed {
+		return 0, io.ErrClosedPipe
+	}
+
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
-	if d.closed {
+	if d.closed || d.handle == nil {
 		return 0, io.ErrClosedPipe
 	}
 
