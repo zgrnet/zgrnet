@@ -288,8 +288,7 @@ test "server join and leave" {
     defer srv.deinit();
 
     var open = OpenAuth.init();
-    const open_iface = open.authenticator();
-    srv.registerAuth(&open_iface);
+    srv.registerAuth(&open.iface);
 
     var seed: [32]u8 = undefined;
     std.crypto.random.bytes(&seed);
@@ -323,8 +322,7 @@ test "server auth methods" {
     defer srv.deinit();
 
     var open = OpenAuth.init();
-    const open_iface = open.authenticator();
-    srv.registerAuth(&open_iface);
+    srv.registerAuth(&open.iface);
 
     var buf: [8][]const u8 = undefined;
     const n = srv.authMethods(&buf);
@@ -369,8 +367,7 @@ test "server labels" {
     defer srv.deinit();
 
     var open = OpenAuth.init();
-    const open_iface = open.authenticator();
-    srv.registerAuth(&open_iface);
+    srv.registerAuth(&open.iface);
 
     var seed: [32]u8 = undefined;
     std.crypto.random.bytes(&seed);
@@ -406,8 +403,7 @@ test "server events via channel" {
     defer srv.deinit();
 
     var open = OpenAuth.init();
-    const open_iface = open.authenticator();
-    srv.registerAuth(&open_iface);
+    srv.registerAuth(&open.iface);
 
     // Subscribe — get a Channel.
     const ch = try srv.subscribe();

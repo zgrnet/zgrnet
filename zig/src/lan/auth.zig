@@ -262,19 +262,17 @@ fn testKey() Key {
 
 test "open auth" {
     var open = OpenAuth.init();
-    const a = open.authenticator();
-    try std.testing.expectEqualStrings("open", a.method());
-    try a.authenticate(testKey(), "");
+    try std.testing.expectEqualStrings("open", open.iface.method());
+    try open.iface.authenticate(testKey(), "");
 }
 
 test "password auth" {
     var pa = PasswordAuth.fromPlaintext("secret123");
-    const a = pa.authenticator();
-    try std.testing.expectEqualStrings("password", a.method());
+    try std.testing.expectEqualStrings("password", pa.iface.method());
 
-    try a.authenticate(testKey(), "secret123");
-    try std.testing.expectError(AuthError.InvalidPassword, a.authenticate(testKey(), "wrong"));
-    try std.testing.expectError(AuthError.InvalidPassword, a.authenticate(testKey(), ""));
+    try pa.iface.authenticate(testKey(), "secret123");
+    try std.testing.expectError(AuthError.InvalidPassword, pa.iface.authenticate(testKey(), "wrong"));
+    try std.testing.expectError(AuthError.InvalidPassword, pa.iface.authenticate(testKey(), ""));
 }
 
 test "invite code auth" {
@@ -283,14 +281,13 @@ test "invite code auth" {
     var ica = InviteCodeAuth.init(allocator);
     defer ica.deinit();
 
-    const code = try ica.generateCode(1); // single use
-    const a = ica.authenticator();
+    const code = try ica.generateCode(1);
 
-    try std.testing.expectEqualStrings("invite_code", a.method());
-    try a.authenticate(testKey(), code);
-    try std.testing.expectError(AuthError.InviteCodeExhausted, a.authenticate(testKey(), code));
-    try std.testing.expectError(AuthError.InvalidInviteCode, a.authenticate(testKey(), "nonexistent"));
-    try std.testing.expectError(AuthError.InvalidInviteCode, a.authenticate(testKey(), ""));
+    try std.testing.expectEqualStrings("invite_code", ica.iface.method());
+    try ica.iface.authenticate(testKey(), code);
+    try std.testing.expectError(AuthError.InviteCodeExhausted, ica.iface.authenticate(testKey(), code));
+    try std.testing.expectError(AuthError.InvalidInviteCode, ica.iface.authenticate(testKey(), "nonexistent"));
+    try std.testing.expectError(AuthError.InvalidInviteCode, ica.iface.authenticate(testKey(), ""));
 }
 
 test "invite code unlimited" {
@@ -299,12 +296,11 @@ test "invite code unlimited" {
     var ica = InviteCodeAuth.init(allocator);
     defer ica.deinit();
 
-    const code = try ica.generateCode(0); // unlimited
-    const a = ica.authenticator();
+    const code = try ica.generateCode(0);
 
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        try a.authenticate(testKey(), code);
+        try ica.iface.authenticate(testKey(), code);
     }
 }
 
@@ -330,16 +326,15 @@ test "pubkey whitelist auth" {
     var wl = PubkeyWhitelistAuth.init(allocator, &keys);
     defer wl.deinit();
 
-    const a = wl.authenticator();
-    try std.testing.expectEqualStrings("pubkey_whitelist", a.method());
+    try std.testing.expectEqualStrings("pubkey_whitelist", wl.iface.method());
 
-    try a.authenticate(pk1, "");
-    try a.authenticate(pk2, "");
-    try std.testing.expectError(AuthError.PubkeyNotWhitelisted, a.authenticate(pk_unknown, ""));
+    try wl.iface.authenticate(pk1, "");
+    try wl.iface.authenticate(pk2, "");
+    try std.testing.expectError(AuthError.PubkeyNotWhitelisted, wl.iface.authenticate(pk_unknown, ""));
 
     wl.addKey(pk_unknown);
-    try a.authenticate(pk_unknown, "");
+    try wl.iface.authenticate(pk_unknown, "");
 
     wl.removeKey(pk1);
-    try std.testing.expectError(AuthError.PubkeyNotWhitelisted, a.authenticate(pk1, ""));
+    try std.testing.expectError(AuthError.PubkeyNotWhitelisted, wl.iface.authenticate(pk1, ""));
 }
