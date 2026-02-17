@@ -31,7 +31,8 @@ mod ffi;
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use ffi::RawHandle;
 
@@ -157,15 +158,26 @@ pub fn deinit() {
 
 /// A TUN device.
 ///
-/// This struct is thread-safe and can be shared between threads using `Arc<Device>`.
-/// Internal synchronization is handled by an RwLock for better concurrent read performance.
+/// Thread-safe via `Arc<Device>`. Uses `AtomicBool` for the closed flag
+/// instead of `RwLock` to avoid deadlocking `close()` on a blocked `read()`.
+///
+/// The deadlock: `read_packet()` holds a read lock across a blocking kernel
+/// `read()` syscall. `close()`/`drop()` needs the write lock to null out the
+/// handle. Write lock waits for all read locks — but read can't return until
+/// the fd is closed. Classic deadlock.
+///
+/// Fix: no lock. Use atomic flag + raw pointer. `close()` sets the flag then
+/// closes the fd (unblocking readers). Readers check the flag after returning
+/// from the syscall.
 pub struct Device {
-    handle: RwLock<*mut ffi::TunHandle>,
+    handle: *mut ffi::TunHandle,
+    closed: AtomicBool,
     name: String,
 }
 
-// SAFETY: The handle is protected by an RwLock, ensuring thread-safe access.
-// The underlying FFI handle points to memory managed by the Zig library.
+// SAFETY: The handle is only mutated by close() which is idempotent via AtomicBool.
+// After close, all FFI calls return errors (EBADF). The pointer itself is never
+// freed — the Zig library manages the underlying memory via tun_close.
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
@@ -199,7 +211,8 @@ impl Device {
         };
 
         Ok(Device {
-            handle: RwLock::new(handle),
+            handle,
+            closed: AtomicBool::new(false),
             name: dev_name,
         })
     }
@@ -209,122 +222,87 @@ impl Device {
         &self.name
     }
 
+    /// Close the TUN device (shutdown).
+    ///
+    /// Closes the fd, which unblocks any blocked read/write. The device
+    /// memory remains valid — Drop calls tun_destroy() to free it after
+    /// the Device is no longer referenced.
+    ///
+    /// Safe to call concurrently with read/write. Idempotent.
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return; // already closed
+        }
+        unsafe { ffi::tun_close(self.handle) };
+    }
+
     /// Get the underlying file descriptor (Unix) or HANDLE (Windows).
     pub fn raw_handle(&self) -> RawHandle {
-        let handle = self.handle.read().unwrap();
-        unsafe { ffi::tun_get_handle(*handle) }
+        unsafe { ffi::tun_get_handle(self.handle) }
     }
 
     /// Get the MTU (Maximum Transmission Unit).
     pub fn mtu(&self) -> Result<i32> {
-        let handle = self.handle.read().unwrap();
-        let mtu = unsafe { ffi::tun_get_mtu(*handle) };
-        if mtu < 0 {
-            Err(code_to_error(mtu))
-        } else {
-            Ok(mtu)
-        }
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
+        let mtu = unsafe { ffi::tun_get_mtu(self.handle) };
+        if mtu < 0 { Err(code_to_error(mtu)) } else { Ok(mtu) }
     }
 
-    /// Set the MTU (Maximum Transmission Unit).
-    ///
-    /// Requires root/admin privileges.
+    /// Set the MTU. Requires root/admin privileges.
     pub fn set_mtu(&self, mtu: i32) -> Result<()> {
-        let handle = self.handle.read().unwrap();
-        let rc = unsafe { ffi::tun_set_mtu(*handle, mtu) };
-        if rc == ffi::TUN_OK {
-            Ok(())
-        } else {
-            Err(code_to_error(rc))
-        }
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
+        let rc = unsafe { ffi::tun_set_mtu(self.handle, mtu) };
+        if rc == ffi::TUN_OK { Ok(()) } else { Err(code_to_error(rc)) }
     }
 
     /// Set non-blocking mode.
-    ///
-    /// In non-blocking mode, read returns `Error::WouldBlock` if no data is available.
     pub fn set_nonblocking(&self, enabled: bool) -> Result<()> {
-        let handle = self.handle.read().unwrap();
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
         let flag = if enabled { 1 } else { 0 };
-        let rc = unsafe { ffi::tun_set_nonblocking(*handle, flag) };
-        if rc == ffi::TUN_OK {
-            Ok(())
-        } else {
-            Err(code_to_error(rc))
-        }
+        let rc = unsafe { ffi::tun_set_nonblocking(self.handle, flag) };
+        if rc == ffi::TUN_OK { Ok(()) } else { Err(code_to_error(rc)) }
     }
 
-    /// Bring the interface up.
-    ///
-    /// Requires root/admin privileges.
+    /// Bring the interface up. Requires root/admin privileges.
     pub fn up(&self) -> Result<()> {
-        let handle = self.handle.read().unwrap();
-        let rc = unsafe { ffi::tun_set_up(*handle) };
-        if rc == ffi::TUN_OK {
-            Ok(())
-        } else {
-            Err(code_to_error(rc))
-        }
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
+        let rc = unsafe { ffi::tun_set_up(self.handle) };
+        if rc == ffi::TUN_OK { Ok(()) } else { Err(code_to_error(rc)) }
     }
 
-    /// Bring the interface down.
-    ///
-    /// Requires root/admin privileges.
+    /// Bring the interface down. Requires root/admin privileges.
     pub fn down(&self) -> Result<()> {
-        let handle = self.handle.read().unwrap();
-        let rc = unsafe { ffi::tun_set_down(*handle) };
-        if rc == ffi::TUN_OK {
-            Ok(())
-        } else {
-            Err(code_to_error(rc))
-        }
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
+        let rc = unsafe { ffi::tun_set_down(self.handle) };
+        if rc == ffi::TUN_OK { Ok(()) } else { Err(code_to_error(rc)) }
     }
 
-    /// Set IPv4 address and netmask.
-    ///
-    /// Requires root/admin privileges.
+    /// Set IPv4 address and netmask. Requires root/admin privileges.
     pub fn set_ipv4(&self, addr: Ipv4Addr, netmask: Ipv4Addr) -> Result<()> {
-        let handle = self.handle.read().unwrap();
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
         let addr_str = CString::new(addr.to_string()).map_err(|_| Error::InvalidArgument)?;
         let mask_str = CString::new(netmask.to_string()).map_err(|_| Error::InvalidArgument)?;
-
-        let rc = unsafe { ffi::tun_set_ipv4(*handle, addr_str.as_ptr(), mask_str.as_ptr()) };
-        if rc == ffi::TUN_OK {
-            Ok(())
-        } else {
-            Err(code_to_error(rc))
-        }
+        let rc = unsafe { ffi::tun_set_ipv4(self.handle, addr_str.as_ptr(), mask_str.as_ptr()) };
+        if rc == ffi::TUN_OK { Ok(()) } else { Err(code_to_error(rc)) }
     }
 
-    /// Set IPv6 address with prefix length.
-    ///
-    /// Requires root/admin privileges.
+    /// Set IPv6 address with prefix length. Requires root/admin privileges.
     pub fn set_ipv6(&self, addr: Ipv6Addr, prefix_len: i32) -> Result<()> {
-        if prefix_len < 0 || prefix_len > 128 {
-            return Err(Error::InvalidArgument);
-        }
-
-        let handle = self.handle.read().unwrap();
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
+        if !(0..=128).contains(&prefix_len) { return Err(Error::InvalidArgument); }
         let addr_str = CString::new(addr.to_string()).map_err(|_| Error::InvalidArgument)?;
-
-        let rc = unsafe { ffi::tun_set_ipv6(*handle, addr_str.as_ptr(), prefix_len) };
-        if rc == ffi::TUN_OK {
-            Ok(())
-        } else {
-            Err(code_to_error(rc))
-        }
+        let rc = unsafe { ffi::tun_set_ipv6(self.handle, addr_str.as_ptr(), prefix_len) };
+        if rc == ffi::TUN_OK { Ok(()) } else { Err(code_to_error(rc)) }
     }
 
     /// Read a packet from the TUN device.
-    ///
-    /// Returns the number of bytes read.
     pub fn read_packet(&self, buf: &mut [u8]) -> Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
+        if buf.is_empty() { return Ok(0); }
 
-        let handle = self.handle.read().unwrap();
-        let n = unsafe { ffi::tun_read(*handle, buf.as_mut_ptr() as *mut _, buf.len()) };
+        let n = unsafe { ffi::tun_read(self.handle, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n < 0 {
+            if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
             Err(code_to_error(n as i32))
         } else {
             Ok(n as usize)
@@ -332,16 +310,13 @@ impl Device {
     }
 
     /// Write a packet to the TUN device.
-    ///
-    /// Returns the number of bytes written.
     pub fn write_packet(&self, buf: &[u8]) -> Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+        if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
+        if buf.is_empty() { return Ok(0); }
 
-        let handle = self.handle.read().unwrap();
-        let n = unsafe { ffi::tun_write(*handle, buf.as_ptr() as *const _, buf.len()) };
+        let n = unsafe { ffi::tun_write(self.handle, buf.as_ptr() as *const _, buf.len()) };
         if n < 0 {
+            if self.closed.load(Ordering::SeqCst) { return Err(Error::AlreadyClosed); }
             Err(code_to_error(n as i32))
         } else {
             Ok(n as usize)
@@ -351,13 +326,10 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        let mut handle = self.handle.write().unwrap();
-        if !handle.is_null() {
-            unsafe {
-                ffi::tun_close(*handle);
-            }
-            *handle = std::ptr::null_mut();
-        }
+        // Close fd if not already closed, then free memory.
+        // Drop has &mut self, so no concurrent readers exist.
+        self.close();
+        unsafe { ffi::tun_destroy(self.handle) };
     }
 }
 

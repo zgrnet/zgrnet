@@ -1,0 +1,30 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "lan",
+    srcs = [
+        "auth.go",
+        "handler.go",
+        "lan.go",
+        "store.go",
+    ],
+    importpath = "github.com/vibing/zgrnet/pkg/lan",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go:noise",
+        "@org_golang_x_crypto//bcrypt",
+    ],
+)
+
+go_test(
+    name = "lan_test",
+    srcs = [
+        "auth_test.go",
+        "handler_test.go",
+        "lan_test.go",
+    ],
+    embed = [":lan"],
+    deps = [
+        "//go:noise",
+    ],
+)

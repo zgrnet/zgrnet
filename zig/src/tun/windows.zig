@@ -349,13 +349,13 @@ pub fn create(name: ?[]const u8) TunError!Tun {
         .handle = handle,
         .name_buf = name_buf,
         .name_len = name_len,
-        .closed = false,
+        .closed = std.atomic.Value(bool).init(false),
     };
 }
 
 /// Get state with reference count incremented. Caller MUST call releaseState() when done.
 fn acquireState(tun: *Tun) ?*WinTunState {
-    if (tun.closed) return null;
+    if (tun.closed.load(.acquire)) return null;
     const state: *WinTunState = @ptrCast(@alignCast(tun.handle));
     return state.acquire();
 }
@@ -417,8 +417,7 @@ pub fn write(tun: *Tun, data: []const u8) TunError!usize {
 
 /// Close the TUN device
 pub fn close(tun: *Tun) void {
-    if (tun.closed) return;
-    tun.closed = true;
+    if (tun.closed.swap(true, .acq_rel)) return;
 
     const state: *WinTunState = @ptrCast(@alignCast(tun.handle));
 

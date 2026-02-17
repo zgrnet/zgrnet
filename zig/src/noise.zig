@@ -22,6 +22,7 @@ pub const dns_mod = @import("dns/mod.zig");
 pub const dnsmgr_mod = @import("dnsmgr/mod.zig");
 pub const config_mod = @import("config/mod.zig");
 pub const json_config = @import("config.zig");
+pub const lan_mod = @import("lan/mod.zig");
 
 // ============================================================================
 // Concrete Crypto + Runtime instantiation for desktop platforms
@@ -170,6 +171,15 @@ pub const NodeStream = NodeType.NodeStream;
 
 pub const config = config_mod;
 
+// ============================================================================
+// LAN types
+// ============================================================================
+
+pub const lan = lan_mod;
+pub const LanStore = lan_mod.Store;
+pub const LanServer = lan_mod.Server(StdRt);
+pub const LanEvent = lan_mod.Event;
+
 test {
     // Don't use refAllDecls — it forces analysis of generate()/generateIndex()
     // which use std.crypto.random (unavailable on freestanding).
@@ -183,4 +193,5 @@ test {
     _ = dns_mod;
     _ = dnsmgr_mod;
     _ = config_mod;
+    _ = lan_mod;
 }

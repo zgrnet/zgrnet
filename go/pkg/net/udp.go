@@ -575,9 +575,17 @@ func (u *UDP) ReadPacket(buf []byte) (pk noise.PublicKey, proto byte, n int, err
 		case <-pkt.ready:
 			// Decryption done
 		case <-u.closeChan:
-			// Still need to wait for decryption to complete before releasing
-			<-pkt.ready
-			releasePacket(pkt)
+			// Shutting down. The decrypt worker may have already exited
+			// without processing this packet, so pkt.ready may never close.
+			// Try non-blocking check; if not ready, abandon the packet
+			// (acceptable leak during shutdown — process is exiting).
+			select {
+			case <-pkt.ready:
+				releasePacket(pkt)
+			default:
+				// Packet still held by decrypt worker or abandoned; don't
+				// release to avoid racing with a worker that's mid-write.
+			}
 			return pk, 0, 0, ErrClosed
 		}
 

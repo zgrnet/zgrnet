@@ -94,10 +94,33 @@ export fn tun_create(name: ?[*:0]const u8) ?*Tun {
     return tun;
 }
 
-/// Close a TUN device
+/// Close a TUN device (shutdown).
+///
+/// Closes the underlying fd, which unblocks any thread blocked in
+/// tun_read/tun_write. The Tun struct memory remains valid — call
+/// tun_destroy() separately when no concurrent users remain.
+///
+/// Safe to call concurrently with tun_read/tun_write.
+/// Idempotent: multiple calls are harmless.
 export fn tun_close(tun: ?*Tun) void {
     if (tun) |t| {
         t.close();
+    }
+}
+
+/// Destroy a TUN device (free memory).
+///
+/// Releases the Tun struct memory. The caller MUST ensure no concurrent
+/// tun_read/tun_write calls are in progress. Typically called after
+/// all reader/writer threads have exited.
+///
+/// If tun_close() was not called before tun_destroy(), it is called
+/// implicitly.
+export fn tun_destroy(tun: ?*Tun) void {
+    if (tun) |t| {
+        if (!t.closed.load(.acquire)) {
+            t.close();
+        }
         allocator.destroy(t);
     }
 }

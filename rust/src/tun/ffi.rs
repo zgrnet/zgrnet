@@ -45,6 +45,7 @@ extern "C" {
     // Lifecycle
     pub fn tun_create(name: *const c_char) -> *mut TunHandle;
     pub fn tun_close(tun: *mut TunHandle);
+    pub fn tun_destroy(tun: *mut TunHandle);
 
     // Read/Write
     pub fn tun_read(tun: *mut TunHandle, buf: *mut c_void, len: usize) -> isize;

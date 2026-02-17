@@ -20,6 +20,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -68,11 +69,14 @@ func Deinit() {
 
 // Device represents a TUN device.
 // It is safe for concurrent use from multiple goroutines.
+//
+// Close/Read synchronization: Read may block inside a kernel syscall
+// (C.tun_read). Close must close the fd to unblock it. We use an atomic
+// flag instead of a mutex to avoid deadlocking Close on a blocked Read.
 type Device struct {
 	handle *C.tun_t
 	name   string
-	closed bool
-	mu     sync.RWMutex // RWMutex allows concurrent reads while blocking during Close
+	closed atomic.Bool
 }
 
 // Create creates a new TUN device.
@@ -106,39 +110,48 @@ func Create(name string) (*Device, error) {
 	}, nil
 }
 
-// Close closes the TUN device.
+// Close shuts down the TUN device (closes the fd).
+//
+// This unblocks any goroutine blocked in Read/Write. The device memory
+// remains valid — call Destroy() separately after all readers/writers
+// have exited.
+//
+// Safe to call concurrently with Read/Write. Idempotent.
 func (d *Device) Close() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.closed {
+	if !d.closed.CompareAndSwap(false, true) {
 		return ErrAlreadyClosed
 	}
-	// Note: d.handle == nil check removed as redundant - if d.closed is false,
-	// the handle should always be valid (set by constructor, cleared only by Close)
-
 	C.tun_close(d.handle)
-	d.handle = nil
-	d.closed = true
 	return nil
+}
+
+// Destroy frees the TUN device memory.
+//
+// The caller MUST ensure no concurrent Read/Write calls are in progress.
+// Typically called after the host's forwarding loops have exited.
+//
+// If Close() was not called before Destroy(), it is called first.
+func (d *Device) Destroy() {
+	d.Close() // idempotent — ensures fd is closed before freeing memory
+	C.tun_destroy(d.handle)
 }
 
 // Read reads a packet from the TUN device.
 // The packet is a raw IP packet (IPv4 or IPv6).
 func (d *Device) Read(buf []byte) (int, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-
 	if len(buf) == 0 {
 		return 0, nil
 	}
 
 	n := C.tun_read(d.handle, unsafe.Pointer(&buf[0]), C.size_t(len(buf)))
 	if n < 0 {
+		// If closed while we were blocked in the syscall, report cleanly.
+		if d.closed.Load() {
+			return 0, io.ErrClosedPipe
+		}
 		return 0, codeToError(int(n))
 	}
 	return int(n), nil
@@ -147,19 +160,18 @@ func (d *Device) Read(buf []byte) (int, error) {
 // Write writes a packet to the TUN device.
 // The packet should be a valid IP packet (IPv4 or IPv6).
 func (d *Device) Write(buf []byte) (int, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-
 	if len(buf) == 0 {
 		return 0, nil
 	}
 
 	n := C.tun_write(d.handle, unsafe.Pointer(&buf[0]), C.size_t(len(buf)))
 	if n < 0 {
+		if d.closed.Load() {
+			return 0, io.ErrClosedPipe
+		}
 		return 0, codeToError(int(n))
 	}
 	return int(n), nil
@@ -171,27 +183,18 @@ func (d *Device) Name() string {
 }
 
 // Handle returns the underlying file descriptor (Unix) or HANDLE (Windows).
-// This is useful for integrating with event loops.
 func (d *Device) Handle() int {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return -1
 	}
-
 	return int(C.tun_get_handle(d.handle))
 }
 
 // MTU returns the MTU (Maximum Transmission Unit).
 func (d *Device) MTU() (int, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-
 	mtu := C.tun_get_mtu(d.handle)
 	if mtu < 0 {
 		return 0, codeToError(int(mtu))
@@ -199,16 +202,11 @@ func (d *Device) MTU() (int, error) {
 	return int(mtu), nil
 }
 
-// SetMTU sets the MTU (Maximum Transmission Unit).
-// Requires root/admin privileges.
+// SetMTU sets the MTU. Requires root/admin privileges.
 func (d *Device) SetMTU(mtu int) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return io.ErrClosedPipe
 	}
-
 	rc := C.tun_set_mtu(d.handle, C.int(mtu))
 	if rc != 0 {
 		return codeToError(int(rc))
@@ -217,20 +215,14 @@ func (d *Device) SetMTU(mtu int) error {
 }
 
 // SetNonblocking sets non-blocking mode.
-// In non-blocking mode, Read returns ErrWouldBlock if no data is available.
 func (d *Device) SetNonblocking(enabled bool) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return io.ErrClosedPipe
 	}
-
 	flag := 0
 	if enabled {
 		flag = 1
 	}
-
 	rc := C.tun_set_nonblocking(d.handle, C.int(flag))
 	if rc != 0 {
 		return codeToError(int(rc))
@@ -238,16 +230,11 @@ func (d *Device) SetNonblocking(enabled bool) error {
 	return nil
 }
 
-// Up brings the interface up.
-// Requires root/admin privileges.
+// Up brings the interface up. Requires root/admin privileges.
 func (d *Device) Up() error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return io.ErrClosedPipe
 	}
-
 	rc := C.tun_set_up(d.handle)
 	if rc != 0 {
 		return codeToError(int(rc))
@@ -255,16 +242,11 @@ func (d *Device) Up() error {
 	return nil
 }
 
-// Down brings the interface down.
-// Requires root/admin privileges.
+// Down brings the interface down. Requires root/admin privileges.
 func (d *Device) Down() error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return io.ErrClosedPipe
 	}
-
 	rc := C.tun_set_down(d.handle)
 	if rc != 0 {
 		return codeToError(int(rc))
@@ -272,31 +254,21 @@ func (d *Device) Down() error {
 	return nil
 }
 
-// SetIPv4 sets the IPv4 address and netmask.
-// Requires root/admin privileges.
+// SetIPv4 sets the IPv4 address and netmask. Requires root/admin privileges.
 func (d *Device) SetIPv4(addr net.IP, mask net.IPMask) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return io.ErrClosedPipe
 	}
-
 	ip4 := addr.To4()
 	if ip4 == nil {
 		return ErrInvalidArgument
 	}
-
 	if len(mask) != 4 {
 		return ErrInvalidArgument
 	}
-
-	addrStr := ip4.String()
-	maskStr := net.IP(mask).String() // More idiomatic than fmt.Sprintf
-
-	cAddr := C.CString(addrStr)
+	cAddr := C.CString(ip4.String())
 	defer C.free(unsafe.Pointer(cAddr))
-	cMask := C.CString(maskStr)
+	cMask := C.CString(net.IP(mask).String())
 	defer C.free(unsafe.Pointer(cMask))
 
 	rc := C.tun_set_ipv4(d.handle, cAddr, cMask)
@@ -306,25 +278,18 @@ func (d *Device) SetIPv4(addr net.IP, mask net.IPMask) error {
 	return nil
 }
 
-// SetIPv6 sets the IPv6 address with prefix length.
-// Requires root/admin privileges.
+// SetIPv6 sets the IPv6 address with prefix length. Requires root/admin privileges.
 func (d *Device) SetIPv6(addr net.IP, prefixLen int) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if d.closed {
+	if d.closed.Load() {
 		return io.ErrClosedPipe
 	}
-
 	ip6 := addr.To16()
 	if ip6 == nil || ip6.To4() != nil {
 		return ErrInvalidArgument
 	}
-
 	if prefixLen < 0 || prefixLen > 128 {
 		return ErrInvalidArgument
 	}
-
 	cAddr := C.CString(ip6.String())
 	defer C.free(unsafe.Pointer(cAddr))
 

@@ -123,14 +123,36 @@ void tun_deinit(void);
 tun_t* tun_create(const char* name);
 
 /**
- * @brief Close a TUN device
+ * @brief Close a TUN device (shutdown)
  *
- * Releases all resources associated with the device.
- * After close, the handle is invalid and must not be used.
+ * Closes the underlying file descriptor, which unblocks any thread
+ * blocked in tun_read() or tun_write(). The handle remains valid
+ * for the purpose of receiving errors — call tun_destroy() separately
+ * to free the memory.
+ *
+ * Safe to call concurrently with tun_read/tun_write.
+ * Idempotent: multiple calls are harmless.
  *
  * @param tun TUN device handle
  */
 void tun_close(tun_t* tun);
+
+/**
+ * @brief Destroy a TUN device (free memory)
+ *
+ * Releases all memory associated with the device.
+ * The caller MUST ensure no concurrent tun_read/tun_write calls
+ * are in progress. Typically called after all reader/writer threads
+ * have exited.
+ *
+ * If tun_close() was not called before tun_destroy(), it is called
+ * implicitly.
+ *
+ * After tun_destroy(), the handle is invalid and must not be used.
+ *
+ * @param tun TUN device handle
+ */
+void tun_destroy(tun_t* tun);
 
 /* ============================================================================
  * Read/Write

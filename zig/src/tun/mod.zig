@@ -99,8 +99,9 @@ pub const Tun = struct {
     name_buf: [16]u8,
     /// Length of device name
     name_len: u8,
-    /// Whether the device is closed
-    closed: bool,
+    /// Whether the device is closed (atomic for thread-safe close/read).
+    /// Close sets this then closes the fd; read checks it after syscall errors.
+    closed: std.atomic.Value(bool),
 
     const Self = @This();
 
@@ -140,12 +141,17 @@ pub const Tun = struct {
     /// Blocks until a packet is available (unless in non-blocking mode).
     /// Returns the number of bytes read, or an error.
     pub fn read(self: *Self, buf: []u8) TunError!usize {
-        if (self.closed) return TunError.AlreadyClosed;
-        return switch (builtin.os.tag) {
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
+        const result = switch (builtin.os.tag) {
             .macos => darwin.read(self, buf),
             .linux => linux.read(self, buf),
             .windows => windows.read(self, buf),
             else => TunError.NotSupported,
+        };
+        return result catch |err| {
+            // If closed while blocked in syscall, report cleanly.
+            if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
+            return err;
         };
     }
 
@@ -154,28 +160,33 @@ pub const Tun = struct {
     /// The packet should be a valid IP packet.
     /// Returns the number of bytes written, or an error.
     pub fn write(self: *Self, data: []const u8) TunError!usize {
-        if (self.closed) return TunError.AlreadyClosed;
-        return switch (builtin.os.tag) {
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
+        const result = switch (builtin.os.tag) {
             .macos => darwin.write(self, data),
             .linux => linux.write(self, data),
             .windows => windows.write(self, data),
             else => TunError.NotSupported,
         };
+        return result catch |err| {
+            if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
+            return err;
+        };
     }
 
-    /// Close the TUN device
+    /// Close the TUN device (shutdown).
     ///
-    /// Releases all resources associated with the device.
-    /// After close(), the device cannot be used.
+    /// Sets the closed flag (atomic) then closes the fd. This unblocks
+    /// any goroutine/thread blocked in read() or write(). The Tun struct
+    /// memory remains valid — call destroy() separately when no concurrent
+    /// users remain.
     pub fn close(self: *Self) void {
-        if (self.closed) return;
+        if (self.closed.swap(true, .acq_rel)) return; // already closed
         switch (builtin.os.tag) {
             .macos => darwin.close(self),
             .linux => linux.close(self),
             .windows => windows.close(self),
             else => {},
         }
-        self.closed = true;
     }
 
     /// Get the device name
@@ -192,7 +203,7 @@ pub const Tun = struct {
 
     /// Get the MTU (Maximum Transmission Unit)
     pub fn getMtu(self: *Self) TunError!u32 {
-        if (self.closed) return TunError.AlreadyClosed;
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
         return switch (builtin.os.tag) {
             .macos => darwin.getMtu(self),
             .linux => linux.getMtu(self),
@@ -205,7 +216,7 @@ pub const Tun = struct {
     ///
     /// Requires root/admin privileges.
     pub fn setMtu(self: *Self, mtu: u32) TunError!void {
-        if (self.closed) return TunError.AlreadyClosed;
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
         return switch (builtin.os.tag) {
             .macos => darwin.setMtu(self, mtu),
             .linux => linux.setMtu(self, mtu),
@@ -216,7 +227,7 @@ pub const Tun = struct {
 
     /// Set non-blocking mode
     pub fn setNonBlocking(self: *Self, enabled: bool) TunError!void {
-        if (self.closed) return TunError.AlreadyClosed;
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
         return switch (builtin.os.tag) {
             .macos => darwin.setNonBlocking(self, enabled),
             .linux => linux.setNonBlocking(self, enabled),
@@ -229,7 +240,7 @@ pub const Tun = struct {
     ///
     /// Requires root/admin privileges.
     pub fn setUp(self: *Self) TunError!void {
-        if (self.closed) return TunError.AlreadyClosed;
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
         return switch (builtin.os.tag) {
             .macos => darwin.setUp(self),
             .linux => linux.setUp(self),
@@ -242,7 +253,7 @@ pub const Tun = struct {
     ///
     /// Requires root/admin privileges.
     pub fn setDown(self: *Self) TunError!void {
-        if (self.closed) return TunError.AlreadyClosed;
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
         return switch (builtin.os.tag) {
             .macos => darwin.setDown(self),
             .linux => linux.setDown(self),
@@ -255,7 +266,7 @@ pub const Tun = struct {
     ///
     /// Requires root/admin privileges.
     pub fn setIPv4(self: *Self, addr: [4]u8, netmask: [4]u8) TunError!void {
-        if (self.closed) return TunError.AlreadyClosed;
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
         return switch (builtin.os.tag) {
             .macos => darwin.setIPv4(self, addr, netmask),
             .linux => linux.setIPv4(self, addr, netmask),
@@ -268,7 +279,7 @@ pub const Tun = struct {
     ///
     /// Requires root/admin privileges.
     pub fn setIPv6(self: *Self, addr: [16]u8, prefix_len: u8) TunError!void {
-        if (self.closed) return TunError.AlreadyClosed;
+        if (self.closed.load(.acquire)) return TunError.AlreadyClosed;
         return switch (builtin.os.tag) {
             .macos => darwin.setIPv6(self, addr, prefix_len),
             .linux => linux.setIPv6(self, addr, prefix_len),
