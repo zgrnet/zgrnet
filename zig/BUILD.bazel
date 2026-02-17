@@ -1,4 +1,4 @@
-load("@embed_zig//bazel/zig:defs.bzl", "zig_binary", "zig_library", "zig_package")
+load("@embed_zig//bazel/zig:defs.bzl", "zig_binary", "zig_library", "zig_package", "zig_test")
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 
 # =============================================================================
@@ -88,6 +88,33 @@ zig_library(
     srcs = glob(["src/tun/**/*.zig"]),
     module_name = "tun",
     deps = [":tun_build_options"],
+    link_libc = True,
+)
+
+# =============================================================================
+# zgrnet CLI — offline management tool
+# =============================================================================
+
+zig_binary(
+    name = "zgrnet_bin",
+    main = "cmd_zgrnet.zig",
+    srcs = ["cmd_zgrnet.zig"],
+    deps = [":noise"],
+    c_srcs = _KCP_C_SRCS,
+    c_includes = _KCP_C_INCLUDES,
+    c_flags = _C_FLAGS,
+    link_libc = True,
+    visibility = ["//visibility:public"],
+)
+
+zig_test(
+    name = "zgrnet_cli_test",
+    main = "cmd_zgrnet.zig",
+    srcs = ["cmd_zgrnet.zig"],
+    deps = [":noise"],
+    c_srcs = _KCP_C_SRCS,
+    c_includes = _KCP_C_INCLUDES,
+    c_flags = _C_FLAGS,
     link_libc = True,
 )
 

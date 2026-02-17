@@ -1,0 +1,97 @@
+[
+  {
+    "name": "context_create_and_current",
+    "description": "Create first context, verify it becomes current",
+    "steps": [
+      {"args": ["context", "create", "default"], "expect_exit": 0},
+      {"args": ["context", "current"],           "expect_exit": 0, "expect_stdout": "default\n"}
+    ]
+  },
+  {
+    "name": "context_create_multiple_and_list",
+    "description": "Create two contexts, verify list order",
+    "steps": [
+      {"args": ["context", "create", "alpha"],  "expect_exit": 0},
+      {"args": ["context", "create", "beta"],   "expect_exit": 0},
+      {"args": ["context", "list"],             "expect_exit": 0, "expect_stdout_contains": ["alpha", "beta"]}
+    ]
+  },
+  {
+    "name": "context_use_and_switch",
+    "description": "Create two contexts, switch between them",
+    "steps": [
+      {"args": ["context", "create", "first"],  "expect_exit": 0},
+      {"args": ["context", "create", "second"], "expect_exit": 0},
+      {"args": ["context", "current"],          "expect_exit": 0, "expect_stdout": "first\n"},
+      {"args": ["context", "use", "second"],    "expect_exit": 0},
+      {"args": ["context", "current"],          "expect_exit": 0, "expect_stdout": "second\n"}
+    ]
+  },
+  {
+    "name": "context_delete",
+    "description": "Create two contexts, delete non-current",
+    "steps": [
+      {"args": ["context", "create", "keep"],    "expect_exit": 0},
+      {"args": ["context", "create", "remove"],  "expect_exit": 0},
+      {"args": ["context", "use", "keep"],       "expect_exit": 0},
+      {"args": ["context", "delete", "remove"],  "expect_exit": 0},
+      {"args": ["context", "list"],              "expect_exit": 0, "expect_stdout_not_contains": ["remove"]}
+    ]
+  },
+  {
+    "name": "context_delete_current_fails",
+    "description": "Cannot delete the current context",
+    "steps": [
+      {"args": ["context", "create", "only"], "expect_exit": 0},
+      {"args": ["context", "delete", "only"], "expect_exit": 1}
+    ]
+  },
+  {
+    "name": "context_create_duplicate_fails",
+    "description": "Creating a context with an existing name fails",
+    "steps": [
+      {"args": ["context", "create", "dup"], "expect_exit": 0},
+      {"args": ["context", "create", "dup"], "expect_exit": 1}
+    ]
+  },
+  {
+    "name": "key_show_with_seed",
+    "description": "Inject a known private key, verify public key output is identical across languages",
+    "seed_key": true,
+    "steps": [
+      {"args": ["context", "create", "test"], "expect_exit": 0},
+      {"args": ["key", "show"],               "expect_exit": 0, "expect_stdout_match_seed_pubkey": true}
+    ]
+  },
+  {
+    "name": "config_path",
+    "description": "Config path contains context name",
+    "steps": [
+      {"args": ["context", "create", "myctx"], "expect_exit": 0},
+      {"args": ["config", "path"],             "expect_exit": 0, "expect_stdout_contains": ["myctx"]}
+    ]
+  },
+  {
+    "name": "config_show",
+    "description": "Config show outputs config with network settings",
+    "steps": [
+      {"args": ["context", "create", "cfg"], "expect_exit": 0},
+      {"args": ["config", "show"],           "expect_exit": 0, "expect_stdout_contains": ["private_key", "tun_ipv4"]}
+    ]
+  },
+  {
+    "name": "filesystem_structure",
+    "description": "Verify the on-disk layout after creating contexts",
+    "steps": [
+      {"args": ["context", "create", "prod"],  "expect_exit": 0},
+      {"args": ["context", "create", "stage"], "expect_exit": 0}
+    ],
+    "expect_files": [
+      "current",
+      "prod/private.key",
+      "prod/data",
+      "stage/private.key",
+      "stage/data"
+    ]
+  }
+]

@@ -80,8 +80,10 @@ pub fn list_contexts(base_dir: &Path) -> Result<Vec<String>, String> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        let cfg = base_dir.join(&name).join("config.yaml");
-        if cfg.exists() {
+        // A valid context has a private.key file (language-agnostic marker).
+        // Config format varies by language (config.yaml for Go/Rust, config.json for Zig).
+        let key = base_dir.join(&name).join("private.key");
+        if key.exists() {
             names.push(name);
         }
     }

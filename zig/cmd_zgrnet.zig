@@ -27,8 +27,23 @@ const noise = @import("noise");
 const Key = noise.Key;
 const KeyPair = noise.KeyPair;
 
-const print = std.debug.print;
 const Allocator = std.mem.Allocator;
+
+/// Write pre-formatted data directly to stdout, handling partial writes.
+fn writeStdout(data: []const u8) void {
+    var remaining = data;
+    while (remaining.len > 0) {
+        const n = posix.write(posix.STDOUT_FILENO, remaining) catch return;
+        if (n == 0) return;
+        remaining = remaining[n..];
+    }
+}
+
+fn print(comptime format: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const slice = fmt.bufPrint(&buf, format, args) catch return;
+    writeStdout(slice);
+}
 
 // ============================================================================
 // Main
@@ -114,6 +129,25 @@ fn defaultConfigDir(allocator: Allocator) ![]const u8 {
     return try fmt.allocPrint(allocator, "{s}/.config/zgrnet", .{home});
 }
 
+/// Counts contexts by iterating directories that contain a private.key file.
+/// Uses private.key as the language-agnostic context marker (Go/Rust use config.yaml,
+/// Zig uses config.json, but all three create private.key with the same format).
+fn countContexts(allocator: Allocator, base_dir: []const u8) usize {
+    var dir = fs.cwd().openDir(base_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var count: usize = 0;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const key_path = fmt.allocPrint(allocator, "{s}/{s}/private.key", .{ base_dir, entry.name }) catch continue;
+        defer allocator.free(key_path);
+        if (fs.cwd().access(key_path, .{})) |_| {
+            count += 1;
+        } else |_| {}
+    }
+    return count;
+}
+
 fn contextDir(allocator: Allocator, base_dir: []const u8, name: []const u8) ![]const u8 {
     return try fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
 }
@@ -184,9 +218,9 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             if (entry.kind != .directory) continue;
-            const cfg_path = try fmt.allocPrint(allocator, "{s}/{s}/config.json", .{ base_dir, entry.name });
-            defer allocator.free(cfg_path);
-            if (fs.cwd().access(cfg_path, .{})) |_| {
+            const key_path = try fmt.allocPrint(allocator, "{s}/{s}/private.key", .{ base_dir, entry.name });
+            defer allocator.free(key_path);
+            if (fs.cwd().access(key_path, .{})) |_| {
                 try names.append(allocator, try allocator.dupe(u8, entry.name));
             } else |_| {}
         }
@@ -267,6 +301,18 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
             const cf = try fs.cwd().createFile(cfg_path, .{});
             defer cf.close();
             try cf.writeAll(config_template);
+        }
+
+        // Auto-set as current if it's the first context (matches Go/Rust behavior)
+        const ctx_count = countContexts(allocator, base_dir);
+        if (ctx_count == 1) {
+            const cur_path = try fmt.allocPrint(allocator, "{s}/current", .{base_dir});
+            defer allocator.free(cur_path);
+            if (fs.cwd().createFile(cur_path, .{})) |f| {
+                defer f.close();
+                f.writeAll(name) catch {};
+                f.writeAll("\n") catch {};
+            } else |_| {}
         }
 
         // Show result
@@ -356,8 +402,8 @@ fn runConfig(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_a
         defer allocator.free(path);
         const data = try fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
         defer allocator.free(data);
-        // Write config data to stdout
-        print("{s}", .{data});
+        // Write directly to stdout (bypasses print's 4KB buffer limit)
+        writeStdout(data);
     } else if (mem.eql(u8, args[0], "path")) {
         const path = try contextConfigPath(allocator, base_dir, ctx);
         defer allocator.free(path);

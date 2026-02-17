@@ -73,9 +73,10 @@ func ListContexts(baseDir string) ([]string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		// A valid context has a config.yaml
-		cfgPath := filepath.Join(baseDir, e.Name(), "config.yaml")
-		if _, err := os.Stat(cfgPath); err == nil {
+		// A valid context has a private.key file (language-agnostic marker).
+		// Config format varies by language (config.yaml for Go/Rust, config.json for Zig).
+		keyPath := filepath.Join(baseDir, e.Name(), "private.key")
+		if _, err := os.Stat(keyPath); err == nil {
 			names = append(names, e.Name())
 		}
 	}
