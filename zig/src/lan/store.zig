@@ -47,6 +47,9 @@ pub const Store = struct {
     pub const VTable = struct {
         add: *const fn (ptr: *anyopaque, pk: Key) StoreError!bool,
         remove: *const fn (ptr: *anyopaque, pk: Key) StoreError!bool,
+        /// Returns a pointer to internal storage. The pointer is valid only
+        /// until the next mutating operation (add/remove/setLabels/removeLabels).
+        /// Callers must not hold the pointer across mutations.
         get: *const fn (ptr: *anyopaque, pk: Key) ?*const Member,
         isMember: *const fn (ptr: *anyopaque, pk: Key) bool,
         count: *const fn (ptr: *anyopaque) usize,

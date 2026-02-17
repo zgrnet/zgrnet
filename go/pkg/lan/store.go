@@ -130,6 +130,14 @@ func (s *MemStore) Count() int {
 	return len(s.members)
 }
 
+// restore puts a member back into the store exactly as-is (preserving
+// JoinedAt and labels). Used by FileStore for rollback on save failure.
+func (s *MemStore) restore(m *Member) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.members[m.Pubkey] = m
+}
+
 // ── FileStore ───────────────────────────────────────────────────────────────
 
 // FileStore wraps a MemStore and persists every mutation to a JSON file.
@@ -176,15 +184,14 @@ func (fs *FileStore) Add(pk noise.PublicKey) (bool, error) {
 }
 
 func (fs *FileStore) Remove(pk noise.PublicKey) (bool, error) {
-	m := fs.mem.Get(pk) // snapshot before remove
+	snapshot := fs.mem.Get(pk) // full copy before remove
 	removed, err := fs.mem.Remove(pk)
 	if err != nil || !removed {
 		return removed, err
 	}
 	if err := fs.save(); err != nil {
-		if m != nil {
-			fs.mem.Add(pk) // rollback
-			fs.mem.SetLabels(pk, m.Labels)
+		if snapshot != nil {
+			fs.mem.restore(snapshot) // restore exact original (including JoinedAt)
 		}
 		return false, err
 	}

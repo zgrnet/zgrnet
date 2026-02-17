@@ -53,10 +53,11 @@ pub struct PasswordAuth {
 
 impl PasswordAuth {
     /// Creates from an existing bcrypt hash string.
+    /// Accepts any valid bcrypt hash ($2a$, $2b$, $2y$, etc.).
     pub fn from_hash(hash: String) -> Result<Self, String> {
-        if !hash.starts_with("$2a$") && !hash.starts_with("$2b$") && !hash.starts_with("$2y$") {
-            return Err("lan: invalid bcrypt hash".to_string());
-        }
+        // Validate by attempting to verify — returns Ok(false) for valid hash
+        // with wrong password, or Err for malformed hash.
+        bcrypt::verify("", &hash).map_err(|e| format!("lan: invalid bcrypt hash: {}", e))?;
         Ok(PasswordAuth { hash })
     }
 

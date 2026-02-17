@@ -54,10 +54,10 @@ type PasswordAuth struct {
 }
 
 // NewPasswordAuth creates a password authenticator from an existing bcrypt hash.
+// Accepts any valid bcrypt hash ($2a$, $2b$, $2y$, etc.).
 func NewPasswordAuth(bcryptHash string) (*PasswordAuth, error) {
-	// Verify it's a valid bcrypt hash by checking the prefix.
-	if len(bcryptHash) < 4 || bcryptHash[:4] != "$2a$" && bcryptHash[:4] != "$2b$" {
-		return nil, fmt.Errorf("lan: invalid bcrypt hash")
+	if _, err := bcrypt.Cost([]byte(bcryptHash)); err != nil {
+		return nil, fmt.Errorf("lan: invalid bcrypt hash: %w", err)
 	}
 	return &PasswordAuth{hash: []byte(bcryptHash)}, nil
 }

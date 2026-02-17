@@ -236,14 +236,6 @@ impl Device {
         unsafe { ffi::tun_close(self.handle) };
     }
 
-    /// Destroy the TUN device (free memory).
-    ///
-    /// The caller MUST ensure no concurrent read/write calls are in progress.
-    /// Normally you don't call this directly — Drop handles it.
-    pub fn destroy(&self) {
-        unsafe { ffi::tun_destroy(self.handle) };
-    }
-
     /// Get the underlying file descriptor (Unix) or HANDLE (Windows).
     pub fn raw_handle(&self) -> RawHandle {
         unsafe { ffi::tun_get_handle(self.handle) }

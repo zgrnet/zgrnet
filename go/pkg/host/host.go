@@ -106,6 +106,7 @@ type Host struct {
 
 	closeChan chan struct{}
 	closed    atomic.Bool
+	running   atomic.Bool // set by Run before starting goroutines
 	wg        sync.WaitGroup
 
 	mu    sync.RWMutex
@@ -237,7 +238,12 @@ func (h *Host) Connect(pk noise.PublicKey) error {
 // Run starts the outbound and inbound forwarding loops.
 // This call blocks until Close() is called.
 func (h *Host) Run() error {
+	// Add to wg and set running BEFORE starting goroutines.
+	// This ensures Close().wg.Wait() sees the correct count even
+	// if Close is called concurrently with Run.
 	h.wg.Add(2)
+	h.running.Store(true)
+
 	go h.outboundLoop()
 	go h.inboundLoop()
 
@@ -266,8 +272,12 @@ func (h *Host) Close() error {
 	h.tun.Close()
 	h.udp.Close()
 
-	// Step 3: Wait for outboundLoop and inboundLoop to exit.
-	h.wg.Wait()
+	// Step 3: Wait for forwarding loops only if Run() was called.
+	// If Run() was never called (or hasn't set running yet), wg is 0
+	// and we must not wait — there's nothing to wait for.
+	if h.running.Load() {
+		h.wg.Wait()
+	}
 
 	// Step 4: Now safe to free TUN memory — no concurrent users.
 	if d, ok := h.tun.(TunDestroyer); ok {

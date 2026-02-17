@@ -48,6 +48,12 @@ impl Default for MemStore {
 }
 
 impl MemStore {
+    /// Restore a member exactly as-is (preserving joined_at, labels).
+    /// Used by FileStore for rollback on save failure.
+    pub(crate) fn restore(&self, pk: Key, member: Member) {
+        self.inner.write().unwrap().insert(pk, member);
+    }
+
     pub fn new() -> Self {
         MemStore {
             inner: RwLock::new(HashMap::new()),
@@ -186,14 +192,12 @@ impl Store for FileStore {
     }
 
     fn remove(&self, pk: Key) -> Result<bool, String> {
-        let snapshot = self.mem.get(pk);
+        let snapshot = self.mem.get(pk); // full clone before remove
         let removed = self.mem.remove(pk)?;
         if removed {
             if let Err(e) = self.save() {
-                // Rollback: re-add member with original data.
                 if let Some(m) = snapshot {
-                    self.mem.add(pk).ok();
-                    self.mem.set_labels(pk, m.labels).ok();
+                    self.mem.restore(pk, m); // restore exact original
                 }
                 return Err(e);
             }
