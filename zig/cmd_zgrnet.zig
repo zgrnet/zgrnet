@@ -129,8 +129,9 @@ fn defaultConfigDir(allocator: Allocator) ![]const u8 {
     return try fmt.allocPrint(allocator, "{s}/.config/zgrnet", .{home});
 }
 
-/// Counts contexts by iterating directories that contain a config.json file.
-/// Used by context create to decide whether to auto-set current (same logic as Go/Rust).
+/// Counts contexts by iterating directories that contain a private.key file.
+/// Uses private.key as the language-agnostic context marker (Go/Rust use config.yaml,
+/// Zig uses config.json, but all three create private.key with the same format).
 fn countContexts(allocator: Allocator, base_dir: []const u8) usize {
     var dir = fs.cwd().openDir(base_dir, .{ .iterate = true }) catch return 0;
     defer dir.close();
@@ -138,9 +139,9 @@ fn countContexts(allocator: Allocator, base_dir: []const u8) usize {
     var iter = dir.iterate();
     while (iter.next() catch null) |entry| {
         if (entry.kind != .directory) continue;
-        const cfg_path = fmt.allocPrint(allocator, "{s}/{s}/config.json", .{ base_dir, entry.name }) catch continue;
-        defer allocator.free(cfg_path);
-        if (fs.cwd().access(cfg_path, .{})) |_| {
+        const key_path = fmt.allocPrint(allocator, "{s}/{s}/private.key", .{ base_dir, entry.name }) catch continue;
+        defer allocator.free(key_path);
+        if (fs.cwd().access(key_path, .{})) |_| {
             count += 1;
         } else |_| {}
     }
@@ -217,9 +218,9 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             if (entry.kind != .directory) continue;
-            const cfg_path = try fmt.allocPrint(allocator, "{s}/{s}/config.json", .{ base_dir, entry.name });
-            defer allocator.free(cfg_path);
-            if (fs.cwd().access(cfg_path, .{})) |_| {
+            const key_path = try fmt.allocPrint(allocator, "{s}/{s}/private.key", .{ base_dir, entry.name });
+            defer allocator.free(key_path);
+            if (fs.cwd().access(key_path, .{})) |_| {
                 try names.append(allocator, try allocator.dupe(u8, entry.name));
             } else |_| {}
         }
