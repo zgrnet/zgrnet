@@ -130,8 +130,9 @@ func (d *Device) Close() error {
 // The caller MUST ensure no concurrent Read/Write calls are in progress.
 // Typically called after the host's forwarding loops have exited.
 //
-// If Close() was not called before Destroy(), it is called implicitly.
+// If Close() was not called before Destroy(), it is called first.
 func (d *Device) Destroy() {
+	d.Close() // idempotent — ensures fd is closed before freeing memory
 	C.tun_destroy(d.handle)
 }
 

@@ -236,20 +236,25 @@ pub fn Server(comptime Rt: type) type {
         }
 
         /// Unsubscribes and closes the event channel.
+        /// Only frees the channel if it was actually registered.
         pub fn unsubscribe(self: *Self, ch: *EventChannel) void {
             self.sub_mutex.lock();
             defer self.sub_mutex.unlock();
 
+            var found = false;
             var it = self.subs.iterator();
             while (it.next()) |entry| {
                 if (entry.value_ptr.* == ch) {
                     _ = self.subs.remove(entry.key_ptr.*);
+                    found = true;
                     break;
                 }
             }
 
-            ch.close();
-            self.allocator.destroy(ch);
+            if (found) {
+                ch.close();
+                self.allocator.destroy(ch);
+            }
         }
 
         /// Broadcasts an event to all subscribers via trySend (non-blocking).
