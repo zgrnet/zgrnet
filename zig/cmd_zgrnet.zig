@@ -129,6 +129,24 @@ fn defaultConfigDir(allocator: Allocator) ![]const u8 {
     return try fmt.allocPrint(allocator, "{s}/.config/zgrnet", .{home});
 }
 
+/// Counts contexts by iterating directories that contain a config.json file.
+/// Used by context create to decide whether to auto-set current (same logic as Go/Rust).
+fn countContexts(allocator: Allocator, base_dir: []const u8) usize {
+    var dir = fs.cwd().openDir(base_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var count: usize = 0;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const cfg_path = fmt.allocPrint(allocator, "{s}/{s}/config.json", .{ base_dir, entry.name }) catch continue;
+        defer allocator.free(cfg_path);
+        if (fs.cwd().access(cfg_path, .{})) |_| {
+            count += 1;
+        } else |_| {}
+    }
+    return count;
+}
+
 fn contextDir(allocator: Allocator, base_dir: []const u8, name: []const u8) ![]const u8 {
     return try fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
 }
@@ -284,11 +302,11 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
             try cf.writeAll(config_template);
         }
 
-        // If this is the first context, set it as current
-        const cur_path = try fmt.allocPrint(allocator, "{s}/current", .{base_dir});
-        defer allocator.free(cur_path);
-        const has_current = if (fs.cwd().access(cur_path, .{})) |_| true else |_| false;
-        if (!has_current) {
+        // Auto-set as current if it's the first context (matches Go/Rust behavior)
+        const ctx_count = countContexts(allocator, base_dir);
+        if (ctx_count == 1) {
+            const cur_path = try fmt.allocPrint(allocator, "{s}/current", .{base_dir});
+            defer allocator.free(cur_path);
             if (fs.cwd().createFile(cur_path, .{})) |f| {
                 defer f.close();
                 f.writeAll(name) catch {};
