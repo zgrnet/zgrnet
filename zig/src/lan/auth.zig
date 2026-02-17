@@ -46,10 +46,6 @@ pub const OpenAuth = struct {
         };
     }
 
-    pub fn authenticator(self: *OpenAuth) Authenticator {
-        return self.iface;
-    }
-
     fn methodFn(_: *const Authenticator) []const u8 {
         return "open";
     }
@@ -77,10 +73,6 @@ pub const PasswordAuth = struct {
             },
             .hash = hash,
         };
-    }
-
-    pub fn authenticator(self: *PasswordAuth) Authenticator {
-        return self.iface;
     }
 
     fn methodFn(_: *const Authenticator) []const u8 {
@@ -132,10 +124,6 @@ pub const InviteCodeAuth = struct {
             self.allocator.free(k.*);
         }
         self.codes.deinit();
-    }
-
-    pub fn authenticator(self: *InviteCodeAuth) Authenticator {
-        return self.iface;
     }
 
     /// Generates a new invite code. Returns the code string (owned by the auth).
@@ -216,10 +204,6 @@ pub const PubkeyWhitelistAuth = struct {
 
     pub fn deinit(self: *PubkeyWhitelistAuth) void {
         self.allowed.deinit();
-    }
-
-    pub fn authenticator(self: *PubkeyWhitelistAuth) Authenticator {
-        return self.iface;
     }
 
     pub fn addKey(self: *PubkeyWhitelistAuth, pk: Key) void {

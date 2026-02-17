@@ -76,6 +76,7 @@ func run() error {
 	tunB, err := tun.Create("")
 	if err != nil {
 		tunA.Close()
+		tunA.Destroy()
 		return fmt.Errorf("create TUN B: %w", err)
 	}
 
@@ -92,10 +93,16 @@ func run() error {
 	log.Printf("TUN B: %s = %s/10", tunB.Name(), tunIPb)
 
 	// ── 3. Create hosts ─────────────────────────────────────────────────
+	// host.New takes ownership of the TUN device. On success, Host.Close()
+	// handles TUN shutdown + destroy. On failure, we must clean up manually.
 	hostA, err := host.New(host.Config{
 		PrivateKey: kpA, TunIPv4: ipA, MTU: mtu, ListenPort: 0,
 	}, tunA)
 	if err != nil {
+		tunA.Close()
+		tunA.Destroy()
+		tunB.Close()
+		tunB.Destroy()
 		return fmt.Errorf("create host A: %w", err)
 	}
 	hostB, err := host.New(host.Config{
@@ -103,6 +110,8 @@ func run() error {
 	}, tunB)
 	if err != nil {
 		hostA.Close()
+		tunB.Close()
+		tunB.Destroy()
 		return fmt.Errorf("create host B: %w", err)
 	}
 	log.Printf("Host A on %s, Host B on %s", hostA.LocalAddr(), hostB.LocalAddr())
