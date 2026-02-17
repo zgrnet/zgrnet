@@ -260,7 +260,7 @@ pub fn Server(comptime Rt: type) type {
             var it = self.subs.valueIterator();
             while (it.next()) |ch_ptr| {
                 // Non-blocking: drop if subscriber is slow.
-                _ = ch_ptr.*.trySend(event);
+                ch_ptr.*.trySend(event) catch {};
             }
         }
     };

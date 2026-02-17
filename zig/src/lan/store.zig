@@ -11,24 +11,24 @@ const Key = noise.Key;
 /// A LAN member.
 pub const Member = struct {
     pubkey: Key,
-    labels: std.ArrayList([]const u8),
+    labels: std.ArrayListUnmanaged([]const u8),
     joined_at_secs: i64,
 
     const Self = @This();
 
-    pub fn initMember(allocator: std.mem.Allocator, pk: Key) Self {
+    pub fn initMember(pk: Key) Self {
         return .{
             .pubkey = pk,
-            .labels = std.ArrayList([]const u8).init(allocator),
+            .labels = .{},
             .joined_at_secs = std.time.timestamp(),
         };
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
         for (self.labels.items) |label| {
-            self.labels.allocator.free(label);
+            allocator.free(label);
         }
-        self.labels.deinit();
+        self.labels.deinit(allocator);
     }
 };
 
@@ -104,7 +104,7 @@ pub const MemStore = struct {
     pub fn deinit(self: *Self) void {
         var it = self.members.valueIterator();
         while (it.next()) |m| {
-            @constCast(m).deinit();
+            @constCast(m).deinit(self.allocator);
         }
         self.members.deinit();
     }
@@ -133,7 +133,7 @@ pub const MemStore = struct {
         defer self.mutex.unlock();
 
         if (self.members.contains(pk.data)) return false;
-        self.members.put(pk.data, Member.initMember(self.allocator, pk)) catch return StoreError.OutOfMemory;
+        self.members.put(pk.data, Member.initMember(pk)) catch return StoreError.OutOfMemory;
         return true;
     }
 
@@ -145,7 +145,7 @@ pub const MemStore = struct {
         const entry = self.members.fetchRemove(pk.data);
         if (entry == null) return false;
         var m = entry.?.value;
-        m.deinit();
+        m.deinit(self.allocator);
         return true;
     }
 
@@ -184,7 +184,7 @@ pub const MemStore = struct {
 
         for (labels) |label| {
             const duped = self.allocator.dupe(u8, label) catch return StoreError.OutOfMemory;
-            m.labels.append(duped) catch {
+            m.labels.append(self.allocator, duped) catch {
                 self.allocator.free(duped);
                 return StoreError.OutOfMemory;
             };

@@ -144,7 +144,12 @@ pub const InviteCodeAuth = struct {
         std.crypto.random.bytes(&buf);
 
         var hex_buf: [32]u8 = undefined;
-        const hex = std.fmt.bufPrint(&hex_buf, "{}", .{std.fmt.fmtSliceHexLower(&buf)}) catch unreachable;
+        const hex_chars = "0123456789abcdef";
+        for (buf, 0..) |byte, i| {
+            hex_buf[i * 2] = hex_chars[byte >> 4];
+            hex_buf[i * 2 + 1] = hex_chars[byte & 0x0f];
+        }
+        const hex: []const u8 = &hex_buf;
 
         self.mutex.lock();
         defer self.mutex.unlock();
