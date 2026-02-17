@@ -367,12 +367,21 @@ func runCmd(t *testing.T, binPath string, args []string, home string) (stdout, s
 	t.Helper()
 
 	cmd := exec.Command(binPath, args...)
-	cmd.Env = append(os.Environ(),
+	// Build a clean environment: inherit parent env but remove ZGRNET_HOME
+	// (all three languages check ZGRNET_HOME before HOME) and override HOME.
+	var env []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "ZGRNET_HOME=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	env = append(env,
 		fmt.Sprintf("HOME=%s", home),
-		// Ensure consistent behavior across platforms
 		"LANG=C",
 		"LC_ALL=C",
 	)
+	cmd.Env = env
 
 	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
