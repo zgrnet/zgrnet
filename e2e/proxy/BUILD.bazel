@@ -1,21 +1,21 @@
-load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("@rules_go//go:def.bzl", "go_test")
 
 # Re-export language-specific binaries
 alias(
     name = "go",
-    actual = "//examples/proxy_test/go:proxy_test",
+    actual = "//e2e/proxy/go:proxy_test",
     visibility = ["//visibility:public"],
 )
 
 alias(
     name = "rust",
-    actual = "//examples/proxy_test/rust:proxy_test",
+    actual = "//e2e/proxy/rust:proxy_test",
     visibility = ["//visibility:public"],
 )
 
 alias(
     name = "zig",
-    actual = "//examples/proxy_test/zig:proxy_test",
+    actual = "//e2e/proxy/zig:proxy_test",
     visibility = ["//visibility:public"],
 )
 
@@ -27,20 +27,20 @@ filegroup(
 )
 
 # Cross-language proxy interop test (Go + Rust + Zig)
-sh_test(
+go_test(
     name = "interop_test",
-    srcs = ["run_bazel.sh"],
+    srcs = ["interop_test.go"],
+    importpath = "github.com/vibing/zgrnet/e2e/proxy",
     data = [
-        ":configs",
-        "//examples/proxy_test/go:proxy_test",
-        "//examples/proxy_test/rust:proxy_test",
+        "//e2e/proxy/go:proxy_test",
+        "//e2e/proxy/rust:proxy_test",
     ] + select({
-        "@platforms//os:macos": ["//examples/proxy_test/zig:proxy_test"],
+        "@platforms//os:macos": ["//e2e/proxy/zig:proxy_test"],
         "//conditions:default": [],
     }),
     tags = [
-        "local",      # Needs loopback network
-        "exclusive",  # Don't run in parallel (uses fixed ports)
+        "local",
+        "exclusive",
     ],
     timeout = "long",
     visibility = ["//visibility:public"],
