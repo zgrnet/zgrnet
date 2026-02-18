@@ -88,9 +88,7 @@ jobs:
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
           if [ -n "$TARGETS" ]; then
-            # Use tag filters to exclude targets that can't run in normal CI:
-            #   -requires-root: needs sudo (TUN, DNS port 53)
-            #   -benchmark: performance tests run in separate job
+            # Exclude requires-root (needs sudo) and benchmark (separate job)
             bazel build --skip_incompatible_explicit_targets \
               --build_tag_filters=-requires-root,-benchmark \
               $TARGETS
@@ -102,9 +100,8 @@ jobs:
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
           if [ -n "$TARGETS" ]; then
-            # Use tag filters: only run CI-safe tests, exclude root/benchmark
-            # Exit code 4 means "no test targets found", which is OK
-            # --flaky_test_attempts=3: retry flaky tests (timing-sensitive net tests)
+            # Exclude requires-root and benchmark via tag filters.
+            # Exit code 4 = no test targets found, OK.
             bazel test --skip_incompatible_explicit_targets \
               --test_tag_filters=-requires-root,-benchmark \
               --flaky_test_attempts=3 \

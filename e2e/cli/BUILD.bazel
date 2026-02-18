@@ -18,8 +18,5 @@ go_test(
     deps = [
         "@org_golang_x_crypto//curve25519",
     ],
-    tags = [
-        "e2e",
-        "e2e-ci",
-    ],
+    tags = [],
 )

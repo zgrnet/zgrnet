@@ -39,9 +39,7 @@ go_test(
         "//conditions:default": [],
     }),
     tags = [
-        "e2e",
-        "e2e-ci",
-        "requires-network",
+        "local",
         "exclusive",
     ],
     timeout = "long",

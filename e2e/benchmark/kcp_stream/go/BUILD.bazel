@@ -6,8 +6,8 @@ go_binary(
     importpath = "github.com/vibing/zgrnet/e2e/benchmark/kcp_stream/go",
     visibility = ["//visibility:public"],
     tags = [
-        "e2e",
         "benchmark",
+        "manual",
     ],
     deps = [
         "//go:noise",

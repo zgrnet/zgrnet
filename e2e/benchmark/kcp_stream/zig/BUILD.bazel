@@ -8,7 +8,7 @@ zig_binary(
     target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
     tags = [
-        "e2e",
         "benchmark",
+        "manual",
     ],
 )

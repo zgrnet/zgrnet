@@ -6,8 +6,8 @@ rust_binary(
     edition = "2021",
     visibility = ["//visibility:public"],
     tags = [
-        "e2e",
         "benchmark",
+        "manual",
     ],
     deps = [
         "//rust:zgrnet",
