@@ -5,12 +5,12 @@
 //
 // Usage:
 //
-//	bazel run //examples/node_test/runner -- \
+//	bazel run //e2e/node/runner -- \
 //	  --go=path/to/go_binary --rust=path/to/rust_binary [--zig=path/to/zig_binary]
 //
 // Or via bazel test (binaries discovered from runfiles):
 //
-//	bazel test //examples/node_test:interop_test
+//	bazel test //e2e/node:interop_test
 package main
 
 import (
@@ -72,7 +72,7 @@ func main() {
 
 	if *goBin == "" || *rustBin == "" {
 		fmt.Fprintln(os.Stderr, "error: --go and --rust are required")
-		fmt.Fprintln(os.Stderr, "  or run via: bazel test //examples/node_test:interop_test")
+		fmt.Fprintln(os.Stderr, "  or run via: bazel test //e2e/node:interop_test")
 		os.Exit(1)
 	}
 
@@ -243,19 +243,19 @@ func discoverBinaries() {
 	base := filepath.Join(runfiles, "_main")
 
 	if *goBin == "" {
-		p := filepath.Join(base, "examples/node_test/go/node_test_/node_test")
+		p := filepath.Join(base, "e2e/node/go/node_test_/node_test")
 		if _, err := os.Stat(p); err == nil {
 			*goBin = p
 		}
 	}
 	if *rustBin == "" {
-		p := filepath.Join(base, "examples/node_test/rust/node_test")
+		p := filepath.Join(base, "e2e/node/rust/node_test")
 		if _, err := os.Stat(p); err == nil {
 			*rustBin = p
 		}
 	}
 	if *zigBin == "" {
-		p := filepath.Join(base, "examples/node_test/zig/node_test")
+		p := filepath.Join(base, "e2e/node/zig/node_test")
 		if _, err := os.Stat(p); err == nil {
 			*zigBin = p
 		}

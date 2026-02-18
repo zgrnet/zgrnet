@@ -1,9 +1,9 @@
 // Cross-language Node SDK interop test.
 //
-// This test is invoked by `bazel test //examples/node_test:interop_test`.
+// This test is invoked by `bazel test //e2e/node:interop_test`.
 // It discovers Go/Rust/Zig binaries from Bazel runfiles, writes a temp
 // config, and launches opener/accepter pairs to verify echo round-trip.
-package node_test
+package node_e2e
 
 import (
 	"encoding/json"
@@ -61,8 +61,8 @@ func findBinary(t *testing.T, relPath string) string {
 }
 
 func TestGoRustInterop(t *testing.T) {
-	goBin := findBinary(t, "examples/node_test/go/node_test_/node_test")
-	rustBin := findBinary(t, "examples/node_test/rust/node_test")
+	goBin := findBinary(t, "e2e/node/go/node_test_/node_test")
+	rustBin := findBinary(t, "e2e/node/rust/node_test")
 
 	if goBin == "" {
 		t.Fatal("Go binary not found")
@@ -75,8 +75,8 @@ func TestGoRustInterop(t *testing.T) {
 }
 
 func TestGoZigInterop(t *testing.T) {
-	goBin := findBinary(t, "examples/node_test/go/node_test_/node_test")
-	zigBin := findBinary(t, "examples/node_test/zig/node_test")
+	goBin := findBinary(t, "e2e/node/go/node_test_/node_test")
+	zigBin := findBinary(t, "e2e/node/zig/node_test")
 
 	if goBin == "" {
 		t.Fatal("Go binary not found")

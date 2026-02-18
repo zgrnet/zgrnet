@@ -1,21 +1,21 @@
-load("@rules_go//go:def.bzl", "go_binary", "go_test")
+load("@rules_go//go:def.bzl", "go_test")
 
 # Re-export language-specific binaries
 alias(
     name = "go",
-    actual = "//examples/node_test/go:node_test",
+    actual = "//e2e/node/go:node_test",
     visibility = ["//visibility:public"],
 )
 
 alias(
     name = "rust",
-    actual = "//examples/node_test/rust:node_test",
+    actual = "//e2e/node/rust:node_test",
     visibility = ["//visibility:public"],
 )
 
 alias(
     name = "zig",
-    actual = "//examples/node_test/zig:node_test",
+    actual = "//e2e/node/zig:node_test",
     visibility = ["//visibility:public"],
 )
 
@@ -31,17 +31,17 @@ filegroup(
 go_test(
     name = "interop_test",
     srcs = ["interop_test.go"],
-    importpath = "github.com/vibing/zgrnet/examples/node_test",
+    importpath = "github.com/vibing/zgrnet/e2e/node",
     data = [
-        "//examples/node_test/go:node_test",
-        "//examples/node_test/rust:node_test",
+        "//e2e/node/go:node_test",
+        "//e2e/node/rust:node_test",
     ] + select({
-        "@platforms//os:macos": ["//examples/node_test/zig:node_test"],
+        "@platforms//os:macos": ["//e2e/node/zig:node_test"],
         "//conditions:default": [],
     }),
     tags = [
-        "local",      # Needs loopback network
-        "exclusive",  # Don't run in parallel (uses fixed ports)
+        "local",
+        "exclusive",
     ],
     timeout = "long",
     visibility = ["//visibility:public"],
