@@ -60,14 +60,14 @@ jobs:
           # Detect language changes for native tests
           # Include both main SDK dirs and examples
           changed=$(git diff --name-only "$BASE" HEAD 2>/dev/null || true)
-          echo "has_go=$(echo "$changed" | grep -qE '^(go/|examples/.*/go/)' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|examples/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|examples/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_go=$(echo "$changed" | grep -qE '^(go/|e2e/.*/go/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|e2e/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|e2e/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
           
           # Detect changes requiring root (TUN, host, node-host tests)
           # All targets tagged "requires-root" in BUILD.bazel need sudo to run
-          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test|go/pkg/node/|rust/src/node|examples/node_host_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_dns=$(echo "$changed" | grep -qE '^(go/pkg/dns/|rust/src/dns/|zig/src/dns/|zig/src/dnsmgr/|go/pkg/dnsmgr/|rust/src/dnsmgr/|examples/dns_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test|go/pkg/node/|rust/src/node|e2e/node_host/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_dns=$(echo "$changed" | grep -qE '^(go/pkg/dns/|rust/src/dns/|zig/src/dns/|zig/src/dnsmgr/|go/pkg/dnsmgr/|rust/src/dnsmgr/|e2e/dns/)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build and test affected targets with Bazel
   bazel:
@@ -87,20 +87,11 @@ jobs:
       - name: Build affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Filter out targets that can't run in normal CI:
-          # - requires-root: TUN/host/node-host tests (run in tun-test job with sudo)
-          # - KCP interop: Zig KCP times out on Linux CI
-          FILTERED=""
-          for t in $TARGETS; do
-            case "$t" in
-              *tun_test*|*host_test*|*node_host_test*|*smoketest*) echo "Skipping: $t (requires-root)" ;;
-              *kcp_test*interop*) echo "Skipping: $t (Zig KCP timeout on Linux)" ;;
-              *) FILTERED="$FILTERED $t" ;;
-            esac
-          done
-          echo "Building: $FILTERED"
-          if [ -n "$FILTERED" ]; then
-            bazel build --skip_incompatible_explicit_targets $FILTERED
+          if [ -n "$TARGETS" ]; then
+            # Exclude requires-root (needs sudo) and benchmark (separate job)
+            bazel build --skip_incompatible_explicit_targets \
+              --build_tag_filters=-requires-root,-benchmark \
+              $TARGETS
           else
             echo "No targets to build"
           fi
@@ -108,19 +99,14 @@ jobs:
       - name: Test affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Same filter as build step
-          FILTERED=""
-          for t in $TARGETS; do
-            case "$t" in
-              *tun_test*|*host_test*|*node_host_test*|*smoketest*) echo "Skipping: $t (requires-root)" ;;
-              *kcp_test*interop*) echo "Skipping: $t (Zig KCP timeout on Linux)" ;;
-              *) FILTERED="$FILTERED $t" ;;
-            esac
-          done
-          if [ -n "$FILTERED" ]; then
-            # Exit code 4 means "no test targets found", which is OK
-            # --flaky_test_attempts=3: retry flaky tests (timing-sensitive net tests)
-            bazel test --skip_incompatible_explicit_targets $FILTERED --test_output=errors --flaky_test_attempts=3 || [ $? -eq 4 ]
+          if [ -n "$TARGETS" ]; then
+            # Exclude requires-root and benchmark via tag filters.
+            # Exit code 4 = no test targets found, OK.
+            bazel test --skip_incompatible_explicit_targets \
+              --test_tag_filters=-requires-root,-benchmark \
+              --flaky_test_attempts=3 \
+              --test_output=errors \
+              $TARGETS || [ $? -eq 4 ]
           else
             echo "No targets to test"
           fi
@@ -299,8 +285,8 @@ jobs:
         shell: bash
         run: |
           # Build Node-Host integration test (Node dials Host with TUN)
-          bazel build //examples/node_host_test/go:run
-          sudo bazel-bin/examples/node_host_test/go/run_/run
+          bazel build //e2e/node_host/go:run
+          sudo bazel-bin/e2e/node_host/go/run_/run
 
   # DNS integration test (requires elevated privileges)
   # Tests Magic DNS server + OS resolver integration
@@ -328,9 +314,9 @@ jobs:
         working-directory: go
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            go build -o ../dns_test.exe ../examples/dns_test/go/main.go
+            go build -o ../dns_test.exe ../e2e/dns/go/main.go
           else
-            go build -o ../dns_test ../examples/dns_test/go/main.go
+            go build -o ../dns_test ../e2e/dns/go/main.go
           fi
 
       - name: Run DNS test (Unix)

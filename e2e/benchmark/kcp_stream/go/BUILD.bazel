@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "stream_test",
+    srcs = ["main.go"],
+    importpath = "github.com/vibing/zgrnet/e2e/benchmark/kcp_stream/go",
+    visibility = ["//visibility:public"],
+    tags = [
+        "benchmark",
+        "manual",
+    ],
+    deps = [
+        "//go:noise",
+        "//go/pkg/net",
+    ],
+)

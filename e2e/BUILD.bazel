@@ -1,1 +1,34 @@
-# End-to-end tests
+# End-to-end tests and benchmarks.
+#
+# Tag system (two custom tags + Bazel built-ins):
+#
+#   requires-root    - Needs sudo (TUN, DNS port 53). Always paired with manual.
+#   benchmark        - Performance benchmark. Always paired with manual.
+#   manual           - (Bazel built-in) Excluded from `bazel test //...`.
+#   local            - (Bazel built-in) No sandbox, for network access.
+#   exclusive        - (Bazel built-in) No parallel execution (fixed ports).
+#
+# Rule: requires-root or benchmark → must also have manual.
+#
+# CI usage:
+#
+#   # Normal CI — manual excludes root and benchmark automatically
+#   bazel test //e2e/...
+#
+#   # Root job (sudo) — query discovers all requires-root targets
+#   bazel test $(bazel query 'attr(tags, "requires-root", tests(//e2e/...))')
+#
+#   # Benchmark job
+#   bazel test $(bazel query 'attr(tags, "benchmark", tests(//e2e/...))')
+#
+# Directory layout:
+#
+#   kcp/          KCP stream cross-language interop      [local, exclusive]
+#   proxy/        Proxy cross-language interop           [local, exclusive]
+#   node/         Node SDK cross-language interop        [local, exclusive]
+#   cli/          CLI binary cross-language interop
+#   node_host/    Node + Host TUN integration            [requires-root, manual]
+#   dns/          Magic DNS integration                  [requires-root, manual]
+#   lan/          LAN service integration                [requires-root, manual]
+#   udp/          UDP layer cross-language interop
+#   benchmark/    Performance benchmarks                 [benchmark, manual]

@@ -1,18 +1,19 @@
 load("@rules_go//go:def.bzl", "go_binary")
 
 go_binary(
-    name = "lan_e2e",
-    srcs = ["run.go"],
-    importpath = "github.com/vibing/zgrnet/e2e/lan/go",
+    name = "run",
+    srcs = ["main.go"],
+    importpath = "github.com/vibing/zgrnet/e2e/node_host/go",
     visibility = ["//visibility:public"],
     tags = [
         "requires-root",
         "manual",
     ],
     deps = [
-        "//go/pkg/host",
-        "//go/pkg/lan",
         "//go:noise",
+        "//go/pkg/host",
+        "//go/pkg/net",
+        "//go/pkg/node",
         "//go/pkg/tun",
     ],
 )

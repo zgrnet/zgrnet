@@ -1,0 +1,47 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+# Re-export language-specific binaries
+alias(
+    name = "go",
+    actual = "//e2e/proxy/go:proxy_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "rust",
+    actual = "//e2e/proxy/rust:proxy_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "zig",
+    actual = "//e2e/proxy/zig:proxy_test",
+    visibility = ["//visibility:public"],
+)
+
+# Test data files
+filegroup(
+    name = "configs",
+    srcs = ["config.json"],
+    visibility = ["//visibility:public"],
+)
+
+# Cross-language proxy interop test (Go + Rust + Zig)
+go_test(
+    name = "interop_test",
+    srcs = ["interop_test.go"],
+    importpath = "github.com/vibing/zgrnet/e2e/proxy",
+    data = [
+        "//e2e/proxy/go:proxy_test",
+        "//e2e/proxy/rust:proxy_test",
+    ] + select({
+        "@platforms//os:macos": ["//e2e/proxy/zig:proxy_test"],
+        "//conditions:default": [],
+    }),
+    tags = [
+        "local",
+        "exclusive",
+    ],
+    timeout = "long",
+    visibility = ["//visibility:public"],
+)
