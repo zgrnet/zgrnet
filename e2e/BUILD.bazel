@@ -1,1 +1,12 @@
-# End-to-end tests
+# End-to-end tests and benchmarks.
+#
+# Structure:
+#   e2e/kcp/          - KCP stream cross-language interop
+#   e2e/proxy/        - Proxy cross-language interop
+#   e2e/node/         - Node SDK cross-language interop
+#   e2e/node_host/    - Node + Host TUN integration (requires root)
+#   e2e/dns/          - Magic DNS integration (requires root)
+#   e2e/udp/          - UDP layer cross-language interop
+#   e2e/cli/          - CLI binary cross-language interop
+#   e2e/lan/          - LAN service integration (requires root)
+#   e2e/benchmark/    - Performance benchmarks
