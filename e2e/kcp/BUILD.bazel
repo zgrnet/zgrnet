@@ -1,0 +1,52 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+# Re-export language-specific binaries for easy access
+alias(
+    name = "go",
+    actual = "//e2e/kcp/go:kcp_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "rust",
+    actual = "//e2e/kcp/rust:kcp_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "zig",
+    actual = "//e2e/kcp/zig:kcp_test",
+    visibility = ["//visibility:public"],
+)
+
+# Test data files
+filegroup(
+    name = "configs",
+    srcs = [
+        "config.json",
+        "config_full.json",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# Cross-language KCP interop test.
+# Go test runner discovers and launches Go/Rust/Zig binaries in pairs.
+go_test(
+    name = "interop_test",
+    srcs = ["interop_test.go"],
+    importpath = "github.com/vibing/zgrnet/e2e/kcp",
+    data = [
+        "//e2e/kcp/go:kcp_test",
+        "//e2e/kcp/rust:kcp_test",
+    ] + select({
+        "@platforms//os:macos": ["//e2e/kcp/zig:kcp_test"],
+        "//conditions:default": [],
+    }),
+    tags = [
+        "local",
+        "exclusive",
+        "manual",
+    ],
+    timeout = "long",
+    visibility = ["//visibility:public"],
+)
