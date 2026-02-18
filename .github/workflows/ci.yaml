@@ -60,14 +60,14 @@ jobs:
           # Detect language changes for native tests
           # Include both main SDK dirs and examples
           changed=$(git diff --name-only "$BASE" HEAD 2>/dev/null || true)
-          echo "has_go=$(echo "$changed" | grep -qE '^(go/|examples/.*/go/)' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|examples/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|examples/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_go=$(echo "$changed" | grep -qE '^(go/|e2e/.*/go/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|e2e/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|e2e/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
           
           # Detect changes requiring root (TUN, host, node-host tests)
           # All targets tagged "requires-root" in BUILD.bazel need sudo to run
-          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test|go/pkg/node/|rust/src/node|examples/node_host_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_dns=$(echo "$changed" | grep -qE '^(go/pkg/dns/|rust/src/dns/|zig/src/dns/|zig/src/dnsmgr/|go/pkg/dnsmgr/|rust/src/dnsmgr/|examples/dns_test/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/|go/pkg/host/|go/examples/host_test/|rust/src/host/|rust/examples/host_test|go/pkg/node/|rust/src/node|e2e/node_host/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_dns=$(echo "$changed" | grep -qE '^(go/pkg/dns/|rust/src/dns/|zig/src/dns/|zig/src/dnsmgr/|go/pkg/dnsmgr/|rust/src/dnsmgr/|e2e/dns/)' && echo true || echo false)" >> $GITHUB_OUTPUT
 
   # Build and test affected targets with Bazel
   bazel:
@@ -299,8 +299,8 @@ jobs:
         shell: bash
         run: |
           # Build Node-Host integration test (Node dials Host with TUN)
-          bazel build //examples/node_host_test/go:run
-          sudo bazel-bin/examples/node_host_test/go/run_/run
+          bazel build //e2e/node_host/go:run
+          sudo bazel-bin/e2e/node_host/go/run_/run
 
   # DNS integration test (requires elevated privileges)
   # Tests Magic DNS server + OS resolver integration
@@ -328,9 +328,9 @@ jobs:
         working-directory: go
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            go build -o ../dns_test.exe ../examples/dns_test/go/main.go
+            go build -o ../dns_test.exe ../e2e/dns/go/main.go
           else
-            go build -o ../dns_test ../examples/dns_test/go/main.go
+            go build -o ../dns_test ../e2e/dns/go/main.go
           fi
 
       - name: Run DNS test (Unix)

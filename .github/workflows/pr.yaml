@@ -54,9 +54,9 @@ jobs:
           # Detect language changes for native tests
           # Include both main SDK dirs and examples
           changed=$(git diff --name-only "$BASE" HEAD)
-          echo "has_go=$(echo "$changed" | grep -qE '^(go/|examples/.*/go/)' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|examples/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|examples/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_go=$(echo "$changed" | grep -qE '^(go/|e2e/.*/go/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_rust=$(echo "$changed" | grep -qE '^(rust/|e2e/.*/rust/)' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_zig=$(echo "$changed" | grep -qE '^(zig/|e2e/.*/zig/)' && echo true || echo false)" >> $GITHUB_OUTPUT
           
           # Detect TUN-specific changes (requires root privileges to test)
           echo "has_tun=$(echo "$changed" | grep -qE '^(zig/src/tun/|go/pkg/tun/|rust/src/tun/)' && echo true || echo false)" >> $GITHUB_OUTPUT
