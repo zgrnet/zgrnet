@@ -1,0 +1,7 @@
+# Raw UDP throughput benchmarks (single-language, single-process).
+# Each language creates two local peers and measures Noise-encrypted
+# UDP throughput without KCP.
+
+# Source files exported for SDK-level builds.
+# Proper Bazel binary targets can be added when needed.
+exports_files(glob(["**/*.go", "**/*.rs", "**/*.zig"]))
