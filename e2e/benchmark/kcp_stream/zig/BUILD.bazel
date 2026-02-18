@@ -7,4 +7,8 @@ zig_binary(
     deps = ["//zig:noise"],
     target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
+    tags = [
+        "e2e",
+        "benchmark",
+    ],
 )

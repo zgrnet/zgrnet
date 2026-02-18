@@ -87,20 +87,13 @@ jobs:
       - name: Build affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Filter out targets that can't run in normal CI:
-          # - requires-root: TUN/host/node-host tests (run in tun-test job with sudo)
-          # - KCP interop: Zig KCP times out on Linux CI
-          FILTERED=""
-          for t in $TARGETS; do
-            case "$t" in
-              *tun_test*|*host_test*|*node_host_test*|*smoketest*) echo "Skipping: $t (requires-root)" ;;
-              *kcp_test*interop*) echo "Skipping: $t (Zig KCP timeout on Linux)" ;;
-              *) FILTERED="$FILTERED $t" ;;
-            esac
-          done
-          echo "Building: $FILTERED"
-          if [ -n "$FILTERED" ]; then
-            bazel build --skip_incompatible_explicit_targets $FILTERED
+          if [ -n "$TARGETS" ]; then
+            # Use tag filters to exclude targets that can't run in normal CI:
+            #   -requires-root: needs sudo (TUN, DNS port 53)
+            #   -benchmark: performance tests run in separate job
+            bazel build --skip_incompatible_explicit_targets \
+              --build_tag_filters=-requires-root,-benchmark \
+              $TARGETS
           else
             echo "No targets to build"
           fi
@@ -108,19 +101,15 @@ jobs:
       - name: Test affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Same filter as build step
-          FILTERED=""
-          for t in $TARGETS; do
-            case "$t" in
-              *tun_test*|*host_test*|*node_host_test*|*smoketest*) echo "Skipping: $t (requires-root)" ;;
-              *kcp_test*interop*) echo "Skipping: $t (Zig KCP timeout on Linux)" ;;
-              *) FILTERED="$FILTERED $t" ;;
-            esac
-          done
-          if [ -n "$FILTERED" ]; then
+          if [ -n "$TARGETS" ]; then
+            # Use tag filters: only run CI-safe tests, exclude root/benchmark
             # Exit code 4 means "no test targets found", which is OK
             # --flaky_test_attempts=3: retry flaky tests (timing-sensitive net tests)
-            bazel test --skip_incompatible_explicit_targets $FILTERED --test_output=errors --flaky_test_attempts=3 || [ $? -eq 4 ]
+            bazel test --skip_incompatible_explicit_targets \
+              --test_tag_filters=-requires-root,-benchmark \
+              --flaky_test_attempts=3 \
+              --test_output=errors \
+              $TARGETS || [ $? -eq 4 ]
           else
             echo "No targets to test"
           fi

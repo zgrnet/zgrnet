@@ -5,7 +5,11 @@ go_binary(
     srcs = ["main.go"],
     importpath = "github.com/vibing/zgrnet/e2e/node_host/go",
     visibility = ["//visibility:public"],
-    tags = ["requires-root"],
+    tags = [
+        "e2e",
+        "requires-root",
+        "requires-network",
+    ],
     deps = [
         "//go:noise",
         "//go/pkg/host",

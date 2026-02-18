@@ -5,6 +5,10 @@ go_binary(
     srcs = ["main.go"],
     importpath = "github.com/vibing/zgrnet/e2e/benchmark/kcp_stream/go",
     visibility = ["//visibility:public"],
+    tags = [
+        "e2e",
+        "benchmark",
+    ],
     deps = [
         "//go:noise",
         "//go/pkg/net",

@@ -80,18 +80,10 @@ jobs:
       - name: Build affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Filter out targets that can't run in normal CI
-          FILTERED=""
-          for t in $TARGETS; do
-            case "$t" in
-              *tun_test*) echo "Skipping TUN test: $t (requires root)" ;;
-              *interop_test*) echo "Skipping interop test: $t (Zig KCP timeout)" ;;
-              *) FILTERED="$FILTERED $t" ;;
-            esac
-          done
-          echo "Building: $FILTERED"
-          if [ -n "$FILTERED" ]; then
-            bazel build --skip_incompatible_explicit_targets $FILTERED
+          if [ -n "$TARGETS" ]; then
+            bazel build --skip_incompatible_explicit_targets \
+              --build_tag_filters=-requires-root,-benchmark \
+              $TARGETS
           else
             echo "No targets to build"
           fi
@@ -115,19 +107,12 @@ jobs:
       - name: Test affected targets
         run: |
           TARGETS="${{ needs.affected.outputs.targets }}"
-          # Filter out targets that can't run in normal CI
-          FILTERED=""
-          for t in $TARGETS; do
-            case "$t" in
-              *tun_test*) echo "Skipping TUN test: $t (requires root)" ;;
-              *interop_test*) echo "Skipping interop test: $t (Zig KCP timeout)" ;;
-              *) FILTERED="$FILTERED $t" ;;
-            esac
-          done
-          if [ -n "$FILTERED" ]; then
-            # Exit code 4 means "no test targets found", which is OK
-            # --flaky_test_attempts=3: retry flaky tests (timing-sensitive net tests)
-            bazel test --skip_incompatible_explicit_targets $FILTERED --test_output=errors --flaky_test_attempts=3 || [ $? -eq 4 ]
+          if [ -n "$TARGETS" ]; then
+            bazel test --skip_incompatible_explicit_targets \
+              --test_tag_filters=-requires-root,-benchmark \
+              --flaky_test_attempts=3 \
+              --test_output=errors \
+              $TARGETS || [ $? -eq 4 ]
           else
             echo "No targets to test"
           fi

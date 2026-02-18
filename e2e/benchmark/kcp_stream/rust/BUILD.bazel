@@ -5,6 +5,10 @@ rust_binary(
     srcs = ["src/main.rs"],
     edition = "2021",
     visibility = ["//visibility:public"],
+    tags = [
+        "e2e",
+        "benchmark",
+    ],
     deps = [
         "//rust:zgrnet",
         "@crates//:hex",

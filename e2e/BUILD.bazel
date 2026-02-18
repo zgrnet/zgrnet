@@ -1,12 +1,36 @@
 # End-to-end tests and benchmarks.
 #
-# Structure:
-#   e2e/kcp/          - KCP stream cross-language interop
-#   e2e/proxy/        - Proxy cross-language interop
-#   e2e/node/         - Node SDK cross-language interop
-#   e2e/node_host/    - Node + Host TUN integration (requires root)
-#   e2e/dns/          - Magic DNS integration (requires root)
-#   e2e/udp/          - UDP layer cross-language interop
-#   e2e/cli/          - CLI binary cross-language interop
-#   e2e/lan/          - LAN service integration (requires root)
-#   e2e/benchmark/    - Performance benchmarks
+# Tag system:
+#
+#   e2e              - All e2e targets (tests + benchmarks)
+#   e2e-ci           - Safe to run in normal CI (no root, no special hardware)
+#   requires-root    - Needs sudo/root (TUN devices, DNS port 53, etc.)
+#   requires-network - Needs loopback network (ports, UDP sockets)
+#   benchmark        - Performance benchmarks (separate CI job, not in normal CI)
+#   exclusive        - Must not run in parallel with other tests (fixed ports)
+#
+# CI usage:
+#
+#   # Run all CI-safe e2e tests:
+#   bazel test //e2e/... --test_tag_filters=e2e-ci
+#
+#   # Run root-required tests (with sudo):
+#   bazel test //e2e/... --test_tag_filters=requires-root
+#
+#   # Run benchmarks:
+#   bazel test //e2e/... --test_tag_filters=benchmark
+#
+#   # Run everything:
+#   bazel test //e2e/... --test_tag_filters=e2e
+#
+# Directory structure:
+#
+#   e2e/kcp/          - KCP stream cross-language interop      [e2e-ci]
+#   e2e/proxy/        - Proxy cross-language interop           [e2e-ci]
+#   e2e/node/         - Node SDK cross-language interop        [e2e-ci]
+#   e2e/cli/          - CLI binary cross-language interop      [e2e-ci]
+#   e2e/node_host/    - Node + Host TUN integration            [requires-root]
+#   e2e/dns/          - Magic DNS integration                  [requires-root]
+#   e2e/lan/          - LAN service integration                [requires-root]
+#   e2e/udp/          - UDP layer cross-language interop       [e2e-ci] (TODO)
+#   e2e/benchmark/    - Performance benchmarks                 [benchmark]
