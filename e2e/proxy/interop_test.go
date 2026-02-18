@@ -105,6 +105,32 @@ func TestZigGoProxy(t *testing.T) {
 	runPairTest(t, zigBin, goBin, "zig", "go")
 }
 
+func TestRustZigProxy(t *testing.T) {
+	rustBin := requireBin(t, "e2e/proxy/rust/proxy_test", "Rust")
+	zigBin := findBinary(t, "e2e/proxy/zig/proxy_test")
+	if zigBin == "" {
+		t.Skip("Zig binary not available on this platform")
+	}
+	runPairTest(t, rustBin, zigBin, "rust", "zig")
+}
+
+func TestZigRustProxy(t *testing.T) {
+	zigBin := findBinary(t, "e2e/proxy/zig/proxy_test")
+	if zigBin == "" {
+		t.Skip("Zig binary not available on this platform")
+	}
+	rustBin := requireBin(t, "e2e/proxy/rust/proxy_test", "Rust")
+	runPairTest(t, zigBin, rustBin, "zig", "rust")
+}
+
+func TestZigZigProxy(t *testing.T) {
+	zigBin := findBinary(t, "e2e/proxy/zig/proxy_test")
+	if zigBin == "" {
+		t.Skip("Zig binary not available on this platform")
+	}
+	runPairTest(t, zigBin, zigBin, "zig", "zig")
+}
+
 func requireBin(t *testing.T, relPath, name string) string {
 	t.Helper()
 	bin := findBinary(t, relPath)
