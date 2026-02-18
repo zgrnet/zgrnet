@@ -1,0 +1,21 @@
+# KCP Stream throughput benchmarks (single-language, single-process).
+# Each language creates two local peers and measures bidirectional
+# KCP stream throughput.
+
+alias(
+    name = "go",
+    actual = "//e2e/benchmark/kcp_stream/go:stream_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "rust",
+    actual = "//e2e/benchmark/kcp_stream/rust:stream_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "zig",
+    actual = "//e2e/benchmark/kcp_stream/zig:stream_test",
+    visibility = ["//visibility:public"],
+)
