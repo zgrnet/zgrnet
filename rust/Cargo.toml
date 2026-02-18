@@ -57,7 +57,7 @@ path = "examples/host_test.rs"
 
 [[example]]
 name = "throughput_rust"
-path = "../examples/throughput/rust/main.rs"
+path = "../e2e/benchmark/udp/rust/main.rs"
 
 [[bin]]
 name = "zgrnet"
@@ -68,5 +68,5 @@ name = "zgrnetd"
 path = "src/bin/zgrnetd.rs"
 required-features = ["tun", "dnsmgr"]
 
-# Note: stream_test and kcp_interop moved to examples/stream_test/rust/ and examples/kcp_test/rust/
+# Note: stream_test and kcp_interop moved to e2e/benchmark/kcp_stream/rust/ and e2e/kcp/rust/
 # Note: async_bench removed — async module migrated to embed-zig (#22)
