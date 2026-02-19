@@ -18,6 +18,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -37,7 +38,9 @@ import (
 	"github.com/vibing/zgrnet/pkg/dns"
 	"github.com/vibing/zgrnet/pkg/dnsmgr"
 	"github.com/vibing/zgrnet/pkg/host"
+	"github.com/vibing/zgrnet/pkg/kcp"
 	"github.com/vibing/zgrnet/pkg/lan"
+	"github.com/vibing/zgrnet/pkg/listener"
 	znet "github.com/vibing/zgrnet/pkg/net"
 	"github.com/vibing/zgrnet/pkg/noise"
 	"github.com/vibing/zgrnet/pkg/proxy"
@@ -323,13 +326,29 @@ func run(cfgPath string) error {
 	}()
 	defer proxySrv.Close()
 
-	// ── 11. Accept incoming TCP_PROXY streams (exit node) ────────────────
-	// For each peer, accept KCP streams with proto=69 and handle them
-	// by dialing the real TCP target and relaying.
+	// ── 11. Create Handler Registry + Control Socket ─────────────────────
+	handlerDir := filepath.Join(dataDir, "handlers")
+	if err := os.MkdirAll(handlerDir, 0700); err != nil {
+		return fmt.Errorf("create handler dir: %w", err)
+	}
+	registry := listener.NewRegistry(handlerDir)
+
+	controlSockPath := filepath.Join(dataDir, "control.sock")
+	os.Remove(controlSockPath)
+	controlLn, err := net.Listen("unix", controlSockPath)
+	if err != nil {
+		return fmt.Errorf("listen control socket: %w", err)
+	}
+	defer controlLn.Close()
+
+	go serveControlSocket(controlLn, registry)
+	log.Printf("control socket: %s", controlSockPath)
+
+	// ── 11b. Accept incoming streams via registry dispatch ────────────
 	for domain := range cfg.Peers {
 		hexPK, _ := pubkeyFromDomain(domain)
 		pk, _ := noise.KeyFromHex(hexPK)
-		go acceptTCPProxyStreams(udpTransport, pk)
+		go acceptAndDispatch(udpTransport, pk, registry)
 	}
 
 	// ── 12. Start LAN service + RESTful API server ─────────────────────
@@ -360,6 +379,7 @@ func run(cfgPath string) error {
 		DNSServer:   dnsServer,
 		ProxyServer: proxySrv,
 		LanHandler:  lanServer.Handler(),
+		Registry:    registry,
 	})
 
 	go func() {
@@ -414,25 +434,103 @@ func run(cfgPath string) error {
 	return nil
 }
 
-// acceptTCPProxyStreams accepts incoming KCP streams from a peer and handles
-// TCP_PROXY (proto=69) by dialing the real target and relaying traffic.
-// This makes this node an "exit node" for the peer's proxy traffic.
-func acceptTCPProxyStreams(udp *znet.UDP, pk noise.PublicKey) {
+// acceptAndDispatch accepts incoming KCP streams from a peer and dispatches
+// them to registered handlers via the registry. Unregistered protos are rejected.
+func acceptAndDispatch(udp *znet.UDP, pk noise.PublicKey, registry *listener.Registry) {
 	for {
 		stream, err := udp.AcceptStream(pk)
 		if err != nil {
-			return // peer gone or UDP closed
+			return
 		}
-		if stream.Proto() != noise.ProtocolTCPProxy {
+
+		h := registry.Lookup(stream.Proto())
+		if h == nil {
+			log.Printf("stream from %s: no handler for proto %d, rejecting",
+				pk.ShortString(), stream.Proto())
 			stream.Close()
 			continue
 		}
-		go func() {
-			if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
-				log.Printf("tcp_proxy from %s: %v", pk.ShortString(), err)
-			}
-		}()
+
+		go relayToHandler(stream, pk, h)
 	}
+}
+
+// relayToHandler connects to a handler's socket, sends the stream header,
+// and relays data bidirectionally between the KCP stream and the handler.
+func relayToHandler(stream *kcp.Stream, pk noise.PublicKey, h *listener.Handler) {
+	defer stream.Close()
+
+	h.AddActive(1)
+	defer h.AddActive(-1)
+
+	conn, err := listener.ConnectHandler(h)
+	if err != nil {
+		log.Printf("handler %q connect: %v", h.Name, err)
+		return
+	}
+	defer conn.Close()
+
+	var pubkey [32]byte
+	copy(pubkey[:], pk[:])
+
+	if err := listener.WriteStreamHeader(conn, pubkey, stream.Proto(), stream.Metadata()); err != nil {
+		log.Printf("handler %q write header: %v", h.Name, err)
+		return
+	}
+
+	proxy.Relay(stream, conn)
+}
+
+// serveControlSocket accepts Listener SDK registration requests on the
+// control Unix socket and registers handlers in the registry.
+func serveControlSocket(ln net.Listener, registry *listener.Registry) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go handleControlConn(conn, registry)
+	}
+}
+
+func handleControlConn(conn net.Conn, registry *listener.Registry) {
+	defer conn.Close()
+
+	var req struct {
+		Proto byte          `json:"proto"`
+		Name  string        `json:"name"`
+		Mode  listener.Mode `json:"mode"`
+	}
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		writeControlResponse(conn, "", fmt.Sprintf("invalid request: %v", err))
+		return
+	}
+
+	if req.Mode == "" {
+		req.Mode = listener.ModeStream
+	}
+
+	h, err := registry.Register(req.Proto, req.Name, req.Mode, "")
+	if err != nil {
+		writeControlResponse(conn, "", err.Error())
+		return
+	}
+
+	log.Printf("handler registered: %s (proto=%d, mode=%s, sock=%s)",
+		h.Name, h.Proto, h.Mode, h.Sock)
+
+	writeControlResponse(conn, h.Sock, "")
+}
+
+func writeControlResponse(conn net.Conn, sock, errMsg string) {
+	resp := struct {
+		Sock  string `json:"sock,omitempty"`
+		Error string `json:"error,omitempty"`
+	}{
+		Sock:  sock,
+		Error: errMsg,
+	}
+	json.NewEncoder(conn).Encode(resp)
 }
 
 // loadOrGenerateKey reads a Noise private key from file, or generates one

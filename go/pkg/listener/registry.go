@@ -54,6 +54,11 @@ func (h *Handler) Active() int64 {
 	return h.active.Load()
 }
 
+// AddActive adjusts the active connection count by delta.
+func (h *Handler) AddActive(delta int64) {
+	h.active.Add(delta)
+}
+
 // HandlerInfo is the JSON-friendly view of a handler.
 type HandlerInfo struct {
 	Proto  byte   `json:"proto"`
