@@ -280,6 +280,24 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             };
         }
 
+        /// Connect to a remote peer through a relay and open a KCP stream.
+        pub fn dialRelay(self: *Self, dst: *const Key, relay_pk: *const Key, port: u16) !NodeStream {
+            if (self.getState() != .running) return error.NotRunning;
+
+            if (self.udp.getRouteTable()) |rt| {
+                rt.addRoute(dst.data, relay_pk.data);
+            }
+
+            try self.addPeer(.{ .public_key = dst.*, .endpoint = null });
+
+            return self.dial(dst, port);
+        }
+
+        /// Returns the node's route table, or null if none.
+        pub fn routeTable(self: *Self) ?*@import("relay/route.zig").RouteTable {
+            return self.udp.getRouteTable();
+        }
+
         /// Accept a stream from any peer (blocking).
         pub fn acceptStream(self: *Self) ?NodeStream {
             self.accept_mutex.lock();

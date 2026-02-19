@@ -366,8 +366,9 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
         // Options
         allow_unknown: bool,
 
-        // Relay forwarding
-        router: ?relay_mod.Router,
+        // Relay routing and forwarding
+        router: ?relay_mod.Router, // kept for relay engine forwarding
+        route_table: ?*relay_mod.RouteTable, // for outbound relay wrapping
         local_metrics: relay_mod.NodeMetrics,
 
         // Peer management
@@ -466,6 +467,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 .local_port = local_port,
                 .allow_unknown = options.allow_unknown,
                 .router = null,
+                .route_table = null,
                 .local_metrics = .{},
                 .peers_mutex = Rt.Mutex.init(),
                 .peers = std.AutoHashMap([32]u8, *PeerState).init(allocator),
@@ -588,6 +590,17 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
         /// Set the relay router for forwarding relay packets.
         pub fn setRouter(self: *Self, router: relay_mod.Router) void {
             self.router = router;
+        }
+
+        /// Set the route table for relay forwarding and outbound wrapping.
+        pub fn setRouteTable(self: *Self, rt: *relay_mod.RouteTable) void {
+            self.route_table = rt;
+            self.router = rt.router();
+        }
+
+        /// Get the current route table.
+        pub fn getRouteTable(self: *Self) ?*relay_mod.RouteTable {
+            return self.route_table;
         }
 
         /// Update the local node metrics for PONG responses.
