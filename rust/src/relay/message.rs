@@ -246,6 +246,135 @@ pub fn decode_pong(data: &[u8]) -> Result<Pong, RelayError> {
 }
 
 // ============================================================================
+// BIND/ALIAS messages
+// ============================================================================
+
+/// BIND/ALIAS header sizes (excluding protocol byte).
+pub const RELAY0_BIND_SIZE: usize = 4 + 32;      // relay_id + dst_key
+pub const RELAY0_ALIAS_MIN: usize = 4;            // relay_id (+ var payload)
+pub const RELAY1_BIND_SIZE: usize = 4 + 32 + 32;  // relay_id + src_key + dst_key
+pub const RELAY1_ALIAS_MIN: usize = 4;
+pub const RELAY2_BIND_SIZE: usize = 4 + 32;       // relay_id + src_key
+pub const RELAY2_ALIAS_MIN: usize = 4;
+
+#[derive(Debug, Clone)]
+pub struct Relay0Bind { pub relay_id: u32, pub dst_key: [u8; 32] }
+
+#[derive(Debug, Clone)]
+pub struct Relay0Alias { pub relay_id: u32, pub payload: Vec<u8> }
+
+#[derive(Debug, Clone)]
+pub struct Relay1Bind { pub relay_id: u32, pub src_key: [u8; 32], pub dst_key: [u8; 32] }
+
+#[derive(Debug, Clone)]
+pub struct Relay1Alias { pub relay_id: u32, pub payload: Vec<u8> }
+
+#[derive(Debug, Clone)]
+pub struct Relay2Bind { pub relay_id: u32, pub src_key: [u8; 32] }
+
+#[derive(Debug, Clone)]
+pub struct Relay2Alias { pub relay_id: u32, pub payload: Vec<u8> }
+
+pub fn encode_relay0_bind(r: &Relay0Bind) -> Vec<u8> {
+    let mut buf = vec![0u8; RELAY0_BIND_SIZE];
+    buf[0..4].copy_from_slice(&r.relay_id.to_le_bytes());
+    buf[4..36].copy_from_slice(&r.dst_key);
+    buf
+}
+
+pub fn decode_relay0_bind(data: &[u8]) -> Result<Relay0Bind, RelayError> {
+    if data.len() < RELAY0_BIND_SIZE { return Err(RelayError::TooShort); }
+    let mut dst_key = [0u8; 32];
+    dst_key.copy_from_slice(&data[4..36]);
+    Ok(Relay0Bind {
+        relay_id: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        dst_key,
+    })
+}
+
+pub fn encode_relay0_alias(r: &Relay0Alias) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + r.payload.len());
+    buf.extend_from_slice(&r.relay_id.to_le_bytes());
+    buf.extend_from_slice(&r.payload);
+    buf
+}
+
+pub fn decode_relay0_alias(data: &[u8]) -> Result<Relay0Alias, RelayError> {
+    if data.len() < RELAY0_ALIAS_MIN { return Err(RelayError::TooShort); }
+    Ok(Relay0Alias {
+        relay_id: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        payload: data[4..].to_vec(),
+    })
+}
+
+pub fn encode_relay1_bind(r: &Relay1Bind) -> Vec<u8> {
+    let mut buf = vec![0u8; RELAY1_BIND_SIZE];
+    buf[0..4].copy_from_slice(&r.relay_id.to_le_bytes());
+    buf[4..36].copy_from_slice(&r.src_key);
+    buf[36..68].copy_from_slice(&r.dst_key);
+    buf
+}
+
+pub fn decode_relay1_bind(data: &[u8]) -> Result<Relay1Bind, RelayError> {
+    if data.len() < RELAY1_BIND_SIZE { return Err(RelayError::TooShort); }
+    let mut src_key = [0u8; 32];
+    let mut dst_key = [0u8; 32];
+    src_key.copy_from_slice(&data[4..36]);
+    dst_key.copy_from_slice(&data[36..68]);
+    Ok(Relay1Bind {
+        relay_id: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        src_key, dst_key,
+    })
+}
+
+pub fn encode_relay1_alias(r: &Relay1Alias) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + r.payload.len());
+    buf.extend_from_slice(&r.relay_id.to_le_bytes());
+    buf.extend_from_slice(&r.payload);
+    buf
+}
+
+pub fn decode_relay1_alias(data: &[u8]) -> Result<Relay1Alias, RelayError> {
+    if data.len() < RELAY1_ALIAS_MIN { return Err(RelayError::TooShort); }
+    Ok(Relay1Alias {
+        relay_id: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        payload: data[4..].to_vec(),
+    })
+}
+
+pub fn encode_relay2_bind(r: &Relay2Bind) -> Vec<u8> {
+    let mut buf = vec![0u8; RELAY2_BIND_SIZE];
+    buf[0..4].copy_from_slice(&r.relay_id.to_le_bytes());
+    buf[4..36].copy_from_slice(&r.src_key);
+    buf
+}
+
+pub fn decode_relay2_bind(data: &[u8]) -> Result<Relay2Bind, RelayError> {
+    if data.len() < RELAY2_BIND_SIZE { return Err(RelayError::TooShort); }
+    let mut src_key = [0u8; 32];
+    src_key.copy_from_slice(&data[4..36]);
+    Ok(Relay2Bind {
+        relay_id: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        src_key,
+    })
+}
+
+pub fn encode_relay2_alias(r: &Relay2Alias) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + r.payload.len());
+    buf.extend_from_slice(&r.relay_id.to_le_bytes());
+    buf.extend_from_slice(&r.payload);
+    buf
+}
+
+pub fn decode_relay2_alias(data: &[u8]) -> Result<Relay2Alias, RelayError> {
+    if data.len() < RELAY2_ALIAS_MIN { return Err(RelayError::TooShort); }
+    Ok(Relay2Alias {
+        relay_id: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        payload: data[4..].to_vec(),
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -357,6 +486,90 @@ mod tests {
         assert_eq!(Strategy::from(0), Strategy::Auto);
         assert_eq!(Strategy::from(1), Strategy::Fastest);
         assert_eq!(Strategy::from(2), Strategy::Cheapest);
-        assert_eq!(Strategy::from(255), Strategy::Auto); // unknown defaults to Auto
+        assert_eq!(Strategy::from(255), Strategy::Auto);
+    }
+
+    #[test]
+    fn test_relay0_bind_roundtrip() {
+        let mut dst_key = [0u8; 32];
+        for i in 0..32 { dst_key[i] = i as u8; }
+        let orig = Relay0Bind { relay_id: 0x1234, dst_key };
+        let encoded = encode_relay0_bind(&orig);
+        assert_eq!(encoded.len(), RELAY0_BIND_SIZE);
+        let decoded = decode_relay0_bind(&encoded).unwrap();
+        assert_eq!(decoded.relay_id, 0x1234);
+        assert_eq!(decoded.dst_key, dst_key);
+    }
+
+    #[test]
+    fn test_relay0_bind_too_short() {
+        assert_eq!(decode_relay0_bind(&[0u8; RELAY0_BIND_SIZE - 1]).unwrap_err(), RelayError::TooShort);
+    }
+
+    #[test]
+    fn test_relay0_alias_roundtrip() {
+        let payload = b"alias payload".to_vec();
+        let orig = Relay0Alias { relay_id: 0xABCD, payload: payload.clone() };
+        let encoded = encode_relay0_alias(&orig);
+        assert_eq!(encoded.len(), 4 + payload.len());
+        let decoded = decode_relay0_alias(&encoded).unwrap();
+        assert_eq!(decoded.relay_id, 0xABCD);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_relay1_bind_roundtrip() {
+        let mut src_key = [0u8; 32];
+        let mut dst_key = [0u8; 32];
+        for i in 0..32 { src_key[i] = i as u8; dst_key[i] = (i + 100) as u8; }
+        let orig = Relay1Bind { relay_id: 0x5678, src_key, dst_key };
+        let encoded = encode_relay1_bind(&orig);
+        assert_eq!(encoded.len(), RELAY1_BIND_SIZE);
+        let decoded = decode_relay1_bind(&encoded).unwrap();
+        assert_eq!(decoded.relay_id, 0x5678);
+        assert_eq!(decoded.src_key, src_key);
+        assert_eq!(decoded.dst_key, dst_key);
+    }
+
+    #[test]
+    fn test_relay1_alias_roundtrip() {
+        let payload = b"relay1 alias".to_vec();
+        let orig = Relay1Alias { relay_id: 0xFF00, payload: payload.clone() };
+        let encoded = encode_relay1_alias(&orig);
+        let decoded = decode_relay1_alias(&encoded).unwrap();
+        assert_eq!(decoded.relay_id, 0xFF00);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_relay2_bind_roundtrip() {
+        let mut src_key = [0u8; 32];
+        for i in 0..32 { src_key[i] = (i + 50) as u8; }
+        let orig = Relay2Bind { relay_id: 0x9ABC, src_key };
+        let encoded = encode_relay2_bind(&orig);
+        assert_eq!(encoded.len(), RELAY2_BIND_SIZE);
+        let decoded = decode_relay2_bind(&encoded).unwrap();
+        assert_eq!(decoded.relay_id, 0x9ABC);
+        assert_eq!(decoded.src_key, src_key);
+    }
+
+    #[test]
+    fn test_relay2_alias_roundtrip() {
+        let payload = b"relay2 alias final".to_vec();
+        let orig = Relay2Alias { relay_id: 0xDEAD, payload: payload.clone() };
+        let encoded = encode_relay2_alias(&orig);
+        let decoded = decode_relay2_alias(&encoded).unwrap();
+        assert_eq!(decoded.relay_id, 0xDEAD);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn test_alias_empty_payload() {
+        let orig = Relay0Alias { relay_id: 42, payload: vec![] };
+        let encoded = encode_relay0_alias(&orig);
+        assert_eq!(encoded.len(), 4);
+        let decoded = decode_relay0_alias(&encoded).unwrap();
+        assert_eq!(decoded.relay_id, 42);
+        assert!(decoded.payload.is_empty());
     }
 }

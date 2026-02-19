@@ -210,8 +210,194 @@ pub fn decodePong(data: []const u8) error{TooShort}!Pong {
 }
 
 // ============================================================================
+// BIND/ALIAS messages
+// ============================================================================
+
+pub const relay0_bind_size: usize = 4 + 32;
+pub const relay0_alias_min: usize = 4;
+pub const relay1_bind_size: usize = 4 + 32 + 32;
+pub const relay1_alias_min: usize = 4;
+pub const relay2_bind_size: usize = 4 + 32;
+pub const relay2_alias_min: usize = 4;
+
+pub const Relay0Bind = struct { relay_id: u32, dst_key: [32]u8 };
+pub const Relay0Alias = struct { relay_id: u32, payload: []const u8 };
+pub const Relay1Bind = struct { relay_id: u32, src_key: [32]u8, dst_key: [32]u8 };
+pub const Relay1Alias = struct { relay_id: u32, payload: []const u8 };
+pub const Relay2Bind = struct { relay_id: u32, src_key: [32]u8 };
+pub const Relay2Alias = struct { relay_id: u32, payload: []const u8 };
+
+pub fn encodeRelay0Bind(r: *const Relay0Bind, buf: []u8) error{TooShort}!usize {
+    if (buf.len < relay0_bind_size) return error.TooShort;
+    mem.writeInt(u32, buf[0..4], r.relay_id, .little);
+    @memcpy(buf[4..36], &r.dst_key);
+    return relay0_bind_size;
+}
+
+pub fn decodeRelay0Bind(data: []const u8) error{TooShort}!Relay0Bind {
+    if (data.len < relay0_bind_size) return error.TooShort;
+    return Relay0Bind{
+        .relay_id = mem.readInt(u32, data[0..4], .little),
+        .dst_key = data[4..36].*,
+    };
+}
+
+pub fn encodeRelay0Alias(r: *const Relay0Alias, buf: []u8) error{TooShort}!usize {
+    const total = 4 + r.payload.len;
+    if (buf.len < total) return error.TooShort;
+    mem.writeInt(u32, buf[0..4], r.relay_id, .little);
+    if (r.payload.len > 0) {
+        @memcpy(buf[4 .. 4 + r.payload.len], r.payload);
+    }
+    return total;
+}
+
+pub fn decodeRelay0Alias(data: []const u8) error{TooShort}!Relay0Alias {
+    if (data.len < relay0_alias_min) return error.TooShort;
+    return Relay0Alias{
+        .relay_id = mem.readInt(u32, data[0..4], .little),
+        .payload = data[4..],
+    };
+}
+
+pub fn encodeRelay1Bind(r: *const Relay1Bind, buf: []u8) error{TooShort}!usize {
+    if (buf.len < relay1_bind_size) return error.TooShort;
+    mem.writeInt(u32, buf[0..4], r.relay_id, .little);
+    @memcpy(buf[4..36], &r.src_key);
+    @memcpy(buf[36..68], &r.dst_key);
+    return relay1_bind_size;
+}
+
+pub fn decodeRelay1Bind(data: []const u8) error{TooShort}!Relay1Bind {
+    if (data.len < relay1_bind_size) return error.TooShort;
+    return Relay1Bind{
+        .relay_id = mem.readInt(u32, data[0..4], .little),
+        .src_key = data[4..36].*,
+        .dst_key = data[36..68].*,
+    };
+}
+
+pub fn encodeRelay1Alias(r: *const Relay1Alias, buf: []u8) error{TooShort}!usize {
+    const total = 4 + r.payload.len;
+    if (buf.len < total) return error.TooShort;
+    mem.writeInt(u32, buf[0..4], r.relay_id, .little);
+    if (r.payload.len > 0) {
+        @memcpy(buf[4 .. 4 + r.payload.len], r.payload);
+    }
+    return total;
+}
+
+pub fn decodeRelay1Alias(data: []const u8) error{TooShort}!Relay1Alias {
+    if (data.len < relay1_alias_min) return error.TooShort;
+    return Relay1Alias{
+        .relay_id = mem.readInt(u32, data[0..4], .little),
+        .payload = data[4..],
+    };
+}
+
+pub fn encodeRelay2Bind(r: *const Relay2Bind, buf: []u8) error{TooShort}!usize {
+    if (buf.len < relay2_bind_size) return error.TooShort;
+    mem.writeInt(u32, buf[0..4], r.relay_id, .little);
+    @memcpy(buf[4..36], &r.src_key);
+    return relay2_bind_size;
+}
+
+pub fn decodeRelay2Bind(data: []const u8) error{TooShort}!Relay2Bind {
+    if (data.len < relay2_bind_size) return error.TooShort;
+    return Relay2Bind{
+        .relay_id = mem.readInt(u32, data[0..4], .little),
+        .src_key = data[4..36].*,
+    };
+}
+
+pub fn encodeRelay2Alias(r: *const Relay2Alias, buf: []u8) error{TooShort}!usize {
+    const total = 4 + r.payload.len;
+    if (buf.len < total) return error.TooShort;
+    mem.writeInt(u32, buf[0..4], r.relay_id, .little);
+    if (r.payload.len > 0) {
+        @memcpy(buf[4 .. 4 + r.payload.len], r.payload);
+    }
+    return total;
+}
+
+pub fn decodeRelay2Alias(data: []const u8) error{TooShort}!Relay2Alias {
+    if (data.len < relay2_alias_min) return error.TooShort;
+    return Relay2Alias{
+        .relay_id = mem.readInt(u32, data[0..4], .little),
+        .payload = data[4..],
+    };
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
+
+test "relay0 bind roundtrip" {
+    const orig = Relay0Bind{ .relay_id = 0x1234, .dst_key = [_]u8{0} ** 16 ++ [_]u8{1} ** 16 };
+    var buf: [relay0_bind_size]u8 = undefined;
+    const n = try encodeRelay0Bind(&orig, &buf);
+    try std.testing.expectEqual(relay0_bind_size, n);
+    const decoded = try decodeRelay0Bind(&buf);
+    try std.testing.expectEqual(@as(u32, 0x1234), decoded.relay_id);
+    try std.testing.expectEqualSlices(u8, &orig.dst_key, &decoded.dst_key);
+}
+
+test "relay0 bind too short" {
+    var short: [relay0_bind_size - 1]u8 = undefined;
+    try std.testing.expectError(error.TooShort, decodeRelay0Bind(&short));
+}
+
+test "relay0 alias roundtrip" {
+    const payload = "alias payload";
+    const orig = Relay0Alias{ .relay_id = 0xABCD, .payload = payload };
+    var buf: [256]u8 = undefined;
+    const n = try encodeRelay0Alias(&orig, &buf);
+    try std.testing.expectEqual(@as(usize, 4 + payload.len), n);
+    const decoded = try decodeRelay0Alias(buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 0xABCD), decoded.relay_id);
+    try std.testing.expectEqualStrings(payload, decoded.payload);
+}
+
+test "relay1 bind roundtrip" {
+    var src_key: [32]u8 = undefined;
+    var dst_key: [32]u8 = undefined;
+    for (0..32) |i| {
+        src_key[i] = @intCast(i);
+        dst_key[i] = @intCast(i + 100);
+    }
+    const orig = Relay1Bind{ .relay_id = 0x5678, .src_key = src_key, .dst_key = dst_key };
+    var buf: [relay1_bind_size]u8 = undefined;
+    const n = try encodeRelay1Bind(&orig, &buf);
+    try std.testing.expectEqual(relay1_bind_size, n);
+    const decoded = try decodeRelay1Bind(&buf);
+    try std.testing.expectEqual(@as(u32, 0x5678), decoded.relay_id);
+    try std.testing.expectEqualSlices(u8, &src_key, &decoded.src_key);
+    try std.testing.expectEqualSlices(u8, &dst_key, &decoded.dst_key);
+}
+
+test "relay2 bind roundtrip" {
+    var src_key: [32]u8 = undefined;
+    for (0..32) |i| {
+        src_key[i] = @intCast(i + 50);
+    }
+    const orig = Relay2Bind{ .relay_id = 0x9ABC, .src_key = src_key };
+    var buf: [relay2_bind_size]u8 = undefined;
+    const n = try encodeRelay2Bind(&orig, &buf);
+    try std.testing.expectEqual(relay2_bind_size, n);
+    const decoded = try decodeRelay2Bind(&buf);
+    try std.testing.expectEqual(@as(u32, 0x9ABC), decoded.relay_id);
+    try std.testing.expectEqualSlices(u8, &src_key, &decoded.src_key);
+}
+
+test "relay2 alias roundtrip" {
+    const payload = "relay2 alias final";
+    const orig = Relay2Alias{ .relay_id = 0xDEAD, .payload = payload };
+    var buf: [256]u8 = undefined;
+    const n = try encodeRelay2Alias(&orig, &buf);
+    const decoded = try decodeRelay2Alias(buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 0xDEAD), decoded.relay_id);
+    try std.testing.expectEqualStrings(payload, decoded.payload);
+}
 
 test "relay0 roundtrip" {
     var dst_key: [32]u8 = undefined;

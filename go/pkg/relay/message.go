@@ -198,3 +198,157 @@ func DecodePong(data []byte) (*Pong, error) {
 		Price:      binary.LittleEndian.Uint32(data[17:21]),
 	}, nil
 }
+
+// BIND/ALIAS message sizes (excluding the protocol byte).
+const (
+	Relay0BindSize  = 4 + 32      // relay_id(4) + dst_pubkey(32) = 36
+	Relay0AliasSize = 4           // relay_id(4) + payload(var), minimum 4
+	Relay1BindSize  = 4 + 32 + 32 // relay_id(4) + src_pubkey(32) + dst_pubkey(32) = 68
+	Relay1AliasSize = 4           // relay_id(4) + payload(var), minimum 4
+	Relay2BindSize  = 4 + 32      // relay_id(4) + src_pubkey(32) = 36
+	Relay2AliasSize = 4           // relay_id(4) + payload(var), minimum 4
+)
+
+// Relay0Bind is sent by a relay node back to the sender to assign a relay_id.
+type Relay0Bind struct {
+	RelayID uint32
+	DstKey  [32]byte
+}
+
+// Relay0Alias is the short-mode first-hop message using relay_id.
+type Relay0Alias struct {
+	RelayID uint32
+	Payload []byte
+}
+
+// Relay1Bind is sent by a relay node to assign a relay_id for middle-hop.
+type Relay1Bind struct {
+	RelayID uint32
+	SrcKey  [32]byte
+	DstKey  [32]byte
+}
+
+// Relay1Alias is the short-mode middle-hop message using relay_id.
+type Relay1Alias struct {
+	RelayID uint32
+	Payload []byte
+}
+
+// Relay2Bind is sent by a relay node to assign a relay_id for last-hop.
+type Relay2Bind struct {
+	RelayID uint32
+	SrcKey  [32]byte
+}
+
+// Relay2Alias is the short-mode last-hop message using relay_id.
+type Relay2Alias struct {
+	RelayID uint32
+	Payload []byte
+}
+
+func EncodeRelay0Bind(r *Relay0Bind) []byte {
+	buf := make([]byte, Relay0BindSize)
+	binary.LittleEndian.PutUint32(buf[0:4], r.RelayID)
+	copy(buf[4:36], r.DstKey[:])
+	return buf
+}
+
+func DecodeRelay0Bind(data []byte) (*Relay0Bind, error) {
+	if len(data) < Relay0BindSize {
+		return nil, ErrTooShort
+	}
+	r := &Relay0Bind{
+		RelayID: binary.LittleEndian.Uint32(data[0:4]),
+	}
+	copy(r.DstKey[:], data[4:36])
+	return r, nil
+}
+
+func EncodeRelay0Alias(r *Relay0Alias) []byte {
+	buf := make([]byte, 4+len(r.Payload))
+	binary.LittleEndian.PutUint32(buf[0:4], r.RelayID)
+	copy(buf[4:], r.Payload)
+	return buf
+}
+
+func DecodeRelay0Alias(data []byte) (*Relay0Alias, error) {
+	if len(data) < Relay0AliasSize {
+		return nil, ErrTooShort
+	}
+	return &Relay0Alias{
+		RelayID: binary.LittleEndian.Uint32(data[0:4]),
+		Payload: data[4:],
+	}, nil
+}
+
+func EncodeRelay1Bind(r *Relay1Bind) []byte {
+	buf := make([]byte, Relay1BindSize)
+	binary.LittleEndian.PutUint32(buf[0:4], r.RelayID)
+	copy(buf[4:36], r.SrcKey[:])
+	copy(buf[36:68], r.DstKey[:])
+	return buf
+}
+
+func DecodeRelay1Bind(data []byte) (*Relay1Bind, error) {
+	if len(data) < Relay1BindSize {
+		return nil, ErrTooShort
+	}
+	r := &Relay1Bind{
+		RelayID: binary.LittleEndian.Uint32(data[0:4]),
+	}
+	copy(r.SrcKey[:], data[4:36])
+	copy(r.DstKey[:], data[36:68])
+	return r, nil
+}
+
+func EncodeRelay1Alias(r *Relay1Alias) []byte {
+	buf := make([]byte, 4+len(r.Payload))
+	binary.LittleEndian.PutUint32(buf[0:4], r.RelayID)
+	copy(buf[4:], r.Payload)
+	return buf
+}
+
+func DecodeRelay1Alias(data []byte) (*Relay1Alias, error) {
+	if len(data) < Relay1AliasSize {
+		return nil, ErrTooShort
+	}
+	return &Relay1Alias{
+		RelayID: binary.LittleEndian.Uint32(data[0:4]),
+		Payload: data[4:],
+	}, nil
+}
+
+func EncodeRelay2Bind(r *Relay2Bind) []byte {
+	buf := make([]byte, Relay2BindSize)
+	binary.LittleEndian.PutUint32(buf[0:4], r.RelayID)
+	copy(buf[4:36], r.SrcKey[:])
+	return buf
+}
+
+func DecodeRelay2Bind(data []byte) (*Relay2Bind, error) {
+	if len(data) < Relay2BindSize {
+		return nil, ErrTooShort
+	}
+	r := &Relay2Bind{
+		RelayID: binary.LittleEndian.Uint32(data[0:4]),
+	}
+	copy(r.SrcKey[:], data[4:36])
+	return r, nil
+}
+
+func EncodeRelay2Alias(r *Relay2Alias) []byte {
+	buf := make([]byte, 4+len(r.Payload))
+	binary.LittleEndian.PutUint32(buf[0:4], r.RelayID)
+	copy(buf[4:], r.Payload)
+	return buf
+}
+
+func DecodeRelay2Alias(data []byte) (*Relay2Alias, error) {
+	if len(data) < Relay2AliasSize {
+		return nil, ErrTooShort
+	}
+	return &Relay2Alias{
+		RelayID: binary.LittleEndian.Uint32(data[0:4]),
+		Payload: data[4:],
+	}, nil
+}
