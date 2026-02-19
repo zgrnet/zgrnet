@@ -9,6 +9,7 @@
 const noise = @import("noise/mod.zig");
 const net_mod = @import("net/mod.zig");
 const kcp_mod = @import("kcp/mod.zig");
+const channel_pkg = @import("channel");
 
 const Key = noise.Key;
 const message = noise.message;
@@ -88,6 +89,39 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             }
         };
 
+        const ChannelT = channel_pkg.Channel;
+
+        /// Proto-specific KCP stream listener. Created by Node.listen(proto).
+        pub const StreamListener = struct {
+            proto_byte: u8,
+            ch: ChannelT(NodeStream, 64, Rt),
+
+            pub fn init(proto_val: u8) StreamListener {
+                return .{
+                    .proto_byte = proto_val,
+                    .ch = ChannelT(NodeStream, 64, Rt).init(),
+                };
+            }
+
+            pub fn deinit(self: *StreamListener) void {
+                self.ch.deinit();
+            }
+
+            /// Accept the next incoming KCP stream. Returns null when closed.
+            pub fn accept(self: *StreamListener) ?NodeStream {
+                return self.ch.recv();
+            }
+
+            /// Close the listener (signals no more streams).
+            pub fn close(self: *StreamListener) void {
+                self.ch.close();
+            }
+
+            pub fn proto(self: *const StreamListener) u8 {
+                return self.proto_byte;
+            }
+        };
+
         // ── Fields ────────────────────────────────────────────────────
 
         allocator: Allocator,
@@ -101,6 +135,9 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
         accept_count: usize,
         accept_mutex: Rt.Mutex,
         accept_cond: Rt.Condition,
+
+        // Per-proto stream listeners: proto(u8) → optional pointer to StreamListener.
+        proto_listeners: [256]?*StreamListener,
 
         // Per-peer accept forwarder threads
         peer_keys: [16]Key, // registered peer keys
@@ -137,6 +174,7 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
                 .accept_count = 0,
                 .accept_mutex = Rt.Mutex.init(),
                 .accept_cond = Rt.Condition.init(),
+                .proto_listeners = .{null} ** 256,
                 .peer_keys = undefined,
                 .peer_stops = undefined,
                 .peer_count = 0,
@@ -168,6 +206,16 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             }
             self.accept_cond.broadcast();
 
+            // Close all proto listeners.
+            for (&self.proto_listeners) |*slot| {
+                if (slot.*) |ln| {
+                    ln.close();
+                    ln.deinit();
+                    self.allocator.destroy(ln);
+                    slot.* = null;
+                }
+            }
+
             // Close UDP (unblocks IO threads).
             self.udp.close();
 
@@ -187,6 +235,13 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
         /// Stop the node (signals shutdown without joining/deallocating).
         pub fn stop(self: *Self) void {
             self.state.store(@intFromEnum(State.stopped), .release);
+
+            // Close all proto listeners.
+            for (&self.proto_listeners) |*slot| {
+                if (slot.*) |ln| {
+                    ln.close();
+                }
+            }
 
             self.peer_mutex.lock();
             const count = self.peer_count;
@@ -298,7 +353,30 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             return self.udp.getRouteTable();
         }
 
+        /// Register a proto-specific stream listener. All incoming KCP streams
+        /// with the given proto are routed to this listener. Returns error if
+        /// the proto is already registered.
+        pub fn listen(self: *Self, proto_byte: u8) !*StreamListener {
+            if (self.proto_listeners[proto_byte] != null) return error.ProtoRegistered;
+
+            const ln = self.allocator.create(StreamListener) catch return error.OutOfMemory;
+            ln.* = StreamListener.init(proto_byte);
+            self.proto_listeners[proto_byte] = ln;
+            return ln;
+        }
+
+        /// Unregister a proto listener. Subsequent streams fall through to acceptStream.
+        pub fn closeListen(self: *Self, proto_byte: u8) void {
+            if (self.proto_listeners[proto_byte]) |ln| {
+                ln.close();
+                ln.deinit();
+                self.allocator.destroy(ln);
+                self.proto_listeners[proto_byte] = null;
+            }
+        }
+
         /// Accept a stream from any peer (blocking).
+        /// Streams with a registered listen() proto are NOT delivered here.
         pub fn acceptStream(self: *Self) ?NodeStream {
             self.accept_mutex.lock();
             defer self.accept_mutex.unlock();
@@ -355,15 +433,22 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
 
         fn acceptLoopFn(self: *Self, pk: Key, idx: usize) void {
             while (!self.peer_stops[idx].load(.acquire) and self.getState() != .stopped) {
-                // acceptStream blocks until a stream arrives or returns null
-                // if the peer has no mux yet (not established).
                 if (self.udp.acceptStream(&pk)) |stream| {
-                    self.pushAccept(NodeStream{
+                    const ns = NodeStream{
                         .stream = stream,
                         .remote_pk = pk,
-                    });
+                    };
+
+                    // Route to proto-specific listener if registered.
+                    const proto_byte = stream.getProto();
+                    if (self.proto_listeners[proto_byte]) |ln| {
+                        ln.ch.send(ns) catch {
+                            stream.shutdown();
+                        };
+                    } else {
+                        self.pushAccept(ns);
+                    }
                 } else {
-                    // Peer not established yet or no stream — poll.
                     Rt.sleepMs(50);
                 }
             }
