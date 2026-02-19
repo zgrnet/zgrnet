@@ -83,7 +83,7 @@ func (bt *BindTable) Expire(maxAge time.Duration) int {
 
 	removed := 0
 	for id, entry := range bt.entries {
-		if entry.Created.Before(cutoff) {
+		if !entry.Created.After(cutoff) {
 			delete(bt.entries, id)
 			removed++
 		}

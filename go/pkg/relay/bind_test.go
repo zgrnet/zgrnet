@@ -86,7 +86,8 @@ func TestBindTable_Expire(t *testing.T) {
 		t.Errorf("Len: got %d, want 2", bt.Len())
 	}
 
-	// Expire everything with 0 maxAge
+	// Expire everything — 1ms sleep ensures entries are older than maxAge=0
+	time.Sleep(time.Millisecond)
 	removed = bt.Expire(0)
 	if removed != 2 {
 		t.Errorf("Expire(0): removed %d, want 2", removed)
