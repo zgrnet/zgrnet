@@ -1,0 +1,19 @@
+{
+  "hosts": [
+    {
+      "name": "opener",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "port": 22010,
+      "role": "opener"
+    },
+    {
+      "name": "accepter",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "port": 23010,
+      "role": "accepter"
+    }
+  ],
+  "test": {
+    "echo_message": "Hello Listen Interop!"
+  }
+}
