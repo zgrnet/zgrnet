@@ -11,6 +11,7 @@ go_library(
         "//go/pkg/config",
         "//go/pkg/dns",
         "//go/pkg/host",
+        "//go/pkg/listener",
         "//go/pkg/net",
         "//go/pkg/proxy",
     ],

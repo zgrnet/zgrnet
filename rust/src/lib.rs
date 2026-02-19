@@ -35,6 +35,7 @@ pub mod config;
 pub mod api;
 pub mod cli;
 pub mod lan;
+#[cfg(unix)]
 pub mod listener;
 
 #[cfg(feature = "tun")]
