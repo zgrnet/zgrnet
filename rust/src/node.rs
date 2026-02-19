@@ -391,6 +391,7 @@ impl Node {
 
     /// Registers a proto-specific stream listener. All incoming KCP streams
     /// with the given proto are routed here instead of accept_stream().
+    /// The listener automatically unregisters when dropped.
     pub fn listen(&self, proto: u8) -> Result<StreamListener> {
         let mut listeners = self.stream_listeners.lock().unwrap();
         if listeners.contains_key(&proto) {
@@ -398,11 +399,16 @@ impl Node {
         }
         let (tx, rx) = bounded(64);
         listeners.insert(proto, tx);
-        Ok(StreamListener { proto, rx })
+        Ok(StreamListener {
+            proto,
+            rx,
+            stream_listeners: Arc::clone(&self.stream_listeners),
+        })
     }
 
     /// Registers a proto-specific datagram listener. All incoming raw UDP
     /// packets with the given proto are routed here instead of read_from().
+    /// The listener automatically unregisters when dropped.
     pub fn listen_packet(&self, proto: u8) -> Result<PacketListener> {
         let mut listeners = self.packet_listeners.lock().unwrap();
         if listeners.contains_key(&proto) {
@@ -410,19 +416,11 @@ impl Node {
         }
         let (tx, rx) = bounded(64);
         listeners.insert(proto, tx);
-        Ok(PacketListener { proto, rx })
-    }
-
-    /// Unregisters a stream listener for the given proto.
-    pub fn close_listener(&self, proto: u8) {
-        let mut listeners = self.stream_listeners.lock().unwrap();
-        listeners.remove(&proto);
-    }
-
-    /// Unregisters a packet listener for the given proto.
-    pub fn close_packet_listener(&self, proto: u8) {
-        let mut listeners = self.packet_listeners.lock().unwrap();
-        listeners.remove(&proto);
+        Ok(PacketListener {
+            proto,
+            rx,
+            packet_listeners: Arc::clone(&self.packet_listeners),
+        })
     }
 
     /// Waits for an incoming KCP stream from any peer.
@@ -458,14 +456,28 @@ impl Node {
     // ── Internal ──────────────────────────────────────────────────────
 
     /// Background receive loop — drives the UDP receive pipeline.
+    /// Also dispatches raw UDP packets to proto-specific PacketListeners.
     fn recv_loop(&self) {
         let mut buf = vec![0u8; 65535];
         loop {
             if self.state() == State::Stopped {
                 return;
             }
-            match self.udp.read_from(&mut buf) {
-                Ok(_) => {}
+            match self.udp.read_packet(&mut buf) {
+                Ok((pk, proto, n)) => {
+                    if n > 0 {
+                        let listeners = self.packet_listeners.lock().unwrap();
+                        if let Some(tx) = listeners.get(&proto) {
+                            let mut data = vec![0u8; n];
+                            data.copy_from_slice(&buf[..n]);
+                            let _ = tx.try_send(RawPacket {
+                                data,
+                                remote_pk: pk,
+                                proto,
+                            });
+                        }
+                    }
+                }
                 Err(UdpError::Closed) => return,
                 Err(_) => continue,
             }
@@ -524,7 +536,15 @@ impl Node {
                         };
 
                         if let Some(tx) = proto_tx {
-                            let _ = tx.try_send(ns);
+                            match tx.try_send(ns) {
+                                Ok(()) => {}
+                                Err(crossbeam_channel::TrySendError::Full(dropped)) => {
+                                    dropped.stream.shutdown();
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(dropped)) => {
+                                    dropped.stream.shutdown();
+                                }
+                            }
                         } else if accept_tx.send(ns).is_err() {
                             return;
                         }
@@ -546,9 +566,11 @@ impl Drop for Node {
 }
 
 /// Proto-specific KCP stream listener. Created by `Node::listen(proto)`.
+/// Automatically unregisters from the Node when dropped.
 pub struct StreamListener {
     proto: u8,
     rx: Receiver<NodeStream>,
+    stream_listeners: Arc<Mutex<HashMap<u8, Sender<NodeStream>>>>,
 }
 
 impl StreamListener {
@@ -568,10 +590,19 @@ impl StreamListener {
     }
 }
 
+impl Drop for StreamListener {
+    fn drop(&mut self) {
+        let mut listeners = self.stream_listeners.lock().unwrap();
+        listeners.remove(&self.proto);
+    }
+}
+
 /// Proto-specific raw datagram listener. Created by `Node::listen_packet(proto)`.
+/// Automatically unregisters from the Node when dropped.
 pub struct PacketListener {
     proto: u8,
     rx: Receiver<RawPacket>,
+    packet_listeners: Arc<Mutex<HashMap<u8, Sender<RawPacket>>>>,
 }
 
 impl PacketListener {
@@ -586,6 +617,13 @@ impl PacketListener {
     /// Returns the protocol byte this listener handles.
     pub fn proto(&self) -> u8 {
         self.proto
+    }
+}
+
+impl Drop for PacketListener {
+    fn drop(&mut self) {
+        let mut listeners = self.packet_listeners.lock().unwrap();
+        listeners.remove(&self.proto);
     }
 }
 

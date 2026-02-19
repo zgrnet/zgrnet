@@ -455,16 +455,17 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
                     };
 
                     // Route to proto-specific listener if registered.
+                    // Hold lock during send to prevent closeListen from
+                    // destroying the listener between lookup and use.
                     const proto_byte = stream.getProto();
                     self.listener_mutex.lock();
-                    const ln = self.proto_listeners[proto_byte];
-                    self.listener_mutex.unlock();
-
-                    if (ln) |l| {
+                    if (self.proto_listeners[proto_byte]) |l| {
                         l.ch.send(ns) catch {
                             stream.shutdown();
                         };
+                        self.listener_mutex.unlock();
                     } else {
+                        self.listener_mutex.unlock();
                         self.pushAccept(ns);
                     }
                 } else {

@@ -538,36 +538,58 @@ fn relay_to_handler(
     proto: u8,
     metadata: &[u8],
 ) {
-    let path = if sock_path.starts_with("unix://") {
-        &sock_path[7..]
-    } else {
-        sock_path
-    };
+    let is_tcp = !sock_path.is_empty()
+        && !sock_path.starts_with('/')
+        && !sock_path.starts_with("unix://");
 
-    let mut conn = match std::os::unix::net::UnixStream::connect(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("handler {:?} connect: {}", handler_name, e);
+    if is_tcp {
+        let mut conn = match TcpStream::connect(sock_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("handler {:?} connect tcp {}: {}", handler_name, sock_path, e);
+                stream.shutdown();
+                return;
+            }
+        };
+        if let Err(e) = listener::write_stream_header(&mut conn, &pk.0, proto, metadata) {
+            eprintln!("handler {:?} write header: {}", handler_name, e);
             stream.shutdown();
             return;
         }
-    };
-
-    if let Err(e) = listener::write_stream_header(&mut conn, &pk.0, proto, metadata) {
-        eprintln!("handler {:?} write header: {}", handler_name, e);
-        stream.shutdown();
-        return;
+        let mut sio = StreamIo(stream);
+        let kcp = sio.0.clone();
+        let mut conn2 = conn.try_clone().unwrap();
+        let t = thread::spawn(move || {
+            let mut kcp_w = StreamIo(kcp);
+            let _ = copy_32k(&mut conn2, &mut kcp_w);
+        });
+        let _ = copy_32k(&mut sio, &mut conn);
+        let _ = t.join();
+    } else {
+        let path = if let Some(p) = sock_path.strip_prefix("unix://") { p } else { sock_path };
+        let mut conn = match std::os::unix::net::UnixStream::connect(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("handler {:?} connect unix {}: {}", handler_name, path, e);
+                stream.shutdown();
+                return;
+            }
+        };
+        if let Err(e) = listener::write_stream_header(&mut conn, &pk.0, proto, metadata) {
+            eprintln!("handler {:?} write header: {}", handler_name, e);
+            stream.shutdown();
+            return;
+        }
+        let mut sio = StreamIo(stream);
+        let kcp = sio.0.clone();
+        let mut conn2 = conn.try_clone().unwrap();
+        let t = thread::spawn(move || {
+            let mut kcp_w = StreamIo(kcp);
+            let _ = copy_32k(&mut conn2, &mut kcp_w);
+        });
+        let _ = copy_32k(&mut sio, &mut conn);
+        let _ = t.join();
     }
-
-    let mut sio = StreamIo(stream);
-    let kcp = sio.0.clone();
-    let mut conn2 = conn.try_clone().unwrap();
-    let t = thread::spawn(move || {
-        let mut kcp_w = StreamIo(kcp);
-        let _ = copy_32k(&mut conn2, &mut kcp_w);
-    });
-    let _ = copy_32k(&mut sio, &mut conn);
-    let _ = t.join();
 }
 
 // ============================================================================
