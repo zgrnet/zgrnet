@@ -19,6 +19,7 @@
 use crate::kcp::Stream as KcpStream;
 use crate::net::{PeerInfo, PeerState, UdpError, UdpOptions, UDP};
 use crate::noise::{self, Address, Key, KeyPair, ATYP_IPV4};
+use crate::relay::RouteTable;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::collections::HashMap;
@@ -184,6 +185,9 @@ impl Node {
         )
         .map_err(NodeError::Udp)?;
 
+        let rt = Arc::new(RouteTable::new());
+        udp.set_route_table(rt);
+
         let udp = Arc::new(udp);
         let (accept_tx, accept_rx) = bounded(64);
         let (stop_tx, stop_rx) = bounded(1);
@@ -343,6 +347,29 @@ impl Node {
             stream: raw,
             remote_pk: *pk,
         })
+    }
+
+    /// Connects to a remote peer through a relay and opens a KCP stream.
+    ///
+    /// `relay_pk` is the public key of the relay node. Both this node and
+    /// the relay must have established sessions.
+    pub fn dial_relay(&self, dst: &Key, relay_pk: &Key, port: u16) -> Result<NodeStream> {
+        if self.state() != State::Running {
+            return Err(NodeError::NotRunning);
+        }
+
+        if let Some(rt) = self.udp.route_table() {
+            rt.add_route(dst.0, relay_pk.0);
+        }
+
+        self.add_peer(PeerConfig { public_key: *dst, endpoint: None })?;
+
+        self.dial(dst, port)
+    }
+
+    /// Returns the node's relay route table.
+    pub fn route_table(&self) -> Option<Arc<RouteTable>> {
+        self.udp.route_table()
     }
 
     /// Waits for an incoming KCP stream from any peer.
