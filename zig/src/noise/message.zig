@@ -54,6 +54,18 @@ pub const Protocol = enum(u8) {
     ping = 70,
     /// Pong probe response
     pong = 71,
+    /// Relay first hop BIND (relay_id + dst_pubkey)
+    relay_0_bind = 72,
+    /// Relay first hop ALIAS (relay_id + payload)
+    relay_0_alias = 73,
+    /// Relay middle hop BIND (relay_id + src + dst pubkey)
+    relay_1_bind = 74,
+    /// Relay middle hop ALIAS (relay_id + payload)
+    relay_1_alias = 75,
+    /// Relay last hop BIND (relay_id + src_pubkey)
+    relay_2_bind = 76,
+    /// Relay last hop ALIAS (relay_id + payload)
+    relay_2_alias = 77,
 
     // Application layer protocols (128-255)
     /// Chat messages

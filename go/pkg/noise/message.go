@@ -27,14 +27,20 @@ const (
 	ProtocolUDP  byte = 17 // UDP in ZigNet (no IP header)
 
 	// ZigNet extension protocols (64-127)
-	ProtocolKCP      byte = 64 // KCP reliable UDP
-	ProtocolUDPProxy byte = 65 // UDP proxy
-	ProtocolRelay0   byte = 66 // Relay first hop
-	ProtocolRelay1   byte = 67 // Relay middle hop
-	ProtocolRelay2   byte = 68 // Relay last hop
-	ProtocolTCPProxy byte = 69 // TCP proxy via KCP stream
-	ProtocolPing     byte = 70 // Ping probe request
-	ProtocolPong     byte = 71 // Pong probe response
+	ProtocolKCP         byte = 64 // KCP reliable UDP
+	ProtocolUDPProxy    byte = 65 // UDP proxy
+	ProtocolRelay0      byte = 66 // Relay first hop
+	ProtocolRelay1      byte = 67 // Relay middle hop
+	ProtocolRelay2      byte = 68 // Relay last hop
+	ProtocolTCPProxy    byte = 69 // TCP proxy via KCP stream
+	ProtocolPing        byte = 70 // Ping probe request
+	ProtocolPong        byte = 71 // Pong probe response
+	ProtocolRelay0Bind  byte = 72 // Relay first hop BIND (relay_id + dst_pubkey)
+	ProtocolRelay0Alias byte = 73 // Relay first hop ALIAS (relay_id + payload)
+	ProtocolRelay1Bind  byte = 74 // Relay middle hop BIND (relay_id + src + dst pubkey)
+	ProtocolRelay1Alias byte = 75 // Relay middle hop ALIAS (relay_id + payload)
+	ProtocolRelay2Bind  byte = 76 // Relay last hop BIND (relay_id + src_pubkey)
+	ProtocolRelay2Alias byte = 77 // Relay last hop ALIAS (relay_id + payload)
 
 	// Application layer protocols (128-255)
 	ProtocolChat   byte = 128 // Chat messages

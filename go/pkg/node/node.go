@@ -28,6 +28,7 @@ import (
 	"github.com/vibing/zgrnet/pkg/kcp"
 	znet "github.com/vibing/zgrnet/pkg/net"
 	"github.com/vibing/zgrnet/pkg/noise"
+	"github.com/vibing/zgrnet/pkg/relay"
 )
 
 // State represents the lifecycle state of a Node.
@@ -112,11 +113,14 @@ func New(cfg Config) (*Node, error) {
 		return nil, errors.New("node: PrivateKey is required")
 	}
 
+	rt := relay.NewRouteTable()
+
 	bindAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ListenPort)
 	udp, err := znet.NewUDP(
 		cfg.PrivateKey,
 		znet.WithBindAddr(bindAddr),
 		znet.WithAllowUnknown(cfg.AllowUnknown),
+		znet.WithRouteTable(rt),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("node: create UDP: %w", err)
@@ -292,6 +296,38 @@ func (n *Node) OpenStream(pk noise.PublicKey, proto byte, metadata []byte) (*Str
 		return nil, err
 	}
 	return &Stream{Stream: raw, remotePK: pk}, nil
+}
+
+// DialRelay connects to a remote peer through a relay and opens a KCP stream.
+//
+// relayPK is the public key of the relay node that both this node and the
+// remote peer are connected to. The relay node forwards handshake and data
+// packets between the two peers (via RELAY_0/RELAY_2).
+//
+// The relay route is registered in the RouteTable, so all subsequent traffic
+// to dst automatically goes through the relay (including KCP stream data).
+//
+// Both this node and the relay must have established sessions (call AddPeer +
+// Connect for the relay first).
+func (n *Node) DialRelay(dst noise.PublicKey, relayPK noise.PublicKey, port uint16) (*Stream, error) {
+	if n.State() != StateRunning {
+		return nil, ErrNotRunning
+	}
+
+	// Register relay route: dst → relay
+	n.udp.RouteTable().AddRoute(dst, relayPK)
+
+	// Register the peer without an endpoint (relay-only).
+	// AddPeer is idempotent if the peer is already registered.
+	n.AddPeer(PeerConfig{PublicKey: dst})
+
+	// Dial goes through initiateHandshake (relay-aware) then OpenStream.
+	return n.Dial(dst, port)
+}
+
+// RouteTable returns the node's relay route table.
+func (n *Node) RouteTable() *relay.RouteTable {
+	return n.udp.RouteTable()
 }
 
 // AcceptStream waits for an incoming KCP stream from any peer.

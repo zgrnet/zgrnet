@@ -6,6 +6,7 @@ import (
 
 	"github.com/vibing/zgrnet/pkg/kcp"
 	"github.com/vibing/zgrnet/pkg/noise"
+	"github.com/vibing/zgrnet/pkg/relay"
 )
 
 // stream wraps kcp.Stream for peer-specific operations.
@@ -101,7 +102,59 @@ func (u *UDP) muxUpdateLoop(m *mux) {
 }
 
 // sendToPeer sends data to a peer with the given protocol byte.
+// If the peer has a relay route in the RouteTable, the data is first encrypted
+// with the peer's session (inner layer), wrapped in RELAY_0, then sent through
+// the relay peer's session (outer layer). Otherwise, sends directly.
 func (u *UDP) sendToPeer(peer *peerState, protocol byte, data []byte) error {
+	if u.routeTable == nil {
+		return u.sendDirect(peer, protocol, data)
+	}
+
+	relayPK := u.routeTable.RelayFor(peer.pk)
+	if relayPK == nil {
+		return u.sendDirect(peer, protocol, data)
+	}
+
+	// Relay path: encrypt with peer's session (inner), wrap in RELAY_0, send via relay.
+	peer.mu.RLock()
+	session := peer.session
+	peer.mu.RUnlock()
+
+	if session == nil {
+		return ErrNoSession
+	}
+
+	// Inner encryption: peer's session
+	plaintext := noise.EncodePayload(protocol, data)
+	ciphertext, counter, err := session.Encrypt(plaintext)
+	if err != nil {
+		return err
+	}
+	type4msg := noise.BuildTransportMessage(session.RemoteIndex(), counter, ciphertext)
+
+	// Wrap in RELAY_0
+	relay0Data := relay.EncodeRelay0(&relay.Relay0{
+		TTL:      relay.DefaultTTL,
+		Strategy: relay.StrategyAuto,
+		DstKey:   [32]byte(peer.pk),
+		Payload:  type4msg,
+	})
+
+	// Send through relay peer (direct, no further wrapping)
+	u.mu.RLock()
+	relayPeer, exists := u.peers[*relayPK]
+	u.mu.RUnlock()
+	if !exists {
+		return ErrPeerNotFound
+	}
+
+	return u.sendDirect(relayPeer, noise.ProtocolRelay0, relay0Data)
+}
+
+// sendDirect sends data directly to a peer (no relay wrapping).
+// This is used by executeRelayAction (relay engine already computed the next hop)
+// and as the base case for sendToPeer when no relay route exists.
+func (u *UDP) sendDirect(peer *peerState, protocol byte, data []byte) error {
 	peer.mu.RLock()
 	session := peer.session
 	endpoint := peer.endpoint

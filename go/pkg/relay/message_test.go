@@ -255,3 +255,177 @@ func TestStrategyConstants(t *testing.T) {
 		t.Errorf("StrategyCheapest: got %d, want 2", StrategyCheapest)
 	}
 }
+
+func TestRelay0BindRoundtrip(t *testing.T) {
+	var dstKey [32]byte
+	for i := range dstKey {
+		dstKey[i] = byte(i)
+	}
+	orig := &Relay0Bind{RelayID: 0x1234, DstKey: dstKey}
+	encoded := EncodeRelay0Bind(orig)
+	if len(encoded) != Relay0BindSize {
+		t.Fatalf("len: got %d, want %d", len(encoded), Relay0BindSize)
+	}
+	decoded, err := DecodeRelay0Bind(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RelayID != 0x1234 {
+		t.Errorf("RelayID: got %d, want %d", decoded.RelayID, 0x1234)
+	}
+	if decoded.DstKey != dstKey {
+		t.Error("DstKey mismatch")
+	}
+}
+
+func TestRelay0BindTooShort(t *testing.T) {
+	_, err := DecodeRelay0Bind(make([]byte, Relay0BindSize-1))
+	if err != ErrTooShort {
+		t.Errorf("expected ErrTooShort, got %v", err)
+	}
+}
+
+func TestRelay0AliasRoundtrip(t *testing.T) {
+	payload := []byte("alias payload data")
+	orig := &Relay0Alias{RelayID: 0xABCD, Payload: payload}
+	encoded := EncodeRelay0Alias(orig)
+	if len(encoded) != 4+len(payload) {
+		t.Fatalf("len: got %d, want %d", len(encoded), 4+len(payload))
+	}
+	decoded, err := DecodeRelay0Alias(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RelayID != 0xABCD {
+		t.Errorf("RelayID: got %d, want %d", decoded.RelayID, 0xABCD)
+	}
+	if !bytes.Equal(decoded.Payload, payload) {
+		t.Error("Payload mismatch")
+	}
+}
+
+func TestRelay0AliasTooShort(t *testing.T) {
+	_, err := DecodeRelay0Alias(make([]byte, 3))
+	if err != ErrTooShort {
+		t.Errorf("expected ErrTooShort, got %v", err)
+	}
+}
+
+func TestRelay1BindRoundtrip(t *testing.T) {
+	var srcKey, dstKey [32]byte
+	for i := range srcKey {
+		srcKey[i] = byte(i)
+		dstKey[i] = byte(i + 100)
+	}
+	orig := &Relay1Bind{RelayID: 0x5678, SrcKey: srcKey, DstKey: dstKey}
+	encoded := EncodeRelay1Bind(orig)
+	if len(encoded) != Relay1BindSize {
+		t.Fatalf("len: got %d, want %d", len(encoded), Relay1BindSize)
+	}
+	decoded, err := DecodeRelay1Bind(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RelayID != 0x5678 {
+		t.Errorf("RelayID: got %d, want %d", decoded.RelayID, 0x5678)
+	}
+	if decoded.SrcKey != srcKey {
+		t.Error("SrcKey mismatch")
+	}
+	if decoded.DstKey != dstKey {
+		t.Error("DstKey mismatch")
+	}
+}
+
+func TestRelay1BindTooShort(t *testing.T) {
+	_, err := DecodeRelay1Bind(make([]byte, Relay1BindSize-1))
+	if err != ErrTooShort {
+		t.Errorf("expected ErrTooShort, got %v", err)
+	}
+}
+
+func TestRelay1AliasRoundtrip(t *testing.T) {
+	payload := []byte("relay1 alias data")
+	orig := &Relay1Alias{RelayID: 0xFF00, Payload: payload}
+	encoded := EncodeRelay1Alias(orig)
+	decoded, err := DecodeRelay1Alias(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RelayID != 0xFF00 {
+		t.Errorf("RelayID mismatch")
+	}
+	if !bytes.Equal(decoded.Payload, payload) {
+		t.Error("Payload mismatch")
+	}
+}
+
+func TestRelay2BindRoundtrip(t *testing.T) {
+	var srcKey [32]byte
+	for i := range srcKey {
+		srcKey[i] = byte(i + 50)
+	}
+	orig := &Relay2Bind{RelayID: 0x9ABC, SrcKey: srcKey}
+	encoded := EncodeRelay2Bind(orig)
+	if len(encoded) != Relay2BindSize {
+		t.Fatalf("len: got %d, want %d", len(encoded), Relay2BindSize)
+	}
+	decoded, err := DecodeRelay2Bind(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RelayID != 0x9ABC {
+		t.Errorf("RelayID mismatch")
+	}
+	if decoded.SrcKey != srcKey {
+		t.Error("SrcKey mismatch")
+	}
+}
+
+func TestRelay2BindTooShort(t *testing.T) {
+	_, err := DecodeRelay2Bind(make([]byte, Relay2BindSize-1))
+	if err != ErrTooShort {
+		t.Errorf("expected ErrTooShort, got %v", err)
+	}
+}
+
+func TestRelay2AliasRoundtrip(t *testing.T) {
+	payload := []byte("relay2 alias final")
+	orig := &Relay2Alias{RelayID: 0xDEAD, Payload: payload}
+	encoded := EncodeRelay2Alias(orig)
+	decoded, err := DecodeRelay2Alias(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RelayID != 0xDEAD {
+		t.Errorf("RelayID mismatch")
+	}
+	if !bytes.Equal(decoded.Payload, payload) {
+		t.Error("Payload mismatch")
+	}
+}
+
+func TestRelay2AliasTooShort(t *testing.T) {
+	_, err := DecodeRelay2Alias(make([]byte, 3))
+	if err != ErrTooShort {
+		t.Errorf("expected ErrTooShort, got %v", err)
+	}
+}
+
+func TestAliasEmptyPayload(t *testing.T) {
+	orig := &Relay0Alias{RelayID: 42, Payload: nil}
+	encoded := EncodeRelay0Alias(orig)
+	if len(encoded) != 4 {
+		t.Fatalf("len: got %d, want 4", len(encoded))
+	}
+	decoded, err := DecodeRelay0Alias(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.RelayID != 42 {
+		t.Errorf("RelayID: got %d, want 42", decoded.RelayID)
+	}
+	if len(decoded.Payload) != 0 {
+		t.Errorf("Payload len: got %d, want 0", len(decoded.Payload))
+	}
+}

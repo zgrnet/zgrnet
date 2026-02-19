@@ -181,8 +181,8 @@ pub struct UDP {
     local_key: KeyPair,
     allow_unknown: bool,
 
-    // Relay forwarding
-    router: RwLock<Option<Box<dyn relay::Router + Send + Sync>>>,
+    // Relay routing and forwarding
+    route_table: RwLock<Option<Arc<relay::RouteTable>>>,
     local_metrics: Mutex<relay::NodeMetrics>,
 
     // Peer management
@@ -214,7 +214,7 @@ impl UDP {
             socket,
             local_key: key,
             allow_unknown: opts.allow_unknown,
-            router: RwLock::new(None),
+            route_table: RwLock::new(None),
             local_metrics: Mutex::new(relay::NodeMetrics::default()),
             peers: RwLock::new(HashMap::new()),
             by_index: RwLock::new(HashMap::new()),
@@ -227,8 +227,19 @@ impl UDP {
     }
 
     /// Sets the relay router for forwarding relay packets.
-    pub fn set_router(&self, router: Box<dyn relay::Router + Send + Sync>) {
-        *self.router.write().unwrap() = Some(router);
+    /// Deprecated: Use set_route_table instead.
+    pub fn set_router(&self, _router: Box<dyn relay::Router + Send + Sync>) {
+        // No-op — use set_route_table
+    }
+
+    /// Sets the route table for relay forwarding and outbound wrapping.
+    pub fn set_route_table(&self, rt: Arc<relay::RouteTable>) {
+        *self.route_table.write().unwrap() = Some(rt);
+    }
+
+    /// Returns the current route table.
+    pub fn route_table(&self) -> Option<Arc<relay::RouteTable>> {
+        self.route_table.read().unwrap().clone()
     }
 
     /// Updates the local node metrics for PONG responses.
@@ -978,10 +989,10 @@ impl UDP {
             }
 
             message::protocol::RELAY_0 => {
-                let router_guard = self.router.read().unwrap();
-                if let Some(ref router) = *router_guard {
-                    if let Ok(action) = relay::handle_relay0(router.as_ref(), &peer_pk.0, payload) {
-                        drop(router_guard);
+                let rt_guard = self.route_table.read().unwrap();
+                if let Some(ref rt) = *rt_guard {
+                    if let Ok(action) = relay::handle_relay0(rt.as_ref(), &peer_pk.0, payload) {
+                        drop(rt_guard);
                         self.execute_relay_action(&action);
                     }
                 }
@@ -989,10 +1000,10 @@ impl UDP {
             }
 
             message::protocol::RELAY_1 => {
-                let router_guard = self.router.read().unwrap();
-                if let Some(ref router) = *router_guard {
-                    if let Ok(action) = relay::handle_relay1(router.as_ref(), payload) {
-                        drop(router_guard);
+                let rt_guard = self.route_table.read().unwrap();
+                if let Some(ref rt) = *rt_guard {
+                    if let Ok(action) = relay::handle_relay1(rt.as_ref(), payload) {
+                        drop(rt_guard);
                         self.execute_relay_action(&action);
                     }
                 }
@@ -1010,9 +1021,9 @@ impl UDP {
             }
 
             message::protocol::PING => {
-                let router_guard = self.router.read().unwrap();
-                if router_guard.is_some() {
-                    drop(router_guard);
+                let rt_guard = self.route_table.read().unwrap();
+                if rt_guard.is_some() {
+                    drop(rt_guard);
                     let metrics = *self.local_metrics.lock().unwrap();
                     if let Ok(action) = relay::handle_ping(&peer_pk.0, payload, &metrics) {
                         self.execute_relay_action(&action);

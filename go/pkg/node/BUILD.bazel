@@ -9,6 +9,7 @@ go_library(
         "//go:noise",
         "//go/pkg/kcp",
         "//go/pkg/net",
+        "//go/pkg/relay",
     ],
 )
 

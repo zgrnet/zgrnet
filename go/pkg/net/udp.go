@@ -153,8 +153,8 @@ type UDP struct {
 	// Options
 	allowUnknown bool
 
-	// Relay forwarding
-	router       relay.Router      // nil = no relay forwarding
+	// Relay routing and forwarding
+	routeTable   *relay.RouteTable // nil = no relay; used for both forwarding and outbound wrapping
 	localMetrics relay.NodeMetrics // local metrics for PONG responses
 
 	// Peer management
@@ -216,7 +216,7 @@ type options struct {
 	bindAddr       string
 	allowUnknown   bool
 	decryptWorkers int // 0 = runtime.NumCPU()
-	router         relay.Router
+	routeTable     *relay.RouteTable
 	localMetrics   relay.NodeMetrics
 }
 
@@ -245,9 +245,19 @@ func WithDecryptWorkers(n int) Option {
 
 // WithRouter sets the relay router for forwarding relay packets.
 // If nil (default), relay packets are dropped.
+// Deprecated: Use WithRouteTable instead.
 func WithRouter(r relay.Router) Option {
 	return func(o *options) {
-		o.router = r
+		if rt, ok := r.(*relay.RouteTable); ok {
+			o.routeTable = rt
+		}
+	}
+}
+
+// WithRouteTable sets the route table for relay forwarding and outbound wrapping.
+func WithRouteTable(rt *relay.RouteTable) Option {
+	return func(o *options) {
+		o.routeTable = rt
 	}
 }
 
@@ -287,7 +297,7 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		socket:       socket,
 		localKey:     key,
 		allowUnknown: o.allowUnknown,
-		router:       o.router,
+		routeTable:   o.routeTable,
 		localMetrics: o.localMetrics,
 		peers:        make(map[noise.PublicKey]*peerState),
 		byIndex:      make(map[uint32]*peerState),
@@ -376,8 +386,21 @@ func (u *UDP) RemovePeer(pk noise.PublicKey) {
 }
 
 // SetRouter sets the relay router for forwarding relay packets at runtime.
+// Deprecated: Use SetRouteTable instead.
 func (u *UDP) SetRouter(r relay.Router) {
-	u.router = r
+	if rt, ok := r.(*relay.RouteTable); ok {
+		u.routeTable = rt
+	}
+}
+
+// SetRouteTable sets the route table at runtime.
+func (u *UDP) SetRouteTable(rt *relay.RouteTable) {
+	u.routeTable = rt
+}
+
+// RouteTable returns the current route table, or nil if none is set.
+func (u *UDP) RouteTable() *relay.RouteTable {
+	return u.routeTable
 }
 
 // SetLocalMetrics updates the local node metrics for PONG responses.
@@ -488,6 +511,7 @@ func (u *UDP) GetConn(pk noise.PublicKey) *Conn {
 
 // WriteTo sends encrypted data to a peer.
 // Uses a default protocol byte (ProtocolRaw) for transport.
+// If the peer has a relay route, data is automatically sent through the relay.
 func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 	if u.closed.Load() {
 		return ErrClosed
@@ -501,44 +525,7 @@ func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 		return ErrPeerNotFound
 	}
 
-	peer.mu.RLock()
-	session := peer.session
-	endpoint := peer.endpoint
-	peer.mu.RUnlock()
-
-	if endpoint == nil {
-		return ErrNoEndpoint
-	}
-
-	if session == nil {
-		return ErrNoSession
-	}
-
-	// Encode with default protocol byte
-	payload := noise.EncodePayload(noise.ProtocolRaw, data)
-
-	// Encrypt the data
-	encrypted, nonce, err := session.Encrypt(payload)
-	if err != nil {
-		return err
-	}
-
-	// Build transport message
-	msg := noise.BuildTransportMessage(session.RemoteIndex(), nonce, encrypted)
-
-	// Send
-	n, err := u.socket.WriteToUDP(msg, endpoint)
-	if err != nil {
-		return err
-	}
-
-	// Update stats
-	u.totalTx.Add(uint64(n))
-	peer.mu.Lock()
-	peer.txBytes += uint64(n)
-	peer.mu.Unlock()
-
-	return nil
+	return u.sendToPeer(peer, noise.ProtocolRaw, data)
 }
 
 // ReadFrom reads the next decrypted message from any peer.
@@ -831,7 +818,8 @@ func (u *UDP) Connect(pk noise.PublicKey) error {
 }
 
 // initiateHandshake starts a handshake with a peer.
-// This is called internally when needed.
+// If the peer has a relay route, the handshake is sent through the relay.
+// Otherwise, it is sent directly to the peer's endpoint.
 func (u *UDP) initiateHandshake(peer *peerState) error {
 	peer.mu.Lock()
 	endpoint := peer.endpoint
@@ -839,17 +827,22 @@ func (u *UDP) initiateHandshake(peer *peerState) error {
 	peer.state = PeerStateConnecting
 	peer.mu.Unlock()
 
-	if endpoint == nil {
+	// Check for relay route
+	var relayPK *noise.PublicKey
+	if u.routeTable != nil {
+		relayPK = u.routeTable.RelayFor(pk)
+	}
+
+	// Need either a direct endpoint or a relay route
+	if endpoint == nil && relayPK == nil {
 		return ErrNoEndpoint
 	}
 
-	// Generate local index
 	localIdx, err := noise.GenerateIndex()
 	if err != nil {
 		return err
 	}
 
-	// Create handshake state
 	hs, err := noise.NewHandshakeState(noise.Config{
 		Pattern:      noise.PatternIK,
 		Initiator:    true,
@@ -860,17 +853,14 @@ func (u *UDP) initiateHandshake(peer *peerState) error {
 		return err
 	}
 
-	// Write handshake initiation
 	msg1, err := hs.WriteMessage(nil)
 	if err != nil {
 		return err
 	}
 
-	// Build wire message
 	ephemeral := hs.LocalEphemeral()
 	wireMsg := noise.BuildHandshakeInit(localIdx, ephemeral, msg1[noise.KeySize:])
 
-	// Register pending handshake
 	done := make(chan error, 1)
 	u.mu.Lock()
 	u.pending[localIdx] = &pendingHandshake{
@@ -882,8 +872,32 @@ func (u *UDP) initiateHandshake(peer *peerState) error {
 	}
 	u.mu.Unlock()
 
-	// Send handshake initiation
-	_, err = u.socket.WriteToUDP(wireMsg, endpoint)
+	if relayPK != nil {
+		// Send handshake through relay: wrap in RELAY_0(dst=pk)
+		relay0Data := relay.EncodeRelay0(&relay.Relay0{
+			TTL:      relay.DefaultTTL,
+			Strategy: relay.StrategyAuto,
+			DstKey:   [32]byte(pk),
+			Payload:  wireMsg,
+		})
+
+		u.mu.RLock()
+		relayPeer, relayExists := u.peers[*relayPK]
+		u.mu.RUnlock()
+
+		if !relayExists {
+			u.mu.Lock()
+			delete(u.pending, localIdx)
+			u.mu.Unlock()
+			return ErrPeerNotFound
+		}
+
+		err = u.sendDirect(relayPeer, noise.ProtocolRelay0, relay0Data)
+	} else {
+		// Direct handshake to endpoint
+		_, err = u.socket.WriteToUDP(wireMsg, endpoint)
+	}
+
 	if err != nil {
 		u.mu.Lock()
 		delete(u.pending, localIdx)
@@ -891,7 +905,6 @@ func (u *UDP) initiateHandshake(peer *peerState) error {
 		return err
 	}
 
-	// Wait for response with timeout
 	select {
 	case err := <-done:
 		return err
@@ -1139,8 +1152,8 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		pkt.err = ErrNoData
 
 	case noise.ProtocolRelay0:
-		if u.router != nil {
-			action, err := relay.HandleRelay0(u.router, pkt.pk, payload)
+		if u.routeTable != nil {
+			action, err := relay.HandleRelay0(u.routeTable, pkt.pk, payload)
 			if err == nil {
 				u.executeRelayAction(action)
 			}
@@ -1148,8 +1161,8 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		pkt.err = ErrNoData // Relay packets are not delivered to ReadFrom
 
 	case noise.ProtocolRelay1:
-		if u.router != nil {
-			action, err := relay.HandleRelay1(u.router, payload)
+		if u.routeTable != nil {
+			action, err := relay.HandleRelay1(u.routeTable, payload)
 			if err == nil {
 				u.executeRelayAction(action)
 			}
@@ -1168,7 +1181,7 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		pkt.err = ErrNoData
 
 	case noise.ProtocolPing:
-		if u.router != nil {
+		if u.routeTable != nil {
 			action, err := relay.HandlePing(pkt.pk, payload, u.localMetrics)
 			if err == nil {
 				u.executeRelayAction(action)
@@ -1202,6 +1215,7 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 }
 
 // executeRelayAction sends a relay forwarding action to the target peer.
+// Uses sendDirect because the relay engine already computed the next hop.
 func (u *UDP) executeRelayAction(action *relay.Action) {
 	pk := noise.PublicKey(action.Dst)
 
@@ -1213,22 +1227,50 @@ func (u *UDP) executeRelayAction(action *relay.Action) {
 		return
 	}
 
-	_ = u.sendToPeer(peer, action.Protocol, action.Data)
+	_ = u.sendDirect(peer, action.Protocol, action.Data)
 }
 
 // processRelayedPacket handles a RELAY_2 inner payload.
-// The inner payload is a Type 4 transport message that was encrypted under
-// the A-B session. We decrypt it and fill in the packet fields.
+// The inner payload can be:
+//   - Type 4 (Transport): decrypt with the end-to-end session, route to mux/inbound
+//   - Type 1 (HandshakeInit): relayed handshake initiation from src through relay
+//   - Type 2 (HandshakeResp): relayed handshake response from src through relay
+//
+// pkt.pk is the relay peer's public key (who delivered the RELAY_2 to us).
 func (u *UDP) processRelayedPacket(pkt *packet, src [32]byte, innerPayload []byte, from *net.UDPAddr) {
-	// The inner payload should be a complete Type 4 transport message.
-	// Parse and decrypt it using the normal transport pipeline.
+	if len(innerPayload) == 0 {
+		pkt.err = ErrNoData
+		return
+	}
+
+	msgType := innerPayload[0]
+
+	switch msgType {
+	case noise.MessageTypeHandshakeInit:
+		relayPK := pkt.pk // the relay peer who forwarded this to us
+		u.handleRelayedHandshakeInit(innerPayload, src, relayPK)
+		pkt.err = ErrNoData
+
+	case noise.MessageTypeHandshakeResp:
+		u.handleRelayedHandshakeResp(innerPayload, src)
+		pkt.err = ErrNoData
+
+	case noise.MessageTypeTransport:
+		u.processRelayedTransport(pkt, src, innerPayload)
+
+	default:
+		pkt.err = ErrNoData
+	}
+}
+
+// processRelayedTransport handles a Type 4 transport message inside RELAY_2.
+func (u *UDP) processRelayedTransport(pkt *packet, src [32]byte, innerPayload []byte) {
 	msg, err := noise.ParseTransportMessage(innerPayload)
 	if err != nil {
 		pkt.err = ErrNoData
 		return
 	}
 
-	// Find the session by receiver index
 	u.mu.RLock()
 	innerPeer, exists := u.byIndex[msg.ReceiverIndex]
 	u.mu.RUnlock()
@@ -1247,7 +1289,6 @@ func (u *UDP) processRelayedPacket(pkt *packet, src [32]byte, innerPayload []byt
 		return
 	}
 
-	// Decrypt the inner payload
 	innerPlaintext, err := session.Decrypt(msg.Ciphertext, msg.Counter)
 	if err != nil {
 		pkt.err = ErrNoData
@@ -1259,14 +1300,12 @@ func (u *UDP) processRelayedPacket(pkt *packet, src [32]byte, innerPayload []byt
 		return
 	}
 
-	// Decode the inner protocol + payload
 	innerProto, innerData, err := noise.DecodePayload(innerPlaintext)
 	if err != nil {
 		pkt.err = ErrNoData
 		return
 	}
 
-	// Fill packet fields with the decrypted inner data
 	pkt.pk = noise.PublicKey(src)
 	pkt.protocol = innerProto
 	pkt.payload = make([]byte, len(innerData))
@@ -1274,7 +1313,6 @@ func (u *UDP) processRelayedPacket(pkt *packet, src [32]byte, innerPayload []byt
 	pkt.payloadN = len(innerData)
 	pkt.err = nil
 
-	// Route KCP internally
 	if innerProto == noise.ProtocolKCP {
 		innerPeer.mu.RLock()
 		mux := innerPeer.mux
@@ -1286,7 +1324,6 @@ func (u *UDP) processRelayedPacket(pkt *packet, src [32]byte, innerPayload []byt
 		return
 	}
 
-	// Route to inboundChan for non-KCP
 	innerPeer.mu.RLock()
 	inChan := innerPeer.inboundChan
 	innerPeer.mu.RUnlock()
@@ -1295,5 +1332,210 @@ func (u *UDP) processRelayedPacket(pkt *packet, src [32]byte, innerPayload []byt
 		case inChan <- protoPacket{protocol: innerProto, payload: pkt.payload}:
 		default:
 		}
+	}
+}
+
+// handleRelayedHandshakeInit processes a Handshake Initiation that arrived
+// through a relay (inside RELAY_2). Like handleHandshakeInit but:
+//   - Learns relay route: src → relayPK (so response goes back through relay)
+//   - Sends response via RELAY_0 through relay (not direct WriteToUDP)
+//   - Does NOT set peer.endpoint (relayed peer has no direct endpoint)
+func (u *UDP) handleRelayedHandshakeInit(data []byte, src [32]byte, relayPK noise.PublicKey) {
+	msg, err := noise.ParseHandshakeInit(data)
+	if err != nil {
+		return
+	}
+
+	hs, err := noise.NewHandshakeState(noise.Config{
+		Pattern:     noise.PatternIK,
+		Initiator:   false,
+		LocalStatic: u.localKey,
+	})
+	if err != nil {
+		return
+	}
+
+	noiseMsg := make([]byte, noise.KeySize+48)
+	copy(noiseMsg[:noise.KeySize], msg.Ephemeral[:])
+	copy(noiseMsg[noise.KeySize:], msg.Static)
+
+	_, err = hs.ReadMessage(noiseMsg)
+	if err != nil {
+		return
+	}
+
+	remotePK := hs.RemoteStatic()
+
+	u.mu.Lock()
+	peer, exists := u.peers[remotePK]
+	if !exists {
+		if !u.allowUnknown {
+			u.mu.Unlock()
+			return
+		}
+		peer = &peerState{
+			pk:    remotePK,
+			state: PeerStateNew,
+		}
+		u.peers[remotePK] = peer
+	}
+	u.mu.Unlock()
+
+	// Learn relay route: to reach the remote peer, go through relay
+	if u.routeTable != nil {
+		u.routeTable.AddRoute(remotePK, relayPK)
+	}
+
+	localIdx, err := noise.GenerateIndex()
+	if err != nil {
+		return
+	}
+
+	respPayload, err := hs.WriteMessage(nil)
+	if err != nil {
+		return
+	}
+
+	ephemeral := hs.LocalEphemeral()
+	wireMsg := noise.BuildHandshakeResp(localIdx, msg.SenderIndex, ephemeral, respPayload[noise.KeySize:])
+
+	// Send response through relay (wrapped in RELAY_0)
+	u.mu.RLock()
+	relayPeer, relayExists := u.peers[relayPK]
+	u.mu.RUnlock()
+
+	if !relayExists {
+		return
+	}
+
+	relay0Data := relay.EncodeRelay0(&relay.Relay0{
+		TTL:      relay.DefaultTTL,
+		Strategy: relay.StrategyAuto,
+		DstKey:   [32]byte(remotePK),
+		Payload:  wireMsg,
+	})
+
+	if err := u.sendDirect(relayPeer, noise.ProtocolRelay0, relay0Data); err != nil {
+		return
+	}
+
+	// Complete handshake and create session
+	sendCS, recvCS, err := hs.Split()
+	if err != nil {
+		return
+	}
+
+	session, err := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  localIdx,
+		RemoteIndex: msg.SenderIndex,
+		SendKey:     sendCS.Key(),
+		RecvKey:     recvCS.Key(),
+		RemotePK:    remotePK,
+	})
+	if err != nil {
+		return
+	}
+
+	muxRes := u.createMux(peer)
+
+	peer.mu.Lock()
+	// No endpoint for relayed peers — all traffic goes through relay
+	peer.session = session
+	peer.mux = muxRes.mux
+	peer.acceptChan = muxRes.acceptChan
+	peer.inboundChan = muxRes.inboundChan
+	peer.state = PeerStateEstablished
+	peer.lastSeen = time.Now()
+	peer.mu.Unlock()
+
+	u.mu.Lock()
+	u.byIndex[localIdx] = peer
+	u.mu.Unlock()
+
+	u.startMuxUpdateLoop(muxRes.mux)
+}
+
+// handleRelayedHandshakeResp processes a Handshake Response that arrived
+// through a relay (inside RELAY_2). Like handleHandshakeResp but does NOT
+// set peer.endpoint (relayed peer, the relay route was set by the initiator).
+func (u *UDP) handleRelayedHandshakeResp(data []byte, src [32]byte) {
+	msg, err := noise.ParseHandshakeResp(data)
+	if err != nil {
+		return
+	}
+
+	u.mu.Lock()
+	pending, exists := u.pending[msg.ReceiverIndex]
+	if !exists {
+		u.mu.Unlock()
+		return
+	}
+	delete(u.pending, msg.ReceiverIndex)
+	u.mu.Unlock()
+
+	noiseMsg := make([]byte, noise.KeySize+16)
+	copy(noiseMsg[:noise.KeySize], msg.Ephemeral[:])
+	copy(noiseMsg[noise.KeySize:], msg.Empty)
+
+	_, err = pending.hsState.ReadMessage(noiseMsg)
+	if err != nil {
+		pending.peer.mu.Lock()
+		pending.peer.state = PeerStateFailed
+		pending.peer.mu.Unlock()
+		if pending.done != nil {
+			pending.done <- ErrHandshakeFailed
+		}
+		return
+	}
+
+	sendCS, recvCS, err := pending.hsState.Split()
+	if err != nil {
+		pending.peer.mu.Lock()
+		pending.peer.state = PeerStateFailed
+		pending.peer.mu.Unlock()
+		if pending.done != nil {
+			pending.done <- err
+		}
+		return
+	}
+
+	session, err := noise.NewSession(noise.SessionConfig{
+		LocalIndex:  pending.localIdx,
+		RemoteIndex: msg.SenderIndex,
+		SendKey:     sendCS.Key(),
+		RecvKey:     recvCS.Key(),
+		RemotePK:    pending.peer.pk,
+	})
+	if err != nil {
+		pending.peer.mu.Lock()
+		pending.peer.state = PeerStateFailed
+		pending.peer.mu.Unlock()
+		if pending.done != nil {
+			pending.done <- err
+		}
+		return
+	}
+
+	peer := pending.peer
+	muxRes := u.createMux(peer)
+
+	peer.mu.Lock()
+	// No endpoint update for relayed peers — relay route handles routing
+	peer.session = session
+	peer.mux = muxRes.mux
+	peer.acceptChan = muxRes.acceptChan
+	peer.inboundChan = muxRes.inboundChan
+	peer.state = PeerStateEstablished
+	peer.lastSeen = time.Now()
+	peer.mu.Unlock()
+
+	u.mu.Lock()
+	u.byIndex[pending.localIdx] = peer
+	u.mu.Unlock()
+
+	u.startMuxUpdateLoop(muxRes.mux)
+
+	if pending.done != nil {
+		pending.done <- nil
 	}
 }

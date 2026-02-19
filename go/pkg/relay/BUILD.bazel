@@ -3,8 +3,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "relay",
     srcs = [
+        "bind.go",
         "message.go",
         "relay.go",
+        "route.go",
     ],
     importpath = "github.com/vibing/zgrnet/pkg/relay",
     visibility = ["//visibility:public"],
@@ -16,8 +18,10 @@ go_library(
 go_test(
     name = "relay_test",
     srcs = [
+        "bind_test.go",
         "message_test.go",
         "relay_test.go",
+        "route_test.go",
     ],
     embed = [":relay"],
     deps = [
