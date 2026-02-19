@@ -9,6 +9,8 @@
 
 mod message;
 mod engine;
+pub mod route;
 
 pub use message::*;
 pub use engine::*;
+pub use route::RouteTable;

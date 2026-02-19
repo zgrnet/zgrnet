@@ -8,6 +8,7 @@ const std = @import("std");
 
 pub const message = @import("message.zig");
 pub const engine = @import("relay.zig");
+pub const route = @import("route.zig");
 
 // Re-export message types
 pub const Relay0 = message.Relay0;
@@ -48,8 +49,12 @@ pub const handleRelay1 = engine.handleRelay1;
 pub const handleRelay2 = engine.handleRelay2;
 pub const handlePing = engine.handlePing;
 
+// Re-export route types
+pub const RouteTable = route.RouteTable;
+
 test {
     std.testing.refAllDecls(@This());
     _ = message;
     _ = engine;
+    _ = route;
 }
