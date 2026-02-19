@@ -57,6 +57,7 @@ pub enum NodeError {
     PeerNotFound,
     NotConnected,
     Stopped,
+    ProtoRegistered,
     Udp(UdpError),
     Io(std::io::Error),
     Other(String),
@@ -70,6 +71,7 @@ impl fmt::Display for NodeError {
             NodeError::PeerNotFound => write!(f, "node: peer not found"),
             NodeError::NotConnected => write!(f, "node: peer not connected"),
             NodeError::Stopped => write!(f, "node: stopped"),
+            NodeError::ProtoRegistered => write!(f, "node: proto already registered"),
             NodeError::Udp(e) => write!(f, "node: udp: {}", e),
             NodeError::Io(e) => write!(f, "node: io: {}", e),
             NodeError::Other(s) => write!(f, "node: {}", s),
@@ -117,6 +119,13 @@ pub struct NodeStream {
     pub remote_pk: Key,
 }
 
+/// A raw UDP datagram received from a peer.
+pub struct RawPacket {
+    pub data: Vec<u8>,
+    pub remote_pk: Key,
+    pub proto: u8,
+}
+
 impl NodeStream {
     /// Returns the remote peer's public key.
     pub fn remote_pubkey(&self) -> Key {
@@ -156,7 +165,7 @@ impl NodeStream {
 
 /// An embeddable zgrnet network node.
 ///
-/// Provides Dial (active connect), AcceptStream (passive accept),
+/// Provides Dial (active connect), Listen/AcceptStream (passive accept),
 /// and raw UDP send/recv — all over Noise-encrypted KCP transport.
 /// No TUN device, no root privileges required.
 pub struct Node {
@@ -166,6 +175,12 @@ pub struct Node {
     // Global accept channel aggregates streams from all peers.
     accept_tx: Sender<NodeStream>,
     accept_rx: Receiver<NodeStream>,
+
+    // Per-proto stream listeners: proto → sender channel.
+    stream_listeners: Arc<Mutex<HashMap<u8, Sender<NodeStream>>>>,
+
+    // Per-proto packet listeners: proto → sender channel.
+    packet_listeners: Arc<Mutex<HashMap<u8, Sender<RawPacket>>>>,
 
     // Per-peer stop signals for accept forwarder threads.
     peer_stops: Mutex<HashMap<Key, Sender<()>>>,
@@ -197,6 +212,8 @@ impl Node {
             state: AtomicU8::new(State::Running as u8),
             accept_tx,
             accept_rx,
+            stream_listeners: Arc::new(Mutex::new(HashMap::new())),
+            packet_listeners: Arc::new(Mutex::new(HashMap::new())),
             peer_stops: Mutex::new(HashMap::new()),
             stop_tx,
             stop_rx,
@@ -372,7 +389,44 @@ impl Node {
         self.udp.route_table()
     }
 
+    /// Registers a proto-specific stream listener. All incoming KCP streams
+    /// with the given proto are routed here instead of accept_stream().
+    pub fn listen(&self, proto: u8) -> Result<StreamListener> {
+        let mut listeners = self.stream_listeners.lock().unwrap();
+        if listeners.contains_key(&proto) {
+            return Err(NodeError::ProtoRegistered);
+        }
+        let (tx, rx) = bounded(64);
+        listeners.insert(proto, tx);
+        Ok(StreamListener { proto, rx })
+    }
+
+    /// Registers a proto-specific datagram listener. All incoming raw UDP
+    /// packets with the given proto are routed here instead of read_from().
+    pub fn listen_packet(&self, proto: u8) -> Result<PacketListener> {
+        let mut listeners = self.packet_listeners.lock().unwrap();
+        if listeners.contains_key(&proto) {
+            return Err(NodeError::ProtoRegistered);
+        }
+        let (tx, rx) = bounded(64);
+        listeners.insert(proto, tx);
+        Ok(PacketListener { proto, rx })
+    }
+
+    /// Unregisters a stream listener for the given proto.
+    pub fn close_listener(&self, proto: u8) {
+        let mut listeners = self.stream_listeners.lock().unwrap();
+        listeners.remove(&proto);
+    }
+
+    /// Unregisters a packet listener for the given proto.
+    pub fn close_packet_listener(&self, proto: u8) {
+        let mut listeners = self.packet_listeners.lock().unwrap();
+        listeners.remove(&proto);
+    }
+
     /// Waits for an incoming KCP stream from any peer.
+    /// Streams with a proto that has a registered listen() are NOT delivered here.
     pub fn accept_stream(&self) -> Result<NodeStream> {
         self.accept_rx
             .recv()
@@ -419,7 +473,7 @@ impl Node {
     }
 
     /// Starts a thread that forwards accepted streams from one peer
-    /// into the global accept channel.
+    /// into the global accept channel, routing by proto.
     fn start_accept_loop(&self, pk: Key) {
         let mut stops = self.peer_stops.lock().unwrap();
         if stops.contains_key(&pk) {
@@ -433,6 +487,8 @@ impl Node {
         let accept_tx = self.accept_tx.clone();
         let global_stop = self.stop_rx.clone();
 
+        let stream_listeners = Arc::clone(&self.stream_listeners);
+
         thread::spawn(move || {
             // Phase 1: Wait for peer to become established.
             loop {
@@ -441,14 +497,13 @@ impl Node {
                         break;
                     }
                 }
-                // Check stop signals.
                 if stop_rx.try_recv().is_ok() || global_stop.try_recv().is_ok() {
                     return;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
 
-            // Phase 2: Accept streams.
+            // Phase 2: Accept streams — route by proto.
             loop {
                 if stop_rx.try_recv().is_ok() || global_stop.try_recv().is_ok() {
                     return;
@@ -456,17 +511,29 @@ impl Node {
 
                 match udp.accept_stream(&pk) {
                     Ok(raw) => {
+                        let proto = raw.proto();
                         let ns = NodeStream {
                             stream: raw,
                             remote_pk: pk,
                         };
-                        if accept_tx.send(ns).is_err() {
-                            return; // global channel closed
+
+                        let routed = {
+                            let listeners = stream_listeners.lock().unwrap();
+                            if let Some(tx) = listeners.get(&proto) {
+                                tx.try_send(ns).is_ok()
+                            } else {
+                                false
+                            }
+                        };
+
+                        if !routed {
+                            if accept_tx.send(ns).is_err() {
+                                return;
+                            }
                         }
                     }
                     Err(UdpError::Closed) | Err(UdpError::PeerNotFound) => return,
                     Err(_) => {
-                        // Transient error (session reset, etc.) — retry after delay.
                         thread::sleep(Duration::from_millis(50));
                     }
                 }
@@ -478,6 +545,50 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Proto-specific KCP stream listener. Created by `Node::listen(proto)`.
+pub struct StreamListener {
+    proto: u8,
+    rx: Receiver<NodeStream>,
+}
+
+impl StreamListener {
+    /// Waits for the next incoming KCP stream with this listener's proto.
+    pub fn accept(&self) -> Result<NodeStream> {
+        self.rx.recv().map_err(|_| NodeError::Stopped)
+    }
+
+    /// Non-blocking accept.
+    pub fn try_accept(&self) -> Option<NodeStream> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Returns the protocol byte this listener handles.
+    pub fn proto(&self) -> u8 {
+        self.proto
+    }
+}
+
+/// Proto-specific raw datagram listener. Created by `Node::listen_packet(proto)`.
+pub struct PacketListener {
+    proto: u8,
+    rx: Receiver<RawPacket>,
+}
+
+impl PacketListener {
+    /// Waits for the next raw UDP packet with this listener's proto.
+    pub fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Key)> {
+        let pkt = self.rx.recv().map_err(|_| NodeError::Stopped)?;
+        let n = buf.len().min(pkt.data.len());
+        buf[..n].copy_from_slice(&pkt.data[..n]);
+        Ok((n, pkt.remote_pk))
+    }
+
+    /// Returns the protocol byte this listener handles.
+    pub fn proto(&self) -> u8 {
+        self.proto
     }
 }
 
@@ -656,6 +767,79 @@ mod tests {
     }
 
     /// Reads from a NodeStream with a polling timeout.
+    #[test]
+    fn test_listen_proto_routing() {
+        let kp1 = gen_key(0x30);
+        let kp2 = gen_key(0x40);
+
+        let n1 = Node::new(NodeConfig {
+            key: kp1.clone(),
+            listen_port: 0,
+            allow_unknown: true,
+        })
+        .unwrap();
+
+        let n2 = Node::new(NodeConfig {
+            key: kp2.clone(),
+            listen_port: 0,
+            allow_unknown: true,
+        })
+        .unwrap();
+
+        let n2_addr = n2.local_addr().to_string();
+        let n1_addr = n1.local_addr().to_string();
+        n1.add_peer(PeerConfig {
+            public_key: kp2.public,
+            endpoint: Some(n2_addr),
+        })
+        .unwrap();
+        n2.add_peer(PeerConfig {
+            public_key: kp1.public,
+            endpoint: Some(n1_addr),
+        })
+        .unwrap();
+
+        n1.connect(&kp2.public).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        const PROTO_CHAT: u8 = 128;
+        const PROTO_FILE: u8 = 200;
+
+        // Register listener for proto=128 on n2.
+        let chat_ln = n2.listen(PROTO_CHAT).unwrap();
+
+        // Duplicate registration must fail.
+        assert!(matches!(
+            n2.listen(PROTO_CHAT),
+            Err(NodeError::ProtoRegistered)
+        ));
+
+        // n1 opens streams with different protos.
+        let chat_stream = n1.open_stream(&kp2.public, PROTO_CHAT, b"chat-meta").unwrap();
+        let _file_stream = n1.open_stream(&kp2.public, PROTO_FILE, b"file-meta").unwrap();
+
+        // proto=128 should arrive at chat_ln.
+        let accepted_chat = chat_ln.accept().unwrap();
+        assert_eq!(accepted_chat.proto(), PROTO_CHAT);
+        assert_eq!(accepted_chat.remote_pubkey(), kp1.public);
+
+        // Echo test through the chat listener stream.
+        chat_stream.write(b"hello chat").unwrap();
+        let mut buf = [0u8; 256];
+        let n = read_timeout(&accepted_chat, &mut buf, Duration::from_secs(5))
+            .expect("chat read timeout");
+        assert_eq!(&buf[..n], b"hello chat");
+
+        // proto=200 should fall through to accept_stream.
+        let accepted_file = n2.accept_stream().unwrap();
+        assert_eq!(accepted_file.proto(), PROTO_FILE);
+
+        accepted_chat.close();
+        accepted_file.close();
+        n1.stop();
+        n2.stop();
+    }
+
     fn read_timeout(s: &NodeStream, buf: &mut [u8], timeout: Duration) -> Option<usize> {
         let start = std::time::Instant::now();
         loop {
