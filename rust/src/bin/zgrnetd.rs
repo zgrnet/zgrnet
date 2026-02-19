@@ -22,6 +22,7 @@ use zgrnet::config;
 use zgrnet::dns;
 use zgrnet::host::{self, Host, TunDevice};
 use zgrnet::kcp::StreamIo;
+use zgrnet::listener;
 use zgrnet::noise::address;
 use zgrnet::noise::message::protocol;
 use zgrnet::noise::{Key, KeyPair};
@@ -238,13 +239,32 @@ fn run(cfg_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // ── 10. Accept incoming TCP_PROXY streams (exit node) ────────────
+    // ── 10. Create Handler Registry + Control Socket ──────────────────
+    let handler_dir = data_dir.join("handlers");
+    std::fs::create_dir_all(&handler_dir)
+        .map_err(|e| format!("create handler dir: {}", e))?;
+    let registry = Arc::new(listener::Registry::new(
+        handler_dir.to_str().unwrap_or("/tmp/handlers"),
+    ));
+
+    let control_sock_path = data_dir.join("control.sock");
+    let _ = std::fs::remove_file(&control_sock_path);
+    let control_ln = std::os::unix::net::UnixListener::bind(&control_sock_path)
+        .map_err(|e| format!("bind control socket: {}", e))?;
+    let reg_for_control = Arc::clone(&registry);
+    thread::spawn(move || {
+        serve_control_socket(control_ln, &reg_for_control);
+    });
+    eprintln!("control socket: {:?}", control_sock_path);
+
+    // ── 10b. Accept incoming streams via registry dispatch ───────────
     for domain in cfg.peers.keys() {
         if let Ok(hex_pk) = config::pubkey_from_domain(domain) {
             if let Ok(pk) = Key::from_hex(&hex_pk) {
                 let udp = udp_transport.clone();
+                let reg = Arc::clone(&registry);
                 thread::spawn(move || {
-                    accept_tcp_proxy_streams(&udp, pk);
+                    accept_and_dispatch(&udp, pk, &reg);
                 });
             }
         }
@@ -462,40 +482,150 @@ fn handle_socks5_proxy(mut conn: TcpStream, udp: &zgrnet::net::UDP) {
 }
 
 // ============================================================================
-// TCP_PROXY accept loop (exit node)
+// Registry-based stream dispatch
 // ============================================================================
 
-fn accept_tcp_proxy_streams(udp: &zgrnet::net::UDP, pk: Key) {
+fn accept_and_dispatch(udp: &zgrnet::net::UDP, pk: Key, registry: &listener::Registry) {
     loop {
         let stream = match udp.accept_stream(&pk) {
             Ok(s) => s,
             Err(_) => return,
         };
-        if stream.proto() != protocol::TCP_PROXY {
+
+        let proto = stream.proto();
+        let handler_idx = match registry.lookup(proto) {
+            Some(idx) => idx,
+            None => {
+                eprintln!(
+                    "stream from {}: no handler for proto {}, rejecting",
+                    &hex::encode(pk)[..8],
+                    proto
+                );
+                stream.shutdown();
+                continue;
+            }
+        };
+
+        // Get handler info for connecting.
+        if let Some(handler) = registry.handler(handler_idx) {
+            let sock_path = if handler.target.is_empty() {
+                handler.sock.clone()
+            } else {
+                handler.target.clone()
+            };
+            let name = handler.name.clone();
+            handler.add_active(1);
+            drop(handler);
+
+            let metadata = stream.metadata().to_vec();
+            let reg_ref = registry as *const listener::Registry;
+
+            thread::spawn(move || {
+                relay_to_handler(stream, pk, &sock_path, &name, proto, &metadata);
+                // SAFETY: registry outlives all dispatch threads (it's Arc in main).
+                unsafe { &*reg_ref }.handler(handler_idx).map(|h| h.add_active(-1));
+            });
+        } else {
             stream.shutdown();
-            continue;
         }
-        let metadata = stream.metadata().to_vec();
-        thread::spawn(move || {
-            let mut sio = StreamIo(stream);
-            if let Ok((addr, _)) = address::Address::decode(&metadata) {
-                let target = format!("{}:{}", addr.host, addr.port);
-                if let Ok(sa) = target.parse::<SocketAddr>() {
-                    if let Ok(mut remote) = TcpStream::connect_timeout(&sa, Duration::from_secs(5))
-                    {
-                        let mut remote2 = remote.try_clone().unwrap();
-                        let kcp = sio.0.clone();
-                        let t = thread::spawn(move || {
-                            let mut kcp_w = StreamIo(kcp);
-                            let _ = copy_32k(&mut remote2, &mut kcp_w);
-                        });
-                        let _ = copy_32k(&mut sio, &mut remote);
-                        let _ = t.join();
+    }
+}
+
+fn relay_to_handler(
+    stream: Arc<zgrnet::kcp::Stream>,
+    pk: Key,
+    sock_path: &str,
+    handler_name: &str,
+    proto: u8,
+    metadata: &[u8],
+) {
+    let path = if sock_path.starts_with("unix://") {
+        &sock_path[7..]
+    } else {
+        sock_path
+    };
+
+    let mut conn = match std::os::unix::net::UnixStream::connect(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("handler {:?} connect: {}", handler_name, e);
+            stream.shutdown();
+            return;
+        }
+    };
+
+    if let Err(e) = listener::write_stream_header(&mut conn, &pk.0, proto, metadata) {
+        eprintln!("handler {:?} write header: {}", handler_name, e);
+        stream.shutdown();
+        return;
+    }
+
+    let mut sio = StreamIo(stream);
+    let kcp = sio.0.clone();
+    let mut conn2 = conn.try_clone().unwrap();
+    let t = thread::spawn(move || {
+        let mut kcp_w = StreamIo(kcp);
+        let _ = copy_32k(&mut conn2, &mut kcp_w);
+    });
+    let _ = copy_32k(&mut sio, &mut conn);
+    let _ = t.join();
+}
+
+// ============================================================================
+// Control socket for Listener SDK registrations
+// ============================================================================
+
+fn serve_control_socket(ln: std::os::unix::net::UnixListener, registry: &listener::Registry) {
+    for stream in ln.incoming() {
+        if let Ok(mut conn) = stream {
+            let mut buf = vec![0u8; 4096];
+            if let Ok(n) = conn.read(&mut buf) {
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                // Simple JSON parse for proto, name, mode.
+                let proto = parse_json_u8(&req_str, "proto").unwrap_or(0);
+                let name = parse_json_str(&req_str, "name").unwrap_or_default();
+                let mode_str = parse_json_str(&req_str, "mode").unwrap_or_else(|| "stream".to_string());
+                let mode = if mode_str == "dgram" {
+                    listener::Mode::Dgram
+                } else {
+                    listener::Mode::Stream
+                };
+
+                match registry.register(proto, &name, mode, "") {
+                    Ok(idx) => {
+                        if let Some(handler) = registry.handler(idx) {
+                            let resp = format!(
+                                r#"{{"sock":"{}"}}"#,
+                                handler.sock
+                            );
+                            eprintln!("handler registered: {} (proto={}, sock={})", name, proto, handler.sock);
+                            let _ = conn.write_all(resp.as_bytes());
+                        }
+                    }
+                    Err(e) => {
+                        let resp = format!(r#"{{"error":"{}"}}"#, e);
+                        let _ = conn.write_all(resp.as_bytes());
                     }
                 }
             }
-        });
+        }
     }
+}
+
+fn parse_json_str(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":\"", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = &json[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn parse_json_u8(json: &str, key: &str) -> Option<u8> {
+    let pattern = format!("\"{}\":", key);
+    let start = json.find(&pattern)? + pattern.len();
+    let rest = json[start..].trim_start();
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 // ============================================================================
