@@ -1,0 +1,39 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+# Re-export language-specific binaries
+alias(
+    name = "go",
+    actual = "//e2e/listener/go:listener_test",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "rust",
+    actual = "//e2e/listener/rust:listener_test",
+    visibility = ["//visibility:public"],
+)
+
+# Test data files
+filegroup(
+    name = "configs",
+    srcs = ["config.json"],
+    visibility = ["//visibility:public"],
+)
+
+# Cross-language Node.Listen interop test.
+# Tests proto-specific stream routing (Listen + AcceptStream).
+go_test(
+    name = "interop_test",
+    srcs = ["interop_test.go"],
+    importpath = "github.com/vibing/zgrnet/e2e/listener",
+    data = [
+        "//e2e/listener/go:listener_test",
+        "//e2e/listener/rust:listener_test",
+    ],
+    tags = [
+        "local",
+        "exclusive",
+    ],
+    timeout = "long",
+    visibility = ["//visibility:public"],
+)

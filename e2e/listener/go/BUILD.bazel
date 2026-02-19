@@ -1,0 +1,12 @@
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "listener_test",
+    srcs = ["main.go"],
+    importpath = "github.com/vibing/zgrnet/e2e/listener/go",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//go:noise",
+        "//go/pkg/node",
+    ],
+)
