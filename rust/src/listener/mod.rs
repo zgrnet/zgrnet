@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::sync::{atomic::{AtomicI64, Ordering}, Mutex};
 
@@ -222,17 +223,38 @@ pub fn read_stream_header(r: &mut dyn Read) -> io::Result<StreamMeta> {
     })
 }
 
-/// Connects to a handler's socket.
-pub fn connect_handler(handler: &Handler) -> io::Result<UnixStream> {
-    let path = if handler.target.is_empty() {
+/// Connects to a handler's socket. Returns a boxed Read+Write trait object.
+///
+/// - Empty target → Unix socket at handler.sock (Mode A)
+/// - `unix://` prefix → Unix socket at the given path
+/// - `/` prefix → Unix socket (bare path)
+/// - Otherwise → TCP connection (Mode B with TCP target)
+pub fn connect_handler(handler: &Handler) -> io::Result<Box<dyn ReadWrite>> {
+    let addr = if handler.target.is_empty() {
         &handler.sock
-    } else if handler.target.starts_with("unix://") {
-        &handler.target[7..]
     } else {
         &handler.target
     };
-    UnixStream::connect(path)
+
+    if addr.is_empty() {
+        return Err(io::Error::other(format!("handler {:?} has no target or socket", handler.name)));
+    }
+
+    if addr.starts_with('/') {
+        return Ok(Box::new(UnixStream::connect(addr)?));
+    }
+
+    if let Some(path) = addr.strip_prefix("unix://") {
+        return Ok(Box::new(UnixStream::connect(path)?));
+    }
+
+    Ok(Box::new(TcpStream::connect(addr)?))
 }
+
+/// Trait alias for Read + Write + Send.
+pub trait ReadWrite: Read + Write + Send {}
+impl ReadWrite for UnixStream {}
+impl ReadWrite for TcpStream {}
 
 // ════════════════════════════════════════════════════════════════════════
 // Listener SDK

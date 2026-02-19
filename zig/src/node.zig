@@ -137,7 +137,9 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
         accept_cond: Rt.Condition,
 
         // Per-proto stream listeners: proto(u8) → optional pointer to StreamListener.
+        // Protected by listener_mutex for concurrent access from accept loops.
         proto_listeners: [256]?*StreamListener,
+        listener_mutex: Rt.Mutex,
 
         // Per-peer accept forwarder threads
         peer_keys: [16]Key, // registered peer keys
@@ -175,6 +177,7 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
                 .accept_mutex = Rt.Mutex.init(),
                 .accept_cond = Rt.Condition.init(),
                 .proto_listeners = .{null} ** 256,
+                .listener_mutex = Rt.Mutex.init(),
                 .peer_keys = undefined,
                 .peer_stops = undefined,
                 .peer_count = 0,
@@ -207,6 +210,7 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             self.accept_cond.broadcast();
 
             // Close all proto listeners.
+            self.listener_mutex.lock();
             for (&self.proto_listeners) |*slot| {
                 if (slot.*) |ln| {
                     ln.close();
@@ -215,6 +219,7 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
                     slot.* = null;
                 }
             }
+            self.listener_mutex.unlock();
 
             // Close UDP (unblocks IO threads).
             self.udp.close();
@@ -228,6 +233,7 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             self.udp.deinit();
             self.accept_mutex.deinit();
             self.accept_cond.deinit();
+            self.listener_mutex.deinit();
             self.peer_mutex.deinit();
             self.allocator.destroy(self);
         }
@@ -237,11 +243,13 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             self.state.store(@intFromEnum(State.stopped), .release);
 
             // Close all proto listeners.
+            self.listener_mutex.lock();
             for (&self.proto_listeners) |*slot| {
                 if (slot.*) |ln| {
                     ln.close();
                 }
             }
+            self.listener_mutex.unlock();
 
             self.peer_mutex.lock();
             const count = self.peer_count;
@@ -357,6 +365,9 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
         /// with the given proto are routed to this listener. Returns error if
         /// the proto is already registered.
         pub fn listen(self: *Self, proto_byte: u8) !*StreamListener {
+            self.listener_mutex.lock();
+            defer self.listener_mutex.unlock();
+
             if (self.proto_listeners[proto_byte] != null) return error.ProtoRegistered;
 
             const ln = self.allocator.create(StreamListener) catch return error.OutOfMemory;
@@ -367,11 +378,15 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
 
         /// Unregister a proto listener. Subsequent streams fall through to acceptStream.
         pub fn closeListen(self: *Self, proto_byte: u8) void {
-            if (self.proto_listeners[proto_byte]) |ln| {
-                ln.close();
-                ln.deinit();
-                self.allocator.destroy(ln);
-                self.proto_listeners[proto_byte] = null;
+            self.listener_mutex.lock();
+            const ln = self.proto_listeners[proto_byte];
+            self.proto_listeners[proto_byte] = null;
+            self.listener_mutex.unlock();
+
+            if (ln) |l| {
+                l.close();
+                l.deinit();
+                self.allocator.destroy(l);
             }
         }
 
@@ -441,8 +456,12 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
 
                     // Route to proto-specific listener if registered.
                     const proto_byte = stream.getProto();
-                    if (self.proto_listeners[proto_byte]) |ln| {
-                        ln.ch.send(ns) catch {
+                    self.listener_mutex.lock();
+                    const ln = self.proto_listeners[proto_byte];
+                    self.listener_mutex.unlock();
+
+                    if (ln) |l| {
+                        l.ch.send(ns) catch {
                             stream.shutdown();
                         };
                     } else {

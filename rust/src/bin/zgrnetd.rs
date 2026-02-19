@@ -485,7 +485,7 @@ fn handle_socks5_proxy(mut conn: TcpStream, udp: &zgrnet::net::UDP) {
 // Registry-based stream dispatch
 // ============================================================================
 
-fn accept_and_dispatch(udp: &zgrnet::net::UDP, pk: Key, registry: &listener::Registry) {
+fn accept_and_dispatch(udp: &zgrnet::net::UDP, pk: Key, registry: &Arc<listener::Registry>) {
     loop {
         let stream = match udp.accept_stream(&pk) {
             Ok(s) => s,
@@ -518,12 +518,11 @@ fn accept_and_dispatch(udp: &zgrnet::net::UDP, pk: Key, registry: &listener::Reg
             drop(handler);
 
             let metadata = stream.metadata().to_vec();
-            let reg_ref = registry as *const listener::Registry;
+            let reg_clone = Arc::clone(registry);
 
             thread::spawn(move || {
                 relay_to_handler(stream, pk, &sock_path, &name, proto, &metadata);
-                // SAFETY: registry outlives all dispatch threads (it's Arc in main).
-                unsafe { &*reg_ref }.handler(handler_idx).map(|h| h.add_active(-1));
+                reg_clone.handler(handler_idx).map(|h| h.add_active(-1));
             });
         } else {
             stream.shutdown();

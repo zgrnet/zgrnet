@@ -167,16 +167,20 @@ func (n *Node) Stop() {
 
 	close(n.done)
 
-	// Close all proto listeners.
+	// Close all proto listeners — remove from map and close channels.
+	// Must delete from map first so acceptLoopForPeer won't find them
+	// after we close the channels.
 	n.listenerMu.Lock()
-	for _, ln := range n.listeners {
-		close(ln.ch)
+	for proto, ln := range n.listeners {
+		delete(n.listeners, proto)
+		ln.closeOnce.Do(func() { close(ln.ch) })
 	}
 	n.listenerMu.Unlock()
 
 	n.pktListenerMu.Lock()
-	for _, pl := range n.pktListeners {
-		close(pl.ch)
+	for proto, pl := range n.pktListeners {
+		delete(n.pktListeners, proto)
+		pl.closeOnce.Do(func() { close(pl.ch) })
 	}
 	n.pktListenerMu.Unlock()
 
@@ -536,23 +540,33 @@ func (n *Node) acceptLoopForPeer(pk noise.PublicKey, stop <-chan struct{}) {
 
 		s := &Stream{Stream: raw, remotePK: pk}
 
+		// Check if we're shutting down before touching channels.
+		if n.State() == StateStopped {
+			raw.Close()
+			return
+		}
+
 		// Route to proto-specific listener if registered.
+		// Hold RLock during send to prevent Stop() from closing
+		// the channel between our lookup and send.
 		n.listenerMu.RLock()
 		ln := n.listeners[raw.Proto()]
-		n.listenerMu.RUnlock()
-
 		if ln != nil {
 			select {
 			case ln.ch <- s:
+				n.listenerMu.RUnlock()
+				continue
 			case <-stop:
+				n.listenerMu.RUnlock()
 				raw.Close()
 				return
 			case <-n.done:
+				n.listenerMu.RUnlock()
 				raw.Close()
 				return
 			}
-			continue
 		}
+		n.listenerMu.RUnlock()
 
 		// Fallback to global accept channel.
 		select {
@@ -581,9 +595,10 @@ func (s *Stream) RemotePubkey() noise.PublicKey {
 // StreamListener receives KCP streams for a specific proto byte.
 // Created by Node.Listen(proto). Analogous to net.Listener.
 type StreamListener struct {
-	proto byte
-	ch    chan *Stream
-	node  *Node
+	proto     byte
+	ch        chan *Stream
+	node      *Node
+	closeOnce sync.Once
 }
 
 // Accept waits for the next incoming KCP stream with this listener's proto.
@@ -602,15 +617,14 @@ func (ln *StreamListener) Proto() byte {
 }
 
 // Close unregisters this listener. Subsequent streams with this proto
-// will fall through to the global AcceptStream channel.
+// will fall through to the global AcceptStream channel. Safe to call
+// multiple times and concurrently with Node.Stop().
 func (ln *StreamListener) Close() error {
 	ln.node.listenerMu.Lock()
-	defer ln.node.listenerMu.Unlock()
+	delete(ln.node.listeners, ln.proto)
+	ln.node.listenerMu.Unlock()
 
-	if _, exists := ln.node.listeners[ln.proto]; exists {
-		delete(ln.node.listeners, ln.proto)
-		close(ln.ch)
-	}
+	ln.closeOnce.Do(func() { close(ln.ch) })
 	return nil
 }
 
@@ -624,9 +638,10 @@ type Packet struct {
 // PacketListener receives raw UDP packets for a specific proto byte.
 // Created by Node.ListenPacket(proto). Analogous to net.PacketConn.
 type PacketListener struct {
-	proto byte
-	ch    chan Packet
-	node  *Node
+	proto     byte
+	ch        chan Packet
+	node      *Node
+	closeOnce sync.Once
 }
 
 // ReadFrom waits for the next raw UDP packet with this listener's proto.
@@ -645,14 +660,13 @@ func (pl *PacketListener) Proto() byte {
 	return pl.proto
 }
 
-// Close unregisters this packet listener.
+// Close unregisters this packet listener. Safe to call multiple times
+// and concurrently with Node.Stop().
 func (pl *PacketListener) Close() error {
 	pl.node.pktListenerMu.Lock()
-	defer pl.node.pktListenerMu.Unlock()
+	delete(pl.node.pktListeners, pl.proto)
+	pl.node.pktListenerMu.Unlock()
 
-	if _, exists := pl.node.pktListeners[pl.proto]; exists {
-		delete(pl.node.pktListeners, pl.proto)
-		close(pl.ch)
-	}
+	pl.closeOnce.Do(func() { close(pl.ch) })
 	return nil
 }

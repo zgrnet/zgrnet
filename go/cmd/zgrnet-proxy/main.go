@@ -18,7 +18,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -29,6 +28,7 @@ import (
 
 	"github.com/vibing/zgrnet/pkg/listener"
 	"github.com/vibing/zgrnet/pkg/noise"
+	"github.com/vibing/zgrnet/pkg/proxy"
 )
 
 var (
@@ -121,18 +121,5 @@ func handleTCPProxy(conn *listener.Conn) {
 
 	log.Printf("tcp-proxy: %x → %s", conn.Meta.RemotePubkey[:4], target)
 
-	relay(conn, remote)
-}
-
-func relay(a, b io.ReadWriteCloser) {
-	done := make(chan struct{}, 2)
-	go func() {
-		io.Copy(b, a)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(a, b)
-		done <- struct{}{}
-	}()
-	<-done
+	proxy.Relay(conn, remote)
 }
