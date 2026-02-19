@@ -14,7 +14,8 @@
 //
 //	stream, err := n.Dial(remotePK, 8080)
 //	// or
-//	stream, err := n.AcceptStream()
+//	ln := n.Listen(128)
+//	stream, err := ln.Accept()
 package node
 
 import (
@@ -55,11 +56,12 @@ func (s State) String() string {
 
 // Errors returned by Node operations.
 var (
-	ErrNotRunning     = errors.New("node: not running")
-	ErrAlreadyRunning = errors.New("node: already running")
-	ErrPeerNotFound   = errors.New("node: peer not found")
-	ErrNotConnected   = errors.New("node: peer not connected")
-	ErrStopped        = errors.New("node: stopped")
+	ErrNotRunning      = errors.New("node: not running")
+	ErrAlreadyRunning  = errors.New("node: already running")
+	ErrPeerNotFound    = errors.New("node: peer not found")
+	ErrNotConnected    = errors.New("node: peer not connected")
+	ErrStopped         = errors.New("node: stopped")
+	ErrProtoRegistered = errors.New("node: proto already registered")
 )
 
 // Config holds the configuration for creating a Node.
@@ -86,15 +88,23 @@ type PeerConfig struct {
 
 // Node is an embeddable zgrnet network node.
 //
-// It provides Dial (active connect), AcceptStream (passive accept),
+// It provides Dial (active connect), Listen/AcceptStream (passive accept),
 // and raw UDP send/recv — all over Noise-encrypted KCP transport.
 // No TUN device, no root privileges required.
 type Node struct {
 	config Config
 	udp    *znet.UDP
 
-	// Global accept channel aggregates streams from all peers.
+	// Global accept channel for streams with no registered proto listener.
 	acceptCh chan *Stream
+
+	// Per-proto stream listeners: proto → *StreamListener.
+	listenerMu sync.RWMutex
+	listeners  map[byte]*StreamListener
+
+	// Per-proto packet listeners: proto → *PacketListener.
+	pktListenerMu sync.RWMutex
+	pktListeners  map[byte]*PacketListener
 
 	// Tracks per-peer accept goroutines.
 	peerMu   sync.Mutex
@@ -127,11 +137,13 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		config:   cfg,
-		udp:      udp,
-		acceptCh: make(chan *Stream, 64),
-		peerDone: make(map[noise.PublicKey]chan struct{}),
-		done:     make(chan struct{}),
+		config:       cfg,
+		udp:          udp,
+		acceptCh:     make(chan *Stream, 64),
+		listeners:    make(map[byte]*StreamListener),
+		pktListeners: make(map[byte]*PacketListener),
+		peerDone:     make(map[noise.PublicKey]chan struct{}),
+		done:         make(chan struct{}),
 	}
 	n.state.Store(int32(StateRunning))
 
@@ -154,6 +166,19 @@ func (n *Node) Stop() {
 	}
 
 	close(n.done)
+
+	// Close all proto listeners.
+	n.listenerMu.Lock()
+	for _, ln := range n.listeners {
+		close(ln.ch)
+	}
+	n.listenerMu.Unlock()
+
+	n.pktListenerMu.Lock()
+	for _, pl := range n.pktListeners {
+		close(pl.ch)
+	}
+	n.pktListenerMu.Unlock()
 
 	// Stop all per-peer accept loops.
 	n.peerMu.Lock()
@@ -330,11 +355,59 @@ func (n *Node) RouteTable() *relay.RouteTable {
 	return n.udp.RouteTable()
 }
 
+// Listen registers a proto-specific stream listener. All incoming KCP streams
+// with the given proto byte are routed to this listener instead of the global
+// AcceptStream channel. Returns ErrProtoRegistered if the proto is already taken.
+//
+// Close the returned StreamListener to unregister and stop receiving streams.
+func (n *Node) Listen(proto byte) (*StreamListener, error) {
+	n.listenerMu.Lock()
+	defer n.listenerMu.Unlock()
+
+	if _, exists := n.listeners[proto]; exists {
+		return nil, ErrProtoRegistered
+	}
+
+	ln := &StreamListener{
+		proto: proto,
+		ch:    make(chan *Stream, 64),
+		node:  n,
+	}
+	n.listeners[proto] = ln
+	return ln, nil
+}
+
+// ListenPacket registers a proto-specific datagram listener. All incoming
+// raw UDP packets with the given proto byte are routed to this listener
+// instead of the global ReadFrom path. Returns ErrProtoRegistered if taken.
+//
+// Close the returned PacketListener to unregister.
+func (n *Node) ListenPacket(proto byte) (*PacketListener, error) {
+	n.pktListenerMu.Lock()
+	defer n.pktListenerMu.Unlock()
+
+	if _, exists := n.pktListeners[proto]; exists {
+		return nil, ErrProtoRegistered
+	}
+
+	pl := &PacketListener{
+		proto: proto,
+		ch:    make(chan Packet, 64),
+		node:  n,
+	}
+	n.pktListeners[proto] = pl
+	return pl, nil
+}
+
 // AcceptStream waits for an incoming KCP stream from any peer.
+// Streams with a proto that has a registered Listen() are NOT delivered here.
 // Returns the stream with RemotePubkey() identifying the sender.
 func (n *Node) AcceptStream() (*Stream, error) {
 	select {
-	case s := <-n.acceptCh:
+	case s, ok := <-n.acceptCh:
+		if !ok {
+			return nil, ErrStopped
+		}
 		return s, nil
 	case <-n.done:
 		return nil, ErrStopped
@@ -365,6 +438,7 @@ func (n *Node) UDP() *znet.UDP {
 
 // recvLoop runs in the background to drive the UDP receive pipeline.
 // Without this, handshakes and transport messages won't be processed.
+// It also dispatches raw UDP packets to proto-specific PacketListeners.
 func (n *Node) recvLoop() {
 	buf := make([]byte, 65535)
 	for {
@@ -373,13 +447,29 @@ func (n *Node) recvLoop() {
 			return
 		default:
 		}
-		_, _, err := n.udp.ReadFrom(buf)
+		pk, proto, nr, err := n.udp.ReadPacket(buf)
 		if err != nil {
 			if errors.Is(err, znet.ErrClosed) {
 				return
 			}
 			continue
 		}
+
+		// Route to proto-specific packet listener if registered.
+		n.pktListenerMu.RLock()
+		pl := n.pktListeners[proto]
+		n.pktListenerMu.RUnlock()
+
+		if pl != nil && nr > 0 {
+			data := make([]byte, nr)
+			copy(data, buf[:nr])
+			select {
+			case pl.ch <- Packet{Data: data, RemotePK: pk, Proto: proto}:
+			default:
+				// Drop if channel is full — dgram has no backpressure.
+			}
+		}
+		_ = pk // consumed above or discarded
 	}
 }
 
@@ -434,8 +524,6 @@ func (n *Node) acceptLoopForPeer(pk noise.PublicKey, stop <-chan struct{}) {
 			if errors.Is(err, znet.ErrClosed) || errors.Is(err, znet.ErrPeerNotFound) {
 				return
 			}
-			// Session may have been reset (rekey, reconnect). Go back to
-			// waiting for re-establishment.
 			select {
 			case <-stop:
 				return
@@ -447,6 +535,26 @@ func (n *Node) acceptLoopForPeer(pk noise.PublicKey, stop <-chan struct{}) {
 		}
 
 		s := &Stream{Stream: raw, remotePK: pk}
+
+		// Route to proto-specific listener if registered.
+		n.listenerMu.RLock()
+		ln := n.listeners[raw.Proto()]
+		n.listenerMu.RUnlock()
+
+		if ln != nil {
+			select {
+			case ln.ch <- s:
+			case <-stop:
+				raw.Close()
+				return
+			case <-n.done:
+				raw.Close()
+				return
+			}
+			continue
+		}
+
+		// Fallback to global accept channel.
 		select {
 		case n.acceptCh <- s:
 		case <-stop:
@@ -468,4 +576,83 @@ type Stream struct {
 // RemotePubkey returns the public key of the peer on the other end.
 func (s *Stream) RemotePubkey() noise.PublicKey {
 	return s.remotePK
+}
+
+// StreamListener receives KCP streams for a specific proto byte.
+// Created by Node.Listen(proto). Analogous to net.Listener.
+type StreamListener struct {
+	proto byte
+	ch    chan *Stream
+	node  *Node
+}
+
+// Accept waits for the next incoming KCP stream with this listener's proto.
+// Returns ErrStopped if the listener or node is closed.
+func (ln *StreamListener) Accept() (*Stream, error) {
+	s, ok := <-ln.ch
+	if !ok {
+		return nil, ErrStopped
+	}
+	return s, nil
+}
+
+// Proto returns the protocol byte this listener is registered for.
+func (ln *StreamListener) Proto() byte {
+	return ln.proto
+}
+
+// Close unregisters this listener. Subsequent streams with this proto
+// will fall through to the global AcceptStream channel.
+func (ln *StreamListener) Close() error {
+	ln.node.listenerMu.Lock()
+	defer ln.node.listenerMu.Unlock()
+
+	if _, exists := ln.node.listeners[ln.proto]; exists {
+		delete(ln.node.listeners, ln.proto)
+		close(ln.ch)
+	}
+	return nil
+}
+
+// Packet holds a single raw UDP datagram received from a peer.
+type Packet struct {
+	Data     []byte
+	RemotePK noise.PublicKey
+	Proto    byte
+}
+
+// PacketListener receives raw UDP packets for a specific proto byte.
+// Created by Node.ListenPacket(proto). Analogous to net.PacketConn.
+type PacketListener struct {
+	proto byte
+	ch    chan Packet
+	node  *Node
+}
+
+// ReadFrom waits for the next raw UDP packet with this listener's proto.
+// Returns the packet data, sender's public key, and any error.
+func (pl *PacketListener) ReadFrom(buf []byte) (int, noise.PublicKey, error) {
+	pkt, ok := <-pl.ch
+	if !ok {
+		return 0, noise.PublicKey{}, ErrStopped
+	}
+	n := copy(buf, pkt.Data)
+	return n, pkt.RemotePK, nil
+}
+
+// Proto returns the protocol byte this listener is registered for.
+func (pl *PacketListener) Proto() byte {
+	return pl.proto
+}
+
+// Close unregisters this packet listener.
+func (pl *PacketListener) Close() error {
+	pl.node.pktListenerMu.Lock()
+	defer pl.node.pktListenerMu.Unlock()
+
+	if _, exists := pl.node.pktListeners[pl.proto]; exists {
+		delete(pl.node.pktListeners, pl.proto)
+		close(pl.ch)
+	}
+	return nil
 }
