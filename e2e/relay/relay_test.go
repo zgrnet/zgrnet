@@ -316,6 +316,121 @@ func TestConcurrentRelayStreams(t *testing.T) {
 	wg.Wait()
 }
 
+// Test 6: 100-node mesh topology with multi-hop relay
+//
+// Topology: 10 relay nodes (0-9) fully connected, 90 endpoint nodes (10-99)
+// each connected to 2 relay nodes. Random pairs of endpoints communicate
+// through the relay mesh.
+func TestMeshTopology100Nodes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping large mesh test in short mode")
+	}
+
+	const (
+		numRelays    = 10
+		numEndpoints = 90
+		numTotal     = numRelays + numEndpoints
+		numPairs     = 10 // number of random pairs to test
+	)
+
+	nodes := make([]*testNode, numTotal)
+	for i := range nodes {
+		nodes[i] = newNode(t)
+		defer nodes[i].Stop()
+	}
+
+	// Connect relay nodes in a full mesh (every relay knows every other relay)
+	for i := 0; i < numRelays; i++ {
+		for j := i + 1; j < numRelays; j++ {
+			connect(t, nodes[i], nodes[j])
+		}
+	}
+
+	// Connect each endpoint to 2 relay nodes
+	for i := numRelays; i < numTotal; i++ {
+		relay1 := (i - numRelays) % numRelays
+		relay2 := ((i - numRelays) + 1) % numRelays
+		connect(t, nodes[i], nodes[relay1])
+		connect(t, nodes[i], nodes[relay2])
+	}
+
+	t.Logf("Created %d nodes: %d relays, %d endpoints", numTotal, numRelays, numEndpoints)
+
+	// Set up routes: endpoint → relay → relay → endpoint
+	// For each relay, add routes to all endpoints behind other relays.
+	for ri := 0; ri < numRelays; ri++ {
+		for ei := numRelays; ei < numTotal; ei++ {
+			primaryRelay := (ei - numRelays) % numRelays
+			if primaryRelay == ri {
+				continue // this endpoint is directly connected to this relay
+			}
+			// Route: endpoint[ei] is via relay[primaryRelay]
+			nodes[ri].RouteTable().AddRoute(nodes[ei].key.Public, nodes[primaryRelay].key.Public)
+		}
+	}
+
+	// Test random pairs of endpoints
+	type pair struct{ src, dst int }
+	pairs := []pair{
+		{10, 50}, {20, 60}, {30, 70}, {40, 80},
+		{15, 55}, {25, 65}, {35, 75}, {45, 85},
+		{11, 99}, {19, 91},
+	}
+
+	var wg sync.WaitGroup
+	for _, p := range pairs {
+		srcIdx := p.src
+		dstIdx := p.dst
+		srcNode := nodes[srcIdx]
+		dstNode := nodes[dstIdx]
+
+		// Determine relay: src's primary relay
+		srcRelay := (srcIdx - numRelays) % numRelays
+
+		// Register dst on src's side and src on dst's side
+		dstNode.AddPeer(node.PeerConfig{PublicKey: srcNode.key.Public})
+
+		wg.Add(1)
+		go func(si, di, ri int) {
+			defer wg.Done()
+
+			stream, err := srcNode.DialRelay(dstNode.key.Public, nodes[ri].key.Public, 8080)
+			if err != nil {
+				t.Errorf("nodes[%d] → nodes[%d] via relay[%d]: DialRelay failed: %v", si, di, ri, err)
+				return
+			}
+			defer stream.Close()
+
+			accepted, err := dstNode.AcceptStream()
+			if err != nil {
+				t.Errorf("nodes[%d] AcceptStream failed: %v", di, err)
+				return
+			}
+			defer accepted.Close()
+
+			msg := fmt.Sprintf("mesh-%d-to-%d", si, di)
+			if _, err := stream.Write([]byte(msg)); err != nil {
+				t.Errorf("write: %v", err)
+				return
+			}
+
+			buf := make([]byte, 256)
+			n, err := readTimeout(accepted, buf, 5*time.Second)
+			if err != nil {
+				t.Errorf("nodes[%d] read: %v", di, err)
+				return
+			}
+			if string(buf[:n]) != msg {
+				t.Errorf("nodes[%d] got %q, want %q", di, buf[:n], msg)
+				return
+			}
+			t.Logf("PASS: nodes[%d] → relay[%d] → nodes[%d]: %q", si, ri, di, msg)
+		}(srcIdx, dstIdx, srcRelay)
+	}
+
+	wg.Wait()
+}
+
 // Helper functions that wrap the relay package for TTL test
 
 func newRouteTable() *routeTableHelper {
