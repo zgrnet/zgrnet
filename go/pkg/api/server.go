@@ -59,6 +59,7 @@ import (
 	"github.com/vibing/zgrnet/pkg/config"
 	"github.com/vibing/zgrnet/pkg/dns"
 	"github.com/vibing/zgrnet/pkg/host"
+	"github.com/vibing/zgrnet/pkg/listener"
 	"github.com/vibing/zgrnet/pkg/noise"
 	"github.com/vibing/zgrnet/pkg/proxy"
 )
@@ -68,13 +69,14 @@ var adminHTML []byte
 
 // Server is the zgrnetd RESTful API server.
 // It provides HTTP endpoints for managing peers, lans, policy, routes,
-// and querying node status. Write operations persist changes to config.yaml
-// and update the runtime state immediately.
+// handlers, and querying node status. Write operations persist changes
+// to config.yaml and update the runtime state immediately.
 type Server struct {
 	host      *host.Host
 	cfgMgr    *config.Manager
 	dnsSrv    *dns.Server
 	proxySrv  *proxy.Server
+	registry  *listener.Registry
 	startTime time.Time
 	server    *http.Server
 }
@@ -99,6 +101,10 @@ type ServerConfig struct {
 	// LanHandler is an optional HTTP handler for LAN service API (/api/lan/*).
 	// If nil, LAN endpoints are not registered.
 	LanHandler http.Handler
+
+	// Registry is the handler registry for Listener API.
+	// If nil, handler endpoints are not registered.
+	Registry *listener.Registry
 }
 
 // NewServer creates a new API server with all routes registered.
@@ -108,6 +114,7 @@ func NewServer(cfg ServerConfig) *Server {
 		cfgMgr:    cfg.ConfigMgr,
 		dnsSrv:    cfg.DNSServer,
 		proxySrv:  cfg.ProxyServer,
+		registry:  cfg.Registry,
 		startTime: time.Now(),
 	}
 
@@ -141,6 +148,11 @@ func NewServer(cfg ServerConfig) *Server {
 	mux.HandleFunc("GET /api/routes", s.handleListRoutes)
 	mux.HandleFunc("POST /api/routes", s.handleAddRoute)
 	mux.HandleFunc("DELETE /api/routes/{id}", s.handleDeleteRoute)
+
+	// Handlers (Listener API)
+	mux.HandleFunc("GET /api/handlers", s.handleListHandlers)
+	mux.HandleFunc("POST /api/handlers", s.handleRegisterHandler)
+	mux.HandleFunc("DELETE /api/handlers/{name}", s.handleUnregisterHandler)
 
 	// Identity (internal)
 	mux.HandleFunc("GET /internal/identity", s.handleIdentity)
@@ -625,6 +637,68 @@ func (s *Server) handleDeleteRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ─── Handlers (Listener API) ────────────────────────────────────────────
+
+func (s *Server) handleListHandlers(w http.ResponseWriter, r *http.Request) {
+	if s.registry == nil {
+		writeJSON(w, http.StatusOK, []listener.HandlerInfo{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.registry.List())
+}
+
+func (s *Server) handleRegisterHandler(w http.ResponseWriter, r *http.Request) {
+	if s.registry == nil {
+		writeError(w, http.StatusServiceUnavailable, "handler registry not initialized")
+		return
+	}
+
+	var req struct {
+		Proto  byte            `json:"proto"`
+		Name   string          `json:"name"`
+		Mode   listener.Mode   `json:"mode"`
+		Target string          `json:"target,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if req.Mode == "" {
+		req.Mode = listener.ModeStream
+	}
+
+	h, err := s.registry.Register(req.Proto, req.Name, req.Mode, req.Target)
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"proto": h.Proto,
+		"name":  h.Name,
+		"mode":  h.Mode,
+		"sock":  h.Sock,
+	})
+}
+
+func (s *Server) handleUnregisterHandler(w http.ResponseWriter, r *http.Request) {
+	if s.registry == nil {
+		writeError(w, http.StatusServiceUnavailable, "handler registry not initialized")
+		return
+	}
+
+	name := r.PathValue("name")
+	if err := s.registry.Unregister(name); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
