@@ -517,19 +517,16 @@ impl Node {
                             remote_pk: pk,
                         };
 
-                        let routed = {
+                        // Try proto-specific listener first, fall back to global.
+                        let proto_tx = {
                             let listeners = stream_listeners.lock().unwrap();
-                            if let Some(tx) = listeners.get(&proto) {
-                                tx.try_send(ns).is_ok()
-                            } else {
-                                false
-                            }
+                            listeners.get(&proto).cloned()
                         };
 
-                        if !routed {
-                            if accept_tx.send(ns).is_err() {
-                                return;
-                            }
+                        if let Some(tx) = proto_tx {
+                            let _ = tx.try_send(ns);
+                        } else if accept_tx.send(ns).is_err() {
+                            return;
                         }
                     }
                     Err(UdpError::Closed) | Err(UdpError::PeerNotFound) => return,

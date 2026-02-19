@@ -657,10 +657,10 @@ func (s *Server) handleRegisterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Proto  byte            `json:"proto"`
-		Name   string          `json:"name"`
-		Mode   listener.Mode   `json:"mode"`
-		Target string          `json:"target,omitempty"`
+		Proto  byte          `json:"proto"`
+		Name   string        `json:"name"`
+		Mode   listener.Mode `json:"mode"`
+		Target string        `json:"target,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())

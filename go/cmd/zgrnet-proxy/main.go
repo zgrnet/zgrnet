@@ -29,7 +29,6 @@ import (
 
 	"github.com/vibing/zgrnet/pkg/listener"
 	"github.com/vibing/zgrnet/pkg/noise"
-	"github.com/vibing/zgrnet/pkg/proxy"
 )
 
 var (

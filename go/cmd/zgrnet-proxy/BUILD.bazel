@@ -8,6 +8,5 @@ go_binary(
     deps = [
         "//go:noise",
         "//go/pkg/listener",
-        "//go/pkg/proxy",
     ],
 )
