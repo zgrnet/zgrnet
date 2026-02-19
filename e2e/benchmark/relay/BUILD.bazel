@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_test")
+
+go_test(
+    name = "relay_bench_test",
+    srcs = ["relay_bench_test.go"],
+    importpath = "github.com/vibing/zgrnet/e2e/benchmark/relay",
+    tags = [
+        "benchmark",
+        "manual",
+        "local",
+        "exclusive",
+    ],
+    timeout = "long",
+    deps = [
+        "//go:noise",
+        "//go/pkg/node",
+    ],
+)
