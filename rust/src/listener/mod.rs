@@ -273,7 +273,7 @@ impl Listener {
         let resp = String::from_utf8_lossy(&buf[..n]);
 
         if resp.contains("\"error\"") && !resp.contains("\"error\":\"\"") {
-            return Err(io::Error::new(io::ErrorKind::Other, resp.to_string()));
+            return Err(io::Error::other(resp.to_string()));
         }
 
         // Extract sock path from response (simple parse).
@@ -284,7 +284,7 @@ impl Listener {
             }
         }
 
-        Err(io::Error::new(io::ErrorKind::InvalidData, "no sock in response"))
+        Err(io::Error::other("no sock in response"))
     }
 }
 
