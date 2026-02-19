@@ -1,9 +1,11 @@
 // Cross-language Node.Listen interop test.
 //
 // Tests that proto-specific stream routing (Listen/AcceptStream) works
-// correctly across Go ↔ Rust pairs. The opener sends streams with
-// proto=128 (chat) and proto=200 (file). The accepter uses Listen(128)
-// for chat and AcceptStream for file.
+// correctly across all 3×3 language pairs: Go, Rust, Zig.
+//
+// The opener sends streams with proto=128 (chat) and proto=200 (file).
+// The accepter uses Listen(128) for chat and AcceptStream for file.
+// Both streams do echo round-trip verification.
 package listener_e2e
 
 import (
@@ -59,41 +61,121 @@ func findBinary(t *testing.T, relPath string) string {
 	return ""
 }
 
-func TestGoGoListenInterop(t *testing.T) {
-	goBin := findBinary(t, "e2e/listener/go/listener_test_/listener_test")
-	if goBin == "" {
-		t.Fatal("Go binary not found")
-	}
-	runPairTest(t, goBin, goBin, "go-opener", "go-accepter")
+func goBin(t *testing.T) string {
+	return findBinary(t, "e2e/listener/go/listener_test_/listener_test")
 }
 
-func TestGoRustListenInterop(t *testing.T) {
-	goBin := findBinary(t, "e2e/listener/go/listener_test_/listener_test")
-	rustBin := findBinary(t, "e2e/listener/rust/listener_test")
+func rustBin(t *testing.T) string {
+	return findBinary(t, "e2e/listener/rust/listener_test")
+}
 
-	if goBin == "" {
+func zigBin(t *testing.T) string {
+	return findBinary(t, "e2e/listener/zig/listener_test")
+}
+
+// ─── Go ↔ Go ──────────────────────────────────────────────────────────
+
+func TestGoOpener_GoAccepter(t *testing.T) {
+	b := goBin(t)
+	if b == "" {
 		t.Fatal("Go binary not found")
 	}
-	if rustBin == "" {
+	runPairTest(t, b, b, "go-opener", "go-accepter")
+}
+
+// ─── Go ↔ Rust ────────────────────────────────────────────────────────
+
+func TestGoOpener_RustAccepter(t *testing.T) {
+	g, r := goBin(t), rustBin(t)
+	if g == "" {
+		t.Fatal("Go binary not found")
+	}
+	if r == "" {
 		t.Fatal("Rust binary not found")
 	}
-
-	runPairTest(t, goBin, rustBin, "go", "rust")
+	runPairTest(t, g, r, "go", "rust")
 }
 
-func TestRustGoListenInterop(t *testing.T) {
-	goBin := findBinary(t, "e2e/listener/go/listener_test_/listener_test")
-	rustBin := findBinary(t, "e2e/listener/rust/listener_test")
-
-	if goBin == "" {
+func TestRustOpener_GoAccepter(t *testing.T) {
+	g, r := goBin(t), rustBin(t)
+	if g == "" {
 		t.Fatal("Go binary not found")
 	}
-	if rustBin == "" {
+	if r == "" {
 		t.Fatal("Rust binary not found")
 	}
-
-	runPairTest(t, rustBin, goBin, "rust", "go")
+	runPairTest(t, r, g, "rust", "go")
 }
+
+// ─── Go ↔ Zig ─────────────────────────────────────────────────────────
+
+func TestGoOpener_ZigAccepter(t *testing.T) {
+	g, z := goBin(t), zigBin(t)
+	if g == "" {
+		t.Fatal("Go binary not found")
+	}
+	if z == "" {
+		t.Skip("Zig binary not available on this platform")
+	}
+	runPairTest(t, g, z, "go", "zig")
+}
+
+func TestZigOpener_GoAccepter(t *testing.T) {
+	g, z := goBin(t), zigBin(t)
+	if g == "" {
+		t.Fatal("Go binary not found")
+	}
+	if z == "" {
+		t.Skip("Zig binary not available on this platform")
+	}
+	runPairTest(t, z, g, "zig", "go")
+}
+
+// ─── Rust ↔ Rust ──────────────────────────────────────────────────────
+
+func TestRustOpener_RustAccepter(t *testing.T) {
+	r := rustBin(t)
+	if r == "" {
+		t.Fatal("Rust binary not found")
+	}
+	runPairTest(t, r, r, "rust-opener", "rust-accepter")
+}
+
+// ─── Rust ↔ Zig ───────────────────────────────────────────────────────
+
+func TestRustOpener_ZigAccepter(t *testing.T) {
+	r, z := rustBin(t), zigBin(t)
+	if r == "" {
+		t.Fatal("Rust binary not found")
+	}
+	if z == "" {
+		t.Skip("Zig binary not available on this platform")
+	}
+	runPairTest(t, r, z, "rust", "zig")
+}
+
+func TestZigOpener_RustAccepter(t *testing.T) {
+	r, z := rustBin(t), zigBin(t)
+	if r == "" {
+		t.Fatal("Rust binary not found")
+	}
+	if z == "" {
+		t.Skip("Zig binary not available on this platform")
+	}
+	runPairTest(t, z, r, "zig", "rust")
+}
+
+// ─── Zig ↔ Zig ────────────────────────────────────────────────────────
+
+func TestZigOpener_ZigAccepter(t *testing.T) {
+	z := zigBin(t)
+	if z == "" {
+		t.Skip("Zig binary not available on this platform")
+	}
+	runPairTest(t, z, z, "zig-opener", "zig-accepter")
+}
+
+// ─── Runner ────────────────────────────────────────────────────────────
 
 func runPairTest(t *testing.T, openerBin, accepterBin, openerName, accepterName string) {
 	t.Helper()
@@ -147,17 +229,17 @@ func runPairTest(t *testing.T, openerBin, accepterBin, openerName, accepterName 
 	wg.Wait()
 
 	if openerErr != nil {
-		t.Errorf("opener failed: %v", openerErr)
+		t.Errorf("opener (%s) failed: %v", openerName, openerErr)
 		t.Logf("opener output:\n%s", indent(openerOut.String()))
 	}
 	if accepterErr != nil {
-		t.Errorf("accepter failed: %v", accepterErr)
+		t.Errorf("accepter (%s) failed: %v", accepterName, accepterErr)
 		t.Logf("accepter output:\n%s", indent(accepterOut.String()))
 	}
 
 	if openerErr == nil && accepterErr == nil {
-		t.Logf("opener output:\n%s", indent(openerOut.String()))
-		t.Logf("accepter output:\n%s", indent(accepterOut.String()))
+		t.Logf("opener (%s) output:\n%s", openerName, indent(openerOut.String()))
+		t.Logf("accepter (%s) output:\n%s", accepterName, indent(accepterOut.String()))
 	}
 }
 

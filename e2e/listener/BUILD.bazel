@@ -13,6 +13,12 @@ alias(
     visibility = ["//visibility:public"],
 )
 
+alias(
+    name = "zig",
+    actual = "//e2e/listener/zig:listener_test",
+    visibility = ["//visibility:public"],
+)
+
 # Test data files
 filegroup(
     name = "configs",
@@ -21,7 +27,9 @@ filegroup(
 )
 
 # Cross-language Node.Listen interop test.
-# Tests proto-specific stream routing (Listen + AcceptStream).
+# 9 test cases: all 3×3 pairs of Go, Rust, Zig (opener × accepter).
+# Each test: opener sends proto=128 (chat) + proto=200 (file),
+# accepter uses Listen(128) for chat, AcceptStream for file.
 go_test(
     name = "interop_test",
     srcs = ["interop_test.go"],
@@ -29,7 +37,10 @@ go_test(
     data = [
         "//e2e/listener/go:listener_test",
         "//e2e/listener/rust:listener_test",
-    ],
+    ] + select({
+        "@platforms//os:macos": ["//e2e/listener/zig:listener_test"],
+        "//conditions:default": [],
+    }),
     tags = [
         "local",
         "exclusive",

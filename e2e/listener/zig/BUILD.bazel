@@ -1,0 +1,10 @@
+load("@embed_zig//bazel/zig:defs.bzl", "zig_binary")
+
+zig_binary(
+    name = "listener_test",
+    main = "src/main.zig",
+    srcs = ["src/main.zig"],
+    deps = ["//zig:noise"],
+    target_compatible_with = ["@platforms//os:macos"],
+    visibility = ["//visibility:public"],
+)
