@@ -6,6 +6,7 @@
 
 use std::env;
 use std::fs;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -138,7 +139,7 @@ fn run_opener(node: &Node, peer_pk: &Key, test: &TestConfig) {
     file_stream.close();
 }
 
-fn run_accepter(node: &Node, test: &TestConfig, _name: &str) {
+fn run_accepter(node: &Arc<Node>, test: &TestConfig, _name: &str) {
     // Register listener for proto=128 (chat).
     let chat_ln = node.listen(PROTO_CHAT).expect("listen(chat)");
     println!("[accepter] listening on proto={} (chat)", PROTO_CHAT);
@@ -167,8 +168,9 @@ fn run_accepter(node: &Node, test: &TestConfig, _name: &str) {
     });
 
     // Accept file via accept_stream (no listener for proto=200).
+    let node_clone = Arc::clone(node);
     let file_handle = thread::spawn(move || {
-        let stream = node.accept_stream().expect("accept_stream");
+        let stream = node_clone.accept_stream().expect("accept_stream");
         assert_eq!(stream.proto(), PROTO_FILE, "file proto mismatch");
         println!("[accepter] accepted file stream (proto={})", stream.proto());
 
