@@ -308,6 +308,113 @@ func TestOperationsOnStoppedNode(t *testing.T) {
 	}
 }
 
+// TestDialRelayThreeNodes tests A → C (relay) → D with KCP stream echo.
+// A and D have no direct connection. C is the relay that forwards traffic.
+func TestDialRelayThreeNodes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	kpA := genKey(t, 0xA0)
+	kpC := genKey(t, 0xC0)
+	kpD := genKey(t, 0xD0)
+
+	// Create 3 nodes. C allows unknown peers so it can accept relayed
+	// handshakes for A from D.
+	nodeA, err := New(Config{PrivateKey: kpA, ListenPort: 0, AllowUnknown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeA.Stop()
+
+	nodeC, err := New(Config{PrivateKey: kpC, ListenPort: 0, AllowUnknown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeC.Stop()
+
+	nodeD, err := New(Config{PrivateKey: kpD, ListenPort: 0, AllowUnknown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeD.Stop()
+
+	// Set up direct connections: A↔C, C↔D
+	nodeA.AddPeer(PeerConfig{PublicKey: kpC.Public, Endpoint: nodeC.LocalAddr().String()})
+	nodeC.AddPeer(PeerConfig{PublicKey: kpA.Public, Endpoint: nodeA.LocalAddr().String()})
+
+	nodeC.AddPeer(PeerConfig{PublicKey: kpD.Public, Endpoint: nodeD.LocalAddr().String()})
+	nodeD.AddPeer(PeerConfig{PublicKey: kpC.Public, Endpoint: nodeC.LocalAddr().String()})
+
+	// Establish A↔C session
+	if err := nodeA.Connect(kpC.Public); err != nil {
+		t.Fatalf("A→C Connect: %v", err)
+	}
+	// Establish C↔D session
+	if err := nodeC.Connect(kpD.Public); err != nil {
+		t.Fatalf("C→D Connect: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// D registers A as a relay-only peer (no endpoint) so its accept loop
+	// is running when the relayed handshake completes.
+	nodeD.AddPeer(PeerConfig{PublicKey: kpA.Public})
+
+	// A dials D through relay C.
+	// DialRelay adds route D → C, registers D as peer, then does handshake through relay.
+	stream, err := nodeA.DialRelay(kpD.Public, kpC.Public, 8080)
+	if err != nil {
+		t.Fatalf("DialRelay: %v", err)
+	}
+	defer stream.Close()
+
+	t.Logf("A opened stream to D through relay C: proto=%d", stream.Proto())
+
+	// D should accept the stream from A.
+	accepted, err := nodeD.AcceptStream()
+	if err != nil {
+		t.Fatalf("D AcceptStream: %v", err)
+	}
+	defer accepted.Close()
+
+	rpk := accepted.RemotePubkey()
+	if rpk != kpA.Public {
+		t.Errorf("D accepted from wrong peer: got %x, want %x", rpk[:4], kpA.Public[:4])
+	}
+	t.Logf("D accepted stream from A: proto=%d", accepted.Proto())
+
+	// Echo test: A writes, D reads and echoes back.
+	msg := []byte("hello through relay!")
+	if _, err := stream.Write(msg); err != nil {
+		t.Fatalf("A Write: %v", err)
+	}
+
+	buf := make([]byte, 256)
+	n, readErr := readTimeout(accepted, buf, 5*time.Second)
+	if readErr != nil {
+		t.Fatalf("D Read: %v", readErr)
+	}
+	if string(buf[:n]) != string(msg) {
+		t.Errorf("D got %q, want %q", buf[:n], msg)
+	}
+	t.Logf("D received: %q", buf[:n])
+
+	// D echoes back.
+	reply := []byte("echo: " + string(buf[:n]))
+	if _, err := accepted.Write(reply); err != nil {
+		t.Fatalf("D Write: %v", err)
+	}
+
+	n, readErr = readTimeout(stream, buf, 5*time.Second)
+	if readErr != nil {
+		t.Fatalf("A Read reply: %v", readErr)
+	}
+	if string(buf[:n]) != string(reply) {
+		t.Errorf("A got %q, want %q", buf[:n], reply)
+	}
+	t.Logf("A received reply: %q", buf[:n])
+}
+
 // readTimeout reads from a stream with a deadline.
 func readTimeout(s *Stream, buf []byte, timeout time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
