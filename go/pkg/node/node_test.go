@@ -415,6 +415,173 @@ func TestDialRelayThreeNodes(t *testing.T) {
 	t.Logf("A received reply: %q", buf[:n])
 }
 
+// TestListenProtoRouting verifies that Listen(proto) receives only matching
+// streams while unmatched protos fall through to AcceptStream.
+func TestListenProtoRouting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	kp1 := genKey(t, 0x30)
+	kp2 := genKey(t, 0x40)
+
+	n1, err := New(Config{PrivateKey: kp1, ListenPort: 0, AllowUnknown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n1.Stop()
+
+	n2, err := New(Config{PrivateKey: kp2, ListenPort: 0, AllowUnknown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Stop()
+
+	n1.AddPeer(PeerConfig{PublicKey: kp2.Public, Endpoint: n2.LocalAddr().String()})
+	n2.AddPeer(PeerConfig{PublicKey: kp1.Public, Endpoint: n1.LocalAddr().String()})
+
+	if err := n1.Connect(kp2.Public); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	const protoChat byte = 128
+	const protoFile byte = 200
+
+	// n2 registers a listener for proto=128 (chat).
+	chatLn, err := n2.Listen(protoChat)
+	if err != nil {
+		t.Fatalf("Listen(128): %v", err)
+	}
+	defer chatLn.Close()
+
+	// Duplicate registration must fail.
+	if _, err := n2.Listen(protoChat); err != ErrProtoRegistered {
+		t.Fatalf("duplicate Listen: err = %v, want ErrProtoRegistered", err)
+	}
+
+	// n1 opens two streams: one with proto=128 (chat), one with proto=200 (file).
+	chatStream, err := n1.OpenStream(kp2.Public, protoChat, []byte("chat-meta"))
+	if err != nil {
+		t.Fatalf("OpenStream(chat): %v", err)
+	}
+	defer chatStream.Close()
+
+	fileStream, err := n1.OpenStream(kp2.Public, protoFile, []byte("file-meta"))
+	if err != nil {
+		t.Fatalf("OpenStream(file): %v", err)
+	}
+	defer fileStream.Close()
+
+	// proto=128 should arrive at chatLn.Accept(), not AcceptStream().
+	done := make(chan *Stream, 1)
+	go func() {
+		s, err := chatLn.Accept()
+		if err != nil {
+			t.Errorf("chatLn.Accept: %v", err)
+			return
+		}
+		done <- s
+	}()
+
+	select {
+	case s := <-done:
+		if s.Proto() != protoChat {
+			t.Errorf("chatLn got proto %d, want %d", s.Proto(), protoChat)
+		}
+		if s.RemotePubkey() != kp1.Public {
+			t.Error("chatLn: RemotePubkey mismatch")
+		}
+		// Echo test.
+		chatStream.Write([]byte("hello chat"))
+		buf := make([]byte, 256)
+		nr, err := readTimeout(s, buf, 5*time.Second)
+		if err != nil {
+			t.Fatalf("chatLn read: %v", err)
+		}
+		if string(buf[:nr]) != "hello chat" {
+			t.Errorf("chatLn got %q, want %q", buf[:nr], "hello chat")
+		}
+		s.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for chatLn.Accept")
+	}
+
+	// proto=200 should arrive at AcceptStream() (no listener registered).
+	accepted, err := n2.AcceptStream()
+	if err != nil {
+		t.Fatalf("AcceptStream: %v", err)
+	}
+	defer accepted.Close()
+	if accepted.Proto() != protoFile {
+		t.Errorf("AcceptStream got proto %d, want %d", accepted.Proto(), protoFile)
+	}
+}
+
+// TestListenClose verifies that closing a StreamListener unregisters it,
+// so subsequent streams fall through to AcceptStream.
+func TestListenClose(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	kp1 := genKey(t, 0x50)
+	kp2 := genKey(t, 0x60)
+
+	n1, err := New(Config{PrivateKey: kp1, ListenPort: 0, AllowUnknown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n1.Stop()
+
+	n2, err := New(Config{PrivateKey: kp2, ListenPort: 0, AllowUnknown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Stop()
+
+	n1.AddPeer(PeerConfig{PublicKey: kp2.Public, Endpoint: n2.LocalAddr().String()})
+	n2.AddPeer(PeerConfig{PublicKey: kp1.Public, Endpoint: n1.LocalAddr().String()})
+
+	if err := n1.Connect(kp2.Public); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	const proto byte = 150
+
+	ln, err := n2.Listen(proto)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Close the listener — should unregister.
+	ln.Close()
+
+	// Now same proto should re-register successfully.
+	ln2, err := n2.Listen(proto)
+	if err != nil {
+		t.Fatalf("re-Listen after close: %v", err)
+	}
+	defer ln2.Close()
+
+	// Open a stream — should go to ln2.
+	s1, err := n1.OpenStream(kp2.Public, proto, nil)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	defer s1.Close()
+
+	accepted, err := ln2.Accept()
+	if err != nil {
+		t.Fatalf("ln2.Accept: %v", err)
+	}
+	if accepted.Proto() != proto {
+		t.Errorf("proto = %d, want %d", accepted.Proto(), proto)
+	}
+	accepted.Close()
+}
+
 // readTimeout reads from a stream with a deadline.
 func readTimeout(s *Stream, buf []byte, timeout time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
