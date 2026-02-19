@@ -49,6 +49,18 @@ pub mod protocol {
     pub const PING: u8 = 70;
     /// Pong probe response
     pub const PONG: u8 = 71;
+    /// Relay first hop BIND (relay_id + dst_pubkey)
+    pub const RELAY_0_BIND: u8 = 72;
+    /// Relay first hop ALIAS (relay_id + payload)
+    pub const RELAY_0_ALIAS: u8 = 73;
+    /// Relay middle hop BIND (relay_id + src + dst pubkey)
+    pub const RELAY_1_BIND: u8 = 74;
+    /// Relay middle hop ALIAS (relay_id + payload)
+    pub const RELAY_1_ALIAS: u8 = 75;
+    /// Relay last hop BIND (relay_id + src_pubkey)
+    pub const RELAY_2_BIND: u8 = 76;
+    /// Relay last hop ALIAS (relay_id + payload)
+    pub const RELAY_2_ALIAS: u8 = 77;
 
     // Application layer protocols (128-255)
     /// Chat messages
