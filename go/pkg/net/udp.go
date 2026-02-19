@@ -153,8 +153,8 @@ type UDP struct {
 	// Options
 	allowUnknown bool
 
-	// Relay forwarding
-	router       relay.Router      // nil = no relay forwarding
+	// Relay routing and forwarding
+	routeTable   *relay.RouteTable // nil = no relay; used for both forwarding and outbound wrapping
 	localMetrics relay.NodeMetrics // local metrics for PONG responses
 
 	// Peer management
@@ -216,7 +216,7 @@ type options struct {
 	bindAddr       string
 	allowUnknown   bool
 	decryptWorkers int // 0 = runtime.NumCPU()
-	router         relay.Router
+	routeTable     *relay.RouteTable
 	localMetrics   relay.NodeMetrics
 }
 
@@ -245,9 +245,19 @@ func WithDecryptWorkers(n int) Option {
 
 // WithRouter sets the relay router for forwarding relay packets.
 // If nil (default), relay packets are dropped.
+// Deprecated: Use WithRouteTable instead.
 func WithRouter(r relay.Router) Option {
 	return func(o *options) {
-		o.router = r
+		if rt, ok := r.(*relay.RouteTable); ok {
+			o.routeTable = rt
+		}
+	}
+}
+
+// WithRouteTable sets the route table for relay forwarding and outbound wrapping.
+func WithRouteTable(rt *relay.RouteTable) Option {
+	return func(o *options) {
+		o.routeTable = rt
 	}
 }
 
@@ -287,7 +297,7 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		socket:       socket,
 		localKey:     key,
 		allowUnknown: o.allowUnknown,
-		router:       o.router,
+		routeTable:   o.routeTable,
 		localMetrics: o.localMetrics,
 		peers:        make(map[noise.PublicKey]*peerState),
 		byIndex:      make(map[uint32]*peerState),
@@ -376,8 +386,21 @@ func (u *UDP) RemovePeer(pk noise.PublicKey) {
 }
 
 // SetRouter sets the relay router for forwarding relay packets at runtime.
+// Deprecated: Use SetRouteTable instead.
 func (u *UDP) SetRouter(r relay.Router) {
-	u.router = r
+	if rt, ok := r.(*relay.RouteTable); ok {
+		u.routeTable = rt
+	}
+}
+
+// SetRouteTable sets the route table at runtime.
+func (u *UDP) SetRouteTable(rt *relay.RouteTable) {
+	u.routeTable = rt
+}
+
+// RouteTable returns the current route table, or nil if none is set.
+func (u *UDP) RouteTable() *relay.RouteTable {
+	return u.routeTable
 }
 
 // SetLocalMetrics updates the local node metrics for PONG responses.
@@ -488,6 +511,7 @@ func (u *UDP) GetConn(pk noise.PublicKey) *Conn {
 
 // WriteTo sends encrypted data to a peer.
 // Uses a default protocol byte (ProtocolRaw) for transport.
+// If the peer has a relay route, data is automatically sent through the relay.
 func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 	if u.closed.Load() {
 		return ErrClosed
@@ -501,44 +525,7 @@ func (u *UDP) WriteTo(pk noise.PublicKey, data []byte) error {
 		return ErrPeerNotFound
 	}
 
-	peer.mu.RLock()
-	session := peer.session
-	endpoint := peer.endpoint
-	peer.mu.RUnlock()
-
-	if endpoint == nil {
-		return ErrNoEndpoint
-	}
-
-	if session == nil {
-		return ErrNoSession
-	}
-
-	// Encode with default protocol byte
-	payload := noise.EncodePayload(noise.ProtocolRaw, data)
-
-	// Encrypt the data
-	encrypted, nonce, err := session.Encrypt(payload)
-	if err != nil {
-		return err
-	}
-
-	// Build transport message
-	msg := noise.BuildTransportMessage(session.RemoteIndex(), nonce, encrypted)
-
-	// Send
-	n, err := u.socket.WriteToUDP(msg, endpoint)
-	if err != nil {
-		return err
-	}
-
-	// Update stats
-	u.totalTx.Add(uint64(n))
-	peer.mu.Lock()
-	peer.txBytes += uint64(n)
-	peer.mu.Unlock()
-
-	return nil
+	return u.sendToPeer(peer, noise.ProtocolRaw, data)
 }
 
 // ReadFrom reads the next decrypted message from any peer.
@@ -1139,8 +1126,8 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		pkt.err = ErrNoData
 
 	case noise.ProtocolRelay0:
-		if u.router != nil {
-			action, err := relay.HandleRelay0(u.router, pkt.pk, payload)
+		if u.routeTable != nil {
+			action, err := relay.HandleRelay0(u.routeTable, pkt.pk, payload)
 			if err == nil {
 				u.executeRelayAction(action)
 			}
@@ -1148,8 +1135,8 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		pkt.err = ErrNoData // Relay packets are not delivered to ReadFrom
 
 	case noise.ProtocolRelay1:
-		if u.router != nil {
-			action, err := relay.HandleRelay1(u.router, payload)
+		if u.routeTable != nil {
+			action, err := relay.HandleRelay1(u.routeTable, payload)
 			if err == nil {
 				u.executeRelayAction(action)
 			}
@@ -1168,7 +1155,7 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		pkt.err = ErrNoData
 
 	case noise.ProtocolPing:
-		if u.router != nil {
+		if u.routeTable != nil {
 			action, err := relay.HandlePing(pkt.pk, payload, u.localMetrics)
 			if err == nil {
 				u.executeRelayAction(action)
@@ -1202,6 +1189,7 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 }
 
 // executeRelayAction sends a relay forwarding action to the target peer.
+// Uses sendDirect because the relay engine already computed the next hop.
 func (u *UDP) executeRelayAction(action *relay.Action) {
 	pk := noise.PublicKey(action.Dst)
 
@@ -1213,7 +1201,7 @@ func (u *UDP) executeRelayAction(action *relay.Action) {
 		return
 	}
 
-	_ = u.sendToPeer(peer, action.Protocol, action.Data)
+	_ = u.sendDirect(peer, action.Protocol, action.Data)
 }
 
 // processRelayedPacket handles a RELAY_2 inner payload.
