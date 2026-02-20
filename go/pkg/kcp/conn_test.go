@@ -621,3 +621,99 @@ func BenchmarkKCPConn_Throughput_Sizes(b *testing.B) {
 		})
 	}
 }
+
+// === BUG regression tests — these must FAIL before fix, PASS after ===
+
+// TestKCPConn_BUG1_ConcurrentWriteRace verifies that concurrent Write calls
+// from multiple goroutines don't race with the internal runLoop.
+// Run with -race to detect: go test -race -run BUG1
+func TestKCPConn_BUG1_ConcurrentWriteRace(t *testing.T) {
+	a, b := connPair(0)
+	defer a.Close()
+	defer b.Close()
+
+	const numWriters = 10
+	const writesPerGoroutine = 100
+	msg := bytes.Repeat([]byte("R"), 128)
+
+	var wg sync.WaitGroup
+
+	// Multiple goroutines writing concurrently
+	for i := 0; i < numWriters; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < writesPerGoroutine; j++ {
+				a.Write(msg)
+			}
+		}()
+	}
+
+	// Reader consuming data on the other side
+	totalExpected := numWriters * writesPerGoroutine * len(msg)
+	received := 0
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 64*1024)
+		for received < totalExpected {
+			n, err := b.Read(buf)
+			if err != nil {
+				return
+			}
+			received += n
+		}
+	}()
+
+	wg.Wait()
+
+	select {
+	case <-readDone:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timeout: received %d/%d bytes", received, totalExpected)
+	}
+
+	if received != totalExpected {
+		t.Errorf("received %d bytes, want %d", received, totalExpected)
+	}
+}
+
+// TestKCPConn_BUG2_ReadDeadline verifies that SetReadDeadline actually
+// causes Read to return with a timeout error after the deadline.
+// Before fix: Read blocks forever (SetDeadline was no-op).
+func TestKCPConn_BUG2_ReadDeadline(t *testing.T) {
+	a, b := connPair(0)
+	defer a.Close()
+	defer b.Close()
+
+	b.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+
+	buf := make([]byte, 10)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := b.Read(buf)
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		if err == nil {
+			t.Fatal("expected deadline error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("BUG2: Read did not respect deadline — blocked for 2s (SetDeadline is no-op)")
+	}
+}
+
+// TestKCPConn_BUG2_WriteDeadline verifies that SetWriteDeadline works.
+func TestKCPConn_BUG2_WriteDeadline(t *testing.T) {
+	a, b := connPair(0)
+	defer a.Close()
+	defer b.Close()
+
+	a.SetWriteDeadline(time.Now().Add(-1 * time.Second)) // already expired
+	_, err := a.Write([]byte("should fail"))
+	if err != ErrConnTimeout {
+		t.Errorf("Write with expired deadline: got %v, want ErrConnTimeout", err)
+	}
+}

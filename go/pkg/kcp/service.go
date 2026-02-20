@@ -2,7 +2,6 @@ package kcp
 
 import (
 	"errors"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -53,8 +52,8 @@ type ServiceMux struct {
 	services   map[uint64]*serviceEntry
 	servicesMu sync.RWMutex
 
-	// Global accept queue: streams from all services.
 	acceptCh chan acceptResult
+	closeCh  chan struct{}
 
 	closed    bool
 	closeMu   sync.RWMutex
@@ -72,6 +71,7 @@ func NewServiceMux(cfg ServiceMuxConfig) *ServiceMux {
 		config:   cfg,
 		services: make(map[uint64]*serviceEntry),
 		acceptCh: make(chan acceptResult, 4096),
+		closeCh:  make(chan struct{}),
 	}
 }
 
@@ -149,6 +149,7 @@ func (m *ServiceMux) Close() error {
 		m.closed = true
 		m.closeMu.Unlock()
 
+		close(m.closeCh)
 		close(m.acceptCh)
 
 		m.servicesMu.Lock()
@@ -260,42 +261,34 @@ func (m *ServiceMux) serviceAcceptLoop(service uint64, session *yamux.Session) {
 			return
 		}
 
-		m.closeMu.RLock()
-		closed := m.closed
-		m.closeMu.RUnlock()
-		if closed {
-			stream.Close()
-			return
-		}
-
 		select {
 		case m.acceptCh <- acceptResult{conn: stream, service: service}:
-		default:
+		case <-m.closeCh:
 			stream.Close()
+			return
 		}
 	}
 }
 
 // kcpPipe adapts KCPConn to net.Conn for yamux.
-// yamux requires net.Conn, but KCPConn only implements io.ReadWriteCloser.
-// This wrapper adds the missing net.Conn methods as no-ops.
+// Forwards deadline calls to the underlying KCPConn so yamux's
+// keepalive and timeout detection work correctly.
 type kcpPipe struct {
-	rw io.ReadWriteCloser
+	conn *KCPConn
 }
 
-func newKCPPipe(rw io.ReadWriteCloser) *kcpPipe {
-	return &kcpPipe{rw: rw}
+func newKCPPipe(conn *KCPConn) *kcpPipe {
+	return &kcpPipe{conn: conn}
 }
 
-func (p *kcpPipe) Read(b []byte) (int, error)  { return p.rw.Read(b) }
-func (p *kcpPipe) Write(b []byte) (int, error) { return p.rw.Write(b) }
-func (p *kcpPipe) Close() error                { return p.rw.Close() }
-
-func (p *kcpPipe) LocalAddr() net.Addr                 { return pipeAddr{} }
-func (p *kcpPipe) RemoteAddr() net.Addr                { return pipeAddr{} }
-func (p *kcpPipe) SetDeadline(_ time.Time) error       { return nil }
-func (p *kcpPipe) SetReadDeadline(_ time.Time) error   { return nil }
-func (p *kcpPipe) SetWriteDeadline(_ time.Time) error  { return nil }
+func (p *kcpPipe) Read(b []byte) (int, error)         { return p.conn.Read(b) }
+func (p *kcpPipe) Write(b []byte) (int, error)        { return p.conn.Write(b) }
+func (p *kcpPipe) Close() error                       { return p.conn.Close() }
+func (p *kcpPipe) LocalAddr() net.Addr                { return pipeAddr{} }
+func (p *kcpPipe) RemoteAddr() net.Addr               { return pipeAddr{} }
+func (p *kcpPipe) SetDeadline(t time.Time) error      { return p.conn.SetDeadline(t) }
+func (p *kcpPipe) SetReadDeadline(t time.Time) error  { return p.conn.SetReadDeadline(t) }
+func (p *kcpPipe) SetWriteDeadline(t time.Time) error { return p.conn.SetWriteDeadline(t) }
 
 type pipeAddr struct{}
 

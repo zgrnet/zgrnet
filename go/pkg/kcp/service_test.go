@@ -860,3 +860,56 @@ func TestComposite_100x100(t *testing.T) {
 	}
 	testComposite(t, 100, 100)
 }
+
+// === BUG regression tests — these must FAIL before fix, PASS after ===
+
+// TestServiceMux_BUG3_AcceptBackpressure verifies that when the accept queue
+// is full, streams are NOT silently dropped. They should block until consumed.
+// Before fix: streams beyond buffer capacity are Close()'d silently.
+func TestServiceMux_BUG3_AcceptBackpressure(t *testing.T) {
+	client, server := serviceMuxPair(0)
+	defer client.Close()
+	defer server.Close()
+
+	const total = 5000
+
+	var accepted atomic.Int64
+	go func() {
+		for {
+			_, _, err := server.AcceptStream()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+		}
+	}()
+
+	opened := make([]net.Conn, 0, total)
+	for i := 0; i < total; i++ {
+		s, err := client.OpenStream(1)
+		if err != nil {
+			t.Fatalf("open stream %d: %v", i, err)
+		}
+		opened = append(opened, s)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if accepted.Load() >= int64(total) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	got := accepted.Load()
+	if got < int64(total) {
+		t.Fatalf("BUG3: only accepted %d/%d streams — %d silently dropped!",
+			got, total, int64(total)-got)
+	}
+
+	for _, s := range opened {
+		s.Close()
+	}
+
+	t.Logf("all %d streams accepted (no drops)", total)
+}
