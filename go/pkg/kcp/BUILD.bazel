@@ -5,11 +5,8 @@ go_library(
     srcs = [
         "conn.go",
         "fec.go",
-        "frame.go",
         "kcp.go",
-        "mux.go",
         "service.go",
-        "stream.go",
         # Use centralized patched KCP source from //third_party/kcp
         "//third_party/kcp:srcs",
     ],
@@ -26,11 +23,8 @@ go_test(
     srcs = [
         "conn_test.go",
         "fec_test.go",
-        "frame_test.go",
         "kcp_test.go",
-        "mux_test.go",
         "service_test.go",
-        "throughput_test.go",
     ],
     args = ["-test.short"],
     embed = [":kcp"],

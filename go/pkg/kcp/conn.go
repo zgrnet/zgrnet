@@ -4,42 +4,59 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var (
-	ErrConnClosed = errors.New("kcp: conn closed")
+	ErrConnClosed  = errors.New("kcp: conn closed")
+	ErrConnTimeout = errors.New("kcp: timeout")
 )
 
-// KCPConn wraps a KCP instance as an io.ReadWriteCloser.
+var bufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 64*1024)
+		return &buf
+	},
+}
+
+type writeReq struct {
+	data   []byte
+	result chan writeResult
+}
+
+type writeResult struct {
+	n   int
+	err error
+}
+
+// KCPConn wraps a KCP instance as io.ReadWriteCloser + net.Conn.
 //
-// It runs an internal goroutine for event-driven KCP processing:
-//   - Incoming data via Input() → channel → goroutine → KCP.Input + KCP.Recv
-//   - KCP.Update driven by KCP.Check() (adaptive timer, not fixed ticker)
-//   - Read() blocks until data is available from KCP recv buffer
-//   - Write() feeds data into KCP.Send + KCP.Flush
+// ALL KCP operations (Send, Recv, Input, Update, Flush) execute exclusively
+// in the runLoop goroutine. This eliminates any concurrency issues with the
+// KCP C library. Write() and Input() communicate with runLoop via channels.
 //
-// One goroutine per KCPConn. When the conn is idle (no data, no pending
-// retransmissions), the goroutine sleeps on the timer — zero CPU cost.
+// Supports read/write deadlines for yamux compatibility.
 type KCPConn struct {
 	kcp    *KCP
 	output func([]byte)
 
-	// Input channel: network layer feeds incoming KCP packets here.
 	inputCh chan []byte
+	writeCh chan writeReq
 
-	// Receive buffer: goroutine writes, Read() reads.
+	// Receive buffer: runLoop writes, Read() reads.
 	recvBuf  []byte
 	recvMu   sync.Mutex
 	recvCond *sync.Cond
 
-	// Close management.
+	// Deadlines (atomic for lock-free access from Read/Write)
+	readDeadline  atomic.Value // time.Time
+	writeDeadline atomic.Value // time.Time
+
 	closeCh   chan struct{}
 	closeOnce sync.Once
-	closed    bool
-	closeMu   sync.RWMutex
+	closed    atomic.Bool
 
-	// goroutine lifecycle
 	wg sync.WaitGroup
 }
 
@@ -50,6 +67,7 @@ func NewKCPConn(conv uint32, output func([]byte)) *KCPConn {
 	c := &KCPConn{
 		output:  output,
 		inputCh: make(chan []byte, 256),
+		writeCh: make(chan writeReq, 64),
 		closeCh: make(chan struct{}),
 	}
 	c.recvCond = sync.NewCond(&c.recvMu)
@@ -69,14 +87,10 @@ func NewKCPConn(conv uint32, output func([]byte)) *KCPConn {
 
 // Input feeds an incoming KCP packet from the network layer.
 // Non-blocking: data is queued to the internal goroutine via channel.
-// Returns ErrConnClosed if the conn has been closed.
 func (c *KCPConn) Input(data []byte) error {
-	c.closeMu.RLock()
-	if c.closed {
-		c.closeMu.RUnlock()
+	if c.closed.Load() {
 		return ErrConnClosed
 	}
-	c.closeMu.RUnlock()
 
 	cp := make([]byte, len(data))
 	copy(cp, data)
@@ -90,7 +104,7 @@ func (c *KCPConn) Input(data []byte) error {
 }
 
 // Read reads reassembled data from KCP. Blocks until data is available,
-// the conn is closed, or EOF.
+// the deadline expires, or the conn is closed.
 func (c *KCPConn) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -100,12 +114,29 @@ func (c *KCPConn) Read(b []byte) (int, error) {
 	defer c.recvMu.Unlock()
 
 	for len(c.recvBuf) == 0 {
-		c.closeMu.RLock()
-		closed := c.closed
-		c.closeMu.RUnlock()
-		if closed {
+		if c.closed.Load() {
 			return 0, io.EOF
 		}
+
+		if dl, ok := c.readDeadline.Load().(time.Time); ok && !dl.IsZero() {
+			if time.Now().After(dl) {
+				return 0, ErrConnTimeout
+			}
+			done := make(chan struct{})
+			go func() {
+				timer := time.NewTimer(time.Until(dl))
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					c.recvCond.Broadcast()
+				case <-done:
+				}
+			}()
+			c.recvCond.Wait()
+			close(done)
+			continue
+		}
+
 		c.recvCond.Wait()
 	}
 
@@ -114,35 +145,60 @@ func (c *KCPConn) Read(b []byte) (int, error) {
 	return n, nil
 }
 
-// Write sends data through KCP.
+// Write sends data through KCP. The data is forwarded to the runLoop
+// goroutine which exclusively owns all KCP operations.
 func (c *KCPConn) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
 
-	c.closeMu.RLock()
-	if c.closed {
-		c.closeMu.RUnlock()
+	if c.closed.Load() {
 		return 0, ErrConnClosed
 	}
-	c.closeMu.RUnlock()
 
-	ret := c.kcp.Send(b)
-	if ret < 0 {
-		return 0, errors.New("kcp: send failed")
+	cp := make([]byte, len(b))
+	copy(cp, b)
+
+	req := writeReq{
+		data:   cp,
+		result: make(chan writeResult, 1),
 	}
-	c.kcp.Flush()
 
-	return len(b), nil
+	// Check write deadline
+	var deadline <-chan time.Time
+	if dl, ok := c.writeDeadline.Load().(time.Time); ok && !dl.IsZero() {
+		if time.Now().After(dl) {
+			return 0, ErrConnTimeout
+		}
+		timer := time.NewTimer(time.Until(dl))
+		defer timer.Stop()
+		deadline = timer.C
+	}
+
+	// Send request to runLoop
+	select {
+	case c.writeCh <- req:
+	case <-c.closeCh:
+		return 0, ErrConnClosed
+	case <-deadline:
+		return 0, ErrConnTimeout
+	}
+
+	// Wait for result
+	select {
+	case result := <-req.result:
+		return result.n, result.err
+	case <-c.closeCh:
+		return 0, ErrConnClosed
+	case <-deadline:
+		return 0, ErrConnTimeout
+	}
 }
 
 // Close shuts down the KCPConn and its internal goroutine.
 func (c *KCPConn) Close() error {
 	c.closeOnce.Do(func() {
-		c.closeMu.Lock()
-		c.closed = true
-		c.closeMu.Unlock()
-
+		c.closed.Store(true)
 		close(c.closeCh)
 		c.recvCond.Broadcast()
 		c.wg.Wait()
@@ -151,10 +207,28 @@ func (c *KCPConn) Close() error {
 	return nil
 }
 
-// runLoop is the internal goroutine that drives KCP.
-//
-// It processes incoming packets, runs KCP.Update on an adaptive timer
-// (using KCP.Check()), and drains received data into recvBuf.
+// SetReadDeadline sets the read deadline.
+func (c *KCPConn) SetReadDeadline(t time.Time) error {
+	c.readDeadline.Store(t)
+	c.recvCond.Broadcast()
+	return nil
+}
+
+// SetWriteDeadline sets the write deadline.
+func (c *KCPConn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadline.Store(t)
+	return nil
+}
+
+// SetDeadline sets both read and write deadlines.
+func (c *KCPConn) SetDeadline(t time.Time) error {
+	c.SetReadDeadline(t)
+	c.SetWriteDeadline(t)
+	return nil
+}
+
+// runLoop is the internal goroutine that exclusively owns all KCP operations.
+// No other goroutine touches the KCP instance directly.
 func (c *KCPConn) runLoop() {
 	defer c.wg.Done()
 
@@ -175,11 +249,20 @@ func (c *KCPConn) runLoop() {
 		case data := <-c.inputCh:
 			timer.Stop()
 			c.kcp.Input(data)
+			c.drainInputCh()
 			c.kcp.Update(uint32(time.Now().UnixMilli()))
 			c.drainRecv()
 
-			// Batch drain: process any queued packets without blocking
-			c.drainInputCh()
+		case req := <-c.writeCh:
+			timer.Stop()
+			ret := c.kcp.Send(req.data)
+			if ret < 0 {
+				req.result <- writeResult{0, errors.New("kcp: send failed")}
+			} else {
+				c.kcp.Flush()
+				req.result <- writeResult{len(req.data), nil}
+			}
+			c.drainRecv()
 
 		case <-timer.C:
 			c.kcp.Update(uint32(time.Now().UnixMilli()))
@@ -202,7 +285,6 @@ func (c *KCPConn) drainInputCh() {
 			return
 		}
 	}
-	// Single update after batch input
 }
 
 // drainRecv moves all available data from KCP recv queue into recvBuf.
