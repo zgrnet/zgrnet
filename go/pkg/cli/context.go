@@ -1,7 +1,7 @@
-// Package cli provides the zgrnet CLI tool functionality.
+// Package cli provides the zigor CLI tool functionality.
 //
 // It includes offline context/config management and an API client
-// for interacting with a running zgrnetd daemon.
+// for interacting with a running zigor host daemon.
 package cli
 
 import (
@@ -15,17 +15,17 @@ import (
 	"github.com/vibing/zgrnet/pkg/noise"
 )
 
-// DefaultConfigDir returns the default zgrnet config directory.
-// Uses $ZGRNET_HOME if set, otherwise ~/.config/zgrnet.
+// DefaultConfigDir returns the default zigor config directory.
+// Uses $ZIGOR_CONFIG_DIR if set, otherwise ~/.config/zigor.
 func DefaultConfigDir() (string, error) {
-	if dir := os.Getenv("ZGRNET_HOME"); dir != "" {
+	if dir := os.Getenv("ZIGOR_CONFIG_DIR"); dir != "" {
 		return dir, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot determine home directory: %w", err)
 	}
-	return filepath.Join(home, ".config", "zgrnet"), nil
+	return filepath.Join(home, ".config", "zigor"), nil
 }
 
 // ContextDir returns the path to a specific context directory.
@@ -38,7 +38,7 @@ func CurrentContextName(baseDir string) (string, error) {
 	data, err := os.ReadFile(filepath.Join(baseDir, "current"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("no current context set (run: zgrnet context create <name>)")
+			return "", fmt.Errorf("no current context set (run: zigor ctx create <name>)")
 		}
 		return "", err
 	}
@@ -92,8 +92,31 @@ const contextTemplate = `net:
   listen_port: 51820
 `
 
+// ValidateContextName checks that a context name is safe for use as a directory name.
+func ValidateContextName(name string) error {
+	if name == "" {
+		return fmt.Errorf("context name cannot be empty")
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return fmt.Errorf("context name %q contains path separator", name)
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("context name %q contains path traversal", name)
+	}
+	if strings.ContainsAny(name, " \t\n\r") {
+		return fmt.Errorf("context name %q contains whitespace", name)
+	}
+	if strings.HasPrefix(name, ".") {
+		return fmt.Errorf("context name %q cannot start with dot", name)
+	}
+	return nil
+}
+
 // CreateContext creates a new context with a generated keypair and template config.
 func CreateContext(baseDir, name string) error {
+	if err := ValidateContextName(name); err != nil {
+		return err
+	}
 	dir := ContextDir(baseDir, name)
 	if _, err := os.Stat(dir); err == nil {
 		return fmt.Errorf("context %q already exists", name)
