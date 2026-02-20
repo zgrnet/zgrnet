@@ -16,6 +16,7 @@ mod consts;
 mod dial;
 mod listener;
 mod manager;
+pub mod sockopt;
 mod transport_udp;
 mod udp;
 

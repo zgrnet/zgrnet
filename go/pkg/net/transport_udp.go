@@ -45,6 +45,8 @@ func NewUDPTransport(addr string) (*UDPTransport, error) {
 		return nil, err
 	}
 
+	ApplySocketOptions(conn, DefaultSocketConfig())
+
 	return &UDPTransport{conn: conn}, nil
 }
 

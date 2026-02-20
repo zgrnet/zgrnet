@@ -323,6 +323,8 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		return nil, err
 	}
 
+	ApplySocketOptions(socket, DefaultSocketConfig())
+
 	rawSize := o.rawChanSize
 	if rawSize <= 0 {
 		rawSize = RawChanSize

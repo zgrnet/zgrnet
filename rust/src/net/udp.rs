@@ -207,6 +207,8 @@ impl UDP {
         let bind_addr = opts.bind_addr.as_deref().unwrap_or("0.0.0.0:0");
         let socket = UdpSocket::bind(bind_addr)?;
 
+        super::sockopt::apply_socket_options(&socket, &super::sockopt::SocketConfig::default());
+
         // Set read timeout for non-blocking behavior in receive loop
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
 
