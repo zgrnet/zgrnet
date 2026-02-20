@@ -35,8 +35,10 @@ impl KcpInner {
     }
 
     fn try_wake_reader(&mut self) {
-        if self.pending_reader.is_some() && self.kcp.peek_size() > 0 {
+        let peek = self.kcp.peek_size();
+        if self.pending_reader.is_some() && peek > 0 {
             if let Some(w) = self.pending_reader.take() {
+                eprintln!("[kcp conv={}] WAKING reader, peek={}", self.kcp.conv(), peek);
                 w.wake();
             }
         }
@@ -75,13 +77,16 @@ impl KcpConn {
         let mut kcp = Kcp::new(conv, output_fn);
         kcp.set_default_config();
 
+        let start = Instant::now();
+        kcp.update(start.elapsed().as_millis() as u32);
+
         let inner = Arc::new(Mutex::new(KcpInner {
             kcp,
             input_queue: Vec::new(),
             pending_reader: None,
             pending_writer: None,
             closed: false,
-            start: Instant::now(),
+            start,
         }));
 
         // Spawn update task
@@ -188,6 +193,16 @@ impl AsyncRead for KcpConn {
             return Poll::Ready(Ok(())); // EOF
         }
 
+        // Drain input queue
+        let queue: Vec<Vec<u8>> = inner.input_queue.drain(..).collect();
+        for data in &queue {
+            inner.kcp.input(data);
+        }
+        if !queue.is_empty() {
+            let now = inner.now_ms();
+            inner.kcp.update(now);
+        }
+
         let peek = inner.kcp.peek_size();
         if peek <= 0 {
             inner.pending_reader = Some(cx.waker().clone());
@@ -196,7 +211,7 @@ impl AsyncRead for KcpConn {
 
         let mut tmp = vec![0u8; peek as usize];
         let n = inner.kcp.recv(&mut tmp);
-        drop(inner); // Release lock before copying
+        drop(inner);
 
         if n <= 0 {
             cx.waker().wake_by_ref();
@@ -236,7 +251,6 @@ impl AsyncWrite for KcpConn {
             inner.pending_writer = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        inner.kcp.flush();
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -282,7 +296,19 @@ impl futures::io::AsyncRead for KcpConn {
             return Poll::Ready(Ok(0));
         }
 
+        let queue: Vec<Vec<u8>> = inner.input_queue.drain(..).collect();
+        let queue_len = queue.len();
+        for data in &queue {
+            inner.kcp.input(data);
+        }
+        if !queue.is_empty() {
+            let now = inner.now_ms();
+            inner.kcp.update(now);
+        }
+
         let peek = inner.kcp.peek_size();
+        eprintln!("[f::poll_read conv={}] drained={}, peek={}", inner.kcp.conv(), queue_len, peek);
+
         if peek <= 0 {
             inner.pending_reader = Some(cx.waker().clone());
             return Poll::Pending;
@@ -330,7 +356,6 @@ impl futures::io::AsyncWrite for KcpConn {
             inner.pending_writer = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        inner.kcp.flush();
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -371,6 +396,7 @@ async fn update_loop(inner: Arc<Mutex<KcpInner>>) {
 
         let now = kcp.now_ms();
         kcp.kcp.update(now);
+        kcp.kcp.flush();
         kcp.try_wake_reader();
         kcp.try_wake_writer();
 
@@ -394,14 +420,16 @@ pub fn conn_pair() -> (KcpConn, KcpConn) {
     let b_ref = b_conn.clone();
     let a = KcpConn::new(1, Arc::new(move |data: &[u8]| {
         if let Some(ref inner) = *b_ref.lock().unwrap() {
-            // Queue data — don't try to lock KcpInner directly
-            // (we might be inside a KCP output callback with the lock held)
             let data = data.to_vec();
             let inner = inner.clone();
+            eprintln!("[output a→b] {} bytes", data.len());
             tokio::spawn(async move {
+                eprintln!("[output a→b] task running, acquiring lock...");
                 let mut kcp = inner.lock().await;
+                eprintln!("[output a→b] lock acquired, queueing {} bytes", data.len());
                 kcp.input_queue.push(data);
                 if let Some(w) = kcp.pending_reader.take() {
+                    eprintln!("[output a→b] WAKING reader from spawn");
                     w.wake();
                 }
             });
@@ -413,6 +441,7 @@ pub fn conn_pair() -> (KcpConn, KcpConn) {
         if let Some(ref inner) = *a_ref.lock().unwrap() {
             let data = data.to_vec();
             let inner = inner.clone();
+            eprintln!("[output b→a] {} bytes", data.len());
             tokio::spawn(async move {
                 let mut kcp = inner.lock().await;
                 kcp.input_queue.push(data);
