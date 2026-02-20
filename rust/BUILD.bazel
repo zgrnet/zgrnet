@@ -56,7 +56,16 @@ rust_library(
     deps = all_crate_deps() + ["//third_party/kcp", "//zig/tun:lib", "//zig/dnsmgr:lib"],
 )
 
-# zgrnet CLI — offline management tool
+# zigor CLI — unified management tool (replaces zgrnet + zgrnetd)
+rust_binary(
+    name = "zigor_bin",
+    srcs = ["src/bin/zigor.rs"],
+    edition = "2021",
+    deps = [":zgrnet"] + all_crate_deps(),
+    visibility = ["//visibility:public"],
+)
+
+# Legacy zgrnet CLI (to be removed)
 rust_binary(
     name = "zgrnet_bin",
     srcs = ["src/bin/zgrnet.rs"],
