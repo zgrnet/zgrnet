@@ -106,6 +106,12 @@ pub fn tryGetsockoptInt(fd: posix.socket_t, level: i32, optname: u32) u32 {
 
 const SO_BUSY_POLL: u32 = 46;
 const UDP_GRO: u32 = 104;
+const UDP_SEGMENT: u32 = 103;
+
+/// Check if UDP_SEGMENT (GSO) is available on a socket.
+pub fn gsoSupported(fd: posix.socket_t) bool {
+    return trySetsockoptInt(fd, @intCast(std.posix.IPPROTO.UDP), UDP_SEGMENT, 1400);
+}
 
 fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *OptimizationReport) void {
     if (cfg.busy_poll_us > 0) {

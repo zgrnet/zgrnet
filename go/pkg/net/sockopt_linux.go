@@ -117,3 +117,18 @@ func (bc *batchConn) WriteBatch(buffers [][]byte, addrs []*net.UDPAddr) (int, er
 	}
 	return bc.pc.WriteBatch(bc.msgs[:count], 0)
 }
+
+// GSOSupported returns true if UDP_SEGMENT (GSO) is available on this socket.
+func GSOSupported(conn *net.UDPConn) bool {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return false
+	}
+	var supported bool
+	raw.Control(func(fd uintptr) {
+		// Try setting a GSO segment size; if the kernel supports it, this succeeds.
+		err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, 1400)
+		supported = (err == nil)
+	})
+	return supported
+}
