@@ -8,6 +8,7 @@ go_library(
         "frame.go",
         "kcp.go",
         "mux.go",
+        "service.go",
         "stream.go",
         # Use centralized patched KCP source from //third_party/kcp
         "//third_party/kcp:srcs",
@@ -15,6 +16,9 @@ go_library(
     cgo = True,
     importpath = "github.com/vibing/zgrnet/pkg/kcp",
     visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_hashicorp_yamux//:yamux",
+    ],
 )
 
 go_test(
@@ -25,6 +29,7 @@ go_test(
         "frame_test.go",
         "kcp_test.go",
         "mux_test.go",
+        "service_test.go",
         "throughput_test.go",
     ],
     args = ["-test.short"],
