@@ -242,11 +242,13 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
         pub fn stop(self: *Self) void {
             self.state.store(@intFromEnum(State.stopped), .release);
 
-            // Close all proto listeners.
+            // Close all proto listeners and null their slots so deinit()
+            // won't double-close or double-free them.
             self.listener_mutex.lock();
             for (&self.proto_listeners) |*slot| {
                 if (slot.*) |ln| {
                     ln.close();
+                    slot.* = null;
                 }
             }
             self.listener_mutex.unlock();
@@ -455,12 +457,14 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
                     };
 
                     // Route to proto-specific listener if registered.
-                    // Hold lock during send to prevent closeListen from
+                    // Hold lock during trySend to prevent closeListen from
                     // destroying the listener between lookup and use.
+                    // Use trySend (non-blocking) to avoid holding the mutex
+                    // while blocked on a full channel.
                     const proto_byte = stream.getProto();
                     self.listener_mutex.lock();
                     if (self.proto_listeners[proto_byte]) |l| {
-                        l.ch.send(ns) catch {
+                        l.ch.trySend(ns) catch {
                             stream.shutdown();
                         };
                         self.listener_mutex.unlock();

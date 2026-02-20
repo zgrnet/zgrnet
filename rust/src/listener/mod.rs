@@ -68,32 +68,32 @@ pub struct HandlerInfo {
 }
 
 /// Handler Registry — maps proto bytes to handlers. Thread-safe.
+///
+/// Uses a single HashMap<u8, Handler> keyed by proto for O(1) lookup.
+/// A secondary name→proto index enables unregister-by-name.
 pub struct Registry {
-    by_proto: Mutex<HashMap<u8, usize>>,
-    by_name: Mutex<HashMap<String, usize>>,
-    handlers: Mutex<Vec<Handler>>,
+    handlers: Mutex<HashMap<u8, Handler>>,
+    names: Mutex<HashMap<String, u8>>,
     sock_dir: String,
 }
 
 impl Registry {
     pub fn new(sock_dir: &str) -> Self {
         Self {
-            by_proto: Mutex::new(HashMap::new()),
-            by_name: Mutex::new(HashMap::new()),
-            handlers: Mutex::new(Vec::new()),
+            handlers: Mutex::new(HashMap::new()),
+            names: Mutex::new(HashMap::new()),
             sock_dir: sock_dir.to_string(),
         }
     }
 
-    pub fn register(&self, proto: u8, name: &str, mode: Mode, target: &str) -> Result<usize, String> {
-        let mut by_proto = self.by_proto.lock().unwrap();
-        let mut by_name = self.by_name.lock().unwrap();
+    pub fn register(&self, proto: u8, name: &str, mode: Mode, target: &str) -> Result<u8, String> {
         let mut handlers = self.handlers.lock().unwrap();
+        let mut names = self.names.lock().unwrap();
 
-        if by_proto.contains_key(&proto) {
+        if handlers.contains_key(&proto) {
             return Err(format!("proto {} already registered", proto));
         }
-        if by_name.contains_key(name) {
+        if names.contains_key(name) {
             return Err(format!("name {:?} already registered", name));
         }
 
@@ -103,8 +103,7 @@ impl Registry {
             String::new()
         };
 
-        let idx = handlers.len();
-        handlers.push(Handler {
+        handlers.insert(proto, Handler {
             proto,
             name: name.to_string(),
             mode,
@@ -112,64 +111,43 @@ impl Registry {
             sock,
             active: AtomicI64::new(0),
         });
+        names.insert(name.to_string(), proto);
 
-        by_proto.insert(proto, idx);
-        by_name.insert(name.to_string(), idx);
-
-        Ok(idx)
+        Ok(proto)
     }
 
     pub fn unregister(&self, name: &str) -> Result<(), String> {
-        let mut by_proto = self.by_proto.lock().unwrap();
-        let mut by_name = self.by_name.lock().unwrap();
-        let handlers = self.handlers.lock().unwrap();
+        let mut handlers = self.handlers.lock().unwrap();
+        let mut names = self.names.lock().unwrap();
 
-        let idx = by_name.remove(name)
+        let proto = names.remove(name)
             .ok_or_else(|| format!("handler {:?} not found", name))?;
-        by_proto.remove(&handlers[idx].proto);
+        handlers.remove(&proto);
 
         Ok(())
     }
 
-    pub fn lookup(&self, proto: u8) -> Option<usize> {
-        let by_proto = self.by_proto.lock().unwrap();
-        by_proto.get(&proto).copied()
+    pub fn lookup(&self, proto: u8) -> bool {
+        let handlers = self.handlers.lock().unwrap();
+        handlers.contains_key(&proto)
     }
 
-    pub fn handler(&self, idx: usize) -> Option<HandlerRef<'_>> {
+    pub fn with_handler<F, R>(&self, proto: u8, f: F) -> Option<R>
+    where
+        F: FnOnce(&Handler) -> R,
+    {
         let handlers = self.handlers.lock().unwrap();
-        if idx < handlers.len() {
-            Some(HandlerRef { guard: handlers, idx })
-        } else {
-            None
-        }
+        handlers.get(&proto).map(f)
     }
 
     pub fn list(&self) -> Vec<HandlerInfo> {
-        let by_name = self.by_name.lock().unwrap();
         let handlers = self.handlers.lock().unwrap();
-        by_name.values().map(|&idx| {
-            let h = &handlers[idx];
-            HandlerInfo {
-                proto: h.proto,
-                name: h.name.clone(),
-                mode: h.mode,
-                active: h.active(),
-            }
+        handlers.values().map(|h| HandlerInfo {
+            proto: h.proto,
+            name: h.name.clone(),
+            mode: h.mode,
+            active: h.active(),
         }).collect()
-    }
-}
-
-/// Temporary reference to a handler within the locked handlers vec.
-pub struct HandlerRef<'a> {
-    guard: std::sync::MutexGuard<'a, Vec<Handler>>,
-    idx: usize,
-}
-
-impl<'a> std::ops::Deref for HandlerRef<'a> {
-    type Target = Handler;
-    fn deref(&self) -> &Handler {
-        &self.guard[self.idx]
     }
 }
 
@@ -317,9 +295,10 @@ mod tests {
     #[test]
     fn test_registry_register_lookup() {
         let r = Registry::new("/tmp/test-handlers");
-        let idx = r.register(69, "proxy", Mode::Stream, "").unwrap();
-        assert_eq!(r.lookup(69), Some(idx));
-        assert_eq!(r.lookup(70), None);
+        let proto = r.register(69, "proxy", Mode::Stream, "").unwrap();
+        assert_eq!(proto, 69);
+        assert!(r.lookup(69));
+        assert!(!r.lookup(70));
     }
 
     #[test]
@@ -335,7 +314,7 @@ mod tests {
         let r = Registry::new("/tmp");
         r.register(69, "proxy", Mode::Stream, "").unwrap();
         r.unregister("proxy").unwrap();
-        assert_eq!(r.lookup(69), None);
+        assert!(!r.lookup(69));
     }
 
     #[test]

@@ -493,8 +493,16 @@ fn accept_and_dispatch(udp: &zgrnet::net::UDP, pk: Key, registry: &Arc<listener:
         };
 
         let proto = stream.proto();
-        let handler_idx = match registry.lookup(proto) {
-            Some(idx) => idx,
+
+        // Extract handler info while holding the lock, then release.
+        let handler_info = registry.with_handler(proto, |h| {
+            let sock = if h.target.is_empty() { h.sock.clone() } else { h.target.clone() };
+            h.add_active(1);
+            (sock, h.name.clone())
+        });
+
+        let (sock_path, name) = match handler_info {
+            Some(info) => info,
             None => {
                 eprintln!(
                     "stream from {}: no handler for proto {}, rejecting",
@@ -506,27 +514,13 @@ fn accept_and_dispatch(udp: &zgrnet::net::UDP, pk: Key, registry: &Arc<listener:
             }
         };
 
-        // Get handler info for connecting.
-        if let Some(handler) = registry.handler(handler_idx) {
-            let sock_path = if handler.target.is_empty() {
-                handler.sock.clone()
-            } else {
-                handler.target.clone()
-            };
-            let name = handler.name.clone();
-            handler.add_active(1);
-            drop(handler);
+        let metadata = stream.metadata().to_vec();
+        let reg_clone = Arc::clone(registry);
 
-            let metadata = stream.metadata().to_vec();
-            let reg_clone = Arc::clone(registry);
-
-            thread::spawn(move || {
-                relay_to_handler(stream, pk, &sock_path, &name, proto, &metadata);
-                reg_clone.handler(handler_idx).map(|h| h.add_active(-1));
-            });
-        } else {
-            stream.shutdown();
-        }
+        thread::spawn(move || {
+            relay_to_handler(stream, pk, &sock_path, &name, proto, &metadata);
+            reg_clone.with_handler(proto, |h| h.add_active(-1));
+        });
     }
 }
 
@@ -613,15 +607,12 @@ fn serve_control_socket(ln: std::os::unix::net::UnixListener, registry: &listene
                 };
 
                 match registry.register(proto, &name, mode, "") {
-                    Ok(idx) => {
-                        if let Some(handler) = registry.handler(idx) {
-                            let resp = format!(
-                                r#"{{"sock":"{}"}}"#,
-                                handler.sock
-                            );
-                            eprintln!("handler registered: {} (proto={}, sock={})", name, proto, handler.sock);
-                            let _ = conn.write_all(resp.as_bytes());
-                        }
+                    Ok(registered_proto) => {
+                        let sock = registry.with_handler(registered_proto, |h| h.sock.clone())
+                            .unwrap_or_default();
+                        let resp = format!(r#"{{"sock":"{}"}}"#, sock);
+                        eprintln!("handler registered: {} (proto={}, sock={})", name, proto, sock);
+                        let _ = conn.write_all(resp.as_bytes());
                     }
                     Err(e) => {
                         let resp = format!(r#"{{"error":"{}"}}"#, e);
