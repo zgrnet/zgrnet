@@ -31,6 +31,10 @@ tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros",
 tokio-util = { version = "0.7", features = ["compat"] }
 yamux = "0.13"
 futures = "0.3"
+kcp = "0.5"
+spin = "0.9"
+byte_string = "1"
+log = "0.4"
 libc = "0.2"
 bcrypt = "0.15"
 
