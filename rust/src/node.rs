@@ -233,6 +233,10 @@ impl Node {
             return; // already stopped
         }
 
+        // Drop all proto listener Senders so accept()/read_from() unblock.
+        self.stream_listeners.lock().unwrap().clear();
+        self.packet_listeners.lock().unwrap().clear();
+
         // Signal stop to all accept forwarder threads.
         let _ = self.stop_tx.try_send(());
         let mut stops = self.peer_stops.lock().unwrap();

@@ -498,10 +498,10 @@ fn accept_and_dispatch(udp: &zgrnet::net::UDP, pk: Key, registry: &Arc<listener:
         let handler_info = registry.with_handler(proto, |h| {
             let sock = if h.target.is_empty() { h.sock.clone() } else { h.target.clone() };
             h.add_active(1);
-            (sock, h.name.clone())
+            (sock, h.name.clone(), h.generation())
         });
 
-        let (sock_path, name) = match handler_info {
+        let (sock_path, name, gen) = match handler_info {
             Some(info) => info,
             None => {
                 eprintln!(
@@ -519,7 +519,7 @@ fn accept_and_dispatch(udp: &zgrnet::net::UDP, pk: Key, registry: &Arc<listener:
 
         thread::spawn(move || {
             relay_to_handler(stream, pk, &sock_path, &name, proto, &metadata);
-            reg_clone.with_handler(proto, |h| h.add_active(-1));
+            reg_clone.with_handler_gen(proto, gen, |h| h.add_active(-1));
         });
     }
 }

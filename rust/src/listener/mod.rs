@@ -47,6 +47,7 @@ pub struct Handler {
     pub target: String,
     pub sock: String,
     active: AtomicI64,
+    generation: u64,
 }
 
 impl Handler {
@@ -56,6 +57,10 @@ impl Handler {
 
     pub fn add_active(&self, delta: i64) {
         self.active.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -75,6 +80,7 @@ pub struct Registry {
     handlers: Mutex<HashMap<u8, Handler>>,
     names: Mutex<HashMap<String, u8>>,
     sock_dir: String,
+    next_gen: Mutex<u64>,
 }
 
 impl Registry {
@@ -83,6 +89,7 @@ impl Registry {
             handlers: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             sock_dir: sock_dir.to_string(),
+            next_gen: Mutex::new(1),
         }
     }
 
@@ -103,6 +110,10 @@ impl Registry {
             String::new()
         };
 
+        let mut gen = self.next_gen.lock().unwrap();
+        let g = *gen;
+        *gen += 1;
+
         handlers.insert(proto, Handler {
             proto,
             name: name.to_string(),
@@ -110,6 +121,7 @@ impl Registry {
             target: target.to_string(),
             sock,
             active: AtomicI64::new(0),
+            generation: g,
         });
         names.insert(name.to_string(), proto);
 
@@ -138,6 +150,16 @@ impl Registry {
     {
         let handlers = self.handlers.lock().unwrap();
         handlers.get(&proto).map(f)
+    }
+
+    /// Like with_handler but only calls f if the handler's generation matches.
+    /// Prevents stale relay threads from decrementing a re-registered handler.
+    pub fn with_handler_gen<F, R>(&self, proto: u8, gen: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&Handler) -> R,
+    {
+        let handlers = self.handlers.lock().unwrap();
+        handlers.get(&proto).filter(|h| h.generation == gen).map(f)
     }
 
     pub fn list(&self) -> Vec<HandlerInfo> {

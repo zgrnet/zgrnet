@@ -242,13 +242,12 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
         pub fn stop(self: *Self) void {
             self.state.store(@intFromEnum(State.stopped), .release);
 
-            // Close all proto listeners and null their slots so deinit()
-            // won't double-close or double-free them.
+            // Signal all proto listeners to stop (close their channels).
+            // Don't null slots — deinit() handles deallocation.
             self.listener_mutex.lock();
-            for (&self.proto_listeners) |*slot| {
-                if (slot.*) |ln| {
-                    ln.close();
-                    slot.* = null;
+            for (self.proto_listeners) |ln| {
+                if (ln) |l| {
+                    l.close();
                 }
             }
             self.listener_mutex.unlock();
