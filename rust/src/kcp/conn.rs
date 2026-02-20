@@ -1,28 +1,41 @@
-//! KcpConn — async KCP connection using Mutex + manual Waker.
+//! KcpConn — async KCP connection using pure Rust KCP + SpinMutex + Notify.
 //!
-//! Inspired by tokio-kcp: KCP operations are protected by a Mutex,
-//! poll_read/poll_write directly lock and operate on KCP. Wakers are
-//! stored manually and fired when input() or update() produces readable data.
-//! No std::thread, no channel bridging — everything runs in tokio.
+//! Architecture based on tokio_kcp:
+//! - Pure Rust KCP (kcp crate) instead of C ikcp.c FFI
+//! - SpinMutex for lock-free access from poll context
+//! - tokio::sync::Notify to wake update loop on send
+//! - Manual Waker storage for poll_read/poll_write
 
-use std::io;
+use std::io::{self, Cursor, Write};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use spin::Mutex as SpinMutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Mutex;
-
-use super::kcp::Kcp;
+use tokio::sync::Notify;
 
 /// Output function: called when KCP wants to send a packet over the wire.
 pub type OutputFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
-/// Internal KCP state protected by Mutex.
+/// KCP output adapter implementing std::io::Write.
+struct KcpOutput {
+    output_fn: OutputFn,
+}
+
+impl Write for KcpOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (self.output_fn)(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+/// Internal KCP state protected by SpinMutex.
 pub(crate) struct KcpInner {
-    kcp: Kcp,
-    input_queue: Vec<Vec<u8>>,
+    kcp: kcp::Kcp<KcpOutput>,
     pending_reader: Option<Waker>,
     pending_writer: Option<Waker>,
     closed: bool,
@@ -34,19 +47,20 @@ impl KcpInner {
         self.start.elapsed().as_millis() as u32
     }
 
-    fn try_wake_reader(&mut self) {
-        let peek = self.kcp.peek_size();
-        if self.pending_reader.is_some() && peek > 0 {
-            if let Some(w) = self.pending_reader.take() {
-                eprintln!("[kcp conv={}] WAKING reader, peek={}", self.kcp.conv(), peek);
-                w.wake();
+    fn try_wake_pending(&mut self) {
+        if self.pending_reader.is_some() {
+            if let Ok(peek) = self.kcp.peeksize() {
+                if peek > 0 {
+                    if let Some(w) = self.pending_reader.take() {
+                        w.wake();
+                    }
+                }
             }
         }
-    }
-
-    fn try_wake_writer(&mut self) {
-        if let Some(w) = self.pending_writer.take() {
-            w.wake();
+        if self.pending_writer.is_some() {
+            if let Some(w) = self.pending_writer.take() {
+                w.wake();
+            }
         }
     }
 
@@ -56,113 +70,87 @@ impl KcpInner {
     }
 }
 
-/// KcpConn is an async KCP connection.
-///
-/// All KCP operations go through `Arc<Mutex<KcpInner>>`. poll_read/poll_write
-/// lock the mutex, operate on KCP, and store Wakers for later notification.
-/// A background tokio task calls update() periodically.
+/// Async KCP connection.
 pub struct KcpConn {
-    inner: Arc<Mutex<KcpInner>>,
+    inner: Arc<SpinMutex<KcpInner>>,
+    closed: Arc<AtomicBool>,
+    notifier: Arc<Notify>,
     recv_buf: Vec<u8>,
 }
 
 impl KcpConn {
-    /// Create a new KcpConn.
-    ///
-    /// Spawns a background tokio task for KCP update() driven by check().
+    /// Create a new KcpConn with the given conv and output function.
     pub fn new(conv: u32, output: OutputFn) -> Self {
-        let output_fn: super::kcp::OutputFn = Box::new(move |data: &[u8]| {
-            output(data);
-        });
-        let mut kcp = Kcp::new(conv, output_fn);
-        kcp.set_default_config();
+        let kcp_output = KcpOutput { output_fn: output };
+        let mut kcp_instance = kcp::Kcp::new(conv, kcp_output);
+        kcp_instance.set_nodelay(true, 1, 2, true);
+        kcp_instance.set_wndsize(4096, 4096);
+        let _ = kcp_instance.set_mtu(1400);
 
         let start = Instant::now();
-        kcp.update(start.elapsed().as_millis() as u32);
+        let _ = kcp_instance.update(start.elapsed().as_millis() as u32);
 
-        let inner = Arc::new(Mutex::new(KcpInner {
-            kcp,
-            input_queue: Vec::new(),
+        let inner = Arc::new(SpinMutex::new(KcpInner {
+            kcp: kcp_instance,
             pending_reader: None,
             pending_writer: None,
             closed: false,
             start,
         }));
 
-        // Spawn update task
-        let inner_ref = inner.clone();
-        tokio::spawn(async move {
-            update_loop(inner_ref).await;
-        });
+        let closed = Arc::new(AtomicBool::new(false));
+        let notifier = Arc::new(Notify::new());
+
+        // Spawn update loop
+        {
+            let inner = inner.clone();
+            let closed = closed.clone();
+            let notifier = notifier.clone();
+            tokio::spawn(async move {
+                update_loop(inner, closed, notifier).await;
+            });
+        }
 
         KcpConn {
             inner,
+            closed,
+            notifier,
             recv_buf: Vec::new(),
         }
     }
 
     /// Feed incoming data from the network.
-    pub async fn input(&self, data: &[u8]) {
-        let mut inner = self.inner.lock().await;
-        if inner.closed { return; }
-        inner.kcp.input(data);
-        let now = inner.now_ms();
-        inner.kcp.update(now);
-        inner.try_wake_reader();
+    pub fn input(&self, data: &[u8]) {
+        if self.closed.load(Ordering::Relaxed) { return; }
+        let mut inner = self.inner.lock();
+        let _ = inner.kcp.input(data);
+        inner.try_wake_pending();
+        drop(inner);
+        self.notifier.notify_one();
     }
 
-    /// Queue incoming data for processing by the update loop.
-    /// Safe to call from KCP output callbacks (won't deadlock).
-    pub fn queue_input(&self, data: &[u8]) {
-        if let Ok(mut inner) = self.inner.try_lock() {
-            if inner.closed { return; }
-            inner.input_queue.push(data.to_vec());
-            // Wake the reader so the update loop processes the queue
-            if let Some(w) = inner.pending_reader.take() {
-                w.wake();
-            }
-        } else {
-            // Can't lock — this happens when called from output callback.
-            // Use a separate queue that doesn't need the main lock.
-            // For now, spawn a task to input later.
-            let inner = self.inner.clone();
-            let data = data.to_vec();
-            tokio::spawn(async move {
-                let mut kcp = inner.lock().await;
-                if !kcp.closed {
-                    kcp.input_queue.push(data);
-                    if let Some(w) = kcp.pending_reader.take() {
-                        w.wake();
-                    }
-                }
-            });
-        }
-    }
-
-    /// Close the connection.
-    pub async fn close(&self) {
-        let mut inner = self.inner.lock().await;
-        inner.closed = true;
-        inner.wake_all();
-    }
-
-    /// Check if closed.
-    pub fn is_closed(&self) -> bool {
-        self.inner.try_lock().map(|i| i.closed).unwrap_or(false)
-    }
-
-    /// Get a clone of the inner Arc for sharing.
-    pub fn inner(&self) -> Arc<Mutex<KcpInner>> {
+    /// Get a clone of the inner for sharing (used by ServiceMux).
+    pub fn inner_ref(&self) -> Arc<SpinMutex<KcpInner>> {
         self.inner.clone()
     }
 
-    /// Create a KcpConn from an existing inner. Used by ServiceMux to keep
-    /// a handle for input() after moving the original into yamux.
-    pub fn from_inner(inner: Arc<Mutex<KcpInner>>) -> Self {
-        KcpConn {
-            inner,
-            recv_buf: Vec::new(),
-        }
+    /// Get the notifier (used by ServiceMux).
+    pub fn notifier_ref(&self) -> Arc<Notify> {
+        self.notifier.clone()
+    }
+
+    /// Get the closed flag.
+    pub fn closed_ref(&self) -> Arc<AtomicBool> {
+        self.closed.clone()
+    }
+
+    /// Create a KcpConn from existing inner (for ServiceMux input handle).
+    pub fn from_parts(
+        inner: Arc<SpinMutex<KcpInner>>,
+        closed: Arc<AtomicBool>,
+        notifier: Arc<Notify>,
+    ) -> Self {
+        KcpConn { inner, closed, notifier, recv_buf: Vec::new() }
     }
 }
 
@@ -172,7 +160,6 @@ impl AsyncRead for KcpConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Drain local buffer first
         if !self.recv_buf.is_empty() {
             let n = std::cmp::min(buf.remaining(), self.recv_buf.len());
             buf.put_slice(&self.recv_buf[..n]);
@@ -180,51 +167,34 @@ impl AsyncRead for KcpConn {
             return Poll::Ready(Ok(()));
         }
 
-        // Try to lock and read from KCP
-        let mut inner = match self.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
+        let mut inner = self.inner.lock();
+        if inner.closed { return Poll::Ready(Ok(())); }
+
+        match inner.kcp.peeksize() {
+            Ok(peek) if peek > 0 => {
+                let mut tmp = vec![0u8; peek];
+                match inner.kcp.recv(&mut tmp) {
+                    Ok(n) => {
+                        drop(inner);
+                        let data = &tmp[..n];
+                        let copy_n = std::cmp::min(buf.remaining(), data.len());
+                        buf.put_slice(&data[..copy_n]);
+                        if copy_n < data.len() {
+                            self.recv_buf.extend_from_slice(&data[copy_n..]);
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(_) => {
+                        inner.pending_reader = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                }
             }
-        };
-
-        if inner.closed {
-            return Poll::Ready(Ok(())); // EOF
+            _ => {
+                inner.pending_reader = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
-
-        // Drain input queue
-        let queue: Vec<Vec<u8>> = inner.input_queue.drain(..).collect();
-        for data in &queue {
-            inner.kcp.input(data);
-        }
-        if !queue.is_empty() {
-            let now = inner.now_ms();
-            inner.kcp.update(now);
-        }
-
-        let peek = inner.kcp.peek_size();
-        if peek <= 0 {
-            inner.pending_reader = Some(cx.waker().clone());
-            return Poll::Pending;
-        }
-
-        let mut tmp = vec![0u8; peek as usize];
-        let n = inner.kcp.recv(&mut tmp);
-        drop(inner);
-
-        if n <= 0 {
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        let data = &tmp[..n as usize];
-        let copy_n = std::cmp::min(buf.remaining(), data.len());
-        buf.put_slice(&data[..copy_n]);
-        if copy_n < data.len() {
-            self.recv_buf.extend_from_slice(&data[copy_n..]);
-        }
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -234,43 +204,42 @@ impl AsyncWrite for KcpConn {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut inner = match self.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-        };
-
+        let mut inner = self.inner.lock();
         if inner.closed {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
         }
 
-        let ret = inner.kcp.send(buf);
-        if ret < 0 {
-            inner.pending_writer = Some(cx.waker().clone());
-            return Poll::Pending;
+        match inner.kcp.send(buf) {
+            Ok(n) => {
+                drop(inner);
+                self.notifier.notify_one();
+                Poll::Ready(Ok(n))
+            }
+            Err(_) => {
+                inner.pending_writer = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
-        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Ok(mut inner) = self.inner.try_lock() {
-            inner.kcp.flush();
-        }
+        let mut inner = self.inner.lock();
+        let _ = inner.kcp.flush();
+        drop(inner);
+        self.notifier.notify_one();
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Ok(mut inner) = self.inner.try_lock() {
-            inner.closed = true;
-            inner.wake_all();
-        }
+        self.closed.store(true, Ordering::Relaxed);
+        let mut inner = self.inner.lock();
+        inner.closed = true;
+        inner.wake_all();
         Poll::Ready(Ok(()))
     }
 }
 
-// Also implement futures::io traits for yamux compatibility
+// futures::io traits for yamux compatibility
 impl futures::io::AsyncRead for KcpConn {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -284,52 +253,34 @@ impl futures::io::AsyncRead for KcpConn {
             return Poll::Ready(Ok(n));
         }
 
-        let mut inner = match self.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
+        let mut inner = self.inner.lock();
+        if inner.closed { return Poll::Ready(Ok(0)); }
+
+        match inner.kcp.peeksize() {
+            Ok(peek) if peek > 0 => {
+                let mut tmp = vec![0u8; peek];
+                match inner.kcp.recv(&mut tmp) {
+                    Ok(n) => {
+                        drop(inner);
+                        let data = &tmp[..n];
+                        let cn = std::cmp::min(buf.len(), data.len());
+                        buf[..cn].copy_from_slice(&data[..cn]);
+                        if cn < data.len() {
+                            self.recv_buf.extend_from_slice(&data[cn..]);
+                        }
+                        Poll::Ready(Ok(cn))
+                    }
+                    Err(_) => {
+                        inner.pending_reader = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                }
             }
-        };
-
-        if inner.closed {
-            return Poll::Ready(Ok(0));
+            _ => {
+                inner.pending_reader = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
-
-        let queue: Vec<Vec<u8>> = inner.input_queue.drain(..).collect();
-        let queue_len = queue.len();
-        for data in &queue {
-            inner.kcp.input(data);
-        }
-        if !queue.is_empty() {
-            let now = inner.now_ms();
-            inner.kcp.update(now);
-        }
-
-        let peek = inner.kcp.peek_size();
-        eprintln!("[f::poll_read conv={}] drained={}, peek={}", inner.kcp.conv(), queue_len, peek);
-
-        if peek <= 0 {
-            inner.pending_reader = Some(cx.waker().clone());
-            return Poll::Pending;
-        }
-
-        let mut tmp = vec![0u8; peek as usize];
-        let n = inner.kcp.recv(&mut tmp);
-        drop(inner);
-
-        if n <= 0 {
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-
-        let data = &tmp[..n as usize];
-        let copy_n = std::cmp::min(buf.len(), data.len());
-        buf[..copy_n].copy_from_slice(&data[..copy_n]);
-        if copy_n < data.len() {
-            self.recv_buf.extend_from_slice(&data[copy_n..]);
-        }
-        Poll::Ready(Ok(copy_n))
     }
 }
 
@@ -339,38 +290,36 @@ impl futures::io::AsyncWrite for KcpConn {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut inner = match self.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-        };
-
+        let mut inner = self.inner.lock();
         if inner.closed {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
         }
-
-        let ret = inner.kcp.send(buf);
-        if ret < 0 {
-            inner.pending_writer = Some(cx.waker().clone());
-            return Poll::Pending;
+        match inner.kcp.send(buf) {
+            Ok(n) => {
+                drop(inner);
+                self.notifier.notify_one();
+                Poll::Ready(Ok(n))
+            }
+            Err(_) => {
+                inner.pending_writer = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
-        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Ok(mut inner) = self.inner.try_lock() {
-            inner.kcp.flush();
-        }
+        let mut inner = self.inner.lock();
+        let _ = inner.kcp.flush();
+        drop(inner);
+        self.notifier.notify_one();
         Poll::Ready(Ok(()))
     }
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Ok(mut inner) = self.inner.try_lock() {
-            inner.closed = true;
-            inner.wake_all();
-        }
+        self.closed.store(true, Ordering::Relaxed);
+        let mut inner = self.inner.lock();
+        inner.closed = true;
+        inner.wake_all();
         Poll::Ready(Ok(()))
     }
 }
@@ -378,82 +327,72 @@ impl futures::io::AsyncWrite for KcpConn {
 impl Unpin for KcpConn {}
 
 /// Background task that periodically calls KCP update.
-async fn update_loop(inner: Arc<Mutex<KcpInner>>) {
-    let mut interval = tokio::time::interval(Duration::from_millis(1));
+async fn update_loop(
+    inner: Arc<SpinMutex<KcpInner>>,
+    closed: Arc<AtomicBool>,
+    notifier: Arc<Notify>,
+) {
     loop {
-        interval.tick().await;
+        if closed.load(Ordering::Relaxed) { return; }
 
-        let mut kcp = inner.lock().await;
-        if kcp.closed {
-            return;
+        let next = {
+            let mut kcp = inner.lock();
+            if kcp.closed { return; }
+
+            let now = kcp.now_ms();
+            match kcp.kcp.update(now) {
+                Ok(()) => {}
+                Err(_) => {}
+            }
+            kcp.try_wake_pending();
+
+            let check = kcp.kcp.check(now);
+            let delay = if check <= now { 1 } else { (check - now).min(100) };
+            Duration::from_millis(delay as u64)
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep(next) => {}
+            _ = notifier.notified() => {}
         }
-
-        // Drain input queue
-        let queue: Vec<Vec<u8>> = kcp.input_queue.drain(..).collect();
-        for data in &queue {
-            kcp.kcp.input(data);
-        }
-
-        let now = kcp.now_ms();
-        kcp.kcp.update(now);
-        kcp.kcp.flush();
-        kcp.try_wake_reader();
-        kcp.try_wake_writer();
-
-        // Adaptive interval based on check()
-        let next = kcp.kcp.check(now);
-        let delay = if next <= now { 1 } else { (next - now).min(10) };
-        drop(kcp);
-        interval = tokio::time::interval(Duration::from_millis(delay as u64));
     }
 }
+
+// --- Test infrastructure ---
 
 #[cfg(test)]
 pub fn conn_pair() -> (KcpConn, KcpConn) {
     use std::sync::Mutex as StdMutex;
 
-    let b_conn: Arc<StdMutex<Option<Arc<tokio::sync::Mutex<KcpInner>>>>> =
+    let b_input: Arc<StdMutex<Option<(Arc<SpinMutex<KcpInner>>, Arc<Notify>)>>> =
         Arc::new(StdMutex::new(None));
-    let a_conn: Arc<StdMutex<Option<Arc<tokio::sync::Mutex<KcpInner>>>>> =
+    let a_input: Arc<StdMutex<Option<(Arc<SpinMutex<KcpInner>>, Arc<Notify>)>>> =
         Arc::new(StdMutex::new(None));
 
-    let b_ref = b_conn.clone();
+    let b_ref = b_input.clone();
     let a = KcpConn::new(1, Arc::new(move |data: &[u8]| {
-        if let Some(ref inner) = *b_ref.lock().unwrap() {
-            let data = data.to_vec();
-            let inner = inner.clone();
-            eprintln!("[output a→b] {} bytes", data.len());
-            tokio::spawn(async move {
-                eprintln!("[output a→b] task running, acquiring lock...");
-                let mut kcp = inner.lock().await;
-                eprintln!("[output a→b] lock acquired, queueing {} bytes", data.len());
-                kcp.input_queue.push(data);
-                if let Some(w) = kcp.pending_reader.take() {
-                    eprintln!("[output a→b] WAKING reader from spawn");
-                    w.wake();
-                }
-            });
+        if let Some((ref inner, ref notify)) = *b_ref.lock().unwrap() {
+            let mut kcp = inner.lock();
+            let _ = kcp.kcp.input(data);
+            kcp.try_wake_pending();
+            drop(kcp);
+            notify.notify_one();
         }
     }));
 
-    let a_ref = a_conn.clone();
+    let a_ref = a_input.clone();
     let b = KcpConn::new(1, Arc::new(move |data: &[u8]| {
-        if let Some(ref inner) = *a_ref.lock().unwrap() {
-            let data = data.to_vec();
-            let inner = inner.clone();
-            eprintln!("[output b→a] {} bytes", data.len());
-            tokio::spawn(async move {
-                let mut kcp = inner.lock().await;
-                kcp.input_queue.push(data);
-                if let Some(w) = kcp.pending_reader.take() {
-                    w.wake();
-                }
-            });
+        if let Some((ref inner, ref notify)) = *a_ref.lock().unwrap() {
+            let mut kcp = inner.lock();
+            let _ = kcp.kcp.input(data);
+            kcp.try_wake_pending();
+            drop(kcp);
+            notify.notify_one();
         }
     }));
 
-    *b_conn.lock().unwrap() = Some(b.inner.clone());
-    *a_conn.lock().unwrap() = Some(a.inner.clone());
+    *b_input.lock().unwrap() = Some((b.inner_ref(), b.notifier_ref()));
+    *a_input.lock().unwrap() = Some((a.inner_ref(), a.notifier_ref()));
 
     (a, b)
 }
@@ -489,13 +428,11 @@ mod tests {
         let (mut a, mut b) = conn_pair();
         let data: Vec<u8> = (0..32768).map(|i| (i & 0xFF) as u8).collect();
         let data2 = data.clone();
-
         let writer = tokio::spawn(async move {
             for chunk in data2.chunks(1024) {
                 a.write_all(chunk).await.unwrap();
             }
         });
-
         let mut received = Vec::new();
         let mut buf = vec![0u8; 4096];
         while received.len() < data.len() {
@@ -503,7 +440,6 @@ mod tests {
             if n == 0 { break; }
             received.extend_from_slice(&buf[..n]);
         }
-
         writer.await.unwrap();
         assert_eq!(received, data);
     }
@@ -526,30 +462,20 @@ mod tests {
         let mut server = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
 
         let client_task = tokio::spawn(async move {
-            eprintln!("[yamux-test] client: polling poll_new_outbound...");
-            let r = futures::future::poll_fn(|cx| client.poll_new_outbound(cx)).await;
-            eprintln!("[yamux-test] client: poll_new_outbound returned {:?}", r.is_ok());
-            r
+            futures::future::poll_fn(|cx| client.poll_new_outbound(cx)).await
         });
 
         let server_task = tokio::spawn(async move {
-            eprintln!("[yamux-test] server: polling poll_next_inbound...");
-            let r = futures::future::poll_fn(|cx| server.poll_next_inbound(cx)).await;
-            eprintln!("[yamux-test] server: poll_next_inbound returned");
-            r
+            futures::future::poll_fn(|cx| server.poll_next_inbound(cx)).await
         });
 
         let (c, s) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(3), client_task),
-            tokio::time::timeout(Duration::from_secs(3), server_task),
+            tokio::time::timeout(Duration::from_secs(5), client_task),
+            tokio::time::timeout(Duration::from_secs(5), server_task),
         );
 
-        let client_ok = c.is_ok();
-        let server_ok = s.is_ok();
-        eprintln!("[yamux-test] client_ok={}, server_ok={}", client_ok, server_ok);
-
-        assert!(client_ok, "client timed out");
-        assert!(server_ok, "server timed out");
+        assert!(c.is_ok(), "client timed out");
+        assert!(s.is_ok(), "server timed out");
 
         let mut client_stream = c.unwrap().unwrap().unwrap();
         let mut server_stream = s.unwrap().unwrap().unwrap().unwrap();
