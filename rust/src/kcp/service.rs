@@ -3,25 +3,21 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use super::conn::KcpConn;
 
-/// Output function for ServiceMux.
 pub type ServiceOutputFn = Arc<dyn Fn(u64, &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
 
-/// Configuration for ServiceMux.
 pub struct ServiceMuxConfig {
     pub is_client: bool,
     pub output: ServiceOutputFn,
 }
 
 struct ServiceEntry {
-    conn: KcpConn,
+    input_conn: KcpConn,
     open_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<yamux::Stream, String>>>,
 }
 
-/// ServiceMux manages per-service KCP + yamux sessions.
 pub struct ServiceMux {
     config: ServiceMuxConfig,
     services: RwLock<HashMap<u64, Arc<ServiceEntry>>>,
@@ -42,7 +38,6 @@ impl ServiceMux {
         })
     }
 
-    /// Feed incoming KCP packet to the correct service.
     pub fn input(&self, service: u64, data: &[u8]) {
         if self.closed.load(Ordering::Relaxed) { return; }
 
@@ -51,22 +46,17 @@ impl ServiceMux {
             services.get(&service).cloned()
         };
 
-        if let Some(entry) = entry {
-            entry.conn.queue_input(data);
-        } else {
-            if let Ok(entry) = self.create_service(service) {
-                entry.conn.queue_input(data);
-            }
+        if let Some(e) = entry {
+            e.input_conn.input(data);
+        } else if let Ok(e) = self.create_service(service) {
+            e.input_conn.input(data);
         }
     }
 
     pub async fn open_stream(&self, service: u64) -> Result<yamux::Stream, String> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err("closed".into());
-        }
+        if self.closed.load(Ordering::Relaxed) { return Err("closed".into()); }
 
         let entry = self.ensure_service(service)?;
-
         let (tx, rx) = tokio::sync::oneshot::channel();
         entry.open_tx.send(tx).await.map_err(|_| "channel closed".to_string())?;
         rx.await.map_err(|_| "cancelled".to_string())?
@@ -98,80 +88,32 @@ impl ServiceMux {
 
     fn create_service(&self, service: u64) -> Result<Arc<ServiceEntry>, String> {
         let mut services = self.services.write().unwrap();
-        if let Some(e) = services.get(&service) {
-            return Ok(e.clone());
-        }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err("closed".into());
-        }
+        if let Some(e) = services.get(&service) { return Ok(e.clone()); }
+        if self.closed.load(Ordering::Relaxed) { return Err("closed".into()); }
 
         let output = self.config.output.clone();
         let svc = service;
+
+        // Create KcpConn, save refs, then move into yamux
         let conn = KcpConn::new(service as u32, Arc::new(move |data: &[u8]| {
             let _ = output(svc, data);
         }));
 
-        let mode = if self.config.is_client {
-            yamux::Mode::Client
-        } else {
-            yamux::Mode::Server
-        };
+        let inner_ref = conn.inner_ref();
+        let closed_ref = conn.closed_ref();
+        let notifier_ref = conn.notifier_ref();
 
+        let mode = if self.config.is_client { yamux::Mode::Client } else { yamux::Mode::Server };
         let yamux_conn = yamux::Connection::new(conn, yamux::Config::default(), mode);
 
         let (open_tx, open_rx) = tokio::sync::mpsc::channel(64);
         let accept_tx = self.accept_tx.clone();
-
         tokio::spawn(yamux_driver(yamux_conn, service, open_rx, accept_tx));
 
-        let entry = Arc::new(ServiceEntry { conn: KcpConn::new(service as u32, Arc::new(|_: &[u8]| {})), open_tx });
+        // Create an input handle from the saved refs
+        let input_conn = KcpConn::from_parts(inner_ref, closed_ref, notifier_ref);
 
-        // We need to create the conn once and share it. The conn was moved into yamux.
-        // Rethink: we need the conn for input(), but yamux owns it.
-        // Solution: the conn's output function sends via the outer output.
-        // For input, we access the KcpInner directly.
-
-        // Actually, the KcpConn was moved into yamux::Connection. We can't call
-        // try_input on it anymore. We need to keep a reference to the inner.
-        drop(services);
-        drop(entry);
-
-        // Redesign: create KcpConn, get its inner Arc, then move the conn into yamux.
-        self.create_service_v2(service)
-    }
-
-    fn create_service_v2(&self, service: u64) -> Result<Arc<ServiceEntry>, String> {
-        let mut services = self.services.write().unwrap();
-        if let Some(e) = services.get(&service) {
-            return Ok(e.clone());
-        }
-
-        let output = self.config.output.clone();
-        let svc = service;
-        let conn = KcpConn::new(service as u32, Arc::new(move |data: &[u8]| {
-            let _ = output(svc, data);
-        }));
-
-        // Keep a reference to the inner for input()
-        let inner_ref = conn.inner();
-
-        let mode = if self.config.is_client {
-            yamux::Mode::Client
-        } else {
-            yamux::Mode::Server
-        };
-
-        let yamux_conn = yamux::Connection::new(conn, yamux::Config::default(), mode);
-
-        let (open_tx, open_rx) = tokio::sync::mpsc::channel(64);
-        let accept_tx = self.accept_tx.clone();
-
-        tokio::spawn(yamux_driver(yamux_conn, service, open_rx, accept_tx));
-
-        // Create a "shell" KcpConn that shares the same inner for input()
-        let input_conn = KcpConn::from_inner(inner_ref);
-
-        let entry = Arc::new(ServiceEntry { conn: input_conn, open_tx });
+        let entry = Arc::new(ServiceEntry { input_conn, open_tx });
         services.insert(service, entry.clone());
         Ok(entry)
     }
@@ -183,16 +125,11 @@ async fn yamux_driver(
     mut open_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<yamux::Stream, String>>>,
     accept_tx: tokio::sync::mpsc::Sender<(yamux::Stream, u64)>,
 ) {
-    // Use separate tasks for inbound and outbound since yamux
-    // poll_new_outbound and poll_next_inbound both need &mut self.
-    // Drive them in a single task alternating via poll_fn.
     loop {
         tokio::select! {
             result = futures::future::poll_fn(|cx| connection.poll_next_inbound(cx)) => {
                 match result {
-                    Some(Ok(stream)) => {
-                        let _ = accept_tx.send((stream, service)).await;
-                    }
+                    Some(Ok(stream)) => { let _ = accept_tx.send((stream, service)).await; }
                     _ => return,
                 }
             }
@@ -218,9 +155,7 @@ mod tests {
         let client = ServiceMux::new(ServiceMuxConfig {
             is_client: true,
             output: Arc::new(move |service, data| {
-                if let Some(ref s) = *s_ref.lock().unwrap() {
-                    s.input(service, data);
-                }
+                if let Some(ref s) = *s_ref.lock().unwrap() { s.input(service, data); }
                 Ok(())
             }),
         });
@@ -229,27 +164,22 @@ mod tests {
         let server = ServiceMux::new(ServiceMuxConfig {
             is_client: false,
             output: Arc::new(move |service, data| {
-                if let Some(ref c) = *c_ref.lock().unwrap() {
-                    c.input(service, data);
-                }
+                if let Some(ref c) = *c_ref.lock().unwrap() { c.input(service, data); }
                 Ok(())
             }),
         });
 
         *server_slot.lock().unwrap() = Some(server.clone());
         *client_slot.lock().unwrap() = Some(client.clone());
-
         (client, server)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_yamux_open_close() {
         let (client, server) = service_mux_pair();
-
         let mut stream = client.open_stream(1).await.unwrap();
         let (mut accepted, svc) = server.accept_stream().await.unwrap();
         assert_eq!(svc, 1);
-
         stream.close().await.unwrap();
         accepted.close().await.unwrap();
         client.close();
@@ -259,20 +189,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_yamux_bidirectional() {
         let (client, server) = service_mux_pair();
-
         let mut cs = client.open_stream(1).await.unwrap();
         let (mut ss, _) = server.accept_stream().await.unwrap();
-
         cs.write_all(b"from client").await.unwrap();
         ss.write_all(b"from server").await.unwrap();
-
         let mut buf = vec![0u8; 256];
         let n = ss.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"from client");
-
         let n = cs.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"from server");
-
         cs.close().await.unwrap();
         ss.close().await.unwrap();
         client.close();
@@ -282,7 +207,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_smux_multi_service_3() {
         let (client, server) = service_mux_pair();
-
         let server2 = server.clone();
         let accept = tokio::spawn(async move {
             for _ in 0..3 {
@@ -292,7 +216,6 @@ mod tests {
                 s.close().await.unwrap();
             }
         });
-
         for svc in [1u64, 2, 3] {
             let mut s = client.open_stream(svc).await.unwrap();
             let mut buf = vec![0u8; 256];
@@ -300,7 +223,6 @@ mod tests {
             assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("echo-"));
             s.close().await.unwrap();
         }
-
         accept.await.unwrap();
         assert_eq!(client.num_services(), 3);
         client.close();
