@@ -171,7 +171,7 @@ func main() {
 	// Proxy A: SOCKS5 → KCP stream (proto=69) → B
 	proxyA := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
 		metadata := addr.Encode()
-		stream, err := udpA.OpenStream(keyB.Public, noise.ProtocolTCPProxy, metadata)
+		stream, err := udpA.OpenStream(keyB.Public, noise.ProtocolKCP, metadata)
 		if err != nil {
 			return nil, fmt.Errorf("open stream: %w", err)
 		}
@@ -187,7 +187,7 @@ func main() {
 			if err != nil {
 				return
 			}
-			if stream.Proto() != noise.ProtocolTCPProxy {
+			if stream.Proto() != noise.ProtocolKCP {
 				stream.Close()
 				continue
 			}
@@ -202,7 +202,7 @@ func main() {
 	// Proxy B: SOCKS5 → KCP stream (proto=69) → A
 	proxyB := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
 		metadata := addr.Encode()
-		stream, err := udpB.OpenStream(keyA.Public, noise.ProtocolTCPProxy, metadata)
+		stream, err := udpB.OpenStream(keyA.Public, noise.ProtocolKCP, metadata)
 		if err != nil {
 			return nil, fmt.Errorf("open stream: %w", err)
 		}
@@ -218,7 +218,7 @@ func main() {
 			if err != nil {
 				return
 			}
-			if stream.Proto() != noise.ProtocolTCPProxy {
+			if stream.Proto() != noise.ProtocolKCP {
 				stream.Close()
 				continue
 			}

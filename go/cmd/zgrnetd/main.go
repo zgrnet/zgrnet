@@ -306,7 +306,7 @@ func run(cfgPath string) error {
 
 		// Open KCP stream with TCP_PROXY proto + target address as metadata
 		metadata := addr.Encode()
-		stream, err := udpTransport.OpenStream(targetPK, noise.ProtocolTCPProxy, metadata)
+		stream, err := udpTransport.OpenStream(targetPK, noise.ProtocolKCP, metadata)
 		if err != nil {
 			return nil, fmt.Errorf("open stream to %s: %w", targetPK.ShortString(), err)
 		}
@@ -423,7 +423,7 @@ func acceptTCPProxyStreams(udp *znet.UDP, pk noise.PublicKey) {
 		if err != nil {
 			return // peer gone or UDP closed
 		}
-		if stream.Proto() != noise.ProtocolTCPProxy {
+		if stream.Proto() != noise.ProtocolKCP {
 			stream.Close()
 			continue
 		}

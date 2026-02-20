@@ -294,7 +294,7 @@ func (c *Conn) Send(protocol byte, payload []byte) error {
 		}
 	}
 
-	plaintext := noise.EncodePayload(protocol, payload)
+	plaintext := noise.EncodePayload(protocol, 0, payload)
 	return c.sendPayload(plaintext, false)
 }
 
@@ -541,8 +541,9 @@ func (c *Conn) handleTransportMessage(msg *noise.TransportMessage) (byte, []byte
 		return 0, nil, nil
 	}
 
-	// Decode protocol and payload
-	return noise.DecodePayload(plaintext)
+	// Decode protocol + service + payload (service used in Phase 4)
+	protocol, _, payload, err := noise.DecodePayload(plaintext)
+	return protocol, payload, err
 }
 
 // handleHandshakeResponse processes an incoming handshake response.

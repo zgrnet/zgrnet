@@ -138,8 +138,8 @@ func runHandler(config *Config, myInfo *HostInfo, myKey *noise.KeyPair) {
 	log.Printf("[handler] Got stream id=%d proto=%d metadata=%d bytes",
 		stream.ID(), stream.Proto(), len(stream.Metadata()))
 
-	if stream.Proto() != noise.ProtocolTCPProxy {
-		log.Fatalf("[handler] Expected proto=%d, got %d", noise.ProtocolTCPProxy, stream.Proto())
+	if stream.Proto() != noise.ProtocolKCP {
+		log.Fatalf("[handler] Expected proto=%d, got %d", noise.ProtocolKCP, stream.Proto())
 	}
 
 	// 5. Handle TCP_PROXY: decode address → dial echo server → relay
@@ -190,9 +190,9 @@ func runProxy(config *Config, myInfo *HostInfo, myKey *noise.KeyPair) {
 		Port: uint16(config.EchoPort),
 	}
 	metadata := echoAddr.Encode()
-	log.Printf("[proxy] Opening stream proto=%d target=%s:%d", noise.ProtocolTCPProxy, echoAddr.Host, echoAddr.Port)
+	log.Printf("[proxy] Opening stream proto=%d target=%s:%d", noise.ProtocolKCP, echoAddr.Host, echoAddr.Port)
 
-	stream, err := udp.OpenStream(handlerKey.Public, noise.ProtocolTCPProxy, metadata)
+	stream, err := udp.OpenStream(handlerKey.Public, noise.ProtocolKCP, metadata)
 	if err != nil {
 		log.Fatalf("[proxy] OpenStream failed: %v", err)
 	}

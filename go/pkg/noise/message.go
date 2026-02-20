@@ -18,6 +18,10 @@ const (
 )
 
 // Protocol field values (inside encrypted payload).
+//
+// Wire format after Noise decryption:
+//
+//	protocol(1B) | service(varint) | data
 const (
 	// Transport layer protocols (0-63, matching IP protocol numbers)
 	ProtocolRaw  byte = 0  // Raw data (default for WriteTo)
@@ -27,12 +31,11 @@ const (
 	ProtocolUDP  byte = 17 // UDP in ZigNet (no IP header)
 
 	// ZigNet extension protocols (64-127)
-	ProtocolKCP         byte = 64 // KCP reliable UDP
-	ProtocolUDPProxy    byte = 65 // UDP proxy
+	ProtocolKCP         byte = 64 // KCP reliable UDP → yamux stream multiplexing
+	ProtocolUDPProxy    byte = 65 // UDP proxy (addr + data per packet)
 	ProtocolRelay0      byte = 66 // Relay first hop
 	ProtocolRelay1      byte = 67 // Relay middle hop
 	ProtocolRelay2      byte = 68 // Relay last hop
-	ProtocolTCPProxy    byte = 69 // TCP proxy via KCP stream
 	ProtocolPing        byte = 70 // Ping probe request
 	ProtocolPong        byte = 71 // Pong probe response
 	ProtocolRelay0Bind  byte = 72 // Relay first hop BIND (relay_id + dst_pubkey)
@@ -48,6 +51,16 @@ const (
 	ProtocolMedia  byte = 130 // Audio/video streams
 	ProtocolSignal byte = 131 // Signaling (WebRTC, etc.)
 	ProtocolRPC    byte = 132 // Remote procedure calls
+)
+
+// Well-known service IDs (0-127, 1-byte varint).
+// These are conventions, not enforced by the host.
+const (
+	ServiceRelay uint64 = 0 // Relay service (opt-in per node)
+	ServiceProxy uint64 = 1 // SOCKS5/HTTP CONNECT proxy
+	ServiceTUN   uint64 = 2 // TUN virtual network interface
+	ServiceDNS   uint64 = 3 // Magic DNS
+	ServiceAdmin uint64 = 4 // Admin API
 )
 
 // Message size constants.
@@ -108,20 +121,31 @@ func BuildTransportMessage(receiverIndex uint32, counter uint64, ciphertext []by
 	return msg
 }
 
-// EncodePayload prepends the protocol byte to the payload.
-func EncodePayload(protocol byte, payload []byte) []byte {
-	result := make([]byte, 1+len(payload))
+// EncodePayload encodes protocol + service + data into a single payload.
+//
+// Wire format: protocol(1B) | service(varint) | data
+func EncodePayload(protocol byte, service uint64, payload []byte) []byte {
+	svcLen := VarintLen(service)
+	result := make([]byte, 1+svcLen+len(payload))
 	result[0] = protocol
-	copy(result[1:], payload)
+	EncodeVarint(result[1:], service)
+	copy(result[1+svcLen:], payload)
 	return result
 }
 
-// DecodePayload extracts the protocol byte and payload.
-func DecodePayload(data []byte) (protocol byte, payload []byte, err error) {
-	if len(data) < 1 {
-		return 0, nil, ErrMessageTooShort
+// DecodePayload decodes protocol + service + data from a payload.
+//
+// Wire format: protocol(1B) | service(varint) | data
+func DecodePayload(data []byte) (protocol byte, service uint64, payload []byte, err error) {
+	if len(data) < 2 {
+		return 0, 0, nil, ErrMessageTooShort
 	}
-	return data[0], data[1:], nil
+	protocol = data[0]
+	service, n, err := DecodeVarint(data[1:])
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	return protocol, service, data[1+n:], nil
 }
 
 // HandshakeInitMessage represents a parsed handshake initiation (Type 1).

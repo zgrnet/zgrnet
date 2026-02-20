@@ -90,7 +90,7 @@ func TestProxyThroughput(t *testing.T) {
 	// Start proxy server on client side (dials through tunnel)
 	proxySrv := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
 		metadata := addr.Encode()
-		stream, err := client.OpenStream(serverKey.Public, noise.ProtocolTCPProxy, metadata)
+		stream, err := client.OpenStream(serverKey.Public, noise.ProtocolKCP, metadata)
 		if err != nil {
 			return nil, err
 		}
