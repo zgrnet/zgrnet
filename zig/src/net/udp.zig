@@ -1050,6 +1050,18 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 Rt.sleepMs(1);
 
                 if (self.closed.load(.acquire)) return;
+
+                // Update all peer muxes — drives KCP retransmissions,
+                // flush, and timeout processing.
+                self.peers_mutex.lock();
+                var iter = self.peers.valueIterator();
+                while (iter.next()) |peer_ptr| {
+                    const peer = peer_ptr.*;
+                    if (peer.mux) |mux| {
+                        mux.update();
+                    }
+                }
+                self.peers_mutex.unlock();
             }
         }
 
@@ -1552,6 +1564,85 @@ test "UDP end-to-end: handshake + send/recv" {
         const result2 = try udp1.readFrom(&buf);
         try std.testing.expectEqual(reply.len, result2.n);
         try std.testing.expectEqualSlices(u8, reply, buf[0..result2.n]);
+    }
+}
+
+test "KCP stream: data transfer requires mux.update" {
+    const builtin = @import("builtin");
+    const has_kqueue = comptime (builtin.os.tag == .macos or builtin.os.tag == .freebsd or
+        builtin.os.tag == .netbsd or builtin.os.tag == .openbsd);
+
+    if (comptime has_kqueue) {
+        const KqueueIO = std_impl.kqueue_io.KqueueIO;
+        const UDPImpl = UDP(StdCrypto, StdRt, KqueueIO, StdUdpSocket);
+        const P = noise.Protocol(StdCrypto);
+        const KeyPair = P.KeyPair;
+
+        const allocator = std.testing.allocator;
+
+        var priv1: [32]u8 = undefined;
+        var priv2: [32]u8 = undefined;
+        @memset(&priv1, 0);
+        @memset(&priv2, 0);
+        priv1[31] = 3;
+        priv2[31] = 4;
+        const kp1 = KeyPair.fromPrivate(noise.Key.fromBytes(priv1));
+        const kp2 = KeyPair.fromPrivate(noise.Key.fromBytes(priv2));
+
+        const udp1 = try UDPImpl.init(allocator, &kp1, .{
+            .bind_addr = "127.0.0.1:0",
+            .allow_unknown = true,
+            .decrypt_workers = 1,
+        });
+        defer udp1.deinit();
+
+        const udp2 = try UDPImpl.init(allocator, &kp2, .{
+            .bind_addr = "127.0.0.1:0",
+            .allow_unknown = true,
+            .decrypt_workers = 1,
+        });
+        defer udp2.deinit();
+
+        const port1 = udp1.getLocalPort();
+        const port2 = udp2.getLocalPort();
+
+        udp1.setPeerEndpoint(kp2.public, Endpoint.init(.{ 127, 0, 0, 1 }, port2));
+        udp2.setPeerEndpoint(kp1.public, Endpoint.init(.{ 127, 0, 0, 1 }, port1));
+
+        // Handshake
+        try udp1.connect(&kp2.public);
+
+        // Open stream from udp1
+        const stream1 = try udp1.openStream(&kp2.public, 0, &[_]u8{});
+        defer _ = stream1.release();
+
+        // Accept stream on udp2 (with timeout to avoid hanging if KCP is broken)
+        const stream2 = udp2.acceptStream(&kp1.public) orelse {
+            // If acceptStream returns null, the mux never delivered the SYN.
+            // This itself proves the timerLoop bug — KCP flush never happened.
+            std.debug.print("FAIL: acceptStream returned null — KCP SYN never flushed (timerLoop empty?)\n", .{});
+            return error.TestExpectedEqual;
+        };
+        defer _ = stream2.release();
+
+        // Write data through KCP stream
+        const test_msg = "kcp-timer-test";
+        _ = try stream1.write(test_msg);
+
+        // Read data — this requires mux.update() to drive KCP retransmit/flush.
+        // If timerLoop is empty, the data will never arrive and readBlocking
+        // will timeout.
+        var read_buf: [256]u8 = undefined;
+        const n = stream2.readBlocking(&read_buf, 3 * std.time.ns_per_s) catch |err| {
+            if (err == error.Timeout) {
+                std.debug.print("FAIL: readBlocking timed out — KCP data never arrived (timerLoop empty?)\n", .{});
+                return error.TestExpectedEqual;
+            }
+            return err;
+        };
+
+        try std.testing.expectEqual(test_msg.len, n);
+        try std.testing.expectEqualSlices(u8, test_msg, read_buf[0..n]);
     }
 }
 

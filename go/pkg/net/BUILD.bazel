@@ -29,6 +29,7 @@ go_test(
         "conn_test.go",
         "coverage_test.go",
         "dial_test.go",
+        "leak_test.go",
         "listener_test.go",
         "manager_test.go",
         "peer_test.go",
