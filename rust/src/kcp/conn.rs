@@ -48,19 +48,13 @@ impl KcpInner {
     }
 
     fn try_wake_pending(&mut self) {
-        if self.pending_reader.is_some() {
-            if let Ok(peek) = self.kcp.peeksize() {
-                if peek > 0 {
-                    if let Some(w) = self.pending_reader.take() {
-                        w.wake();
-                    }
-                }
-            }
+        // Always wake reader when new data arrives — yamux may need
+        // to re-poll even if KCP recv queue is empty (internal yamux state).
+        if let Some(w) = self.pending_reader.take() {
+            w.wake();
         }
-        if self.pending_writer.is_some() {
-            if let Some(w) = self.pending_writer.take() {
-                w.wake();
-            }
+        if let Some(w) = self.pending_writer.take() {
+            w.wake();
         }
     }
 
@@ -483,41 +477,62 @@ mod tests {
         let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>>(1);
         let (accept_tx, mut accept_rx) = tokio::sync::mpsc::channel::<yamux::Stream>(1);
 
-        // Client driver: polls both inbound (to flush) and processes open requests
+        // Client driver: persistent poll_fn with timer-based re-poll
         let client_task = tokio::spawn(async move {
+            use std::future::Future;
             let mut pending: Option<tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>> = None;
-            loop {
-                let now = std::time::Instant::now();
-                    let _: Option<()> = futures::future::poll_fn(|cx| {
-                    match client.poll_next_inbound(cx) {
-                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => {
-                            return std::task::Poll::Ready(None);
-                        }
-                        _ => {}
+            let mut timer = std::pin::pin!(tokio::time::sleep(Duration::from_millis(1)));
+
+            futures::future::poll_fn(|cx| {
+                let _ = timer.as_mut().poll(cx);
+
+                match client.poll_next_inbound(cx) {
+                    std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => {
+                        return std::task::Poll::Ready(());
                     }
-                    // Check open requests
-                    if pending.is_none() {
-                        if let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
-                            pending = Some(tx);
+                    _ => {}
+                }
+
+                if pending.is_none() {
+                    if let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
+                        pending = Some(tx);
+                    }
+                }
+
+                if pending.is_some() {
+                    if let std::task::Poll::Ready(result) = client.poll_new_outbound(cx) {
+                        if let Some(tx) = pending.take() {
+                            let _ = tx.send(result);
                         }
                     }
-                    // Try outbound
-                    if pending.is_some() {
-                        if let std::task::Poll::Ready(result) = client.poll_new_outbound(cx) {
-                            if let Some(tx) = pending.take() {
-                                let _ = tx.send(result);
-                            }
-                        }
-                    }
-                    std::task::Poll::Pending
-                }).await;
-            }
+                }
+
+                timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(1));
+                let _ = timer.as_mut().poll(cx);
+                std::task::Poll::Pending
+            }).await;
         });
 
-        // Server driver: keep polling to process all yamux protocol frames
+        // Server driver: persistent poll_fn with timer-based re-poll
         let server_task = tokio::spawn(async move {
+            use std::future::Future;
+            let mut timer = std::pin::pin!(tokio::time::sleep(Duration::from_millis(1)));
+
             loop {
-                let result = futures::future::poll_fn(|cx| server.poll_next_inbound(cx)).await;
+                let result = futures::future::poll_fn(|cx| {
+                    // Register timer Waker for periodic re-poll
+                    let _ = timer.as_mut().poll(cx);
+
+                    match server.poll_next_inbound(cx) {
+                        std::task::Poll::Ready(r) => std::task::Poll::Ready(r),
+                        std::task::Poll::Pending => {
+                            timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(1));
+                            let _ = timer.as_mut().poll(cx);
+                            std::task::Poll::Pending
+                        }
+                    }
+                }).await;
+
                 match result {
                     Some(Ok(s)) => { let _ = accept_tx.send(s).await; }
                     _ => return,
