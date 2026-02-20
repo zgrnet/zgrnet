@@ -184,11 +184,250 @@ fn getsockopt_int(fd: i32, level: i32, optname: i32) -> io::Result<i32> {
 }
 
 #[cfg(target_os = "linux")]
-fn apply_platform_options(_fd: i32, _cfg: &SocketConfig, _report: &mut OptimizationReport) {
-    // Linux-specific optimizations added in later phases:
-    // Phase 2: recvmmsg/sendmmsg (batch_size)
-    // Phase 4: UDP_GRO / UDP_GSO (gro, gso_segment)
-    // Phase 5: SO_BUSY_POLL (busy_poll_us)
+const UDP_GRO: i32 = 104;
+
+#[cfg(target_os = "linux")]
+fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut OptimizationReport) {
+    // SO_BUSY_POLL
+    if cfg.busy_poll_us > 0 {
+        match setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_BUSY_POLL, cfg.busy_poll_us) {
+            Ok(()) => {
+                report.entries.push(OptimizationEntry {
+                    name: "SO_BUSY_POLL",
+                    applied: true,
+                    detail: format!("SO_BUSY_POLL={}μs", cfg.busy_poll_us),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                report.entries.push(OptimizationEntry {
+                    name: "SO_BUSY_POLL",
+                    applied: false,
+                    detail: String::new(),
+                    error: Some(e),
+                });
+            }
+        }
+    }
+
+    // UDP_GRO
+    if cfg.gro {
+        match setsockopt_int(fd, libc::IPPROTO_UDP, UDP_GRO, 1) {
+            Ok(()) => {
+                report.entries.push(OptimizationEntry {
+                    name: "UDP_GRO",
+                    applied: true,
+                    detail: "UDP_GRO=1".to_string(),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                report.entries.push(OptimizationEntry {
+                    name: "UDP_GRO",
+                    applied: false,
+                    detail: String::new(),
+                    error: Some(e),
+                });
+            }
+        }
+    }
+}
+
+/// Batch reader using recvmmsg on Linux.
+#[cfg(target_os = "linux")]
+pub mod batch {
+    use std::io;
+    use std::mem;
+    use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
+
+    pub const DEFAULT_BATCH_SIZE: usize = 64;
+
+    pub struct RecvResult {
+        pub n: usize,
+        pub from: SocketAddr,
+    }
+
+    pub struct BatchReader {
+        fd: i32,
+        batch_size: usize,
+        msgs: Vec<libc::mmsghdr>,
+        iovecs: Vec<libc::iovec>,
+        addrs: Vec<libc::sockaddr_in>,
+    }
+
+    impl BatchReader {
+        pub fn new(fd: i32, batch_size: usize) -> Self {
+            Self {
+                fd,
+                batch_size,
+                msgs: vec![unsafe { mem::zeroed() }; batch_size],
+                iovecs: vec![unsafe { mem::zeroed() }; batch_size],
+                addrs: vec![unsafe { mem::zeroed() }; batch_size],
+            }
+        }
+
+        /// Read up to batch_size packets using recvmmsg.
+        /// Returns the number of packets received.
+        pub fn read_batch(&mut self, buffers: &mut [&mut [u8]]) -> io::Result<Vec<RecvResult>> {
+            let count = buffers.len().min(self.batch_size);
+
+            for i in 0..count {
+                self.iovecs[i] = libc::iovec {
+                    iov_base: buffers[i].as_mut_ptr() as *mut libc::c_void,
+                    iov_len: buffers[i].len(),
+                };
+                self.addrs[i] = unsafe { mem::zeroed() };
+                self.msgs[i].msg_hdr = libc::msghdr {
+                    msg_name: &mut self.addrs[i] as *mut _ as *mut libc::c_void,
+                    msg_namelen: mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    msg_iov: &mut self.iovecs[i],
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                };
+                self.msgs[i].msg_len = 0;
+            }
+
+            let n = unsafe {
+                libc::recvmmsg(
+                    self.fd,
+                    self.msgs.as_mut_ptr(),
+                    count as libc::c_uint,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut results = Vec::with_capacity(n as usize);
+            for i in 0..n as usize {
+                let addr = &self.addrs[i];
+                let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+                let port = u16::from_be(addr.sin_port);
+                results.push(RecvResult {
+                    n: self.msgs[i].msg_len as usize,
+                    from: SocketAddr::V4(SocketAddrV4::new(ip, port)),
+                });
+            }
+            Ok(results)
+        }
+    }
+
+    pub struct BatchWriter {
+        fd: i32,
+        batch_size: usize,
+        msgs: Vec<libc::mmsghdr>,
+        iovecs: Vec<libc::iovec>,
+        addrs: Vec<libc::sockaddr_in>,
+    }
+
+    impl BatchWriter {
+        pub fn new(fd: i32, batch_size: usize) -> Self {
+            Self {
+                fd,
+                batch_size,
+                msgs: vec![unsafe { mem::zeroed() }; batch_size],
+                iovecs: vec![unsafe { mem::zeroed() }; batch_size],
+                addrs: vec![unsafe { mem::zeroed() }; batch_size],
+            }
+        }
+
+        /// Write multiple packets using sendmmsg.
+        pub fn write_batch(
+            &mut self,
+            buffers: &[&[u8]],
+            targets: &[SocketAddr],
+        ) -> io::Result<usize> {
+            let count = buffers.len().min(self.batch_size).min(targets.len());
+
+            for i in 0..count {
+                self.iovecs[i] = libc::iovec {
+                    iov_base: buffers[i].as_ptr() as *mut libc::c_void,
+                    iov_len: buffers[i].len(),
+                };
+                match targets[i] {
+                    SocketAddr::V4(v4) => {
+                        self.addrs[i].sin_family = libc::AF_INET as libc::sa_family_t;
+                        self.addrs[i].sin_port = v4.port().to_be();
+                        self.addrs[i].sin_addr = libc::in_addr {
+                            s_addr: u32::from(*v4.ip()).to_be(),
+                        };
+                    }
+                    _ => continue,
+                }
+                self.msgs[i].msg_hdr = libc::msghdr {
+                    msg_name: &mut self.addrs[i] as *mut _ as *mut libc::c_void,
+                    msg_namelen: mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    msg_iov: &mut self.iovecs[i],
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                };
+            }
+
+            let n = unsafe {
+                libc::sendmmsg(
+                    self.fd,
+                    self.msgs.as_mut_ptr(),
+                    count as libc::c_uint,
+                    0,
+                )
+            };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(n as usize)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::net::UdpSocket;
+        use std::os::unix::io::AsRawFd;
+
+        #[test]
+        fn test_batch_reader_writer() {
+            let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let recv_addr = receiver.local_addr().unwrap();
+
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let sender_fd = sender.as_raw_fd();
+
+            let mut writer = BatchWriter::new(sender_fd, DEFAULT_BATCH_SIZE);
+
+            let msg1 = b"hello batch 1";
+            let msg2 = b"hello batch 2";
+            let msg3 = b"hello batch 3";
+            let bufs: Vec<&[u8]> = vec![msg1, msg2, msg3];
+            let addrs = vec![recv_addr; 3];
+
+            let sent = writer.write_batch(&bufs, &addrs).unwrap();
+            assert_eq!(sent, 3);
+
+            let recv_fd = receiver.as_raw_fd();
+            let mut reader = BatchReader::new(recv_fd, DEFAULT_BATCH_SIZE);
+
+            let mut buf1 = [0u8; 256];
+            let mut buf2 = [0u8; 256];
+            let mut buf3 = [0u8; 256];
+            let mut buffers: Vec<&mut [u8]> = vec![&mut buf1, &mut buf2, &mut buf3];
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let results = reader.read_batch(&mut buffers).unwrap();
+            assert!(results.len() >= 1, "expected at least 1 packet, got 0");
+
+            let mut total_bytes = 0;
+            for r in &results {
+                total_bytes += r.n;
+            }
+            assert!(total_bytes > 0);
+        }
+    }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]

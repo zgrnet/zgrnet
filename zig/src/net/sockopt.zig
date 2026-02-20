@@ -104,11 +104,121 @@ pub fn tryGetsockoptInt(fd: posix.socket_t, level: i32, optname: u32) u32 {
     return @intCast(value);
 }
 
+const SO_BUSY_POLL: u32 = 46;
+const UDP_GRO: u32 = 104;
+
 fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *OptimizationReport) void {
-    _ = fd;
-    _ = cfg;
-    _ = report;
+    if (cfg.busy_poll_us > 0) {
+        const val: i32 = @intCast(cfg.busy_poll_us);
+        if (trySetsockoptInt(fd, posix.SOL.SOCKET, SO_BUSY_POLL, val)) {
+            report.add(.{ .name = "SO_BUSY_POLL", .applied = true, .actual_value = cfg.busy_poll_us });
+        } else {
+            report.add(.{ .name = "SO_BUSY_POLL", .applied = false });
+        }
+    }
+
+    if (cfg.gro) {
+        if (trySetsockoptInt(fd, std.posix.IPPROTO.UDP, UDP_GRO, 1)) {
+            report.add(.{ .name = "UDP_GRO", .applied = true, .actual_value = 1 });
+        } else {
+            report.add(.{ .name = "UDP_GRO", .applied = false });
+        }
+    }
 }
+
+// ============================================================================
+// Batch I/O (Linux recvmmsg / sendmmsg)
+// ============================================================================
+
+pub const default_batch_count: u32 = 64;
+
+/// Result of a single received message in a batch.
+pub const BatchRecvResult = struct {
+    n: usize,
+    src_addr: [4]u8,
+    src_port: u16,
+};
+
+/// Batch reader using recvmmsg (Linux only, no-op on other platforms).
+pub const BatchReader = struct {
+    fd: posix.socket_t,
+    batch_size: usize,
+
+    pub fn init(fd: posix.socket_t, batch_size: usize) BatchReader {
+        return .{ .fd = fd, .batch_size = batch_size };
+    }
+
+    /// Read up to batch_size packets using recvmmsg.
+    /// Returns the number of packets received. Each buffer[i] is filled
+    /// with data and results[i] contains the metadata.
+    pub fn readBatch(
+        self: *const BatchReader,
+        buffers: [][]u8,
+        results: []BatchRecvResult,
+    ) !usize {
+        if (comptime builtin.os.tag != .linux) {
+            // Non-Linux fallback: single recvfrom
+            var from_addr: posix.sockaddr.in = undefined;
+            var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+            const n = posix.recvfrom(self.fd, buffers[0], 0, @ptrCast(&from_addr), &from_len) catch return error.RecvFailed;
+            if (n == 0) return 0;
+            results[0] = .{
+                .n = n,
+                .src_addr = @bitCast(from_addr.addr),
+                .src_port = std.mem.bigToNative(u16, from_addr.port),
+            };
+            return 1;
+        }
+
+        const count = @min(buffers.len, self.batch_size);
+        if (count == 0) return 0;
+
+        var msgs: [64]std.os.linux.mmsghdr_const = undefined;
+        var iovecs: [64]posix.iovec = undefined;
+        var addrs: [64]posix.sockaddr.in = undefined;
+
+        for (0..count) |i| {
+            iovecs[i] = .{
+                .base = buffers[i].ptr,
+                .len = buffers[i].len,
+            };
+            addrs[i] = std.mem.zeroes(posix.sockaddr.in);
+            msgs[i] = .{
+                .msg_hdr = .{
+                    .name = @ptrCast(&addrs[i]),
+                    .namelen = @sizeOf(posix.sockaddr.in),
+                    .iov = @ptrCast(&iovecs[i]),
+                    .iovlen = 1,
+                    .control = .{ .len = 0, .ptr = null },
+                    .flags = 0,
+                },
+                .msg_len = 0,
+            };
+        }
+
+        const rc = std.os.linux.recvmmsg(
+            self.fd,
+            &msgs,
+            count,
+            0,
+            null,
+        );
+        const err = posix.errno(rc);
+        if (err != .SUCCESS) {
+            return posix.unexpectedErrno(err);
+        }
+
+        const received: usize = @intCast(rc);
+        for (0..received) |i| {
+            results[i] = .{
+                .n = msgs[i].msg_len,
+                .src_addr = @bitCast(addrs[i].addr),
+                .src_port = std.mem.bigToNative(u16, addrs[i].port),
+            };
+        }
+        return received;
+    }
+};
 
 // ============================================================================
 // Tests
