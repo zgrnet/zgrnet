@@ -151,30 +151,27 @@ func TestTwoNodesEcho(t *testing.T) {
 	// Wait for mux initialization.
 	time.Sleep(50 * time.Millisecond)
 
-	// n1 dials n2.
-	stream, err := n1.Dial(kp2.Public, 8080)
+	stream, err := n1.Dial(kp2.Public, noise.ServiceProxy)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	defer stream.Close()
 
-	// Verify stream metadata.
-	if stream.Proto() != noise.ProtocolKCP {
-		t.Errorf("Proto = %d, want %d", stream.Proto(), noise.ProtocolKCP)
+	if stream.Service() != noise.ServiceProxy {
+		t.Errorf("Service = %d, want %d", stream.Service(), noise.ServiceProxy)
 	}
 	if stream.RemotePubkey() != kp2.Public {
 		t.Error("RemotePubkey mismatch on dialer side")
 	}
 
-	// n2 accepts the stream.
 	accepted, err := n2.AcceptStream()
 	if err != nil {
 		t.Fatalf("AcceptStream: %v", err)
 	}
 	defer accepted.Close()
 
-	if accepted.Proto() != noise.ProtocolKCP {
-		t.Errorf("accepted Proto = %d, want %d", accepted.Proto(), noise.ProtocolKCP)
+	if accepted.Service() != noise.ServiceProxy {
+		t.Errorf("accepted Service = %d, want %d", accepted.Service(), noise.ServiceProxy)
 	}
 	if accepted.RemotePubkey() != kp1.Public {
 		t.Error("RemotePubkey mismatch on accepter side")
@@ -253,34 +250,30 @@ func TestTwoNodesMultipleStreams(t *testing.T) {
 		}
 	}()
 
-	// Open multiple streams from n1 → n2.
 	var opened []*Stream
 	for i := 0; i < numStreams; i++ {
-		s, err := n1.Dial(kp2.Public, uint16(8080+i))
+		s, err := n1.Dial(kp2.Public, noise.ServiceProxy)
 		if err != nil {
 			t.Fatalf("Dial stream %d: %v", i, err)
 		}
 		opened = append(opened, s)
 	}
 
-	// Verify all streams were accepted.
 	for i := 0; i < numStreams; i++ {
 		select {
 		case s := <-accepted:
-			if s.Proto() != noise.ProtocolKCP {
-				t.Errorf("stream %d: proto = %d, want %d", i, s.Proto(), noise.ProtocolKCP)
+			if s.Service() != noise.ServiceProxy {
+				t.Errorf("stream %d: service = %d, want %d", i, s.Service(), noise.ServiceProxy)
 			}
 			if s.RemotePubkey() != kp1.Public {
 				t.Errorf("stream %d: RemotePubkey mismatch", i)
 			}
-			t.Logf("accepted stream %d: proto=%d, metadata=%x", i, s.Proto(), s.Metadata())
 			s.Close()
 		case <-time.After(5 * time.Second):
 			t.Fatalf("timeout waiting for stream %d", i)
 		}
 	}
 
-	// Clean up opened streams.
 	for _, s := range opened {
 		s.Close()
 	}
@@ -362,13 +355,13 @@ func TestDialRelayThreeNodes(t *testing.T) {
 
 	// A dials D through relay C.
 	// DialRelay adds route D → C, registers D as peer, then does handshake through relay.
-	stream, err := nodeA.DialRelay(kpD.Public, kpC.Public, 8080)
+	stream, err := nodeA.DialRelay(kpD.Public, kpC.Public, noise.ServiceProxy)
 	if err != nil {
 		t.Fatalf("DialRelay: %v", err)
 	}
 	defer stream.Close()
 
-	t.Logf("A opened stream to D through relay C: proto=%d", stream.Proto())
+	t.Logf("A opened stream to D through relay C: service=%d", stream.Service())
 
 	// D should accept the stream from A.
 	accepted, err := nodeD.AcceptStream()
@@ -381,7 +374,7 @@ func TestDialRelayThreeNodes(t *testing.T) {
 	if rpk != kpA.Public {
 		t.Errorf("D accepted from wrong peer: got %x, want %x", rpk[:4], kpA.Public[:4])
 	}
-	t.Logf("D accepted stream from A: proto=%d", accepted.Proto())
+	t.Logf("D accepted stream from A: service=%d", accepted.Service())
 
 	// Echo test: A writes, D reads and echoes back.
 	msg := []byte("hello through relay!")

@@ -131,19 +131,13 @@ func runHandler(config *Config, myInfo *HostInfo, myKey *noise.KeyPair) {
 	}
 
 	log.Printf("[handler] Waiting for TCP_PROXY stream...")
-	stream, err := udp.AcceptStream(peerKey.Public)
+	stream, _, err := udp.AcceptStream(peerKey.Public)
 	if err != nil {
 		log.Fatalf("[handler] AcceptStream failed: %v", err)
 	}
-	log.Printf("[handler] Got stream id=%d proto=%d metadata=%d bytes",
-		stream.ID(), stream.Proto(), len(stream.Metadata()))
+	log.Printf("[handler] Accepted stream")
 
-	if stream.Proto() != noise.ProtocolKCP {
-		log.Fatalf("[handler] Expected proto=%d, got %d", noise.ProtocolKCP, stream.Proto())
-	}
-
-	// 5. Handle TCP_PROXY: decode address → dial echo server → relay
-	if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
+	if err := proxy.HandleTCPProxy(stream, nil, nil, nil); err != nil {
 		log.Printf("[handler] HandleTCPProxy finished: %v", err)
 	}
 
@@ -183,21 +177,14 @@ func runProxy(config *Config, myInfo *HostInfo, myKey *noise.KeyPair) {
 	log.Println("[proxy] Connected!")
 	time.Sleep(200 * time.Millisecond) // Let mux initialize
 
-	// 3. Open stream with proto=69 targeting the echo server
-	echoAddr := &noise.Address{
-		Type: noise.AddressTypeIPv4,
-		Host: "127.0.0.1",
-		Port: uint16(config.EchoPort),
-	}
-	metadata := echoAddr.Encode()
-	log.Printf("[proxy] Opening stream proto=%d target=%s:%d", noise.ProtocolKCP, echoAddr.Host, echoAddr.Port)
+	log.Printf("[proxy] Opening stream service=%d", noise.ServiceProxy)
 
-	stream, err := udp.OpenStream(handlerKey.Public, noise.ProtocolKCP, metadata)
+	stream, err := udp.OpenStream(handlerKey.Public, noise.ServiceProxy)
 	if err != nil {
 		log.Fatalf("[proxy] OpenStream failed: %v", err)
 	}
 	defer stream.Close()
-	log.Printf("[proxy] Stream opened id=%d", stream.ID())
+	log.Printf("[proxy] Stream opened")
 
 	// Wait for stream to establish + handler to accept and connect
 	time.Sleep(500 * time.Millisecond)

@@ -1,6 +1,7 @@
 package net
 
 import (
+	"io"
 	"testing"
 	"time"
 
@@ -72,17 +73,16 @@ func TestPeerOpenStreamAcceptStream(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Open stream from client
-	clientStream, err := client.OpenStream(serverKey.Public, 0, nil)
+	clientStream, err := client.OpenStream(serverKey.Public, 0)
 	if err != nil {
 		t.Fatalf("Failed to open stream: %v", err)
 	}
 	defer clientStream.Close()
 
-	// Accept stream on server
-	serverStreamChan := make(chan *Stream, 1)
+	serverStreamChan := make(chan io.ReadWriteCloser, 1)
 	serverErrChan := make(chan error, 1)
 	go func() {
-		stream, err := server.AcceptStream(clientKey.Public)
+		stream, _, err := server.AcceptStream(clientKey.Public)
 		if err != nil {
 			serverErrChan <- err
 			return
@@ -101,7 +101,7 @@ func TestPeerOpenStreamAcceptStream(t *testing.T) {
 	}
 
 	// Wait for server to accept the stream
-	var serverStream *Stream
+	var serverStream io.ReadWriteCloser
 	select {
 	case serverStream = <-serverStreamChan:
 	case err := <-serverErrChan:
