@@ -92,9 +92,22 @@ zig_library(
 )
 
 # =============================================================================
-# zgrnet CLI — offline management tool
+# zigor CLI — unified management tool (replaces zgrnet + zgrnetd)
 # =============================================================================
 
+zig_binary(
+    name = "zigor_bin",
+    main = "cmd_zigor.zig",
+    srcs = ["cmd_zigor.zig"],
+    deps = [":noise"],
+    c_srcs = _KCP_C_SRCS,
+    c_includes = _KCP_C_INCLUDES,
+    c_flags = _C_FLAGS,
+    link_libc = True,
+    visibility = ["//visibility:public"],
+)
+
+# Legacy zgrnet CLI (to be removed)
 zig_binary(
     name = "zgrnet_bin",
     main = "cmd_zgrnet.zig",
