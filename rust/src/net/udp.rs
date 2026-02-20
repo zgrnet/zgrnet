@@ -369,8 +369,7 @@ impl UDP {
         let endpoint = p.endpoint.ok_or(UdpError::NoEndpoint)?;
         let session = p.session.as_mut().ok_or(UdpError::NoSession)?;
 
-        // Encode payload with protocol byte
-        let payload = encode_payload(protocol, data);
+        let payload = encode_payload(protocol, 0, data);
 
         // Encrypt the data
         let (ciphertext, nonce) = session
@@ -664,8 +663,7 @@ impl UDP {
                     None => return Err("no session".into()),
                 };
 
-                // Encode payload with KCP protocol byte
-                let payload = encode_payload(message::protocol::KCP, data);
+                let payload = encode_payload(message::protocol::KCP, 0, data);
 
                 // Encrypt
                 let (ciphertext, nonce) = session
@@ -981,7 +979,7 @@ impl UDP {
             return Ok((peer_pk, 0, 0));
         }
 
-        let (protocol, payload) = decode_payload(&plaintext)
+        let (protocol, _service, payload) = decode_payload(&plaintext)
             .map_err(|_| UdpError::Session("invalid payload".to_string()))?;
 
         // Route based on protocol (without holding peer lock)
@@ -1070,7 +1068,7 @@ impl UDP {
 
         let p = peer.lock().unwrap();
         if let (Some(ref session), Some(endpoint)) = (&p.session, p.endpoint) {
-            let payload_buf = encode_payload(action.protocol, &action.data);
+            let payload_buf = encode_payload(action.protocol, 0, &action.data);
             if let Ok((ct, nonce)) = session.encrypt(&payload_buf) {
                 let msg = build_transport_message(session.remote_index(), nonce, &ct);
                 let _ = self.socket.send_to(&msg, endpoint);
@@ -1107,7 +1105,7 @@ impl UDP {
             return Ok((Key(*src), 0, 0));
         }
 
-        let (inner_proto, inner_data) = decode_payload(&plaintext)
+        let (inner_proto, _inner_svc, inner_data) = decode_payload(&plaintext)
             .map_err(|_| UdpError::Session("invalid payload".to_string()))?;
 
         match inner_proto {

@@ -23,9 +23,10 @@ pub use session::{generate_index, Session, SessionConfig, SessionError, SessionS
 // Re-export message types
 pub use message::{
     build_handshake_init, build_handshake_resp, build_transport_message, decode_payload,
-    encode_payload, parse_handshake_init, parse_handshake_resp, parse_transport_message,
+    decode_varint, encode_payload, encode_varint, varint_len,
+    parse_handshake_init, parse_handshake_resp, parse_transport_message,
     HandshakeInit, HandshakeResp, MessageError, TransportMessage, MAX_PACKET_SIZE,
-    protocol,
+    protocol, service,
 };
 
 // Re-export address types
