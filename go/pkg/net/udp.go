@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/vibing/zgrnet/pkg/kcp"
 	"github.com/vibing/zgrnet/pkg/noise"
 	"github.com/vibing/zgrnet/pkg/relay"
 )
@@ -217,8 +218,7 @@ type peerState struct {
 	lastSeen time.Time
 
 	// Stream multiplexing (initialized when session is established)
-	mux        *mux
-	acceptChan chan *stream // incoming streams from remote
+	serviceMux *kcp.ServiceMux
 
 	// Protocol routing for non-KCP packets
 	inboundChan chan protoPacket // incoming non-KCP packets
@@ -745,17 +745,14 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Create mux resources before acquiring the lock
-	muxRes := u.createMux(peer)
+	// Create ServiceMux before acquiring the lock
+	smux := u.createServiceMux(peer)
 
-	// Update peer state and mux in the same lock
-	// This ensures mux is ready when packets start routing to this peer
 	peer.mu.Lock()
 	peer.endpoint = from
 	peer.session = session
-	peer.mux = muxRes.mux
-	peer.acceptChan = muxRes.acceptChan
-	peer.inboundChan = muxRes.inboundChan
+	peer.serviceMux = smux
+	peer.inboundChan = make(chan protoPacket, InboundChanSize)
 	peer.state = PeerStateEstablished
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
@@ -764,9 +761,6 @@ func (u *UDP) handleHandshakeInit(data []byte, from *net.UDPAddr) {
 	u.mu.Lock()
 	u.byIndex[localIdx] = peer
 	u.mu.Unlock()
-
-	// Start the mux update loop
-	u.startMuxUpdateLoop(muxRes.mux)
 }
 
 // handleHandshakeResp processes an incoming handshake response.
@@ -833,31 +827,22 @@ func (u *UDP) handleHandshakeResp(data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	// Create mux resources before acquiring the lock
 	peer := pending.peer
-	muxRes := u.createMux(peer)
+	smux := u.createServiceMux(peer)
 
-	// Update peer state and mux in the same lock
-	// This ensures mux is ready when packets start routing to this peer
 	peer.mu.Lock()
 	peer.endpoint = from // Roaming: update endpoint
 	peer.session = session
-	peer.mux = muxRes.mux
-	peer.acceptChan = muxRes.acceptChan
-	peer.inboundChan = muxRes.inboundChan
+	peer.serviceMux = smux
+	peer.inboundChan = make(chan protoPacket, InboundChanSize)
 	peer.state = PeerStateEstablished
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
 
-	// Register in index map
 	u.mu.Lock()
 	u.byIndex[pending.localIdx] = peer
 	u.mu.Unlock()
 
-	// Start the mux update loop
-	u.startMuxUpdateLoop(muxRes.mux)
-
-	// Signal completion
 	if pending.done != nil {
 		pending.done <- nil
 	}
@@ -1249,39 +1234,34 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		peer.inboundChan = make(chan protoPacket, InboundChanSize)
 	}
 	inboundChan := peer.inboundChan
-	muxInstance := peer.mux
+	smux := peer.serviceMux
 	peer.mu.Unlock()
 
-	// Fill packet fields
 	pkt.pk = peer.pk
 
-	// Parse protocol byte
 	if len(plaintext) == 0 {
-		// Empty keepalive packet
 		pkt.err = ErrNoData
 		return
 	}
 
-	protocol, _, payload, err := noise.DecodePayload(plaintext)
+	protocol, service, payload, err := noise.DecodePayload(plaintext)
 	if err != nil {
 		pkt.err = err
 		return
 	}
 
 	pkt.protocol = protocol
-	// Make a copy of payload since plaintext references the pool buffer
 	pkt.payload = make([]byte, len(payload))
 	copy(pkt.payload, payload)
 	pkt.payloadN = len(payload)
+	_ = service // used below for KCP routing
 
 	// Route based on protocol
 	switch protocol {
 	case noise.ProtocolKCP:
-		// mux is initialized when session is established (handshake complete)
-		if muxInstance != nil {
-			muxInstance.Input(payload)
+		if smux != nil {
+			smux.Input(service, payload)
 		}
-		// Don't deliver KCP to ReadFrom
 		pkt.err = ErrNoData
 
 	case noise.ProtocolRelay0:
@@ -1433,7 +1413,7 @@ func (u *UDP) processRelayedTransport(pkt *packet, src [32]byte, innerPayload []
 		return
 	}
 
-	innerProto, _, innerData, err := noise.DecodePayload(innerPlaintext)
+	innerProto, innerService, innerData, err := noise.DecodePayload(innerPlaintext)
 	if err != nil {
 		pkt.err = ErrNoData
 		return
@@ -1448,10 +1428,10 @@ func (u *UDP) processRelayedTransport(pkt *packet, src [32]byte, innerPayload []
 
 	if innerProto == noise.ProtocolKCP {
 		innerPeer.mu.RLock()
-		mux := innerPeer.mux
+		smux := innerPeer.serviceMux
 		innerPeer.mu.RUnlock()
-		if mux != nil {
-			mux.Input(innerData)
+		if smux != nil {
+			smux.Input(innerService, innerData)
 		}
 		pkt.err = ErrNoData
 		return
@@ -1569,14 +1549,12 @@ func (u *UDP) handleRelayedHandshakeInit(data []byte, src [32]byte, relayPK nois
 		return
 	}
 
-	muxRes := u.createMux(peer)
+	smux := u.createServiceMux(peer)
 
 	peer.mu.Lock()
-	// No endpoint for relayed peers — all traffic goes through relay
 	peer.session = session
-	peer.mux = muxRes.mux
-	peer.acceptChan = muxRes.acceptChan
-	peer.inboundChan = muxRes.inboundChan
+	peer.serviceMux = smux
+	peer.inboundChan = make(chan protoPacket, InboundChanSize)
 	peer.state = PeerStateEstablished
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
@@ -1584,8 +1562,6 @@ func (u *UDP) handleRelayedHandshakeInit(data []byte, src [32]byte, relayPK nois
 	u.mu.Lock()
 	u.byIndex[localIdx] = peer
 	u.mu.Unlock()
-
-	u.startMuxUpdateLoop(muxRes.mux)
 }
 
 // handleRelayedHandshakeResp processes a Handshake Response that arrived
@@ -1650,14 +1626,12 @@ func (u *UDP) handleRelayedHandshakeResp(data []byte, src [32]byte) {
 	}
 
 	peer := pending.peer
-	muxRes := u.createMux(peer)
+	smux := u.createServiceMux(peer)
 
 	peer.mu.Lock()
-	// No endpoint update for relayed peers — relay route handles routing
 	peer.session = session
-	peer.mux = muxRes.mux
-	peer.acceptChan = muxRes.acceptChan
-	peer.inboundChan = muxRes.inboundChan
+	peer.serviceMux = smux
+	peer.inboundChan = make(chan protoPacket, InboundChanSize)
 	peer.state = PeerStateEstablished
 	peer.lastSeen = time.Now()
 	peer.mu.Unlock()
@@ -1665,8 +1639,6 @@ func (u *UDP) handleRelayedHandshakeResp(data []byte, src [32]byte) {
 	u.mu.Lock()
 	u.byIndex[pending.localIdx] = peer
 	u.mu.Unlock()
-
-	u.startMuxUpdateLoop(muxRes.mux)
 
 	if pending.done != nil {
 		pending.done <- nil

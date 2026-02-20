@@ -132,21 +132,16 @@ func runOpener(n *node.Node, peerPK noise.PublicKey, peerName string, test TestC
 	time.Sleep(100 * time.Millisecond)
 
 	// Open stream via Dial.
-	log.Printf("[opener] dialing %s:8080...", peerName)
-	stream, err := n.Dial(peerPK, 8080)
+	log.Printf("[opener] dialing %s service=%d...", peerName, noise.ServiceProxy)
+	stream, err := n.Dial(peerPK, noise.ServiceProxy)
 	if err != nil {
 		log.Fatalf("[opener] dial: %v", err)
 	}
 	defer stream.Close()
 
 	rpk := stream.RemotePubkey()
-	log.Printf("[opener] stream opened: proto=%d, remotePK=%x",
-		stream.Proto(), rpk[:8])
-
-	// Verify proto.
-	if stream.Proto() != noise.ProtocolKCP {
-		log.Fatalf("[opener] FAIL: proto=%d, want %d", stream.Proto(), noise.ProtocolKCP)
-	}
+	log.Printf("[opener] stream opened: service=%d, remotePK=%x",
+		stream.Service(), rpk[:8])
 
 	// Echo test.
 	msg := []byte(test.EchoMessage)
@@ -182,21 +177,8 @@ func runAccepter(n *node.Node, peerPK noise.PublicKey, peerName string, test Tes
 	defer stream.Close()
 
 	arpk := stream.RemotePubkey()
-	log.Printf("[accepter] accepted stream: proto=%d, remotePK=%x",
-		stream.Proto(), arpk[:8])
-
-	// Verify proto and metadata.
-	if stream.Proto() != noise.ProtocolKCP {
-		log.Fatalf("[accepter] FAIL: proto=%d, want %d", stream.Proto(), noise.ProtocolKCP)
-	}
-	addr, _, err := noise.DecodeAddress(stream.Metadata())
-	if err != nil {
-		log.Fatalf("[accepter] FAIL: decode address: %v", err)
-	}
-	if addr.Host != "127.0.0.1" || addr.Port != 8080 {
-		log.Fatalf("[accepter] FAIL: expected 127.0.0.1:8080, got %s:%d", addr.Host, addr.Port)
-	}
-	log.Printf("[accepter] address verified: %s:%d", addr.Host, addr.Port)
+	log.Printf("[accepter] accepted stream: service=%d, remotePK=%x",
+		stream.Service(), arpk[:8])
 
 	// Read echo.
 	buf := make([]byte, 1024)
