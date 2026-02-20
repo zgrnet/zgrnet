@@ -465,6 +465,95 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_kcpconn_data_integrity_1mb() {
+        let (mut a, mut b) = conn_pair();
+        let size = 1024 * 1024;
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let data2 = data.clone();
+
+        let writer = tokio::spawn(async move {
+            for chunk in data2.chunks(8192) {
+                a.write_all(chunk).await.unwrap();
+            }
+        });
+
+        let mut received = Vec::with_capacity(size);
+        let mut buf = vec![0u8; 16384];
+        while received.len() < size {
+            let n = b.read(&mut buf).await.unwrap();
+            if n == 0 { break; }
+            received.extend_from_slice(&buf[..n]);
+        }
+        writer.await.unwrap();
+        assert_eq!(received.len(), size);
+        assert_eq!(received, data, "1MB data integrity check failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_kcpconn_concurrent_writers() {
+        let (a, mut b) = conn_pair();
+        let a = Arc::new(tokio::sync::Mutex::new(a));
+
+        let num_writers = 10;
+        let msgs_per_writer = 50;
+        let msg_size = 64;
+
+        let mut handles = Vec::new();
+        for w in 0..num_writers {
+            let a = a.clone();
+            handles.push(tokio::spawn(async move {
+                for m in 0..msgs_per_writer {
+                    let msg = vec![(w * 37 + m) as u8; msg_size];
+                    let mut conn = a.lock().await;
+                    conn.write_all(&msg).await.unwrap();
+                }
+            }));
+        }
+
+        let expected = num_writers * msgs_per_writer * msg_size;
+        let mut received = 0usize;
+        let mut buf = vec![0u8; 16384];
+        while received < expected {
+            let n = b.read(&mut buf).await.unwrap();
+            if n == 0 { break; }
+            received += n;
+        }
+
+        for h in handles { h.await.unwrap(); }
+        assert_eq!(received, expected, "concurrent writers: got {} expected {}", received, expected);
+    }
+
+    #[tokio::test]
+    async fn test_kcpconn_throughput() {
+        let (mut a, mut b) = conn_pair();
+        let size = 4 * 1024 * 1024; // 4MB
+        let data = vec![0xABu8; size];
+        let data2 = data.clone();
+
+        let start = std::time::Instant::now();
+
+        let writer = tokio::spawn(async move {
+            for chunk in data2.chunks(32768) {
+                a.write_all(chunk).await.unwrap();
+            }
+        });
+
+        let mut received = 0;
+        let mut buf = vec![0u8; 65536];
+        while received < size {
+            let n = b.read(&mut buf).await.unwrap();
+            if n == 0 { break; }
+            received += n;
+        }
+        writer.await.unwrap();
+
+        let elapsed = start.elapsed();
+        let mbps = received as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+        eprintln!("[throughput] {} bytes in {:?} = {:.1} MB/s", received, elapsed, mbps);
+        assert_eq!(received, size);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_kcpconn_yamux_echo() {
         use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
