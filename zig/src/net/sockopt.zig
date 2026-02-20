@@ -22,6 +22,18 @@ pub const SocketConfig = struct {
     gro: bool = false,
     gso_segment: u32 = 0,
     batch_size: u32 = 0,
+
+    /// Returns a config with all optimizations enabled.
+    pub fn full() SocketConfig {
+        return .{
+            .recv_buf_size = default_recv_buf_size,
+            .send_buf_size = default_send_buf_size,
+            .busy_poll_us = default_busy_poll_us,
+            .gro = true,
+            .gso_segment = default_gso_segment,
+            .batch_size = default_batch_count,
+        };
+    }
 };
 
 /// Result of a single optimization attempt.
@@ -298,6 +310,21 @@ test "setReusePort: multiple bind" {
         std.debug.print("second bind failed: {}\n", .{err});
         return error.TestUnexpectedResult;
     };
+}
+
+test "applySocketOptions: full config graceful degradation" {
+    const fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+    defer posix.close(fd);
+
+    const report = applySocketOptions(fd, SocketConfig.full());
+
+    // SO_RCVBUF and SO_SNDBUF must always succeed
+    try std.testing.expect(report.count >= 2);
+    try std.testing.expect(report.entries[0].applied); // SO_RCVBUF
+    try std.testing.expect(report.entries[1].applied); // SO_SNDBUF
+
+    // Linux-only options may fail on macOS, that's fine
+    // The point is: no crash, and basic RCVBUF/SNDBUF always work
 }
 
 test "OptimizationReport: allApplied" {

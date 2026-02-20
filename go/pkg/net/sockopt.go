@@ -130,6 +130,19 @@ func ApplySocketOptions(conn *net.UDPConn, cfg SocketConfig) *OptimizationReport
 	return report
 }
 
+// FullSocketConfig returns a config with all optimizations enabled.
+// Suitable for high-throughput Linux servers.
+func FullSocketConfig() SocketConfig {
+	return SocketConfig{
+		RecvBufSize: DefaultRecvBufSize,
+		SendBufSize: DefaultSendBufSize,
+		BusyPollUS:  DefaultBusyPollUS,
+		GRO:         true,
+		GSOSegment:  DefaultGSOSegment,
+		BatchSize:   DefaultBatchSize,
+	}
+}
+
 // getSocketOptInt reads an integer socket option via SyscallConn.
 func getSocketOptInt(conn *net.UDPConn, level, opt int) int {
 	raw, err := conn.SyscallConn()
