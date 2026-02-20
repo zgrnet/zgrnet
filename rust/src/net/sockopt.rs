@@ -433,6 +433,66 @@ pub mod batch {
 #[cfg(all(unix, not(target_os = "linux")))]
 fn apply_platform_options(_fd: i32, _cfg: &SocketConfig, _report: &mut OptimizationReport) {}
 
+/// Create a UDP socket with SO_REUSEPORT set, bound to the given address.
+/// Multiple sockets can bind to the same address for kernel load balancing.
+#[cfg(unix)]
+pub fn bind_reuseport(addr: &str) -> io::Result<UdpSocket> {
+    use std::os::unix::io::FromRawFd;
+
+    let bind_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    let domain = if bind_addr.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1).map_err(|e| {
+        unsafe { libc::close(fd) };
+        e
+    })?;
+
+    let mut sa_storage: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let sa_len: libc::socklen_t;
+
+    match bind_addr {
+        std::net::SocketAddr::V4(v4) => {
+            sa_storage.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa_storage.sin_port = v4.port().to_be();
+            sa_storage.sin_addr = libc::in_addr {
+                s_addr: u32::from(*v4.ip()).to_be(),
+            };
+            sa_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        }
+        _ => {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "IPv6 not implemented"));
+        }
+    }
+
+    let ret = unsafe {
+        libc::bind(
+            fd,
+            &sa_storage as *const libc::sockaddr_in as *const libc::sockaddr,
+            sa_len,
+        )
+    };
+    if ret < 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+
+    Ok(unsafe { UdpSocket::from_raw_fd(fd) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +564,21 @@ mod tests {
         let s = format!("{}", report);
         assert!(s.contains("[ok]"));
         assert!(s.contains("SO_RCVBUF"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_reuseport_multiple_bind() {
+        let sock1 = super::bind_reuseport("127.0.0.1:0").unwrap();
+        let addr = sock1.local_addr().unwrap();
+
+        let sock2 = super::bind_reuseport(&addr.to_string()).unwrap();
+        let sock3 = super::bind_reuseport(&addr.to_string()).unwrap();
+        let sock4 = super::bind_reuseport(&addr.to_string()).unwrap();
+
+        assert_eq!(sock2.local_addr().unwrap().port(), addr.port());
+        assert_eq!(sock3.local_addr().unwrap().port(), addr.port());
+        assert_eq!(sock4.local_addr().unwrap().port(), addr.port());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 package net
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -59,6 +60,32 @@ func (r *OptimizationReport) String() string {
 		}
 	}
 	return b.String()
+}
+
+// SetReusePort sets SO_REUSEPORT on a raw fd before bind.
+// Must be called via net.ListenConfig.Control before the socket is bound.
+func SetReusePort(fd uintptr) error {
+	return syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+}
+
+// ListenUDPReusePort creates a UDP socket with SO_REUSEPORT set.
+// Multiple sockets can bind to the same address; the kernel load-balances
+// incoming packets across them.
+func ListenUDPReusePort(addr string) (*net.UDPConn, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var err error
+			c.Control(func(fd uintptr) {
+				err = SetReusePort(fd)
+			})
+			return err
+		},
+	}
+	pc, err := lc.ListenPacket(context.Background(), "udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return pc.(*net.UDPConn), nil
 }
 
 // ApplySocketOptions applies all configured optimizations to a UDP connection.
