@@ -13,15 +13,6 @@ use std::time::{Duration, Instant};
 /// Output function: called when KCP wants to send a packet over the wire.
 pub type OutputFn = Box<dyn Fn(&[u8]) + Send + Sync>;
 
-struct WriteReq {
-    data: Vec<u8>,
-    result_tx: crossbeam_channel::Sender<WriteResult>,
-}
-
-struct WriteResult {
-    n: usize,
-    err: Option<String>,
-}
 
 /// KcpConn wraps a KCP instance with a dedicated thread for all KCP operations.
 ///
@@ -31,7 +22,7 @@ struct WriteResult {
 /// Received data is pushed to `recv_tx` (tokio mpsc) for the async side.
 pub struct KcpConn {
     input_tx: Sender<Vec<u8>>,
-    write_tx: Sender<WriteReq>,
+    write_tx: Sender<Vec<u8>>,
     recv_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     closed: Arc<AtomicBool>,
     join_handle: Option<thread::JoinHandle<()>>,
@@ -49,7 +40,7 @@ impl KcpConn {
         recv_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> Self {
         let (input_tx, input_rx) = crossbeam_channel::bounded(256);
-        let (write_tx, write_rx) = crossbeam_channel::bounded(64);
+        let (write_tx, write_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
         let closed = Arc::new(AtomicBool::new(false));
         let closed2 = closed.clone();
         let recv_tx2 = recv_tx.clone();
@@ -77,29 +68,17 @@ impl KcpConn {
             .map_err(|_| "input channel full or closed")
     }
 
-    /// Send data through KCP (blocking until the thread processes it).
+    /// Send data through KCP (fire-and-forget, non-blocking).
+    /// Data is queued to the KCP thread which will call kcp.send + flush.
     pub fn write(&self, data: &[u8]) -> Result<usize, String> {
         if self.closed.load(Ordering::Relaxed) {
             return Err("kcp conn closed".into());
         }
-        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
-        let req = WriteReq {
-            data: data.to_vec(),
-            result_tx,
-        };
+        let len = data.len();
         self.write_tx
-            .send(req)
-            .map_err(|_| "write channel closed".to_string())?;
-
-        let result = result_rx
-            .recv()
-            .map_err(|_| "write result channel closed".to_string())?;
-
-        if let Some(err) = result.err {
-            Err(err)
-        } else {
-            Ok(result.n)
-        }
+            .try_send(data.to_vec())
+            .map_err(|_| "write channel full or closed".to_string())?;
+        Ok(len)
     }
 
     /// Close the connection and join the internal thread.
@@ -126,7 +105,7 @@ fn run_loop(
     conv: u32,
     output: OutputFn,
     input_rx: Receiver<Vec<u8>>,
-    write_rx: Receiver<WriteReq>,
+    write_rx: Receiver<Vec<u8>>,
     recv_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     closed: Arc<AtomicBool>,
 ) {
@@ -168,20 +147,9 @@ fn run_loop(
             }
             recv(write_rx) -> msg => {
                 match msg {
-                    Ok(req) => {
-                        let ret = kcp.send(&req.data);
-                        if ret < 0 {
-                            let _ = req.result_tx.send(WriteResult {
-                                n: 0,
-                                err: Some("kcp send failed".into()),
-                            });
-                        } else {
-                            kcp.flush();
-                            let _ = req.result_tx.send(WriteResult {
-                                n: req.data.len(),
-                                err: None,
-                            });
-                        }
+                    Ok(data) => {
+                        kcp.send(&data);
+                        kcp.flush();
                         drain_recv(&mut kcp, &mut recv_buf, &recv_tx);
                     }
                     Err(_) => return,

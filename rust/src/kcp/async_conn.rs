@@ -79,7 +79,7 @@ impl AsyncRead for AsyncKcpConn {
 impl AsyncWrite for AsyncKcpConn {
     fn poll_write(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.closed {
@@ -88,6 +88,10 @@ impl AsyncWrite for AsyncKcpConn {
 
         match self.conn.write(buf) {
             Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) if e.contains("full") => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
         }
     }
