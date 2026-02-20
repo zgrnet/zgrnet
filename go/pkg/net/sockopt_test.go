@@ -98,6 +98,45 @@ func TestOptimizationReport_String(t *testing.T) {
 	t.Log(s)
 }
 
+func TestReusePort_MultipleBind(t *testing.T) {
+	// Create first socket with SO_REUSEPORT
+	conn1, err := ListenUDPReusePort("127.0.0.1:0")
+	if err != nil {
+		t.Skipf("SO_REUSEPORT not available: %v", err)
+	}
+	defer conn1.Close()
+
+	addr := conn1.LocalAddr().String()
+
+	// Create 3 more sockets on the same address
+	conns := []*net.UDPConn{conn1}
+	for i := 0; i < 3; i++ {
+		c, err := ListenUDPReusePort(addr)
+		if err != nil {
+			t.Fatalf("failed to bind socket %d to %s: %v", i+1, addr, err)
+		}
+		defer c.Close()
+		conns = append(conns, c)
+	}
+	t.Logf("4 sockets bound to %s with SO_REUSEPORT", addr)
+}
+
+func TestReusePort_WithoutFlag(t *testing.T) {
+	conn1, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+
+	// Try to bind a second socket to the same address without SO_REUSEPORT
+	addr := conn1.LocalAddr().(*net.UDPAddr)
+	_, err = net.ListenUDP("udp", addr)
+	if err == nil {
+		t.Fatal("expected EADDRINUSE error, but bind succeeded")
+	}
+	t.Logf("correctly got error without SO_REUSEPORT: %v", err)
+}
+
 func TestDefaultSocketConfig(t *testing.T) {
 	cfg := DefaultSocketConfig()
 	if cfg.RecvBufSize != DefaultRecvBufSize {

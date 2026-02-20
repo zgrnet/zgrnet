@@ -127,6 +127,18 @@ fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *Optimizatio
 }
 
 // ============================================================================
+// SO_REUSEPORT
+// ============================================================================
+
+/// Set SO_REUSEPORT on a socket before bind.
+/// Allows multiple sockets to bind to the same address for kernel load balancing.
+pub fn setReusePort(fd: posix.socket_t) bool {
+    const val: i32 = 1;
+    posix.setsockopt(fd, @intCast(posix.SOL.SOCKET), posix.SO.REUSEPORT, std.mem.asBytes(&val)) catch return false;
+    return true;
+}
+
+// ============================================================================
 // Batch I/O (Linux recvmmsg / sendmmsg)
 // ============================================================================
 
@@ -251,6 +263,35 @@ test "applySocketOptions: verify actual buffer size" {
 
     const actual_snd = tryGetsockoptInt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF);
     try std.testing.expect(actual_snd >= 1 * 1024 * 1024);
+}
+
+test "setReusePort: multiple bind" {
+    const fd1 = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+    defer posix.close(fd1);
+
+    try std.testing.expect(setReusePort(fd1));
+
+    const sa = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    posix.bind(fd1, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)) catch return;
+
+    // Get the bound port
+    var bound: posix.sockaddr.in = undefined;
+    var bound_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    posix.getsockname(fd1, @ptrCast(&bound), &bound_len) catch return;
+
+    // Bind second socket to same address
+    const fd2 = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return;
+    defer posix.close(fd2);
+
+    try std.testing.expect(setReusePort(fd2));
+    posix.bind(fd2, @ptrCast(&bound), @sizeOf(posix.sockaddr.in)) catch |err| {
+        std.debug.print("second bind failed: {}\n", .{err});
+        return error.TestUnexpectedResult;
+    };
 }
 
 test "OptimizationReport: allApplied" {
