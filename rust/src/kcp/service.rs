@@ -6,12 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
-use tokio_util::compat::TokioAsyncReadCompatExt;
-use yamux;
 
 use super::conn::KcpConn;
 use super::async_conn::AsyncKcpConn;
@@ -37,21 +32,24 @@ pub struct ServiceMux {
     accept_tx: tokio::sync::mpsc::Sender<(yamux::Stream, u64)>,
     accept_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(yamux::Stream, u64)>>,
     closed: AtomicBool,
+    rt_handle: tokio::runtime::Handle,
 }
 
 impl ServiceMux {
+    /// Create a new ServiceMux. Must be called from within a tokio runtime.
     pub fn new(config: ServiceMuxConfig) -> Arc<Self> {
         let (accept_tx, accept_rx) = tokio::sync::mpsc::channel(4096);
+        let handle = tokio::runtime::Handle::current();
         Arc::new(ServiceMux {
             config,
             services: RwLock::new(HashMap::new()),
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
             closed: AtomicBool::new(false),
+            rt_handle: handle,
         })
     }
 
-    /// Feed an incoming KCP packet to the correct service.
     pub fn input(&self, service: u64, data: &[u8]) -> Result<(), String> {
         if self.closed.load(Ordering::Relaxed) {
             return Err("service mux closed".into());
@@ -73,7 +71,6 @@ impl ServiceMux {
         }
     }
 
-    /// Open a yamux stream on the given service.
     pub async fn open_stream(&self, service: u64) -> Result<yamux::Stream, String> {
         if self.closed.load(Ordering::Relaxed) {
             return Err("service mux closed".into());
@@ -93,20 +90,17 @@ impl ServiceMux {
         result_rx.await.map_err(|_| "open result cancelled".to_string())?
     }
 
-    /// Accept the next yamux stream from any service.
     pub async fn accept_stream(&self) -> Result<(yamux::Stream, u64), String> {
         let mut rx = self.accept_rx.lock().await;
         rx.recv().await.ok_or_else(|| "accept channel closed".into())
     }
 
-    /// Close all services.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         let mut services = self.services.write().unwrap();
         services.clear();
     }
 
-    /// Number of active services.
     pub fn num_services(&self) -> usize {
         self.services.read().unwrap().len()
     }
@@ -133,7 +127,7 @@ impl ServiceMux {
 
         let output = self.config.output.clone();
         let svc = service;
-        let (recv_tx, recv_rx) = tokio::sync::mpsc::channel(256);
+        let (recv_tx, recv_rx) = futures::channel::mpsc::channel(256);
 
         let conn = Arc::new(KcpConn::new(
             service as u32,
@@ -144,7 +138,21 @@ impl ServiceMux {
         ));
 
         let async_conn = AsyncKcpConn::new(conn.clone(), recv_rx);
-        let compat_conn = async_conn.compat();
+
+        // Use a tokio duplex as intermediary between AsyncKcpConn and yamux.
+        // This ensures yamux's Wakers are always dispatched through tokio's executor.
+        let (yamux_io, bridge_io) = tokio::io::duplex(256 * 1024);
+
+        // Bridge task: copy data bidirectionally between AsyncKcpConn and the duplex
+        let handle_for_bridge = self.rt_handle.clone();
+        handle_for_bridge.spawn(async move {
+            let (mut ar, mut aw) = tokio::io::split(bridge_io);
+            let (mut kr, mut kw) = tokio::io::split(async_conn);
+            let _ = tokio::join!(
+                tokio::io::copy(&mut kr, &mut aw),
+                tokio::io::copy(&mut ar, &mut kw),
+            );
+        });
 
         let yamux_config = yamux::Config::default();
         let mode = if self.config.is_client {
@@ -153,98 +161,102 @@ impl ServiceMux {
             yamux::Mode::Server
         };
 
-        let connection = yamux::Connection::new(compat_conn, yamux_config, mode);
+        let connection = yamux::Connection::new(
+            tokio_util::compat::TokioAsyncReadCompatExt::compat(yamux_io),
+            yamux_config,
+            mode,
+        );
 
         let (open_tx, open_rx) = tokio::sync::mpsc::channel(64);
         let accept_tx = self.accept_tx.clone();
 
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| "no tokio runtime available".to_string())?;
-        handle.spawn(yamux_driver(connection, service, open_rx, accept_tx));
+        self.rt_handle.spawn(yamux_driver(connection, service, open_rx, accept_tx));
 
         services.insert(service, ServiceEntry { conn, open_tx });
         Ok(())
     }
 }
 
-/// Drives a yamux Connection in a single task.
-/// Handles both inbound stream acceptance and outbound stream opening.
+/// Drives a yamux Connection: handles inbound acceptance and outbound opening.
+///
+/// Uses a single poll_fn that drives all connection operations. A periodic
+/// timer ensures the connection is re-polled even when Wakers from partial
+/// operations don't fire correctly.
 async fn yamux_driver(
-    mut connection: yamux::Connection<tokio_util::compat::Compat<AsyncKcpConn>>,
+    mut connection: yamux::Connection<tokio_util::compat::Compat<tokio::io::DuplexStream>>,
     service: u64,
     mut open_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<yamux::Stream, String>>>,
     accept_tx: tokio::sync::mpsc::Sender<(yamux::Stream, u64)>,
 ) {
     use std::task::Poll;
+    use std::future::Future;
+    use tokio::time::{sleep, Duration};
 
-    loop {
-        // Create a future that polls both inbound and open requests
-        let result = YamuxPollFuture {
-            connection: &mut connection,
-            open_rx: &mut open_rx,
-        }.await;
+    let mut pending_open: Option<tokio::sync::oneshot::Sender<Result<yamux::Stream, String>>> = None;
+    let mut timer = std::pin::pin!(sleep(Duration::from_millis(1)));
 
-        match result {
-            YamuxEvent::Inbound(Ok(stream)) => {
-                let _ = accept_tx.send((stream, service)).await;
+    futures::future::poll_fn(|cx| {
+        // Reset timer for periodic re-poll
+        let _ = timer.as_mut().poll(cx);
+
+        loop {
+            let mut progress = false;
+
+            // Drive inbound (processes ALL yamux protocol: reads, ACKs, etc.)
+            match connection.poll_next_inbound(cx) {
+                Poll::Ready(Some(Ok(stream))) => {
+                    let _ = accept_tx.try_send((stream, service));
+                    progress = true;
+                    continue;
+                }
+                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                    return Poll::Ready(());
+                }
+                Poll::Pending => {}
             }
-            YamuxEvent::Inbound(Err(_)) => return,
-            YamuxEvent::InboundDone => return,
-            YamuxEvent::OpenRequest(result_tx) => {
-                let poll_result = std::future::poll_fn(|cx| {
-                    connection.poll_new_outbound(cx)
-                }).await;
-                let _ = result_tx.send(poll_result.map_err(|e| e.to_string()));
+
+            // Check for open requests
+            if pending_open.is_none() {
+                match open_rx.poll_recv(cx) {
+                    Poll::Ready(Some(tx)) => {
+                        pending_open = Some(tx);
+                        progress = true;
+                    }
+                    Poll::Ready(None) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                }
             }
-            YamuxEvent::OpenChannelClosed => return,
+
+            // Process outbound open
+            if pending_open.is_some() {
+                match connection.poll_new_outbound(cx) {
+                    Poll::Ready(result) => {
+                        if let Some(tx) = pending_open.take() {
+                            let _ = tx.send(result.map_err(|e| e.to_string()));
+                        }
+                        progress = true;
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            if !progress {
+                // Schedule re-poll via timer
+                timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(1));
+                let _ = timer.as_mut().poll(cx);
+                return Poll::Pending;
+            }
         }
-    }
-}
-
-enum YamuxEvent {
-    Inbound(Result<yamux::Stream, yamux::ConnectionError>),
-    InboundDone,
-    OpenRequest(tokio::sync::oneshot::Sender<Result<yamux::Stream, String>>),
-    OpenChannelClosed,
-}
-
-struct YamuxPollFuture<'a, T> {
-    connection: &'a mut yamux::Connection<T>,
-    open_rx: &'a mut tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<yamux::Stream, String>>>,
-}
-
-impl<'a, T> Future for YamuxPollFuture<'a, T>
-where
-    T: futures::AsyncRead + futures::AsyncWrite + Unpin,
-{
-    type Output = YamuxEvent;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<YamuxEvent> {
-        // Check for inbound streams
-        match self.connection.poll_next_inbound(cx) {
-            Poll::Ready(Some(result)) => return Poll::Ready(YamuxEvent::Inbound(result)),
-            Poll::Ready(None) => return Poll::Ready(YamuxEvent::InboundDone),
-            Poll::Pending => {}
-        }
-
-        // Check for open requests
-        match self.open_rx.poll_recv(cx) {
-            Poll::Ready(Some(tx)) => return Poll::Ready(YamuxEvent::OpenRequest(tx)),
-            Poll::Ready(None) => return Poll::Ready(YamuxEvent::OpenChannelClosed),
-            Poll::Pending => {}
-        }
-
-        Poll::Pending
-    }
+    }).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
 
     fn service_mux_pair() -> (Arc<ServiceMux>, Arc<ServiceMux>) {
-        use std::sync::Mutex;
         let server_mux_slot: Arc<Mutex<Option<Arc<ServiceMux>>>> = Arc::new(Mutex::new(None));
         let client_mux_slot: Arc<Mutex<Option<Arc<ServiceMux>>>> = Arc::new(Mutex::new(None));
 
