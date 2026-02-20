@@ -1262,7 +1262,7 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 		return
 	}
 
-	protocol, payload, err := noise.DecodePayload(plaintext)
+	protocol, _, payload, err := noise.DecodePayload(plaintext)
 	if err != nil {
 		pkt.err = err
 		return
@@ -1433,7 +1433,7 @@ func (u *UDP) processRelayedTransport(pkt *packet, src [32]byte, innerPayload []
 		return
 	}
 
-	innerProto, innerData, err := noise.DecodePayload(innerPlaintext)
+	innerProto, _, innerData, err := noise.DecodePayload(innerPlaintext)
 	if err != nil {
 		pkt.err = ErrNoData
 		return

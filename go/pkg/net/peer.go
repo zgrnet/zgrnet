@@ -125,7 +125,7 @@ func (u *UDP) sendToPeer(peer *peerState, protocol byte, data []byte) error {
 	}
 
 	// Inner encryption: peer's session
-	plaintext := noise.EncodePayload(protocol, data)
+	plaintext := noise.EncodePayload(protocol, 0, data)
 	ciphertext, counter, err := session.Encrypt(plaintext)
 	if err != nil {
 		return err
@@ -167,8 +167,8 @@ func (u *UDP) sendDirect(peer *peerState, protocol byte, data []byte) error {
 		return ErrNoSession
 	}
 
-	// Encode payload with protocol byte
-	plaintext := noise.EncodePayload(protocol, data)
+	// Encode payload with protocol + service + data
+	plaintext := noise.EncodePayload(protocol, 0, data)
 
 	// Encrypt
 	ciphertext, counter, err := session.Encrypt(plaintext)
@@ -195,7 +195,7 @@ func (u *UDP) sendDirect(peer *peerState, protocol byte, data []byte) error {
 
 // OpenStream opens a new KCP stream to the specified peer.
 // The peer must be in established state with mux initialized.
-// proto specifies the stream protocol type (e.g., noise.ProtocolTCPProxy).
+// proto specifies the stream protocol type (e.g., noise.ProtocolKCP).
 // metadata contains additional data sent with the SYN frame (e.g., encoded Address).
 // Use proto=0 and metadata=nil for untyped streams.
 func (u *UDP) OpenStream(pk noise.PublicKey, proto byte, metadata []byte) (*Stream, error) {

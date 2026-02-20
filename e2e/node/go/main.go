@@ -144,8 +144,8 @@ func runOpener(n *node.Node, peerPK noise.PublicKey, peerName string, test TestC
 		stream.Proto(), rpk[:8])
 
 	// Verify proto.
-	if stream.Proto() != noise.ProtocolTCPProxy {
-		log.Fatalf("[opener] FAIL: proto=%d, want %d", stream.Proto(), noise.ProtocolTCPProxy)
+	if stream.Proto() != noise.ProtocolKCP {
+		log.Fatalf("[opener] FAIL: proto=%d, want %d", stream.Proto(), noise.ProtocolKCP)
 	}
 
 	// Echo test.
@@ -186,8 +186,8 @@ func runAccepter(n *node.Node, peerPK noise.PublicKey, peerName string, test Tes
 		stream.Proto(), arpk[:8])
 
 	// Verify proto and metadata.
-	if stream.Proto() != noise.ProtocolTCPProxy {
-		log.Fatalf("[accepter] FAIL: proto=%d, want %d", stream.Proto(), noise.ProtocolTCPProxy)
+	if stream.Proto() != noise.ProtocolKCP {
+		log.Fatalf("[accepter] FAIL: proto=%d, want %d", stream.Proto(), noise.ProtocolKCP)
 	}
 	addr, _, err := noise.DecodeAddress(stream.Metadata())
 	if err != nil {

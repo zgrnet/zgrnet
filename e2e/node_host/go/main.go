@@ -167,11 +167,11 @@ func main() {
 		} else {
 			select {
 			case hs := <-hostStreams:
-				if hs.Proto() == noise.ProtocolTCPProxy {
+				if hs.Proto() == noise.ProtocolKCP {
 					fmt.Println("  Host accepted stream: proto=TCP_PROXY ✓")
 					passed++
 				} else {
-					fmt.Printf("  FAIL: expected proto=%d, got %d\n", noise.ProtocolTCPProxy, hs.Proto())
+					fmt.Printf("  FAIL: expected proto=%d, got %d\n", noise.ProtocolKCP, hs.Proto())
 					failed++
 				}
 				hs.Close()

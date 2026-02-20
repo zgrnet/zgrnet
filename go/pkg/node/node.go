@@ -266,7 +266,7 @@ func (n *Node) Dial(pk noise.PublicKey, port uint16) (*Stream, error) {
 	}
 	metadata := addr.Encode()
 
-	raw, err := n.udp.OpenStream(pk, noise.ProtocolTCPProxy, metadata)
+	raw, err := n.udp.OpenStream(pk, noise.ProtocolKCP, metadata)
 	if err != nil {
 		return nil, fmt.Errorf("node: open stream to %s:%d: %w", pk.ShortString(), port, err)
 	}

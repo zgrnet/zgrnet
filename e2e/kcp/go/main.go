@@ -173,7 +173,7 @@ func runOpenerTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, test
 	}
 	log.Printf("[opener] Metadata: %x (Address IPv4 127.0.0.1:8080)", metadata)
 
-	stream, err := udp.OpenStream(peerKey, noise.ProtocolTCPProxy, metadata)
+	stream, err := udp.OpenStream(peerKey, noise.ProtocolKCP, metadata)
 	if err != nil {
 		log.Fatalf("[opener] Failed to open stream: %v", err)
 	}
@@ -233,8 +233,8 @@ func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, te
 	log.Printf("[accepter] Accepted stream %d (proto=%d, metadata=%x)", stream.ID(), stream.Proto(), stream.Metadata())
 
 	// Verify stream type: must be TCP_PROXY(69) with Address metadata
-	if stream.Proto() != noise.ProtocolTCPProxy {
-		log.Fatalf("[accepter] FAIL: expected proto=%d (TCP_PROXY), got %d", noise.ProtocolTCPProxy, stream.Proto())
+	if stream.Proto() != noise.ProtocolKCP {
+		log.Fatalf("[accepter] FAIL: expected proto=%d (TCP_PROXY), got %d", noise.ProtocolKCP, stream.Proto())
 	}
 	addr, _, err := noise.DecodeAddress(stream.Metadata())
 	if err != nil {

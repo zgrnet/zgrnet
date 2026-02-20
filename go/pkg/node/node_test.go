@@ -159,8 +159,8 @@ func TestTwoNodesEcho(t *testing.T) {
 	defer stream.Close()
 
 	// Verify stream metadata.
-	if stream.Proto() != noise.ProtocolTCPProxy {
-		t.Errorf("Proto = %d, want %d", stream.Proto(), noise.ProtocolTCPProxy)
+	if stream.Proto() != noise.ProtocolKCP {
+		t.Errorf("Proto = %d, want %d", stream.Proto(), noise.ProtocolKCP)
 	}
 	if stream.RemotePubkey() != kp2.Public {
 		t.Error("RemotePubkey mismatch on dialer side")
@@ -173,8 +173,8 @@ func TestTwoNodesEcho(t *testing.T) {
 	}
 	defer accepted.Close()
 
-	if accepted.Proto() != noise.ProtocolTCPProxy {
-		t.Errorf("accepted Proto = %d, want %d", accepted.Proto(), noise.ProtocolTCPProxy)
+	if accepted.Proto() != noise.ProtocolKCP {
+		t.Errorf("accepted Proto = %d, want %d", accepted.Proto(), noise.ProtocolKCP)
 	}
 	if accepted.RemotePubkey() != kp1.Public {
 		t.Error("RemotePubkey mismatch on accepter side")
@@ -267,8 +267,8 @@ func TestTwoNodesMultipleStreams(t *testing.T) {
 	for i := 0; i < numStreams; i++ {
 		select {
 		case s := <-accepted:
-			if s.Proto() != noise.ProtocolTCPProxy {
-				t.Errorf("stream %d: proto = %d, want %d", i, s.Proto(), noise.ProtocolTCPProxy)
+			if s.Proto() != noise.ProtocolKCP {
+				t.Errorf("stream %d: proto = %d, want %d", i, s.Proto(), noise.ProtocolKCP)
 			}
 			if s.RemotePubkey() != kp1.Public {
 				t.Errorf("stream %d: RemotePubkey mismatch", i)
