@@ -185,6 +185,8 @@ fn getsockopt_int(fd: i32, level: i32, optname: i32) -> io::Result<i32> {
 
 #[cfg(target_os = "linux")]
 const UDP_GRO: i32 = 104;
+#[cfg(target_os = "linux")]
+const UDP_SEGMENT: i32 = 103;
 
 #[cfg(target_os = "linux")]
 fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut OptimizationReport) {
@@ -231,6 +233,12 @@ fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut Optimization
             }
         }
     }
+}
+
+/// Check if UDP_SEGMENT (GSO) is available on a socket.
+#[cfg(target_os = "linux")]
+pub fn gso_supported(fd: i32) -> bool {
+    setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, 1400).is_ok()
 }
 
 /// Batch reader using recvmmsg on Linux.
