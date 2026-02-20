@@ -26,6 +26,7 @@ pub const udp = @import("udp.zig");
 // Socket abstraction
 pub const endpoint_mod = @import("endpoint.zig");
 pub const socket_mod = @import("socket.zig");
+pub const sockopt = @import("sockopt.zig");
 pub const std_socket = @import("std_socket.zig");
 
 // Re-export generic type constructors
@@ -97,5 +98,6 @@ test {
     _ = udp;
     _ = endpoint_mod;
     _ = socket_mod;
+    _ = sockopt;
     _ = std_socket;
 }
