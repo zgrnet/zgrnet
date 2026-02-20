@@ -121,7 +121,8 @@ impl ServiceMux {
     }
 }
 
-/// Client driver: verified pattern from TCP test
+/// Client driver: verified pattern from TCP test.
+/// Drives yamux Connection: handles open requests and inbound streams.
 async fn client_driver(
     mut conn: yamux::Connection<KcpConn>,
     mut open_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<yamux::Stream>>,
@@ -162,7 +163,7 @@ async fn client_driver(
     }).await;
 }
 
-/// Server driver: verified pattern from TCP test
+/// Server driver: accepts inbound yamux streams.
 async fn server_driver(
     mut conn: yamux::Connection<KcpConn>,
     accept_tx: tokio::sync::mpsc::Sender<(yamux::Stream, u64)>,
@@ -226,10 +227,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_service_mux_open_accept() {
         let (client, server) = service_mux_pair();
+
+        // yamux defers SYN until first write, so we must write concurrently with accept.
+        let server2 = server.clone();
+        let accept_task = tokio::spawn(async move {
+            server2.accept_stream().await.unwrap()
+        });
+
         let mut cs = client.open_stream(1).await.unwrap();
-        let (mut ss, svc) = server.accept_stream().await.unwrap();
-        assert_eq!(svc, 1);
         cs.write_all(b"hello service").await.unwrap();
+
+        let (mut ss, svc) = tokio::time::timeout(
+            std::time::Duration::from_secs(5), accept_task
+        ).await.expect("accept timed out").unwrap();
+
+        assert_eq!(svc, 1);
         let mut buf = vec![0u8; 256];
         let n = ss.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello service");
@@ -246,23 +258,135 @@ mod tests {
         let server2 = server.clone();
         let accept = tokio::spawn(async move {
             for _ in 0..3 {
-                let (mut s, svc) = server2.accept_stream().await.unwrap();
-                let echo = format!("echo-{}", svc);
-                s.write_all(echo.as_bytes()).await.unwrap();
+                let (mut s, _svc) = server2.accept_stream().await.unwrap();
+                let mut buf = vec![0u8; 256];
+                let n = s.read(&mut buf).await.unwrap();
+                s.write_all(&buf[..n]).await.unwrap();
                 s.close().await.unwrap();
             }
         });
 
+        // yamux defers SYN until first write, so each stream must write first.
         for svc in [1u64, 2, 3] {
             let mut s = client.open_stream(svc).await.unwrap();
+            let msg = format!("svc-{}", svc);
+            s.write_all(msg.as_bytes()).await.unwrap();
             let mut buf = vec![0u8; 256];
             let n = s.read(&mut buf).await.unwrap();
-            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("echo-"));
+            assert_eq!(&buf[..n], msg.as_bytes());
             s.close().await.unwrap();
         }
 
         accept.await.unwrap();
         assert_eq!(client.num_services(), 3);
+        client.close();
+        server.close();
+    }
+
+    /// PM Review BUG 3: accept backpressure — streams must not be silently dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_service_mux_accept_backpressure() {
+        let (client, server) = service_mux_pair();
+
+        let n_streams = 20;
+
+        // Open many streams concurrently without accepting on server.
+        let client2 = client.clone();
+        let opener = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            for i in 0..n_streams {
+                let mut s = client2.open_stream(1).await.unwrap();
+                let msg = format!("stream-{}", i);
+                s.write_all(msg.as_bytes()).await.unwrap();
+                streams.push(s);
+            }
+            streams
+        });
+
+        // Wait a bit, then accept all streams.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut received = 0;
+        let server2 = server.clone();
+        let acceptor = tokio::spawn(async move {
+            let mut count = 0;
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    server2.accept_stream(),
+                ).await {
+                    Ok(Ok((_s, _svc))) => { count += 1; }
+                    _ => break,
+                }
+            }
+            count
+        });
+
+        let mut client_streams = opener.await.unwrap();
+        for s in &mut client_streams { s.close().await.ok(); }
+
+        received = acceptor.await.unwrap();
+        assert!(received >= n_streams, "expected {} streams, got {}", n_streams, received);
+
+        client.close();
+        server.close();
+    }
+
+    /// PM Review issue 7: graceful shutdown with active streams.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_service_mux_shutdown_graceful() {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (client, server) = service_mux_pair();
+
+            let server2 = server.clone();
+            let accept_task = tokio::spawn(async move {
+                server2.accept_stream().await.unwrap()
+            });
+
+            let mut cs = client.open_stream(1).await.unwrap();
+            cs.write_all(b"active stream").await.unwrap();
+
+            let (mut ss, _svc) = accept_task.await.unwrap();
+            let mut buf = vec![0u8; 256];
+            let n = ss.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"active stream");
+
+            // Close with active streams
+            client.close();
+            server.close();
+        }).await;
+        assert!(result.is_ok(), "graceful shutdown should complete within 5 seconds");
+    }
+
+    /// Bidirectional data on same service, multiple streams.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_service_mux_bidirectional_streams() {
+        let (client, server) = service_mux_pair();
+
+        let server2 = server.clone();
+        let accept = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut s, _svc) = server2.accept_stream().await.unwrap();
+                let mut buf = vec![0u8; 1024];
+                let n = s.read(&mut buf).await.unwrap();
+                let response = format!("reply:{}", std::str::from_utf8(&buf[..n]).unwrap());
+                s.write_all(response.as_bytes()).await.unwrap();
+                s.close().await.unwrap();
+            }
+        });
+
+        for i in 0..5 {
+            let mut s = client.open_stream(1).await.unwrap();
+            let msg = format!("msg-{}", i);
+            s.write_all(msg.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = s.read(&mut buf).await.unwrap();
+            let expected = format!("reply:{}", msg);
+            assert_eq!(&buf[..n], expected.as_bytes());
+            s.close().await.unwrap();
+        }
+
+        accept.await.unwrap();
         client.close();
         server.close();
     }

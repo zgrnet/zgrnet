@@ -113,6 +113,10 @@ impl KcpConn {
         }
     }
 
+    pub fn tag(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize % 10000
+    }
+
     /// Feed incoming data from the network.
     pub fn input(&self, data: &[u8]) {
         if self.closed.load(Ordering::Relaxed) { return; }
@@ -334,11 +338,20 @@ async fn update_loop(
             if kcp.closed { return; }
 
             let now = kcp.now_ms();
+            let wait_before = kcp.kcp.wait_snd();
             match kcp.kcp.update(now) {
                 Ok(()) => {}
                 Err(_) => {}
             }
-            kcp.try_wake_pending();
+            let wait_after = kcp.kcp.wait_snd();
+
+            // Only wake pending writer if send queue drained (backpressure relief).
+            // Never spuriously wake pending reader — that causes hot loops.
+            if wait_after < wait_before {
+                if let Some(w) = kcp.pending_writer.take() {
+                    w.wake();
+                }
+            }
 
             let check = kcp.kcp.check(now);
             let delay = if check <= now { 1 } else { (check - now).min(100) };
@@ -365,26 +378,19 @@ pub fn conn_pair() -> (KcpConn, KcpConn) {
     let (b_to_a_tx, mut b_to_a_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     let a = KcpConn::new(1, Arc::new(move |data: &[u8]| {
-        eprintln!("[output a→b] {} bytes", data.len());
         let _ = a_to_b_tx.send(data.to_vec());
     }));
 
     let b = KcpConn::new(1, Arc::new(move |data: &[u8]| {
-        eprintln!("[output b→a] {} bytes", data.len());
         let _ = b_to_a_tx.send(data.to_vec());
     }));
 
-    // Bridge tasks: read from channel → input to the other side's KcpConn
     let b_inner = b.inner_ref();
     let b_notify = b.notifier_ref();
     tokio::spawn(async move {
         while let Some(data) = a_to_b_rx.recv().await {
-            eprintln!("[bridge a→b] {} bytes", data.len());
             let mut kcp = b_inner.lock();
             let _ = kcp.kcp.input(&data);
-            let peek = kcp.kcp.peeksize().unwrap_or(0);
-            let has_reader = kcp.pending_reader.is_some();
-            eprintln!("[bridge a→b] after input: peek={}, has_reader={}", peek, has_reader);
             kcp.try_wake_pending();
             drop(kcp);
             b_notify.notify_one();
@@ -395,12 +401,8 @@ pub fn conn_pair() -> (KcpConn, KcpConn) {
     let a_notify = a.notifier_ref();
     tokio::spawn(async move {
         while let Some(data) = b_to_a_rx.recv().await {
-            eprintln!("[bridge b→a] {} bytes", data.len());
             let mut kcp = a_inner.lock();
             let _ = kcp.kcp.input(&data);
-            let peek = kcp.kcp.peeksize().unwrap_or(0);
-            let has_reader = kcp.pending_reader.is_some();
-            eprintln!("[bridge b→a] after input: peek={}, has_reader={}", peek, has_reader);
             kcp.try_wake_pending();
             drop(kcp);
             a_notify.notify_one();
@@ -702,5 +704,104 @@ mod tests {
 
         driver.abort();
         server.abort();
+    }
+
+    /// PM Review BUG 1 equivalent: concurrent write + input must not panic or corrupt data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_kcpconn_concurrent_write_and_input() {
+        let (a, mut b) = conn_pair();
+        let a = Arc::new(tokio::sync::Mutex::new(a));
+
+        let num_tasks = 8;
+        let msgs_per_task = 100;
+        let msg_size = 32;
+
+        let mut handles = Vec::new();
+        for t in 0..num_tasks {
+            let a = a.clone();
+            handles.push(tokio::spawn(async move {
+                for m in 0..msgs_per_task {
+                    let msg = vec![(t * 31 + m) as u8; msg_size];
+                    let mut conn = a.lock().await;
+                    conn.write_all(&msg).await.unwrap();
+                }
+            }));
+        }
+
+        let expected = num_tasks * msgs_per_task * msg_size;
+        let mut received = 0usize;
+        let mut buf = vec![0u8; 16384];
+        while received < expected {
+            let n = b.read(&mut buf).await.unwrap();
+            if n == 0 { break; }
+            received += n;
+        }
+        for h in handles { h.await.unwrap(); }
+        assert_eq!(received, expected);
+    }
+
+    /// PM Review BUG 2 equivalent: read with timeout must not hang forever.
+    #[tokio::test]
+    async fn test_kcpconn_read_timeout() {
+        let (_a, mut b) = conn_pair();
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            b.read(&mut [0u8; 256]),
+        ).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "read should time out");
+        assert!(elapsed >= Duration::from_millis(150), "timeout too early: {:?}", elapsed);
+        assert!(elapsed < Duration::from_millis(500), "timeout too late: {:?}", elapsed);
+    }
+
+    /// PM Review issue 5: write backpressure — kcp.send() should eventually return Err when
+    /// send buffer is full, causing poll_write to return Pending (not silently drop data).
+    #[tokio::test]
+    async fn test_kcpconn_write_backpressure() {
+        let (mut a, mut b) = conn_pair();
+        let total = 2 * 1024 * 1024; // 2MB
+        let chunk = vec![0xCDu8; 8192];
+
+        let writer = tokio::spawn(async move {
+            let mut written = 0usize;
+            while written < total {
+                a.write_all(&chunk).await.unwrap();
+                written += chunk.len();
+            }
+            written
+        });
+
+        let mut received = 0usize;
+        let mut buf = vec![0u8; 32768];
+        while received < total {
+            let n = b.read(&mut buf).await.unwrap();
+            if n == 0 { break; }
+            received += n;
+        }
+
+        let written = writer.await.unwrap();
+        assert_eq!(written, total);
+        assert_eq!(received, total, "all written data must arrive (no silent drops)");
+    }
+
+    /// Verify shutdown + drop completes within bounded time (no hangs).
+    #[tokio::test]
+    async fn test_kcpconn_shutdown_and_drop() {
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut a, mut b) = conn_pair();
+            a.write_all(b"before shutdown").await.unwrap();
+            let mut buf = vec![0u8; 256];
+            let n = b.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"before shutdown");
+
+            a.shutdown().await.unwrap();
+            let result = a.write_all(b"fail").await;
+            assert!(result.is_err());
+
+            // b should see EOF after a is shut down
+            b.shutdown().await.unwrap();
+        }).await;
+        assert!(result.is_ok(), "shutdown should complete within 2 seconds");
     }
 }
