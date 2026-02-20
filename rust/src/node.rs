@@ -318,7 +318,7 @@ impl Node {
 
         let raw = self
             .udp
-            .open_stream(pk, noise::message::protocol::TCP_PROXY, &metadata)
+            .open_stream(pk, noise::message::protocol::KCP, &metadata)
             .map_err(NodeError::from)?;
 
         Ok(NodeStream {
@@ -604,12 +604,12 @@ mod tests {
 
         // n1 dials n2.
         let s1 = n1.dial(&kp2.public, 8080).unwrap();
-        assert_eq!(s1.proto(), noise::message::protocol::TCP_PROXY);
+        assert_eq!(s1.proto(), noise::message::protocol::KCP);
         assert_eq!(s1.remote_pubkey(), kp2.public);
 
         // n2 accepts.
         let s2 = n2.accept_stream().unwrap();
-        assert_eq!(s2.proto(), noise::message::protocol::TCP_PROXY);
+        assert_eq!(s2.proto(), noise::message::protocol::KCP);
         assert_eq!(s2.remote_pubkey(), kp1.public);
 
         // Echo: n1 writes, n2 reads.

@@ -55,7 +55,8 @@ pub use noise::{
     HandshakeInit, HandshakeResp, TransportMessage, MessageError,
     parse_handshake_init, parse_handshake_resp, parse_transport_message,
     build_handshake_init, build_handshake_resp, build_transport_message,
-    encode_payload, decode_payload, MAX_PACKET_SIZE,
+    encode_payload, decode_payload, encode_varint, decode_varint, varint_len,
+    service, MAX_PACKET_SIZE,
     // Transport types
     Addr, Transport, TransportError, MockAddr, MockTransport,
 };

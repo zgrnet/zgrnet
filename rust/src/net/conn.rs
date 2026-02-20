@@ -396,7 +396,7 @@ impl<T: Transport + 'static> Conn<T> {
             }
         }
 
-        let plaintext = encode_payload(protocol, payload);
+        let plaintext = encode_payload(protocol, 0, payload);
         self.send_payload(plaintext, false)
     }
 
@@ -464,9 +464,7 @@ impl<T: Transport + 'static> Conn<T> {
     /// This avoids allocating a new buffer for receiving on each call.
     /// The buffer should be at least MAX_PACKET_SIZE bytes.
     pub fn recv_with_buffer(&self, buf: &mut [u8]) -> Result<(u8, Vec<u8>)> {
-        let (protocol, plaintext) = self.recv_internal(buf)?;
-        // Skip protocol byte and return owned payload
-        Ok((protocol, plaintext[1..].to_vec()))
+        self.recv_internal(buf)
     }
 
     /// Receives and decrypts a message into the provided output buffer.
@@ -479,10 +477,9 @@ impl<T: Transport + 'static> Conn<T> {
     /// # Returns
     /// * `(protocol, bytes_written)` - The protocol byte and number of bytes written to out_buf
     pub fn recv_into(&self, recv_buf: &mut [u8], out_buf: &mut [u8]) -> Result<(u8, usize)> {
-        let (protocol, plaintext) = self.recv_internal(recv_buf)?;
-        let payload = &plaintext[1..]; // Skip protocol byte
-        let n = std::cmp::min(out_buf.len(), payload.len());
-        out_buf[..n].copy_from_slice(&payload[..n]);
+        let (protocol, data) = self.recv_internal(recv_buf)?;
+        let n = std::cmp::min(out_buf.len(), data.len());
+        out_buf[..n].copy_from_slice(&data[..n]);
         Ok((protocol, n))
     }
 
@@ -522,8 +519,12 @@ impl<T: Transport + 'static> Conn<T> {
                 session.decrypt(&pkt.ciphertext, pkt.counter)?
             };
 
-            let protocol = plaintext.first().copied().unwrap_or(0);
-            return Ok((protocol, plaintext));
+            if plaintext.is_empty() {
+                return Ok((0, Vec::new()));
+            }
+            let (protocol, _service, data) = crate::noise::decode_payload(&plaintext)
+                .map_err(|_| ConnError::InvalidState)?;
+            return Ok((protocol, data.to_vec()));
         }
 
         // Direct connection: receive packet from transport
@@ -544,9 +545,12 @@ impl<T: Transport + 'static> Conn<T> {
             session.decrypt(msg.ciphertext, msg.counter)?
         };
 
-        // Return protocol and full plaintext (including protocol byte)
-        let protocol = plaintext.first().copied().unwrap_or(0);
-        Ok((protocol, plaintext))
+        if plaintext.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let (protocol, _service, data) = crate::noise::decode_payload(&plaintext)
+            .map_err(|_| ConnError::InvalidState)?;
+        Ok((protocol, data.to_vec()))
     }
 
     /// Initiates a rekey by starting a new handshake.
