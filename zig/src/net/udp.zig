@@ -1046,22 +1046,35 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
         // ========================================================================
 
         fn timerLoop(self: *Self) void {
+            // Stack buffer for mux pointers — avoids allocation per tick.
+            // 64 peers should cover most deployments; excess is silently skipped.
+            var mux_buf: [64]*KcpMux = undefined;
+
             while (!self.closed.load(.acquire)) {
                 Rt.sleepMs(1);
 
                 if (self.closed.load(.acquire)) return;
 
-                // Update all peer muxes — drives KCP retransmissions,
-                // flush, and timeout processing.
+                // Collect mux pointers under lock, then release before calling
+                // update(). update() triggers KCP flush → encrypt → sendTo,
+                // which must not hold peers_mutex (hot path contention).
+                var count: usize = 0;
                 self.peers_mutex.lock();
                 var iter = self.peers.valueIterator();
                 while (iter.next()) |peer_ptr| {
                     const peer = peer_ptr.*;
                     if (peer.mux) |mux| {
-                        mux.update();
+                        if (count < mux_buf.len) {
+                            mux_buf[count] = mux;
+                            count += 1;
+                        }
                     }
                 }
                 self.peers_mutex.unlock();
+
+                for (mux_buf[0..count]) |mux| {
+                    mux.update();
+                }
             }
         }
 
