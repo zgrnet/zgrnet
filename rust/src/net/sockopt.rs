@@ -42,6 +42,21 @@ impl Default for SocketConfig {
     }
 }
 
+impl SocketConfig {
+    /// Returns a config with all optimizations enabled.
+    pub fn full() -> Self {
+        Self {
+            recv_buf_size: DEFAULT_RECV_BUF_SIZE,
+            send_buf_size: DEFAULT_SEND_BUF_SIZE,
+            reuse_port: false,
+            busy_poll_us: DEFAULT_BUSY_POLL_US,
+            gro: true,
+            gso_segment: DEFAULT_GSO_SEGMENT,
+            batch_size: DEFAULT_BATCH_SIZE,
+        }
+    }
+}
+
 /// Result of a single optimization attempt.
 pub struct OptimizationEntry {
     pub name: &'static str,
@@ -597,5 +612,39 @@ mod tests {
         assert!(!cfg.reuse_port);
         assert_eq!(cfg.busy_poll_us, 0);
         assert!(!cfg.gro);
+    }
+
+    #[test]
+    fn test_full_config_apply_all() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cfg = SocketConfig::full();
+        let report = apply_socket_options(&socket, &cfg);
+
+        // SO_RCVBUF and SO_SNDBUF must always succeed
+        for e in &report.entries {
+            if (e.name == "SO_RCVBUF" || e.name == "SO_SNDBUF") && !e.applied {
+                panic!("{} should be applied: {:?}", e.name, e.error);
+            }
+        }
+        println!("{}", report);
+    }
+
+    #[test]
+    fn test_graceful_degradation() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cfg = SocketConfig::full();
+        let _ = apply_socket_options(&socket, &cfg);
+
+        // Basic send/recv must work regardless of which optimizations applied
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        socket.send_to(b"graceful-test", peer_addr).unwrap();
+
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let (n, _) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"graceful-test");
     }
 }

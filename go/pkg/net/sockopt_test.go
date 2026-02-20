@@ -4,6 +4,7 @@ import (
 	"net"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestSocketBufferSize_SetAndVerify(t *testing.T) {
@@ -145,4 +146,59 @@ func TestDefaultSocketConfig(t *testing.T) {
 	if cfg.SendBufSize != DefaultSendBufSize {
 		t.Errorf("SendBufSize: got %d, want %d", cfg.SendBufSize, DefaultSendBufSize)
 	}
+}
+
+func TestFullSocketConfig_ApplyAll(t *testing.T) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	cfg := FullSocketConfig()
+	report := ApplySocketOptions(conn, cfg)
+	t.Log(report.String())
+
+	// SO_RCVBUF and SO_SNDBUF must always succeed
+	for _, e := range report.Entries {
+		if (e.Name == "SO_RCVBUF" || e.Name == "SO_SNDBUF") && !e.Applied {
+			t.Errorf("%s should be applied: %v", e.Name, e.Err)
+		}
+	}
+}
+
+func TestGracefulDegradation(t *testing.T) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Apply full config — Linux-only options fail gracefully on macOS
+	report := ApplySocketOptions(conn, FullSocketConfig())
+
+	// Regardless of which optimizations were applied,
+	// basic send/recv must work
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	msg := []byte("graceful-test")
+	_, err = conn.WriteToUDP(msg, peer.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("send failed after applying optimizations: %v", err)
+	}
+
+	buf := make([]byte, 256)
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := peer.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("recv failed: %v", err)
+	}
+	if string(buf[:n]) != "graceful-test" {
+		t.Fatalf("data mismatch: got %q", buf[:n])
+	}
+	t.Log(report.String())
 }
