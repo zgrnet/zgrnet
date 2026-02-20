@@ -466,98 +466,152 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_kcpconn_yamux_basic() {
+    async fn test_kcpconn_yamux_echo() {
         use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use futures::TryStreamExt;
 
         let (a, b) = conn_pair();
 
-        let mut client = yamux::Connection::new(a, yamux::Config::default(), yamux::Mode::Client);
-        let mut server = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
+        let mut server_conn = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
+        let mut client_conn = yamux::Connection::new(a, yamux::Config::default(), yamux::Mode::Client);
 
-        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>>(1);
-        let (accept_tx, mut accept_rx) = tokio::sync::mpsc::channel::<yamux::Stream>(1);
+        // Server: echo each inbound stream (exact yamux test-harness pattern)
+        let server = tokio::spawn(async move {
+            futures::stream::poll_fn(|cx| server_conn.poll_next_inbound(cx))
+                .try_for_each_concurrent(None, |mut stream| async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).await?;
+                        if n == 0 { break; }
+                        stream.write_all(&buf[..n]).await?;
+                    }
+                    stream.close().await?;
+                    Ok(())
+                }).await.ok();
+        });
 
-        // Client driver: persistent poll_fn with timer-based re-poll
-        let client_task = tokio::spawn(async move {
-            use std::future::Future;
-            let mut pending: Option<tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>> = None;
-            let mut timer = std::pin::pin!(tokio::time::sleep(Duration::from_millis(1)));
+        // Client driver: loop with progress tracking (verified pattern from TCP test)
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<yamux::Stream>>(8);
+
+        let driver = tokio::spawn(async move {
+            let mut pending_opens: Vec<tokio::sync::oneshot::Sender<yamux::Stream>> = Vec::new();
 
             futures::future::poll_fn(|cx| {
-                let _ = timer.as_mut().poll(cx);
+                loop {
+                    let mut progress = false;
 
-                match client.poll_next_inbound(cx) {
-                    std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => {
-                        return std::task::Poll::Ready(());
+                    while let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
+                        pending_opens.push(tx);
+                        progress = true;
                     }
-                    _ => {}
-                }
 
-                if pending.is_none() {
-                    if let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
-                        pending = Some(tx);
-                    }
-                }
-
-                if pending.is_some() {
-                    if let std::task::Poll::Ready(result) = client.poll_new_outbound(cx) {
-                        if let Some(tx) = pending.take() {
-                            let _ = tx.send(result);
+                    while !pending_opens.is_empty() {
+                        match client_conn.poll_new_outbound(cx) {
+                            std::task::Poll::Ready(Ok(stream)) => {
+                                let tx = pending_opens.remove(0);
+                                let _ = tx.send(stream);
+                                progress = true;
+                            }
+                            std::task::Poll::Ready(Err(_)) => { pending_opens.remove(0); progress = true; }
+                            std::task::Poll::Pending => break,
                         }
                     }
-                }
 
-                timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(1));
-                let _ = timer.as_mut().poll(cx);
-                std::task::Poll::Pending
+                    match client_conn.poll_next_inbound(cx) {
+                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => {
+                            return std::task::Poll::Ready(());
+                        }
+                        std::task::Poll::Ready(Some(Ok(_))) => { progress = true; continue; }
+                        std::task::Poll::Pending => {}
+                    }
+
+                    if !progress { return std::task::Poll::Pending; }
+                }
             }).await;
         });
 
-        // Server driver: persistent poll_fn with timer-based re-poll
-        let server_task = tokio::spawn(async move {
-            use std::future::Future;
-            let mut timer = std::pin::pin!(tokio::time::sleep(Duration::from_millis(1)));
+        // Test: open stream, echo
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        open_tx.send(tx).await.unwrap();
+        let mut s = tokio::time::timeout(Duration::from_secs(5), rx).await
+            .expect("open timed out").unwrap();
 
-            loop {
-                let result = futures::future::poll_fn(|cx| {
-                    // Register timer Waker for periodic re-poll
-                    let _ = timer.as_mut().poll(cx);
+        s.write_all(b"yamux over kcp!").await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = s.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"yamux over kcp!");
+        s.close().await.unwrap();
 
-                    match server.poll_next_inbound(cx) {
-                        std::task::Poll::Ready(r) => std::task::Poll::Ready(r),
-                        std::task::Poll::Pending => {
-                            timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(1));
-                            let _ = timer.as_mut().poll(cx);
-                            std::task::Poll::Pending
-                        }
+        driver.abort();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_kcpconn_yamux_10_streams() {
+        use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use futures::TryStreamExt;
+
+        let (a, b) = conn_pair();
+
+        let mut server_conn = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
+        let mut client_conn = yamux::Connection::new(a, yamux::Config::default(), yamux::Mode::Client);
+
+        let server = tokio::spawn(async move {
+            futures::stream::poll_fn(|cx| server_conn.poll_next_inbound(cx))
+                .try_for_each_concurrent(None, |mut stream| async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).await?;
+                        if n == 0 { break; }
+                        stream.write_all(&buf[..n]).await?;
                     }
-                }).await;
-
-                match result {
-                    Some(Ok(s)) => { let _ = accept_tx.send(s).await; }
-                    _ => return,
-                }
-            }
+                    stream.close().await?;
+                    Ok(())
+                }).await.ok();
         });
 
-        // Open stream via client driver
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        open_tx.send(result_tx).await.unwrap();
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<yamux::Stream>>(8);
 
-        let client_stream = tokio::time::timeout(Duration::from_secs(5), result_rx).await;
-        assert!(client_stream.is_ok(), "client open timed out");
-        let mut client_stream = client_stream.unwrap().unwrap().unwrap();
+        let driver = tokio::spawn(async move {
+            let mut pending_opens: Vec<tokio::sync::oneshot::Sender<yamux::Stream>> = Vec::new();
+            futures::future::poll_fn(|cx| {
+                loop {
+                    let mut progress = false;
+                    while let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
+                        pending_opens.push(tx);
+                        progress = true;
+                    }
+                    while !pending_opens.is_empty() {
+                        match client_conn.poll_new_outbound(cx) {
+                            std::task::Poll::Ready(Ok(s)) => { let _ = pending_opens.remove(0).send(s); progress = true; }
+                            std::task::Poll::Ready(Err(_)) => { pending_opens.remove(0); progress = true; }
+                            std::task::Poll::Pending => break,
+                        }
+                    }
+                    match client_conn.poll_next_inbound(cx) {
+                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
+                        std::task::Poll::Ready(Some(Ok(_))) => { progress = true; continue; }
+                        std::task::Poll::Pending => {}
+                    }
+                    if !progress { return std::task::Poll::Pending; }
+                }
+            }).await;
+        });
 
-        let server_stream = tokio::time::timeout(Duration::from_secs(5), accept_rx.recv()).await;
-        assert!(server_stream.is_ok(), "server accept timed out");
-        let mut server_stream = server_stream.unwrap().unwrap();
+        for i in 0..10 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            open_tx.send(tx).await.unwrap();
+            let mut s = tokio::time::timeout(Duration::from_secs(5), rx).await
+                .expect(&format!("open {} timed out", i)).unwrap();
+            let msg = format!("stream-{}", i);
+            s.write_all(msg.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 256];
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], msg.as_bytes());
+            s.close().await.unwrap();
+        }
 
-        client_stream.write_all(b"yamux over kcp!").await.unwrap();
-        let mut buf = vec![0u8; 256];
-        let n = server_stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"yamux over kcp!");
-
-        client_stream.close().await.unwrap();
-        server_stream.close().await.unwrap();
+        driver.abort();
+        server.abort();
     }
 }
