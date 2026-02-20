@@ -362,37 +362,56 @@ async fn update_loop(
 
 #[cfg(test)]
 pub fn conn_pair() -> (KcpConn, KcpConn) {
+    use tokio::sync::mpsc;
     use std::sync::Mutex as StdMutex;
 
-    let b_input: Arc<StdMutex<Option<(Arc<SpinMutex<KcpInner>>, Arc<Notify>)>>> =
-        Arc::new(StdMutex::new(None));
-    let a_input: Arc<StdMutex<Option<(Arc<SpinMutex<KcpInner>>, Arc<Notify>)>>> =
-        Arc::new(StdMutex::new(None));
+    // Use channels to avoid SpinMutex AB-BA deadlock in output callbacks.
+    // Output callback sends data to channel → bridge task inputs to the other side.
+    let (a_to_b_tx, mut a_to_b_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (b_to_a_tx, mut b_to_a_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    let b_ref = b_input.clone();
     let a = KcpConn::new(1, Arc::new(move |data: &[u8]| {
-        if let Some((ref inner, ref notify)) = *b_ref.lock().unwrap() {
-            let mut kcp = inner.lock();
-            let _ = kcp.kcp.input(data);
-            kcp.try_wake_pending();
-            drop(kcp);
-            notify.notify_one();
-        }
+        eprintln!("[output a→b] {} bytes", data.len());
+        let _ = a_to_b_tx.send(data.to_vec());
     }));
 
-    let a_ref = a_input.clone();
     let b = KcpConn::new(1, Arc::new(move |data: &[u8]| {
-        if let Some((ref inner, ref notify)) = *a_ref.lock().unwrap() {
-            let mut kcp = inner.lock();
-            let _ = kcp.kcp.input(data);
-            kcp.try_wake_pending();
-            drop(kcp);
-            notify.notify_one();
-        }
+        eprintln!("[output b→a] {} bytes", data.len());
+        let _ = b_to_a_tx.send(data.to_vec());
     }));
 
-    *b_input.lock().unwrap() = Some((b.inner_ref(), b.notifier_ref()));
-    *a_input.lock().unwrap() = Some((a.inner_ref(), a.notifier_ref()));
+    // Bridge tasks: read from channel → input to the other side's KcpConn
+    let b_inner = b.inner_ref();
+    let b_notify = b.notifier_ref();
+    tokio::spawn(async move {
+        while let Some(data) = a_to_b_rx.recv().await {
+            eprintln!("[bridge a→b] {} bytes", data.len());
+            let mut kcp = b_inner.lock();
+            let _ = kcp.kcp.input(&data);
+            let peek = kcp.kcp.peeksize().unwrap_or(0);
+            let has_reader = kcp.pending_reader.is_some();
+            eprintln!("[bridge a→b] after input: peek={}, has_reader={}", peek, has_reader);
+            kcp.try_wake_pending();
+            drop(kcp);
+            b_notify.notify_one();
+        }
+    });
+
+    let a_inner = a.inner_ref();
+    let a_notify = a.notifier_ref();
+    tokio::spawn(async move {
+        while let Some(data) = b_to_a_rx.recv().await {
+            eprintln!("[bridge b→a] {} bytes", data.len());
+            let mut kcp = a_inner.lock();
+            let _ = kcp.kcp.input(&data);
+            let peek = kcp.kcp.peeksize().unwrap_or(0);
+            let has_reader = kcp.pending_reader.is_some();
+            eprintln!("[bridge b→a] after input: peek={}, has_reader={}", peek, has_reader);
+            kcp.try_wake_pending();
+            drop(kcp);
+            a_notify.notify_one();
+        }
+    });
 
     (a, b)
 }
@@ -461,24 +480,62 @@ mod tests {
         let mut client = yamux::Connection::new(a, yamux::Config::default(), yamux::Mode::Client);
         let mut server = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
 
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>>(1);
+        let (accept_tx, mut accept_rx) = tokio::sync::mpsc::channel::<yamux::Stream>(1);
+
+        // Client driver: polls both inbound (to flush) and processes open requests
         let client_task = tokio::spawn(async move {
-            futures::future::poll_fn(|cx| client.poll_new_outbound(cx)).await
+            let mut pending: Option<tokio::sync::oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>> = None;
+            loop {
+                let now = std::time::Instant::now();
+                    let _: Option<()> = futures::future::poll_fn(|cx| {
+                    match client.poll_next_inbound(cx) {
+                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => {
+                            return std::task::Poll::Ready(None);
+                        }
+                        _ => {}
+                    }
+                    // Check open requests
+                    if pending.is_none() {
+                        if let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
+                            pending = Some(tx);
+                        }
+                    }
+                    // Try outbound
+                    if pending.is_some() {
+                        if let std::task::Poll::Ready(result) = client.poll_new_outbound(cx) {
+                            if let Some(tx) = pending.take() {
+                                let _ = tx.send(result);
+                            }
+                        }
+                    }
+                    std::task::Poll::Pending
+                }).await;
+            }
         });
 
+        // Server driver: keep polling to process all yamux protocol frames
         let server_task = tokio::spawn(async move {
-            futures::future::poll_fn(|cx| server.poll_next_inbound(cx)).await
+            loop {
+                let result = futures::future::poll_fn(|cx| server.poll_next_inbound(cx)).await;
+                match result {
+                    Some(Ok(s)) => { let _ = accept_tx.send(s).await; }
+                    _ => return,
+                }
+            }
         });
 
-        let (c, s) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(5), client_task),
-            tokio::time::timeout(Duration::from_secs(5), server_task),
-        );
+        // Open stream via client driver
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        open_tx.send(result_tx).await.unwrap();
 
-        assert!(c.is_ok(), "client timed out");
-        assert!(s.is_ok(), "server timed out");
+        let client_stream = tokio::time::timeout(Duration::from_secs(5), result_rx).await;
+        assert!(client_stream.is_ok(), "client open timed out");
+        let mut client_stream = client_stream.unwrap().unwrap().unwrap();
 
-        let mut client_stream = c.unwrap().unwrap().unwrap();
-        let mut server_stream = s.unwrap().unwrap().unwrap().unwrap();
+        let server_stream = tokio::time::timeout(Duration::from_secs(5), accept_rx.recv()).await;
+        assert!(server_stream.is_ok(), "server accept timed out");
+        let mut server_stream = server_stream.unwrap().unwrap();
 
         client_stream.write_all(b"yamux over kcp!").await.unwrap();
         let mut buf = vec![0u8; 256];
