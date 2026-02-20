@@ -253,23 +253,9 @@ func (u *UDP) AcceptStream(pk noise.PublicKey) (*Stream, error) {
 	select {
 	case s := <-acceptChan:
 		return s, nil
-	case <-u.closedChan():
+	case <-u.closeChan:
 		return nil, ErrClosed
 	}
-}
-
-// closedChan returns a channel that's closed when UDP is closed.
-func (u *UDP) closedChan() <-chan struct{} {
-	// This is a simple implementation; a more efficient one would use
-	// a dedicated close channel
-	ch := make(chan struct{})
-	go func() {
-		for !u.closed.Load() {
-			time.Sleep(100 * time.Millisecond)
-		}
-		close(ch)
-	}()
-	return ch
 }
 
 // Read reads raw data from the specified peer (non-KCP protocols).
@@ -307,7 +293,7 @@ func (u *UDP) Read(pk noise.PublicKey, buf []byte) (proto byte, n int, err error
 	case pkt := <-inboundChan:
 		n = copy(buf, pkt.payload)
 		return pkt.protocol, n, nil
-	case <-u.closedChan():
+	case <-u.closeChan:
 		return 0, 0, ErrClosed
 	}
 }

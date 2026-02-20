@@ -101,9 +101,18 @@ type packet struct {
 	payloadN int             // payload length
 	err      error           // decrypt error (if any)
 
+	// Ownership: true if this packet is in outputChan (ReadFrom will release it).
+	// false means decryptWorker must release it after processing.
+	// Atomic because ioLoop writes it while decryptWorker reads it concurrently.
+	inOutput atomic.Bool
+
 	// Synchronization
 	ready chan struct{} // closed when decryption is complete
 }
+
+// outstandingPackets tracks the number of packets currently acquired from the pool
+// but not yet released. Used for leak detection in tests.
+var outstandingPackets atomic.Int64
 
 // bufferPool provides reusable buffers for receiving UDP packets.
 var bufferPool = sync.Pool{
@@ -123,6 +132,7 @@ var packetPool = sync.Pool{
 
 // acquirePacket gets a packet from the pool and resets it.
 func acquirePacket() *packet {
+	outstandingPackets.Add(1)
 	p := packetPool.Get().(*packet)
 	p.data = bufferPool.Get().([]byte)
 	p.n = 0
@@ -131,12 +141,14 @@ func acquirePacket() *packet {
 	p.payload = nil
 	p.payloadN = 0
 	p.err = nil
+	p.inOutput.Store(false)
 	p.ready = make(chan struct{})
 	return p
 }
 
 // releasePacket returns a packet to the pool.
 func releasePacket(p *packet) {
+	outstandingPackets.Add(-1)
 	if p.data != nil {
 		bufferPool.Put(p.data)
 		p.data = nil
@@ -213,11 +225,13 @@ type pendingHandshake struct {
 type Option func(*options)
 
 type options struct {
-	bindAddr       string
-	allowUnknown   bool
-	decryptWorkers int // 0 = runtime.NumCPU()
-	routeTable     *relay.RouteTable
-	localMetrics   relay.NodeMetrics
+	bindAddr          string
+	allowUnknown      bool
+	decryptWorkers    int // 0 = runtime.NumCPU()
+	rawChanSize       int // 0 = use RawChanSize constant
+	decryptedChanSize int // 0 = use DecryptedChanSize constant
+	routeTable        *relay.RouteTable
+	localMetrics      relay.NodeMetrics
 }
 
 // WithBindAddr sets the local address to bind to.
@@ -268,6 +282,22 @@ func WithLocalMetrics(m relay.NodeMetrics) Option {
 	}
 }
 
+// WithRawChanSize sets the raw packet channel size.
+// Default is RawChanSize (4096).
+func WithRawChanSize(n int) Option {
+	return func(o *options) {
+		o.rawChanSize = n
+	}
+}
+
+// WithDecryptedChanSize sets the decrypted packet channel size.
+// Default is DecryptedChanSize (256).
+func WithDecryptedChanSize(n int) Option {
+	return func(o *options) {
+		o.decryptedChanSize = n
+	}
+}
+
 // NewUDP creates a new UDP network.
 func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 	if key == nil {
@@ -293,6 +323,15 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		return nil, err
 	}
 
+	rawSize := o.rawChanSize
+	if rawSize <= 0 {
+		rawSize = RawChanSize
+	}
+	decryptedSize := o.decryptedChanSize
+	if decryptedSize <= 0 {
+		decryptedSize = DecryptedChanSize
+	}
+
 	u := &UDP{
 		socket:       socket,
 		localKey:     key,
@@ -302,8 +341,8 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		peers:        make(map[noise.PublicKey]*peerState),
 		byIndex:      make(map[uint32]*peerState),
 		pending:      make(map[uint32]*pendingHandshake),
-		decryptChan:  make(chan *packet, RawChanSize),
-		outputChan:   make(chan *packet, DecryptedChanSize),
+		decryptChan:  make(chan *packet, rawSize),
+		outputChan:   make(chan *packet, decryptedSize),
 		closeChan:    make(chan struct{}),
 	}
 	u.lastSeen.Store(time.Time{})
@@ -992,29 +1031,38 @@ func (u *UDP) ioLoop() {
 		default:
 		}
 
-		// Send to both channels (non-blocking)
-		// decryptChan: for decrypt workers to process
-		// outputChan: for ReadFrom to wait and consume
+		// Send to both channels (non-blocking).
+		// outputChan first: if it succeeds, ReadFrom owns the release.
+		// decryptChan second: if it fails, we signal ready immediately
+		// so ReadFrom doesn't block, and ReadFrom will release.
+		select {
+		case u.outputChan <- pkt:
+			pkt.inOutput.Store(true)
+		case <-u.closeChan:
+			releasePacket(pkt)
+			return
+		default:
+			// Output queue full, drop for ReadFrom path.
+			// pkt.inOutput stays false — decryptWorker will release.
+		}
+
 		select {
 		case u.decryptChan <- pkt:
 			// Sent to decrypt worker
 		case <-u.closeChan:
-			releasePacket(pkt)
+			if !pkt.inOutput.Load() {
+				releasePacket(pkt)
+			}
 			return
 		default:
-			// Decrypt queue full, drop packet
-			releasePacket(pkt)
-			continue
-		}
-
-		select {
-		case u.outputChan <- pkt:
-			// Sent to output queue
-		case <-u.closeChan:
-			return
-		default:
-			// Output queue full, packet already in decrypt queue
-			// It will be processed but not delivered to ReadFrom
+			// Decrypt queue full. If packet is in outputChan,
+			// mark it as error and signal ready so ReadFrom skips it.
+			if pkt.inOutput.Load() {
+				pkt.err = ErrNoData
+				close(pkt.ready)
+			} else {
+				releasePacket(pkt)
+			}
 		}
 	}
 }
@@ -1022,6 +1070,8 @@ func (u *UDP) ioLoop() {
 // decryptWorker processes packets from decryptChan.
 // Multiple workers run in parallel for higher throughput.
 // After processing, it signals ready so ReadFrom can consume.
+// If the packet is not in outputChan (inOutput == false), the worker
+// releases it directly to prevent pool leaks.
 func (u *UDP) decryptWorker() {
 	for {
 		select {
@@ -1030,8 +1080,10 @@ func (u *UDP) decryptWorker() {
 				return // channel closed
 			}
 			u.processPacket(pkt)
-			// Signal that decryption is complete
 			close(pkt.ready)
+			if !pkt.inOutput.Load() {
+				releasePacket(pkt)
+			}
 		case <-u.closeChan:
 			return
 		}
