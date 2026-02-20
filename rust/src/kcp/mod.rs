@@ -11,7 +11,6 @@ mod kcp;
 pub mod fec;
 mod stream;
 pub mod conn;
-pub mod async_conn;
 pub mod service;
 
 // Re-export from kcp module
@@ -22,7 +21,6 @@ pub use fec::{Encoder as FecEncoder, Decoder as FecDecoder};
 
 // Re-export new conn types
 pub use conn::KcpConn;
-pub use async_conn::AsyncKcpConn;
 pub use service::{ServiceMux, ServiceMuxConfig, ServiceOutputFn};
 
 // Legacy re-exports (to be removed in Step 5.4)
