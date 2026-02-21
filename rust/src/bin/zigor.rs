@@ -218,10 +218,7 @@ fn run_host(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args:
                 cli::write_pidfile(base_dir, &ctx_name, child.id())?;
                 println!("host started in background (pid {})", child.id());
             } else {
-                // Foreground: the Rust daemon code would go here.
-                // For now, fall back to executing zgrnetd if available.
-                let err = exec_replace("zgrnetd", &["-c", &cfg_path.to_string_lossy()]);
-                return Err(format!("exec zgrnetd: {err}"));
+                return Err("foreground host not implemented in Rust build (use Go build or run with -d)".into());
             }
             Ok(())
         }
@@ -281,24 +278,6 @@ fn run_host(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args:
         }
         cmd => Err(format!("unknown host subcommand {cmd:?}")),
     }
-}
-
-#[cfg(unix)]
-fn exec_replace(program: &str, args: &[&str]) -> String {
-    use std::ffi::CString;
-    let c_prog = CString::new(program).unwrap();
-    let mut c_args: Vec<CString> = vec![CString::new(program).unwrap()];
-    for a in args {
-        c_args.push(CString::new(*a).unwrap());
-    }
-    let c_ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
-    unsafe { libc::execvp(c_prog.as_ptr(), c_ptrs.as_ptr()) };
-    std::io::Error::last_os_error().to_string()
-}
-
-#[cfg(not(unix))]
-fn exec_replace(program: &str, _args: &[&str]) -> String {
-    format!("exec not supported on this platform for {program}")
 }
 
 // ── Online commands ─────────────────────────────────────────────────────────
