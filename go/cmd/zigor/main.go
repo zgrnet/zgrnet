@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -613,10 +614,17 @@ func hostStatus(baseDir, ctxName, apiAddr string, jsonOutput bool) error {
 	}
 
 	proc, err := os.FindProcess(pid)
-	if err != nil || proc.Signal(syscall.Signal(0)) != nil {
+	if err != nil {
 		fmt.Printf("host is not running (stale pidfile, pid %d)\n", pid)
 		cli.RemovePidfile(baseDir, ctxName)
 		return nil
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			fmt.Printf("host is not running (stale pidfile, pid %d)\n", pid)
+			cli.RemovePidfile(baseDir, ctxName)
+			return nil
+		}
 	}
 
 	addr := cli.ResolveAPIAddr(baseDir, ctxName, apiAddr)

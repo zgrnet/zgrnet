@@ -511,8 +511,8 @@ fn runHost(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_add
             return;
         };
 
-        const alive = if (posix.kill(pid, 0)) |_| true else |_| false;
-        if (!alive) {
+        const dead = if (posix.kill(pid, 0)) |_| false else |err| (err == error.ProcessNotFound);
+        if (dead) {
             print("host is not running (stale pidfile, pid {d})\n", .{pid});
             fs.cwd().deleteFile(pid_path) catch {};
             return;

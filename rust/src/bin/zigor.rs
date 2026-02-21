@@ -239,11 +239,17 @@ fn run_host(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args:
             match cli::read_pidfile(base_dir, &ctx_name) {
                 Ok(pid) => {
                     #[cfg(unix)]
-                    let alive = unsafe { libc::kill(pid, 0) == 0 };
+                    let dead = unsafe {
+                        if libc::kill(pid, 0) != 0 {
+                            std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                        } else {
+                            false
+                        }
+                    };
                     #[cfg(not(unix))]
-                    let alive = true;
+                    let dead = false;
 
-                    if !alive {
+                    if dead {
                         println!("host is not running (stale pidfile, pid {pid})");
                         cli::remove_pidfile(base_dir, &ctx_name);
                     } else {
