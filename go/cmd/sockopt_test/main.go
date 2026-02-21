@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -91,7 +92,7 @@ func testReusePort() {
 		},
 	}
 
-	pc1, err := lc.ListenPacket(nil, "udp", "127.0.0.1:0")
+	pc1, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
 	if err != nil {
 		check("first bind", false, err.Error())
 		return
@@ -100,7 +101,7 @@ func testReusePort() {
 	addr := pc1.LocalAddr().String()
 	check("first bind", true, addr)
 
-	pc2, err := lc.ListenPacket(nil, "udp", addr)
+	pc2, err := lc.ListenPacket(context.Background(), "udp", addr)
 	if err != nil {
 		check("second bind (same port)", false, err.Error())
 		return
@@ -108,7 +109,7 @@ func testReusePort() {
 	defer pc2.Close()
 	check("second bind (same port)", true, addr)
 
-	pc3, err := lc.ListenPacket(nil, "udp", addr)
+	pc3, err := lc.ListenPacket(context.Background(), "udp", addr)
 	if err != nil {
 		check("third bind (same port)", false, err.Error())
 		return
