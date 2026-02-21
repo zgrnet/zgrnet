@@ -267,31 +267,87 @@ pub fn buildTransportMessage(
     return msg;
 }
 
-/// Encode a payload with protocol byte.
+/// Well-known service IDs (matches Go/Rust constants).
+pub const Service = struct {
+    pub const relay: u64 = 0;
+    pub const proxy: u64 = 1;
+    pub const tun: u64 = 2;
+    pub const dns: u64 = 3;
+    pub const admin: u64 = 4;
+};
+
+/// Encode a protobuf-style varint (unsigned LEB128).
+pub fn encodeVarint(buf: []u8, value: u64) usize {
+    var v = value;
+    var i: usize = 0;
+    while (v >= 0x80) : (i += 1) {
+        buf[i] = @intCast((v & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    buf[i] = @intCast(v & 0x7F);
+    return i + 1;
+}
+
+/// Decode a protobuf-style varint. Returns value and bytes consumed.
+pub const VarintResult = struct { value: u64, consumed: usize };
+
+pub fn decodeVarint(data: []const u8) MessageError!VarintResult {
+    var value: u64 = 0;
+    var shift: u6 = 0;
+    for (data, 0..) |byte, i| {
+        if (i >= 10) return MessageError.TooShort; // overflow protection
+        value |= @as(u64, byte & 0x7F) << shift;
+        if (byte & 0x80 == 0) {
+            return VarintResult{ .value = value, .consumed = i + 1 };
+        }
+        shift +|= 7;
+    }
+    return MessageError.TooShort;
+}
+
+/// Returns the encoded length of a varint value.
+pub fn varintLen(value: u64) usize {
+    if (value == 0) return 1;
+    var v = value;
+    var len: usize = 0;
+    while (v > 0) : (len += 1) {
+        v >>= 7;
+    }
+    return len;
+}
+
+/// Encode a payload: protocol(1B) | service(varint) | data.
 pub fn encodePayload(
     allocator: std.mem.Allocator,
     protocol: Protocol,
+    service: u64,
     payload: []const u8,
 ) ![]u8 {
-    const result = try allocator.alloc(u8, 1 + payload.len);
+    const svc_len = varintLen(service);
+    const result = try allocator.alloc(u8, 1 + svc_len + payload.len);
     result[0] = @intFromEnum(protocol);
-    @memcpy(result[1..], payload);
+    _ = encodeVarint(result[1..], service);
+    @memcpy(result[1 + svc_len ..], payload);
     return result;
 }
 
-/// Decode a payload to extract protocol and data.
+/// Decode a payload: protocol(1B) | service(varint) | data.
 pub const DecodeResult = struct {
     protocol: Protocol,
+    service: u64,
     payload: []const u8,
 };
 
 pub fn decodePayload(data: []const u8) MessageError!DecodeResult {
-    if (data.len == 0) {
+    if (data.len < 2) {
         return MessageError.TooShort;
     }
+    const protocol: Protocol = @enumFromInt(data[0]);
+    const vr = try decodeVarint(data[1..]);
     return DecodeResult{
-        .protocol = @enumFromInt(data[0]),
-        .payload = data[1..],
+        .protocol = protocol,
+        .service = vr.value,
+        .payload = data[1 + vr.consumed ..],
     };
 }
 
@@ -353,18 +409,111 @@ test "transport message roundtrip" {
     try std.testing.expectEqualSlices(u8, parsed.ciphertext, &ciphertext);
 }
 
-test "payload roundtrip" {
+test "varint zero" {
+    var buf: [10]u8 = undefined;
+    const n = encodeVarint(&buf, 0);
+    try std.testing.expectEqual(n, 1);
+    try std.testing.expectEqual(buf[0], 0);
+
+    const vr = try decodeVarint(buf[0..n]);
+    try std.testing.expectEqual(vr.value, 0);
+    try std.testing.expectEqual(vr.consumed, 1);
+}
+
+test "varint one byte max (127)" {
+    var buf: [10]u8 = undefined;
+    const n = encodeVarint(&buf, 127);
+    try std.testing.expectEqual(n, 1);
+    try std.testing.expectEqual(buf[0], 127);
+
+    const vr = try decodeVarint(buf[0..n]);
+    try std.testing.expectEqual(vr.value, 127);
+}
+
+test "varint two byte (128)" {
+    var buf: [10]u8 = undefined;
+    const n = encodeVarint(&buf, 128);
+    try std.testing.expectEqual(n, 2);
+    try std.testing.expectEqual(buf[0], 0x80);
+    try std.testing.expectEqual(buf[1], 0x01);
+
+    const vr = try decodeVarint(buf[0..n]);
+    try std.testing.expectEqual(vr.value, 128);
+}
+
+test "varint roundtrip 1000 values" {
+    var buf: [10]u8 = undefined;
+    const test_values = [_]u64{ 0, 1, 127, 128, 255, 256, 16383, 16384, 65535, 1 << 21, 1 << 28, 1 << 35, 1 << 63 - 1 };
+    for (test_values) |v| {
+        const n = encodeVarint(&buf, v);
+        try std.testing.expectEqual(n, varintLen(v));
+        const vr = try decodeVarint(buf[0..n]);
+        try std.testing.expectEqual(vr.value, v);
+        try std.testing.expectEqual(vr.consumed, n);
+    }
+}
+
+test "varintLen" {
+    try std.testing.expectEqual(varintLen(0), 1);
+    try std.testing.expectEqual(varintLen(1), 1);
+    try std.testing.expectEqual(varintLen(127), 1);
+    try std.testing.expectEqual(varintLen(128), 2);
+    try std.testing.expectEqual(varintLen(16383), 2);
+    try std.testing.expectEqual(varintLen(16384), 3);
+}
+
+test "payload roundtrip with service" {
     const allocator = std.testing.allocator;
-    const protocol = Protocol.chat;
+    const protocol = Protocol.kcp;
+    const service: u64 = Service.proxy;
     const payload = "hello world";
 
-    const encoded = try encodePayload(allocator, protocol, payload);
+    const encoded = try encodePayload(allocator, protocol, service, payload);
     defer allocator.free(encoded);
-    try std.testing.expectEqual(encoded.len, 1 + payload.len);
 
     const decoded = try decodePayload(encoded);
     try std.testing.expectEqual(decoded.protocol, protocol);
+    try std.testing.expectEqual(decoded.service, service);
     try std.testing.expectEqualSlices(u8, decoded.payload, payload);
+}
+
+test "payload service zero" {
+    const allocator = std.testing.allocator;
+    const encoded = try encodePayload(allocator, Protocol.kcp, 0, "data");
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(encoded);
+    try std.testing.expectEqual(decoded.service, 0);
+    try std.testing.expectEqualSlices(u8, decoded.payload, "data");
+}
+
+test "payload empty data" {
+    const allocator = std.testing.allocator;
+    const encoded = try encodePayload(allocator, Protocol.kcp, 42, "");
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(encoded);
+    try std.testing.expectEqual(decoded.service, 42);
+    try std.testing.expectEqual(decoded.payload.len, 0);
+}
+
+test "payload large service" {
+    const allocator = std.testing.allocator;
+    const big_svc: u64 = 1 << 35;
+    const encoded = try encodePayload(allocator, Protocol.raw, big_svc, "x");
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(encoded);
+    try std.testing.expectEqual(decoded.service, big_svc);
+    try std.testing.expectEqualSlices(u8, decoded.payload, "x");
+}
+
+test "service constants" {
+    try std.testing.expectEqual(Service.relay, 0);
+    try std.testing.expectEqual(Service.proxy, 1);
+    try std.testing.expectEqual(Service.tun, 2);
+    try std.testing.expectEqual(Service.dns, 3);
+    try std.testing.expectEqual(Service.admin, 4);
 }
 
 test "message too short" {
