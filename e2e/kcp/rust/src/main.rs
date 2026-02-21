@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use zgrnet::noise::message::service;
 use zgrnet::{Key, KeyPair, SyncStream};
@@ -31,19 +30,31 @@ struct HostInfo {
 
 #[derive(serde::Deserialize)]
 struct TestConfig {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
     echo_message: String,
+    #[serde(default)]
     throughput_mb: usize,
+    #[serde(default)]
     chunk_kb: usize,
+    #[serde(default)]
+    num_streams: usize,
+    #[serde(default)]
+    delay_ms: u64,
 }
 
 fn main() {
-    // ServiceMux requires a tokio runtime for KcpConn run_loop and yamux driver tasks.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
-        .expect("Failed to create tokio runtime");
-    let _guard = rt.enter();
+        .expect("tokio runtime");
+    // Run everything inside the runtime so all threads have access.
+    rt.block_on(async { tokio::task::spawn_blocking(run).await.unwrap() })
+}
+
+fn run() {
 
     let args: Vec<String> = env::args().collect();
     let name = args.iter().position(|x| x == "--name")
@@ -103,14 +114,21 @@ fn main() {
         eprintln!("[{}] Connecting...", name);
         udp.connect(&peer_kp.public).expect("connect failed");
 
-        // Wait for session establishment
-        for _ in 0..100 {
+        let mut established = false;
+        for i in 0..100 {
             if let Some(info) = udp.peer_info(&peer_kp.public) {
-                if info.state == zgrnet::PeerState::Established { break; }
+                eprintln!("[{}] peer state ({}): {:?}", name, i, info.state);
+                if info.state == zgrnet::PeerState::Established {
+                    established = true;
+                    break;
+                }
             }
             thread::sleep(Duration::from_millis(50));
         }
-        thread::sleep(Duration::from_millis(100));
+        if !established {
+            panic!("session never established after 5 seconds");
+        }
+        thread::sleep(Duration::from_millis(200));
 
         run_opener(&udp, &peer_kp.public, &config.test);
     } else {
@@ -123,25 +141,65 @@ fn main() {
 }
 
 fn run_opener(udp: &Arc<UDP>, peer_pk: &Key, cfg: &TestConfig) {
+    let mode = if cfg.mode.is_empty() { "echo" } else { &cfg.mode };
+
     let mut stream = udp.open_stream(peer_pk, service::PROXY)
         .expect("open_stream failed");
+    eprintln!("[opener] Opened stream (mode={})", mode);
 
-    eprintln!("[opener] Opened stream on service={}", service::PROXY);
+    match mode {
+        "echo" => {
+            stream.write_all(cfg.echo_message.as_bytes()).unwrap();
+            eprintln!("[opener] Sent: {:?}", cfg.echo_message);
+            let mut buf = vec![0u8; 4096];
+            let n = read_with_timeout(&mut stream, &mut buf, Duration::from_secs(10))
+                .expect("echo read failed");
+            eprintln!("[opener] Response: {:?}", String::from_utf8_lossy(&buf[..n]));
+        }
+        "streaming" => {
+            let total = cfg.throughput_mb * 1024 * 1024;
+            let chunk_size = if cfg.chunk_kb > 0 { cfg.chunk_kb * 1024 } else { 8192 };
+            let chunk: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
+            let mut sent = 0;
+            while sent < total {
+                let n = stream.write(&chunk).unwrap();
+                sent += n;
+            }
+            eprintln!("[opener] Sent {} bytes", sent);
+        }
+        "multi_stream" => {
+            let num = if cfg.num_streams > 0 { cfg.num_streams } else { 10 };
+            let data: Vec<u8> = (0..100 * 1024).map(|i| (i % 256) as u8).collect();
+            stream.write_all(&data).unwrap();
 
-    // Echo test: write message, read response.
-    // yamux defers SYN until first write, so this also establishes the stream.
-    stream.write_all(cfg.echo_message.as_bytes()).unwrap();
-    eprintln!("[opener] Sent echo: {:?}", cfg.echo_message);
+            let mut handles = Vec::new();
+            for i in 1..num {
+                let mut s = udp.open_stream(peer_pk, service::PROXY)
+                    .unwrap_or_else(|e| panic!("open stream {}: {}", i, e));
+                let data = data.clone();
+                handles.push(thread::spawn(move || {
+                    s.write_all(&data).unwrap();
+                    eprintln!("[opener] stream {}: sent {} bytes", i, data.len());
+                    s.close();
+                }));
+            }
+            for h in handles { h.join().unwrap(); }
+            eprintln!("[opener] all {} streams done", num);
+        }
+        "delayed_write" => {
+            let delay = if cfg.delay_ms > 0 { cfg.delay_ms } else { 2000 };
+            eprintln!("[opener] delaying {}ms...", delay);
+            thread::sleep(Duration::from_millis(delay));
+            stream.write_all(b"delayed hello").unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = read_with_timeout(&mut stream, &mut buf, Duration::from_secs(10))
+                .expect("delayed read failed");
+            eprintln!("[opener] delayed response: {:?}", String::from_utf8_lossy(&buf[..n]));
+        }
+        _ => panic!("unknown mode: {}", mode),
+    }
 
-    let mut buf = vec![0u8; 4096];
-    let n = read_with_timeout(&mut stream, &mut buf, Duration::from_secs(5))
-        .expect("echo read failed");
-    eprintln!("[opener] Echo response: {:?}", String::from_utf8_lossy(&buf[..n]));
-
-    // Bidirectional throughput test.
-    run_bidirectional(&mut stream, "opener", cfg);
-
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(1));
     stream.close();
 }
 
@@ -156,77 +214,62 @@ fn run_accepter(udp: &Arc<UDP>, peer_pk: &Key, cfg: &TestConfig) {
     }
     thread::sleep(Duration::from_millis(100));
 
-    let (mut stream, svc) = udp.accept_stream(peer_pk)
-        .expect("accept_stream failed");
-    eprintln!("[accepter] Accepted stream on service={}", svc);
+    let mode = if cfg.mode.is_empty() { "echo" } else { &cfg.mode };
 
-    // Echo test: read message, echo back.
-    let mut buf = vec![0u8; 4096];
-    let n = read_with_timeout(&mut stream, &mut buf, Duration::from_secs(5))
-        .expect("echo read failed");
-    let received = String::from_utf8_lossy(&buf[..n]).to_string();
-    eprintln!("[accepter] Received: {:?}", received);
-
-    let response = format!("Echo from accepter: {}", received);
-    stream.write_all(response.as_bytes()).unwrap();
-    eprintln!("[accepter] Sent response: {:?}", response);
-
-    // Bidirectional throughput test.
-    run_bidirectional(&mut stream, "accepter", cfg);
+    match mode {
+        "echo" | "delayed_write" => {
+            let (mut stream, _svc) = udp.accept_stream(peer_pk).expect("accept failed");
+            let mut buf = vec![0u8; 4096];
+            let n = read_with_timeout(&mut stream, &mut buf, Duration::from_secs(30))
+                .expect("read failed");
+            eprintln!("[accepter] Received: {:?}", String::from_utf8_lossy(&buf[..n]));
+            let response = format!("Echo: {}", String::from_utf8_lossy(&buf[..n]));
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.close();
+        }
+        "streaming" => {
+            let (mut stream, _svc) = udp.accept_stream(peer_pk).expect("accept failed");
+            let total = cfg.throughput_mb * 1024 * 1024;
+            let mut buf = vec![0u8; 65536];
+            let mut recv = 0;
+            while recv < total {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => recv += n,
+                    Err(_) => break,
+                }
+            }
+            eprintln!("[accepter] Received {} / {} bytes", recv, total);
+            if recv < total { panic!("incomplete: {} < {}", recv, total); }
+            stream.close();
+        }
+        "multi_stream" => {
+            let num = if cfg.num_streams > 0 { cfg.num_streams } else { 10 };
+            let mut handles = Vec::new();
+            for i in 0..num {
+                let (mut stream, _svc) = udp.accept_stream(peer_pk)
+                    .unwrap_or_else(|e| panic!("accept {}: {}", i, e));
+                handles.push(thread::spawn(move || {
+                    let mut buf = vec![0u8; 65536];
+                    let mut total = 0;
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => total += n,
+                            Err(_) => break,
+                        }
+                    }
+                    eprintln!("[accepter] stream {}: received {} bytes", i, total);
+                    stream.close();
+                }));
+            }
+            for h in handles { h.join().unwrap(); }
+            eprintln!("[accepter] all {} streams done", num);
+        }
+        _ => panic!("unknown mode: {}", mode),
+    }
 
     thread::sleep(Duration::from_secs(1));
-    stream.close();
-}
-
-fn run_bidirectional(stream: &mut SyncStream, role: &str, cfg: &TestConfig) {
-    let total_bytes = (cfg.throughput_mb * 1024 * 1024) as u64;
-    let chunk_size = cfg.chunk_kb * 1024;
-
-    eprintln!("[{}] Bidirectional test: {} MB × 2, {} KB chunks", role, cfg.throughput_mb, cfg.chunk_kb);
-
-    let sent_bytes = Arc::new(AtomicU64::new(0));
-    let recv_bytes = Arc::new(AtomicU64::new(0));
-    let start = Instant::now();
-
-    let mut tx_stream = stream.clone();
-    let sent = sent_bytes.clone();
-    let r = role.to_string();
-    let tx = thread::spawn(move || {
-        let chunk: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
-        let mut s: u64 = 0;
-        while s < total_bytes {
-            match tx_stream.write(&chunk) {
-                Ok(n) => { s += n as u64; sent.store(s, Ordering::Relaxed); }
-                Err(e) => { eprintln!("[{}] write error: {}", r, e); return; }
-            }
-        }
-        eprintln!("[{}] TX done: {} bytes", r, s);
-    });
-
-    let mut rx_stream = stream.clone();
-    let recvd = recv_bytes.clone();
-    let r = role.to_string();
-    let rx = thread::spawn(move || {
-        let mut buf = vec![0u8; chunk_size * 2];
-        let mut recv: u64 = 0;
-        while recv < total_bytes {
-            match rx_stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => { recv += n as u64; recvd.store(recv, Ordering::Relaxed); }
-                Err(e) => { eprintln!("[{}] read error: {}", r, e); return; }
-            }
-        }
-        eprintln!("[{}] RX done: {} bytes", r, recv);
-    });
-
-    tx.join().unwrap();
-    rx.join().unwrap();
-
-    let elapsed = start.elapsed();
-    let s = sent_bytes.load(Ordering::Relaxed);
-    let r = recv_bytes.load(Ordering::Relaxed);
-    let mbps = (s + r) as f64 / elapsed.as_secs_f64() / 1024.0 / 1024.0;
-    eprintln!("[{}] Sent={} Recv={} Time={:?} Throughput={:.1} MB/s", role, s, r, elapsed, mbps);
 }
 
 fn read_with_timeout(stream: &mut SyncStream, buf: &mut [u8], timeout: Duration) -> Result<usize, String> {
