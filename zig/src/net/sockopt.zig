@@ -17,10 +17,8 @@ pub const default_batch_size: u32 = 64;
 pub const SocketConfig = struct {
     recv_buf_size: u32 = default_recv_buf_size,
     send_buf_size: u32 = default_send_buf_size,
-    reuse_port: bool = false,
     busy_poll_us: u32 = 0,
     gro: bool = false,
-    gso_segment: u32 = 0,
 
     /// Returns a config with all optimizations enabled.
     pub fn full() SocketConfig {
@@ -29,7 +27,6 @@ pub const SocketConfig = struct {
             .send_buf_size = default_send_buf_size,
             .busy_poll_us = default_busy_poll_us,
             .gro = true,
-            .gso_segment = default_gso_segment,
         };
     }
 };
