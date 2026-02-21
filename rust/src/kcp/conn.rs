@@ -1340,4 +1340,165 @@ mod tests {
         assert!(got_error, "write should fail after close");
         assert!(elapsed < Duration::from_secs(3), "write took {:?} after close", elapsed);
     }
+
+    /// yamux keepalive timeout: freeze peer's KcpConn, yamux should detect and close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_yamux_keepalive_timeout() {
+        use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use futures::TryStreamExt;
+
+        let (a, b) = conn_pair();
+        let b_close = b.close_handle();
+
+        let mut server_conn = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
+        let mut client_conn = yamux::Connection::new(a, yamux::Config::default(), yamux::Mode::Client);
+
+        let server = tokio::spawn(async move {
+            futures::stream::poll_fn(|cx| server_conn.poll_next_inbound(cx))
+                .try_for_each_concurrent(None, |mut stream| async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).await?;
+                        if n == 0 { break; }
+                        stream.write_all(&buf[..n]).await?;
+                    }
+                    stream.close().await?;
+                    Ok(())
+                }).await.ok();
+        });
+
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<yamux::Stream>>(8);
+        let driver = tokio::spawn(async move {
+            let mut pending: Vec<tokio::sync::oneshot::Sender<yamux::Stream>> = Vec::new();
+            futures::future::poll_fn(|cx| {
+                loop {
+                    let mut progress = false;
+                    while let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
+                        pending.push(tx); progress = true;
+                    }
+                    while !pending.is_empty() {
+                        match client_conn.poll_new_outbound(cx) {
+                            std::task::Poll::Ready(Ok(s)) => { let _ = pending.remove(0).send(s); progress = true; }
+                            std::task::Poll::Ready(Err(_)) => { pending.remove(0); progress = true; }
+                            std::task::Poll::Pending => break,
+                        }
+                    }
+                    match client_conn.poll_next_inbound(cx) {
+                        std::task::Poll::Ready(Some(Ok(_))) => { progress = true; continue; }
+                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
+                        std::task::Poll::Pending => {}
+                    }
+                    if !progress { return std::task::Poll::Pending; }
+                }
+            }).await;
+        });
+
+        // Open a stream and exchange data normally.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        open_tx.send(tx).await.unwrap();
+        let mut s = rx.await.unwrap();
+        s.write_all(b"hello yamux").await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = s.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello yamux");
+
+        // Freeze peer's KcpConn (simulates network interruption).
+        b_close.store(true, Ordering::Relaxed);
+
+        // Read should eventually fail (peer's KcpConn dead → idle timeout → connection dies).
+        let safety = tokio::time::timeout(Duration::from_secs(60), async {
+            let start = std::time::Instant::now();
+            let result = s.read(&mut buf).await;
+            let elapsed = start.elapsed();
+            assert!(elapsed < Duration::from_secs(35),
+                "yamux read took {:?} after peer freeze — no keepalive/timeout", elapsed);
+            match result {
+                Ok(0) | Err(_) => {} // EOF or error — both expected
+                Ok(n) => panic!("unexpected {} bytes after peer freeze", n),
+            }
+        }).await;
+        assert!(safety.is_ok(), "SAFETY: yamux read hung forever after peer freeze");
+
+        driver.abort();
+        server.abort();
+    }
+
+    /// yamux stream read with no data: should eventually return when connection dies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_yamux_stream_read_no_data() {
+        use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use futures::TryStreamExt;
+
+        let (a, b) = conn_pair();
+        let b_close = b.close_handle();
+
+        let mut server_conn = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
+        let mut client_conn = yamux::Connection::new(a, yamux::Config::default(), yamux::Mode::Client);
+
+        // Server accepts but never writes anything.
+        let server = tokio::spawn(async move {
+            futures::stream::poll_fn(|cx| server_conn.poll_next_inbound(cx))
+                .try_for_each_concurrent(None, |mut stream| async move {
+                    // Read the trigger message but don't write back.
+                    let mut buf = vec![0u8; 256];
+                    let _ = stream.read(&mut buf).await;
+                    // Hold stream open, don't write, don't close.
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    Ok(())
+                }).await.ok();
+        });
+
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<yamux::Stream>>(8);
+        let driver = tokio::spawn(async move {
+            let mut pending: Vec<tokio::sync::oneshot::Sender<yamux::Stream>> = Vec::new();
+            futures::future::poll_fn(|cx| {
+                loop {
+                    let mut progress = false;
+                    while let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
+                        pending.push(tx); progress = true;
+                    }
+                    while !pending.is_empty() {
+                        match client_conn.poll_new_outbound(cx) {
+                            std::task::Poll::Ready(Ok(s)) => { let _ = pending.remove(0).send(s); progress = true; }
+                            std::task::Poll::Ready(Err(_)) => { pending.remove(0); progress = true; }
+                            std::task::Poll::Pending => break,
+                        }
+                    }
+                    match client_conn.poll_next_inbound(cx) {
+                        std::task::Poll::Ready(Some(Ok(_))) => { progress = true; continue; }
+                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
+                        std::task::Poll::Pending => {}
+                    }
+                    if !progress { return std::task::Poll::Pending; }
+                }
+            }).await;
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        open_tx.send(tx).await.unwrap();
+        let mut s = rx.await.unwrap();
+        // Trigger SYN by writing, then try to read (server won't respond).
+        s.write_all(b"trigger").await.unwrap();
+
+        // Freeze peer after a moment so idle timeout kicks in.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        b_close.store(true, Ordering::Relaxed);
+
+        let safety = tokio::time::timeout(Duration::from_secs(60), async {
+            let start = std::time::Instant::now();
+            let mut buf = vec![0u8; 256];
+            let result = s.read(&mut buf).await;
+            let elapsed = start.elapsed();
+            assert!(elapsed < Duration::from_secs(35),
+                "yamux read took {:?} with no data — no timeout", elapsed);
+            match result {
+                Ok(0) | Err(_) => {}
+                Ok(n) => panic!("unexpected {} bytes", n),
+            }
+        }).await;
+        assert!(safety.is_ok(), "SAFETY: yamux stream read hung forever with no data");
+
+        driver.abort();
+        server.abort();
+    }
 }
