@@ -1069,6 +1069,216 @@ mod tests {
         server.abort();
     }
 
+    /// Throughput benchmark: single direction, varying chunk sizes.
+    #[tokio::test]
+    async fn test_bench_throughput_sizes() {
+        for &chunk_size in &[64usize, 512, 1024, 4096, 8192, 32768] {
+            let (mut a, mut b) = conn_pair();
+            let total = std::cmp::max(chunk_size * 500, 256 * 1024);
+            let data = vec![0x58u8; chunk_size];
+
+            let writer = tokio::spawn(async move {
+                let mut written = 0;
+                while written < total {
+                    a.write_all(&data).await.unwrap();
+                    written += data.len();
+                }
+            });
+
+            let start = std::time::Instant::now();
+            let mut received = 0usize;
+            let mut buf = vec![0u8; 65536];
+            while received < total {
+                let n = b.read(&mut buf).await.unwrap();
+                if n == 0 { break; }
+                received += n;
+            }
+            let elapsed = start.elapsed();
+            writer.await.unwrap();
+
+            let mbps = received as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+            eprintln!("[throughput] chunk={:>5}B  total={:>7}B  elapsed={:>8.2?}  {:.1} MB/s",
+                chunk_size, received, elapsed, mbps);
+        }
+    }
+
+    /// Yamux throughput: 1 stream, single direction echo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_bench_yamux_throughput_1() {
+        use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use futures::TryStreamExt;
+
+        let (a, b) = conn_pair();
+        let mut server_conn = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
+        let mut client_conn = yamux::Connection::new(a, yamux::Config::default(), yamux::Mode::Client);
+
+        let server = tokio::spawn(async move {
+            futures::stream::poll_fn(|cx| server_conn.poll_next_inbound(cx))
+                .try_for_each_concurrent(None, |mut stream| async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        let n = stream.read(&mut buf).await?;
+                        if n == 0 { break; }
+                        stream.write_all(&buf[..n]).await?;
+                    }
+                    stream.close().await?;
+                    Ok(())
+                }).await.ok();
+        });
+
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<yamux::Stream>>(8);
+        let driver = tokio::spawn(async move {
+            let mut pending: Vec<tokio::sync::oneshot::Sender<yamux::Stream>> = Vec::new();
+            futures::future::poll_fn(|cx| {
+                loop {
+                    let mut progress = false;
+                    while let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
+                        pending.push(tx); progress = true;
+                    }
+                    while !pending.is_empty() {
+                        match client_conn.poll_new_outbound(cx) {
+                            std::task::Poll::Ready(Ok(s)) => { let _ = pending.remove(0).send(s); progress = true; }
+                            std::task::Poll::Ready(Err(_)) => { pending.remove(0); progress = true; }
+                            std::task::Poll::Pending => break,
+                        }
+                    }
+                    match client_conn.poll_next_inbound(cx) {
+                        std::task::Poll::Ready(Some(Ok(_))) => { progress = true; continue; }
+                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
+                        std::task::Poll::Pending => {}
+                    }
+                    if !progress { return std::task::Poll::Pending; }
+                }
+            }).await;
+        });
+
+        let iterations = 500;
+        let chunk_size = 8192;
+        let chunk = vec![0x58u8; chunk_size];
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        open_tx.send(tx).await.unwrap();
+        let mut s = rx.await.unwrap();
+
+        let start = std::time::Instant::now();
+        let mut total_bytes = 0usize;
+        let mut buf = vec![0u8; 65536];
+        for _ in 0..iterations {
+            s.write_all(&chunk).await.unwrap();
+            let mut got = 0;
+            while got < chunk_size {
+                let n = s.read(&mut buf).await.unwrap();
+                if n == 0 { break; }
+                got += n;
+            }
+            total_bytes += got;
+        }
+        let elapsed = start.elapsed();
+
+        let mbps = total_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+        eprintln!("[yamux throughput 1-stream] {} iters, {} bytes in {:?} = {:.1} MB/s",
+            iterations, total_bytes, elapsed, mbps);
+        s.close().await.ok();
+
+        driver.abort();
+        server.abort();
+    }
+
+    /// Yamux throughput: 10 concurrent streams, single direction echo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_bench_yamux_throughput_10() {
+        use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use futures::TryStreamExt;
+
+        let (a, b) = conn_pair();
+        let mut server_conn = yamux::Connection::new(b, yamux::Config::default(), yamux::Mode::Server);
+        let mut client_conn = yamux::Connection::new(a, yamux::Config::default(), yamux::Mode::Client);
+
+        let server = tokio::spawn(async move {
+            futures::stream::poll_fn(|cx| server_conn.poll_next_inbound(cx))
+                .try_for_each_concurrent(None, |mut stream| async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        let n = stream.read(&mut buf).await?;
+                        if n == 0 { break; }
+                        stream.write_all(&buf[..n]).await?;
+                    }
+                    stream.close().await?;
+                    Ok(())
+                }).await.ok();
+        });
+
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<yamux::Stream>>(16);
+        let driver = tokio::spawn(async move {
+            let mut pending: Vec<tokio::sync::oneshot::Sender<yamux::Stream>> = Vec::new();
+            futures::future::poll_fn(|cx| {
+                loop {
+                    let mut progress = false;
+                    while let std::task::Poll::Ready(Some(tx)) = open_rx.poll_recv(cx) {
+                        pending.push(tx); progress = true;
+                    }
+                    while !pending.is_empty() {
+                        match client_conn.poll_new_outbound(cx) {
+                            std::task::Poll::Ready(Ok(s)) => { let _ = pending.remove(0).send(s); progress = true; }
+                            std::task::Poll::Ready(Err(_)) => { pending.remove(0); progress = true; }
+                            std::task::Poll::Pending => break,
+                        }
+                    }
+                    match client_conn.poll_next_inbound(cx) {
+                        std::task::Poll::Ready(Some(Ok(_))) => { progress = true; continue; }
+                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
+                        std::task::Poll::Pending => {}
+                    }
+                    if !progress { return std::task::Poll::Pending; }
+                }
+            }).await;
+        });
+
+        let iterations = 100;
+        let chunk_size = 8192;
+        let chunk = vec![0x58u8; chunk_size];
+        let start = std::time::Instant::now();
+
+        // Open all 10 streams first.
+        let mut streams = Vec::new();
+        for _ in 0..10 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            open_tx.send(tx).await.unwrap();
+            let s = rx.await.unwrap();
+            streams.push(s);
+        }
+
+        // Run all 10 in parallel: write chunk → read echo → repeat.
+        let mut handles = Vec::new();
+        for mut s in streams {
+            let chunk = chunk.clone();
+            handles.push(tokio::spawn(async move {
+                let mut total_bytes = 0usize;
+                let mut buf = vec![0u8; 65536];
+                for _ in 0..iterations {
+                    s.write_all(&chunk).await.unwrap();
+                    let mut got = 0;
+                    while got < chunk_size {
+                        let n = s.read(&mut buf).await.unwrap();
+                        if n == 0 { break; }
+                        got += n;
+                    }
+                    total_bytes += got;
+                }
+                s.close().await.ok();
+                total_bytes
+            }));
+        }
+
+        let mut total = 0usize;
+        for h in handles { total += h.await.unwrap(); }
+        let elapsed = start.elapsed();
+        let mbps = total as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+        eprintln!("[yamux throughput 10-stream] {} bytes in {:?} = {:.1} MB/s", total, elapsed, mbps);
+
+        driver.abort();
+        server.abort();
+    }
+
     /// Verify shutdown + drop completes within bounded time (no hangs).
     #[tokio::test]
     async fn test_kcpconn_shutdown_and_drop() {
