@@ -397,145 +397,131 @@ fn extract_error(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zgrnet_cli_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        let _ = fs::create_dir_all(&dir);
-        dir
-    }
-
-    fn cleanup(dir: &Path) {
-        let _ = fs::remove_dir_all(dir);
+    fn test_dir() -> TempDir {
+        TempDir::new().expect("failed to create temp dir")
     }
 
     #[test]
     fn test_create_and_list() {
-        let dir = temp_dir();
-        assert!(list_contexts(&dir).unwrap().is_empty());
+        let td = test_dir();
+        let dir = td.path();
+        assert!(list_contexts(dir).unwrap().is_empty());
 
-        create_context(&dir, "work").unwrap();
+        create_context(dir, "work").unwrap();
 
-        let names = list_contexts(&dir).unwrap();
+        let names = list_contexts(dir).unwrap();
         assert_eq!(names, vec!["work"]);
 
         assert!(dir.join("work/config.yaml").exists());
         assert!(dir.join("work/private.key").exists());
         assert!(dir.join("work/data").exists());
-
-        cleanup(&dir);
     }
 
     #[test]
     fn test_create_duplicate() {
-        let dir = temp_dir();
-        create_context(&dir, "dup").unwrap();
-        assert!(create_context(&dir, "dup").is_err());
-        cleanup(&dir);
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "dup").unwrap();
+        assert!(create_context(dir, "dup").is_err());
     }
 
     #[test]
     fn test_current_context() {
-        let dir = temp_dir();
-        assert!(current_context_name(&dir).is_err());
+        let td = test_dir();
+        let dir = td.path();
+        assert!(current_context_name(dir).is_err());
 
-        create_context(&dir, "default").unwrap();
-        set_current_context(&dir, "default").unwrap();
+        create_context(dir, "default").unwrap();
+        set_current_context(dir, "default").unwrap();
 
-        assert_eq!(current_context_name(&dir).unwrap(), "default");
-        cleanup(&dir);
+        assert_eq!(current_context_name(dir).unwrap(), "default");
     }
 
     #[test]
     fn test_set_current_nonexistent() {
-        let dir = temp_dir();
-        assert!(set_current_context(&dir, "nope").is_err());
-        cleanup(&dir);
+        let td = test_dir();
+        assert!(set_current_context(td.path(), "nope").is_err());
     }
 
     #[test]
     fn test_delete_context() {
-        let dir = temp_dir();
-        create_context(&dir, "temp").unwrap();
-        delete_context(&dir, "temp").unwrap();
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "temp").unwrap();
+        delete_context(dir, "temp").unwrap();
         assert!(!dir.join("temp").exists());
-        cleanup(&dir);
     }
 
     #[test]
     fn test_delete_current_blocked() {
-        let dir = temp_dir();
-        create_context(&dir, "active").unwrap();
-        set_current_context(&dir, "active").unwrap();
-        assert!(delete_context(&dir, "active").is_err());
-        cleanup(&dir);
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "active").unwrap();
+        set_current_context(dir, "active").unwrap();
+        assert!(delete_context(dir, "active").is_err());
     }
 
     #[test]
     fn test_show_public_key() {
-        let dir = temp_dir();
-        create_context(&dir, "keytest").unwrap();
-        let pk = show_public_key(&dir, "keytest").unwrap();
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "keytest").unwrap();
+        let pk = show_public_key(dir, "keytest").unwrap();
         assert_eq!(pk.len(), 64);
-        cleanup(&dir);
     }
 
     #[test]
     fn test_generate_key() {
-        let dir = temp_dir();
-        create_context(&dir, "regen").unwrap();
-        let pk1 = show_public_key(&dir, "regen").unwrap();
-        let pk2 = generate_key(&dir, "regen").unwrap();
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "regen").unwrap();
+        let pk1 = show_public_key(dir, "regen").unwrap();
+        let pk2 = generate_key(dir, "regen").unwrap();
         assert_ne!(pk1, pk2);
         assert_eq!(pk2.len(), 64);
-        cleanup(&dir);
     }
 
     #[test]
     fn test_resolve_api_addr() {
-        let dir = temp_dir();
-        assert_eq!(resolve_api_addr(&dir, "", "10.0.0.1:8080"), "10.0.0.1:8080");
-        assert_eq!(resolve_api_addr(&dir, "", ""), "100.64.0.1:80");
-        create_context(&dir, "apitest").unwrap();
-        set_current_context(&dir, "apitest").unwrap();
-        assert_eq!(resolve_api_addr(&dir, "", ""), "100.64.0.1:80");
-        cleanup(&dir);
+        let td = test_dir();
+        let dir = td.path();
+        assert_eq!(resolve_api_addr(dir, "", "10.0.0.1:8080"), "10.0.0.1:8080");
+        assert_eq!(resolve_api_addr(dir, "", ""), "100.64.0.1:80");
+        create_context(dir, "apitest").unwrap();
+        set_current_context(dir, "apitest").unwrap();
+        assert_eq!(resolve_api_addr(dir, "", ""), "100.64.0.1:80");
     }
 
     #[test]
     fn test_multiple_contexts_sorted() {
-        let dir = temp_dir();
+        let td = test_dir();
+        let dir = td.path();
         for name in &["charlie", "alpha", "bravo"] {
-            create_context(&dir, name).unwrap();
+            create_context(dir, name).unwrap();
         }
-        let names = list_contexts(&dir).unwrap();
+        let names = list_contexts(dir).unwrap();
         assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
-        cleanup(&dir);
     }
 
     #[test]
     fn test_show_config() {
-        let dir = temp_dir();
-        create_context(&dir, "show").unwrap();
-        let content = show_config(&dir, "show").unwrap();
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "show").unwrap();
+        let content = show_config(dir, "show").unwrap();
         assert!(content.contains("tun_ipv4"));
-        cleanup(&dir);
     }
 
     #[test]
     fn test_config_path() {
-        let dir = temp_dir();
-        create_context(&dir, "pathtest").unwrap();
-        set_current_context(&dir, "pathtest").unwrap();
-        let path = context_config_path(&dir, "").unwrap();
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "pathtest").unwrap();
+        set_current_context(dir, "pathtest").unwrap();
+        let path = context_config_path(dir, "").unwrap();
         assert!(path.ends_with("pathtest/config.yaml"));
-        cleanup(&dir);
     }
 
     #[test]
