@@ -1,3 +1,5 @@
+//go:build linux
+
 // Standalone socket option verification for Linux VMs.
 // Tests SO_RCVBUF, SO_SNDBUF, SO_REUSEPORT, SO_BUSY_POLL, UDP_GRO, recvmmsg.
 // Run: go run ./cmd/sockopt_test/
