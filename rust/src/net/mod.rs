@@ -37,8 +37,8 @@ pub use transport_udp::UdpTransport;
 // High-level UDP API exports
 pub use udp::{HostInfo, Peer, PeerInfo, PeerState, UdpError, UdpOptions, UDP};
 
-// Re-export KCP Stream for convenience
-pub use crate::kcp::Stream;
+// Re-export KCP types for convenience
+pub use crate::kcp::SyncStream;
 
 // Async UDP exports
 pub use async_udp::{AsyncUDP, AsyncUdpConfig, DecryptedPacket, RawPacket};

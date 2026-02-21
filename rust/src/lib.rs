@@ -82,5 +82,5 @@ pub use net::{
 // KCP and stream multiplexing
 pub use kcp::{
     Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE,
-    Stream, StreamState, StreamError, Mux, MuxConfig, MuxError,
+    KcpConn, KcpInput, ServiceMux, ServiceMuxConfig, SyncStream,
 };
