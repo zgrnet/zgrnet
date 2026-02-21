@@ -717,3 +717,115 @@ func TestKCPConn_BUG2_WriteDeadline(t *testing.T) {
 		t.Errorf("Write with expired deadline: got %v, want ErrConnTimeout", err)
 	}
 }
+
+// ==================== Timeout / Dead Peer Tests ====================
+// These test KCPConn's own timeout behavior, not external wrappers.
+
+func TestKCPConn_ReadPeerDead(t *testing.T) {
+	a, b := connPair(0)
+
+	// Exchange data to establish KCP state.
+	a.Write([]byte("setup"))
+	buf := make([]byte, 256)
+	n, err := b.Read(buf)
+	if err != nil || string(buf[:n]) != "setup" {
+		t.Fatal("setup failed")
+	}
+
+	// Simulate peer crash: close A without graceful shutdown.
+	a.Close()
+
+	// B's Read should detect dead peer and return.
+	// With KCP deadlink (20 retransmits) or read deadline, this should finish.
+	b.SetReadDeadline(time.Now().Add(10 * time.Second))
+	start := time.Now()
+	_, err = b.Read(buf)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error after peer death, got nil")
+	}
+	if elapsed > 15*time.Second {
+		t.Fatalf("Read took %v after peer death — too slow", elapsed)
+	}
+	t.Logf("Read returned after %v: %v", elapsed, err)
+}
+
+func TestKCPConn_WritePeerDead(t *testing.T) {
+	a, b := connPair(0)
+
+	a.Write([]byte("setup"))
+	buf := make([]byte, 256)
+	b.Read(buf)
+
+	// Close B (peer dies). A's writes should eventually fail.
+	b.Close()
+
+	a.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	start := time.Now()
+	chunk := make([]byte, 8192)
+	var writeErr error
+	for {
+		_, writeErr = a.Write(chunk)
+		if writeErr != nil {
+			break
+		}
+		if time.Since(start) > 15*time.Second {
+			t.Fatal("Write didn't fail after 15s — no dead peer detection")
+		}
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 15*time.Second {
+		t.Fatalf("Write took %v to fail", elapsed)
+	}
+	t.Logf("Write failed after %v: %v", elapsed, writeErr)
+	a.Close()
+}
+
+func TestKCPConn_CloseUnblocksRead(t *testing.T) {
+	a, b := connPair(0)
+	defer a.Close()
+
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 256)
+		b.Read(buf) // blocks — no data
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	b.Close()
+
+	select {
+	case <-done:
+		// good — Read unblocked
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read didn't unblock after Close()")
+	}
+}
+
+func TestKCPConn_CloseUnblocksWrite(t *testing.T) {
+	a, _ := connPair(0)
+
+	done := make(chan struct{})
+	go func() {
+		chunk := make([]byte, 8192)
+		for {
+			if _, err := a.Write(chunk); err != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	a.Close()
+
+	select {
+	case <-done:
+		// good — Write unblocked
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write didn't unblock after Close()")
+	}
+}
