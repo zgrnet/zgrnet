@@ -294,10 +294,10 @@ pub mod batch {
         pub fn read_batch(&mut self, buffers: &mut [&mut [u8]]) -> io::Result<Vec<RecvResult>> {
             let count = buffers.len().min(self.batch_size);
 
-            for i in 0..count {
+            for (i, buf) in buffers[..count].iter_mut().enumerate() {
                 self.iovecs[i] = libc::iovec {
-                    iov_base: buffers[i].as_mut_ptr() as *mut libc::c_void,
-                    iov_len: buffers[i].len(),
+                    iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
                 };
                 self.addrs[i] = unsafe { mem::zeroed() };
                 self.msgs[i].msg_hdr = libc::msghdr {
@@ -366,12 +366,12 @@ pub mod batch {
         ) -> io::Result<usize> {
             let count = buffers.len().min(self.batch_size).min(targets.len());
 
-            for i in 0..count {
+            for (i, (buf, target)) in buffers[..count].iter().zip(targets[..count].iter()).enumerate() {
                 self.iovecs[i] = libc::iovec {
-                    iov_base: buffers[i].as_ptr() as *mut libc::c_void,
-                    iov_len: buffers[i].len(),
+                    iov_base: buf.as_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
                 };
-                match targets[i] {
+                match *target {
                     SocketAddr::V4(v4) => {
                         self.addrs[i].sin_family = libc::AF_INET as libc::sa_family_t;
                         self.addrs[i].sin_port = v4.port().to_be();
@@ -477,10 +477,10 @@ pub fn bind_reuseport(addr: &str) -> io::Result<UdpSocket> {
         return Err(io::Error::last_os_error());
     }
 
-    setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1).map_err(|e| {
+    if let Err(e) = setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1) {
         unsafe { libc::close(fd) };
-        e
-    })?;
+        return Err(e);
+    }
 
     let mut sa_storage: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let sa_len: libc::socklen_t;
