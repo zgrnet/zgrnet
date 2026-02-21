@@ -420,3 +420,87 @@ test "kcpconn close eof" {
 
     pair.a.deinit();
 }
+
+test "kcpconn close unblocks read" {
+    if (@import("builtin").os.tag == .freestanding) return;
+    const pair = try connPair();
+    defer pair.b.deinit();
+
+    // Reader in background — will block because no data.
+    const ReaderThread = struct {
+        fn run(b: *KcpConn(TestRuntime)) void {
+            var buf: [256]u8 = undefined;
+            _ = b.read(&buf) catch {};
+        }
+    };
+    const t = std.Thread.spawn(.{}, ReaderThread.run, .{pair.a}) catch return;
+
+    TestRuntime.sleepMs(200);
+    pair.a.close();
+
+    t.join();
+    pair.a.deinit();
+    // If we reach here, close unblocked the read. Test passes.
+}
+
+test "kcpconn loss 5pct" {
+    if (@import("builtin").os.tag == .freestanding) return;
+    const allocator = std.testing.allocator;
+    const Conn = KcpConn(TestRuntime);
+
+    // Build lossy conn pair: 5% packet drop.
+    const LossCtx = struct {
+        var a_ptr: ?*Conn = null;
+        var b_ptr: ?*Conn = null;
+        var rng: u64 = 42;
+
+        fn shouldDrop() bool {
+            rng = rng *% 6364136223846793005 +% 1;
+            return ((rng >> 33) % 100) < 5;
+        }
+        fn outputA(data: []const u8, _: ?*anyopaque) void {
+            if (shouldDrop()) return;
+            if (b_ptr) |b| b.input(data) catch {};
+        }
+        fn outputB(data: []const u8, _: ?*anyopaque) void {
+            if (shouldDrop()) return;
+            if (a_ptr) |a| a.input(data) catch {};
+        }
+    };
+    LossCtx.a_ptr = null;
+    LossCtx.b_ptr = null;
+    LossCtx.rng = 42;
+
+    const a = try Conn.init(allocator, 1, LossCtx.outputA, null);
+    defer a.deinit();
+    const b = try Conn.init(allocator, 1, LossCtx.outputB, null);
+    defer b.deinit();
+    LossCtx.a_ptr = a;
+    LossCtx.b_ptr = b;
+
+    const size: usize = 32 * 1024;
+    const data = try allocator.alloc(u8, size);
+    defer allocator.free(data);
+    for (data, 0..) |*byte, i| byte.* = @intCast(i % 251);
+
+    // Write in chunks.
+    var written: usize = 0;
+    while (written < size) {
+        const end = @min(written + 1024, size);
+        _ = try a.write(data[written..end]);
+        written = end;
+    }
+
+    // Read all.
+    const received = try allocator.alloc(u8, size);
+    defer allocator.free(received);
+    var total: usize = 0;
+    while (total < size) {
+        const n = try b.read(received[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+
+    try std.testing.expectEqual(size, total);
+    try std.testing.expectEqualSlices(u8, data, received);
+}

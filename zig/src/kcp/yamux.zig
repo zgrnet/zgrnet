@@ -559,3 +559,159 @@ test "yamux frame flags" {
     try std.testing.expect(!f.hasFin());
     try std.testing.expect(!f.hasRst());
 }
+
+// ============================================================================
+// Integration tests: yamux over KcpConn
+// ============================================================================
+
+const conn_mod = @import("conn.zig");
+
+const TestRt = if (@import("builtin").os.tag != .freestanding) struct {
+    pub const Mutex = struct {
+        inner: std.Thread.Mutex = .{},
+        pub fn init() Mutex { return .{}; }
+        pub fn deinit(_: *Mutex) void {}
+        pub fn lock(self: *Mutex) void { self.inner.lock(); }
+        pub fn unlock(self: *Mutex) void { self.inner.unlock(); }
+    };
+    pub const Condition = struct {
+        inner: std.Thread.Condition = .{},
+        pub fn init() Condition { return .{}; }
+        pub fn deinit(_: *Condition) void {}
+        pub fn wait(self: *Condition, mutex: *Mutex) void { self.inner.wait(&mutex.inner); }
+        pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) bool {
+            self.inner.timedWait(&mutex.inner, timeout_ns) catch return true;
+            return false;
+        }
+        pub fn signal(self: *Condition) void { self.inner.signal(); }
+        pub fn broadcast(self: *Condition) void { self.inner.broadcast(); }
+    };
+    pub const Thread = std.Thread;
+    pub fn nowMs() u64 { return @intCast(std.time.milliTimestamp()); }
+    pub fn sleepMs(ms: u32) void { std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms); }
+} else struct {};
+
+fn yamuxPair() !struct {
+    client: *Yamux(TestRt),
+    server: *Yamux(TestRt),
+    a: *conn_mod.KcpConn(TestRt),
+    b: *conn_mod.KcpConn(TestRt),
+} {
+    if (@import("builtin").os.tag == .freestanding) return error.Unsupported;
+    const KConn = conn_mod.KcpConn(TestRt);
+    const YMux = Yamux(TestRt);
+    const allocator = std.testing.allocator;
+
+    const Ctx = struct {
+        var a_ptr: ?*KConn = null;
+        var b_ptr: ?*KConn = null;
+        fn outputA(data: []const u8, _: ?*anyopaque) void {
+            if (b_ptr) |b| b.input(data) catch {};
+        }
+        fn outputB(data: []const u8, _: ?*anyopaque) void {
+            if (a_ptr) |a| a.input(data) catch {};
+        }
+    };
+    Ctx.a_ptr = null;
+    Ctx.b_ptr = null;
+
+    const a = try KConn.init(allocator, 1, Ctx.outputA, null);
+    const b = try KConn.init(allocator, 1, Ctx.outputB, null);
+    Ctx.a_ptr = a;
+    Ctx.b_ptr = b;
+
+    const TransportAdapter = struct {
+        fn readFn(ctx: *anyopaque, buf: []u8) anyerror!usize {
+            const kc: *KConn = @ptrCast(@alignCast(ctx));
+            return kc.read(buf);
+        }
+        fn writeFn(ctx: *anyopaque, data: []const u8) anyerror!void {
+            const kc: *KConn = @ptrCast(@alignCast(ctx));
+            _ = try kc.write(data);
+        }
+    };
+
+    const client = try YMux.init(allocator, .client, @ptrCast(a), TransportAdapter.readFn, TransportAdapter.writeFn);
+    const server = try YMux.init(allocator, .server, @ptrCast(b), TransportAdapter.readFn, TransportAdapter.writeFn);
+
+    return .{ .client = client, .server = server, .a = a, .b = b };
+}
+
+test "yamux open close" {
+    if (@import("builtin").os.tag == .freestanding) return;
+    const pair = try yamuxPair();
+    defer pair.client.deinit();
+    defer pair.server.deinit();
+    defer pair.a.deinit();
+    defer pair.b.deinit();
+
+    const s = try pair.client.open();
+    const accepted = try pair.server.accept();
+    _ = accepted;
+    s.close();
+}
+
+test "yamux echo" {
+    if (@import("builtin").os.tag == .freestanding) return;
+    const pair = try yamuxPair();
+    defer pair.client.deinit();
+    defer pair.server.deinit();
+    defer pair.a.deinit();
+    defer pair.b.deinit();
+
+    var cs = try pair.client.open();
+
+    // Server accept + echo in thread.
+    const EchoThread = struct {
+        fn run(server: *Yamux(TestRt)) void {
+            var ss = server.accept() catch return;
+            var buf: [4096]u8 = undefined;
+            const n = ss.read(&buf) catch return;
+            _ = ss.write(buf[0..n]) catch return;
+            ss.close();
+        }
+    };
+    const t = std.Thread.spawn(.{}, EchoThread.run, .{pair.server}) catch return;
+
+    _ = try cs.write("hello yamux");
+    var buf: [256]u8 = undefined;
+    const n = try cs.read(&buf);
+    try std.testing.expectEqualStrings("hello yamux", buf[0..n]);
+    cs.close();
+    t.join();
+}
+
+test "yamux multi stream 10" {
+    if (@import("builtin").os.tag == .freestanding) return;
+    const pair = try yamuxPair();
+    defer pair.client.deinit();
+    defer pair.server.deinit();
+    defer pair.a.deinit();
+    defer pair.b.deinit();
+
+    // Server: accept and echo in separate threads.
+    const EchoWorker = struct {
+        fn run(server: *Yamux(TestRt)) void {
+            for (0..10) |_| {
+                var ss = server.accept() catch return;
+                var buf: [4096]u8 = undefined;
+                const n = ss.read(&buf) catch return;
+                _ = ss.write(buf[0..n]) catch return;
+                ss.close();
+            }
+        }
+    };
+    const t = std.Thread.spawn(.{}, EchoWorker.run, .{pair.server}) catch return;
+
+    for (0..10) |i| {
+        var cs = try pair.client.open();
+        var msg_buf: [32]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "stream-{}", .{i}) catch "?";
+        _ = try cs.write(msg);
+        var buf: [256]u8 = undefined;
+        const n = try cs.read(&buf);
+        try std.testing.expectEqualStrings(msg, buf[0..n]);
+        cs.close();
+    }
+    t.join();
+}
