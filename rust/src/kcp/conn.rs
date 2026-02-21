@@ -1,21 +1,23 @@
-//! KcpConn — async KCP connection using tokio task + channel (zero-lock hot path).
+//! KcpConn — async KCP connection with write coalescing.
 //!
-//! Architecture matches Go's KCPConn.runLoop:
-//! - One tokio task exclusively owns the KCP instance
-//! - poll_write sends data via bounded channel → run loop calls kcp.send()
-//! - poll_read receives from unbounded channel ← run loop calls kcp.recv()
+//! Architecture:
+//! - One tokio task exclusively owns the KCP instance (the run loop)
+//! - poll_write appends to a shared BytesMut buffer (Mutex, O(1) memcpy)
+//!   and conditionally notifies the run loop (only when buffer was empty)
+//! - poll_read receives from unbounded channel ← run loop drains kcp.recv()
 //! - input() sends raw packets via unbounded channel → run loop calls kcp.input()
-//! - No locks on the hot path. All synchronization through channels.
+//! - Write coalescing: N small writes become 1 kcp.send() call per update cycle
 
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_util::sync::PollSender;
+use tokio::sync::Notify;
 
 /// Output function: called when KCP wants to send a packet over the wire.
 pub type OutputFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
@@ -33,30 +35,35 @@ impl Write for KcpOutput {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
+const MAX_WRITE_BUF: usize = 256 * 1024; // 256KB backpressure threshold
+
+struct WriteBuffer {
+    data: BytesMut,
+    waker: Option<Waker>,
+}
+
 /// Handle for feeding raw network packets into a KcpConn's run loop.
 #[derive(Clone)]
 pub struct KcpInput {
-    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    input_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 }
 
 impl KcpInput {
     pub fn input(&self, data: &[u8]) {
-        let _ = self.input_tx.send(data.to_vec());
+        let _ = self.input_tx.send(Bytes::copy_from_slice(data));
     }
 }
 
 /// Async KCP connection. Implements futures::io::AsyncRead/AsyncWrite for yamux.
 pub struct KcpConn {
-    write_tx: PollSender<Vec<u8>>,
-    flush_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    read_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    write_buf: Arc<std::sync::Mutex<WriteBuffer>>,
+    write_notify: Arc<Notify>,
+    read_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     closed: Arc<AtomicBool>,
-    recv_buf: Vec<u8>,
+    recv_buf: BytesMut,
 }
 
 impl KcpConn {
-    /// Create a new KcpConn. Returns the connection and an input handle for feeding
-    /// raw network packets (used by ServiceMux bridge tasks).
     pub fn new(conv: u32, output: OutputFn) -> (Self, KcpInput) {
         let kcp_output = KcpOutput { output_fn: output };
         let mut kcp_instance = kcp::Kcp::new(conv, kcp_output);
@@ -64,30 +71,96 @@ impl KcpConn {
         kcp_instance.set_wndsize(4096, 4096);
         let _ = kcp_instance.set_mtu(1400);
 
-        let (write_tx, write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-        let (read_tx, read_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
+        let write_buf = Arc::new(std::sync::Mutex::new(WriteBuffer {
+            data: BytesMut::with_capacity(8192),
+            waker: None,
+        }));
+        let write_notify = Arc::new(Notify::new());
+        let (read_tx, read_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         let closed = Arc::new(AtomicBool::new(false));
 
         {
+            let wb = write_buf.clone();
+            let wn = write_notify.clone();
             let closed = closed.clone();
-            tokio::spawn(run_loop(kcp_instance, write_rx, read_tx, input_rx, flush_rx, closed));
+            tokio::spawn(run_loop(kcp_instance, wb, wn, read_tx, input_rx, closed));
         }
 
         let conn = KcpConn {
-            write_tx: PollSender::new(write_tx),
-            flush_tx,
+            write_buf,
+            write_notify,
             read_rx,
             closed,
-            recv_buf: Vec::new(),
+            recv_buf: BytesMut::new(),
         };
         let input = KcpInput { input_tx };
         (conn, input)
     }
 
     pub fn tag(&self) -> usize { 0 }
+}
+
+// Shared write logic: append to coalescing buffer, conditionally notify run loop.
+fn do_write(
+    write_buf: &std::sync::Mutex<WriteBuffer>,
+    write_notify: &Notify,
+    closed: &AtomicBool,
+    cx: &mut Context<'_>,
+    buf: &[u8],
+) -> Poll<io::Result<usize>> {
+    if closed.load(Ordering::Relaxed) {
+        return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
+    }
+    let mut wb = write_buf.lock().unwrap();
+    if wb.data.len() >= MAX_WRITE_BUF {
+        wb.waker = Some(cx.waker().clone());
+        return Poll::Pending;
+    }
+    let was_empty = wb.data.is_empty();
+    wb.data.extend_from_slice(buf);
+    drop(wb);
+    if was_empty {
+        write_notify.notify_one();
+    }
+    Poll::Ready(Ok(buf.len()))
+}
+
+fn do_flush(write_notify: &Notify) -> Poll<io::Result<()>> {
+    write_notify.notify_one();
+    Poll::Ready(Ok(()))
+}
+
+fn do_close(closed: &AtomicBool) -> Poll<io::Result<()>> {
+    closed.store(true, Ordering::Relaxed);
+    Poll::Ready(Ok(()))
+}
+
+// Shared read logic: drain from recv_buf, then poll read channel.
+fn do_read(
+    recv_buf: &mut BytesMut,
+    read_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+) -> Poll<io::Result<usize>> {
+    if !recv_buf.is_empty() {
+        let n = std::cmp::min(buf.len(), recv_buf.len());
+        buf[..n].copy_from_slice(&recv_buf[..n]);
+        recv_buf.advance(n);
+        return Poll::Ready(Ok(n));
+    }
+    match read_rx.poll_recv(cx) {
+        Poll::Ready(Some(data)) => {
+            let n = std::cmp::min(buf.len(), data.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            if n < data.len() {
+                recv_buf.extend_from_slice(&data[n..]);
+            }
+            Poll::Ready(Ok(n))
+        }
+        Poll::Ready(None) => Poll::Ready(Ok(0)),
+        Poll::Pending => Poll::Pending,
+    }
 }
 
 // tokio::io traits
@@ -97,18 +170,19 @@ impl AsyncRead for KcpConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.recv_buf.is_empty() {
-            let n = std::cmp::min(buf.remaining(), self.recv_buf.len());
-            buf.put_slice(&self.recv_buf[..n]);
-            self.recv_buf.drain(..n);
+        let me = &mut *self;
+        if !me.recv_buf.is_empty() {
+            let n = std::cmp::min(buf.remaining(), me.recv_buf.len());
+            buf.put_slice(&me.recv_buf[..n]);
+            me.recv_buf.advance(n);
             return Poll::Ready(Ok(()));
         }
-        match self.read_rx.poll_recv(cx) {
+        match me.read_rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
                 let n = std::cmp::min(buf.remaining(), data.len());
                 buf.put_slice(&data[..n]);
                 if n < data.len() {
-                    self.recv_buf.extend_from_slice(&data[n..]);
+                    me.recv_buf.extend_from_slice(&data[n..]);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -119,115 +193,51 @@ impl AsyncRead for KcpConn {
 }
 
 impl AsyncWrite for KcpConn {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
-        }
-        match self.write_tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let len = buf.len();
-                self.write_tx.send_item(buf.to_vec())
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "closed"))?;
-                Poll::Ready(Ok(len))
-            }
-            Poll::Ready(Err(_)) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        do_write(&self.write_buf, &self.write_notify, &self.closed, cx, buf)
     }
-
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let _ = self.flush_tx.send(());
-        Poll::Ready(Ok(()))
+        do_flush(&self.write_notify)
     }
-
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.closed.store(true, Ordering::Relaxed);
-        Poll::Ready(Ok(()))
+        do_close(&self.closed)
     }
 }
 
 // futures::io traits for yamux compatibility
 impl futures::io::AsyncRead for KcpConn {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        if !self.recv_buf.is_empty() {
-            let n = std::cmp::min(buf.len(), self.recv_buf.len());
-            buf[..n].copy_from_slice(&self.recv_buf[..n]);
-            self.recv_buf.drain(..n);
-            return Poll::Ready(Ok(n));
-        }
-        match self.read_rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                let n = std::cmp::min(buf.len(), data.len());
-                buf[..n].copy_from_slice(&data[..n]);
-                if n < data.len() {
-                    self.recv_buf.extend_from_slice(&data[n..]);
-                }
-                Poll::Ready(Ok(n))
-            }
-            Poll::Ready(None) => Poll::Ready(Ok(0)),
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        let me = &mut *self;
+        do_read(&mut me.recv_buf, &mut me.read_rx, cx, buf)
     }
 }
 
 impl futures::io::AsyncWrite for KcpConn {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
-        }
-        match self.write_tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let len = buf.len();
-                self.write_tx.send_item(buf.to_vec())
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "closed"))?;
-                Poll::Ready(Ok(len))
-            }
-            Poll::Ready(Err(_)) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        do_write(&self.write_buf, &self.write_notify, &self.closed, cx, buf)
     }
-
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let _ = self.flush_tx.send(());
-        Poll::Ready(Ok(()))
+        do_flush(&self.write_notify)
     }
-
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.closed.store(true, Ordering::Relaxed);
-        Poll::Ready(Ok(()))
+        do_close(&self.closed)
     }
 }
 
 impl Unpin for KcpConn {}
 
-/// Run loop: exclusively owns the KCP instance. All KCP operations happen here.
+/// Run loop: exclusively owns the KCP instance. Drains coalesced write buffer
+/// and input channel, forwards recv data to read channel.
 async fn run_loop(
     mut kcp: kcp::Kcp<KcpOutput>,
-    mut write_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    read_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    mut flush_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    write_buf: Arc<std::sync::Mutex<WriteBuffer>>,
+    write_notify: Arc<Notify>,
+    read_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     closed: Arc<AtomicBool>,
 ) {
     let start = Instant::now();
     let now_ms = || start.elapsed().as_millis() as u32;
-
     let _ = kcp.update(now_ms());
 
     loop {
@@ -240,14 +250,9 @@ async fn run_loop(
         tokio::select! {
             biased;
 
-            Some(data) = write_rx.recv() => {
-                let _ = kcp.send(&data);
-                while let Ok(more) = write_rx.try_recv() {
-                    let _ = kcp.send(&more);
-                }
+            _ = write_notify.notified() => {
+                drain_write_buf(&write_buf, &mut kcp);
                 let _ = kcp.flush();
-                // Also drain recv — update after flush may have ACKs that
-                // complete reassembly of incoming data.
                 drain_recv(&mut kcp, &read_tx);
             }
 
@@ -256,15 +261,13 @@ async fn run_loop(
                 while let Ok(more) = input_rx.try_recv() {
                     let _ = kcp.input(&more);
                 }
-                drain_recv(&mut kcp, &read_tx);
-            }
-
-            Some(()) = flush_rx.recv() => {
+                drain_write_buf(&write_buf, &mut kcp);
                 let _ = kcp.flush();
                 drain_recv(&mut kcp, &read_tx);
             }
 
             _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {
+                drain_write_buf(&write_buf, &mut kcp);
                 let _ = kcp.update(now_ms());
                 drain_recv(&mut kcp, &read_tx);
             }
@@ -272,16 +275,34 @@ async fn run_loop(
     }
 }
 
+/// Drain coalesced write buffer into KCP send queue.
+/// Sends in 8KB chunks so each is an independent KCP message that can be
+/// received incrementally (not one giant message requiring full reassembly).
+fn drain_write_buf(
+    write_buf: &std::sync::Mutex<WriteBuffer>,
+    kcp: &mut kcp::Kcp<KcpOutput>,
+) {
+    let mut wb = write_buf.lock().unwrap();
+    if wb.data.is_empty() { return; }
+    let data = wb.data.split();
+    let waker = wb.waker.take();
+    drop(wb);
+    for chunk in data.chunks(8192) {
+        let _ = kcp.send(chunk);
+    }
+    if let Some(w) = waker { w.wake(); }
+}
+
 /// Drain all available data from KCP recv queue and forward to the read channel.
-fn drain_recv(kcp: &mut kcp::Kcp<KcpOutput>, read_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+fn drain_recv(kcp: &mut kcp::Kcp<KcpOutput>, read_tx: &tokio::sync::mpsc::UnboundedSender<Bytes>) {
     loop {
         match kcp.peeksize() {
             Ok(n) if n > 0 => {
-                let mut buf = vec![0u8; n];
+                let mut buf = BytesMut::zeroed(n);
                 match kcp.recv(&mut buf) {
                     Ok(sz) => {
                         buf.truncate(sz);
-                        if read_tx.send(buf).is_err() { return; }
+                        if read_tx.send(buf.freeze()).is_err() { return; }
                     }
                     Err(_) => return,
                 }
@@ -302,7 +323,7 @@ fn lossy_bridge(
 ) {
     tokio::spawn(async move {
         let mut rng_state: u64 = 12345;
-        let mut delayed: Option<Vec<u8>> = None;
+        let mut delayed: Option<Bytes> = None;
         while let Some(data) = rx.recv().await {
             rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let r = ((rng_state >> 33) % 100) as u8;
@@ -310,7 +331,7 @@ fn lossy_bridge(
             if r < loss_pct { continue; }
 
             if reorder && r % 10 == 0 && delayed.is_none() {
-                delayed = Some(data);
+                delayed = Some(Bytes::from(data));
                 continue;
             }
 
