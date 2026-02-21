@@ -205,7 +205,7 @@ pub const BatchReader = struct {
         }
 
         const max_batch = 64;
-        const count = @min(buffers.len, @min(self.batch_size, max_batch));
+        const count = @min(buffers.len, @min(results.len, @min(self.batch_size, max_batch)));
         if (count == 0) return 0;
 
         var msgs: [max_batch]std.os.linux.mmsghdr_const = undefined;
