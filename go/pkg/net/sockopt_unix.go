@@ -9,7 +9,6 @@ import (
 )
 
 // getSocketBufSize reads the actual socket buffer size via getsockopt.
-// recv=true reads SO_RCVBUF, recv=false reads SO_SNDBUF.
 func getSocketBufSize(conn *net.UDPConn, recv bool) int {
 	raw, err := conn.SyscallConn()
 	if err != nil {
@@ -26,14 +25,7 @@ func getSocketBufSize(conn *net.UDPConn, recv bool) int {
 	return val
 }
 
-// SetReusePort sets SO_REUSEPORT on a raw fd before bind.
-func SetReusePort(fd uintptr) error {
-	return syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
-}
-
 // ListenUDPReusePort creates a UDP socket with SO_REUSEPORT set.
-// Multiple sockets can bind to the same address; the kernel load-balances
-// incoming packets across them.
 func ListenUDPReusePort(addr string) (*net.UDPConn, error) {
 	lc := net.ListenConfig{
 		Control: func(_, _ string, c syscall.RawConn) error {
