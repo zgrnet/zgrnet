@@ -22,7 +22,8 @@ const message = noise.message;
 /// - `SocketImpl`: UDP socket (posix/lwIP)
 pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, comptime SocketImpl: type) type {
     const UDPType = net_mod.udp.UDP(Crypto, Rt, IOBackend, SocketImpl);
-    const KcpStream = kcp_mod.Stream(Rt);
+    const KcpYamuxStream = kcp_mod.YamuxStream(Rt);
+    const noise_message = @import("noise/message.zig");
     const Endpoint = net_mod.endpoint_mod.Endpoint;
     const UdpError = net_mod.UdpError;
     const P = noise.Protocol(Crypto);
@@ -35,7 +36,7 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
     return struct {
         const Self = @This();
 
-        pub const KcpStreamType = KcpStream;
+        pub const KcpStreamType = KcpYamuxStream;
 
         /// Lifecycle state.
         pub const State = enum(u8) {
@@ -58,33 +59,25 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             endpoint: ?Endpoint = null,
         };
 
-        /// A KCP stream with the remote peer's public key.
         pub const NodeStream = struct {
-            stream: *KcpStream,
+            stream: *KcpYamuxStream,
             remote_pk: Key,
+            service: u64 = 0,
 
             pub fn remotePubkey(self: *const NodeStream) Key {
                 return self.remote_pk;
             }
 
-            pub fn proto(self: *const NodeStream) u8 {
-                return self.stream.getProto();
-            }
-
-            pub fn metadata(self: *const NodeStream) []const u8 {
-                return self.stream.getMetadata();
-            }
-
-            pub fn read(self: *const NodeStream, buf: []u8) !usize {
+            pub fn read(self: *NodeStream, buf: []u8) !usize {
                 return self.stream.read(buf);
             }
 
-            pub fn write(self: *const NodeStream, data: []const u8) !usize {
+            pub fn write(self: *NodeStream, data: []const u8) !usize {
                 return self.stream.write(data);
             }
 
-            pub fn close(self: *const NodeStream) void {
-                self.stream.shutdown();
+            pub fn close(self: *NodeStream) void {
+                self.stream.close();
             }
         };
 
@@ -256,27 +249,27 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
             meta_buf[5] = @intCast(port >> 8);
             meta_buf[6] = @intCast(port & 0xff);
 
-            const stream = self.udp.openStream(pk, @intFromEnum(message.Protocol.tcp_proxy), &meta_buf) catch
+            const stream = self.udp.openStream(pk, noise_message.Service.proxy) catch
                 return error.OpenStreamFailed;
 
             return NodeStream{
                 .stream = stream,
                 .remote_pk = pk.*,
+                .service = noise_message.Service.proxy,
             };
         }
 
-        /// Open a raw KCP stream with custom proto and metadata.
-        pub fn openStream(self: *Self, pk: *const Key, proto_byte: u8, meta: []const u8) !NodeStream {
+        pub fn openStreamOnService(self: *Self, pk: *const Key, service: u64) !NodeStream {
             if (self.getState() != .running) return error.NotRunning;
-
             self.udp.connect(pk) catch {};
 
-            const stream = self.udp.openStream(pk, proto_byte, meta) catch
+            const stream = self.udp.openStream(pk, service) catch
                 return error.OpenStreamFailed;
 
             return NodeStream{
                 .stream = stream,
                 .remote_pk = pk.*,
+                .service = service,
             };
         }
 
@@ -355,17 +348,15 @@ pub fn Node(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, 
 
         fn acceptLoopFn(self: *Self, pk: Key, idx: usize) void {
             while (!self.peer_stops[idx].load(.acquire) and self.getState() != .stopped) {
-                // acceptStream blocks until a stream arrives or returns null
-                // if the peer has no mux yet (not established).
-                if (self.udp.acceptStream(&pk)) |stream| {
-                    self.pushAccept(NodeStream{
-                        .stream = stream,
-                        .remote_pk = pk,
-                    });
-                } else {
-                    // Peer not established yet or no stream — poll.
+                const result = self.udp.acceptStream(&pk) catch {
                     Rt.sleepMs(50);
-                }
+                    continue;
+                };
+                self.pushAccept(NodeStream{
+                    .stream = result.stream,
+                    .remote_pk = pk,
+                    .service = result.service,
+                });
             }
         }
 

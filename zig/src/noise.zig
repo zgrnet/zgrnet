@@ -128,15 +128,13 @@ pub fn dial(opts: DialOptions) DialError!*Conn {
 // ============================================================================
 
 pub const kcp = kcp_mod.kcp;
-pub const stream = kcp_mod.stream_mod;
 pub const Kcp = kcp_mod.Kcp;
 pub const Frame = kcp_mod.Frame;
 pub const Cmd = kcp_mod.Cmd;
-pub const Stream = kcp_mod.Stream;
-pub const StreamState = kcp_mod.StreamState;
-pub const StreamError = kcp_mod.StreamError;
-pub const Mux = kcp_mod.Mux;
-pub const MuxConfig = kcp_mod.MuxConfig;
+pub const KcpConn = kcp_mod.KcpConn;
+pub const Yamux = kcp_mod.Yamux;
+pub const YamuxStream = kcp_mod.YamuxStream;
+pub const ServiceMux = kcp_mod.ServiceMux;
 
 // ============================================================================
 // Relay types
@@ -188,6 +186,7 @@ test {
     _ = kcp_mod;
     _ = kcp_mod.conn_mod;
     _ = kcp_mod.yamux_mod;
+    _ = kcp_mod.service_mod;
     _ = relay_mod;
     _ = host;
     _ = node_mod;
