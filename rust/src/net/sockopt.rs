@@ -25,7 +25,6 @@ pub struct SocketConfig {
     pub busy_poll_us: i32,
     pub gro: bool,
     pub gso_segment: i32,
-    pub batch_size: i32,
 }
 
 impl Default for SocketConfig {
@@ -37,7 +36,6 @@ impl Default for SocketConfig {
             busy_poll_us: 0,
             gro: false,
             gso_segment: 0,
-            batch_size: 0,
         }
     }
 }
@@ -52,7 +50,6 @@ impl SocketConfig {
             busy_poll_us: DEFAULT_BUSY_POLL_US,
             gro: true,
             gso_segment: DEFAULT_GSO_SEGMENT,
-            batch_size: DEFAULT_BATCH_SIZE,
         }
     }
 }
@@ -359,44 +356,51 @@ pub mod batch {
         }
 
         /// Write multiple packets using sendmmsg.
+        /// Only IPv4 targets are supported; non-IPv4 entries are skipped.
         pub fn write_batch(
             &mut self,
             buffers: &[&[u8]],
             targets: &[SocketAddr],
         ) -> io::Result<usize> {
-            let count = buffers.len().min(self.batch_size).min(targets.len());
+            let input_count = buffers.len().min(self.batch_size).min(targets.len());
+            let mut valid = 0usize;
 
-            for (i, (buf, target)) in buffers[..count].iter().zip(targets[..count].iter()).enumerate() {
-                self.iovecs[i] = libc::iovec {
+            for (buf, target) in buffers[..input_count].iter().zip(targets[..input_count].iter()) {
+                let v4 = match *target {
+                    SocketAddr::V4(v4) => v4,
+                    _ => continue,
+                };
+
+                self.iovecs[valid] = libc::iovec {
                     iov_base: buf.as_ptr() as *mut libc::c_void,
                     iov_len: buf.len(),
                 };
-                match *target {
-                    SocketAddr::V4(v4) => {
-                        self.addrs[i].sin_family = libc::AF_INET as libc::sa_family_t;
-                        self.addrs[i].sin_port = v4.port().to_be();
-                        self.addrs[i].sin_addr = libc::in_addr {
-                            s_addr: u32::from(*v4.ip()).to_be(),
-                        };
-                    }
-                    _ => continue,
-                }
-                self.msgs[i].msg_hdr = libc::msghdr {
-                    msg_name: &mut self.addrs[i] as *mut _ as *mut libc::c_void,
+                self.addrs[valid].sin_family = libc::AF_INET as libc::sa_family_t;
+                self.addrs[valid].sin_port = v4.port().to_be();
+                self.addrs[valid].sin_addr = libc::in_addr {
+                    s_addr: u32::from(*v4.ip()).to_be(),
+                };
+                self.msgs[valid].msg_hdr = libc::msghdr {
+                    msg_name: &mut self.addrs[valid] as *mut _ as *mut libc::c_void,
                     msg_namelen: mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                    msg_iov: &mut self.iovecs[i],
+                    msg_iov: &mut self.iovecs[valid],
                     msg_iovlen: 1,
                     msg_control: std::ptr::null_mut(),
                     msg_controllen: 0,
                     msg_flags: 0,
                 };
+                valid += 1;
+            }
+
+            if valid == 0 {
+                return Ok(0);
             }
 
             let n = unsafe {
                 libc::sendmmsg(
                     self.fd,
                     self.msgs.as_mut_ptr(),
-                    count as libc::c_uint,
+                    valid as libc::c_uint,
                     0,
                 )
             };

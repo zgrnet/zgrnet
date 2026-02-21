@@ -21,7 +21,6 @@ pub const SocketConfig = struct {
     busy_poll_us: u32 = 0,
     gro: bool = false,
     gso_segment: u32 = 0,
-    batch_size: u32 = 0,
 
     /// Returns a config with all optimizations enabled.
     pub fn full() SocketConfig {
@@ -31,7 +30,6 @@ pub const SocketConfig = struct {
             .busy_poll_us = default_busy_poll_us,
             .gro = true,
             .gso_segment = default_gso_segment,
-            .batch_size = default_batch_count,
         };
     }
 };
