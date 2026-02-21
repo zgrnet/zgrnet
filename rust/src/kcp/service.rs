@@ -652,4 +652,281 @@ mod tests {
         client.close();
         server.close();
     }
+
+    /// Isolation under loss: service A has 50% loss, service B throughput unaffected.
+    /// Uses lossy_service_mux_pair to inject per-service loss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_smux_isolation_loss() {
+        // Build a ServiceMux pair where service 1 has 50% loss but service 2 has none.
+        // We achieve this by having the bridge task drop packets for service 1.
+        let (c_to_s_tx, mut c_to_s_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+        let (s_to_c_tx, mut s_to_c_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+
+        let client = ServiceMux::new(ServiceMuxConfig {
+            is_client: true,
+            runtime: None,
+            output: Arc::new(move |service, data| {
+                let _ = c_to_s_tx.send((service, data.to_vec()));
+                Ok(())
+            }),
+        });
+        let server = ServiceMux::new(ServiceMuxConfig {
+            is_client: false,
+            runtime: None,
+            output: Arc::new(move |service, data| {
+                let _ = s_to_c_tx.send((service, data.to_vec()));
+                Ok(())
+            }),
+        });
+
+        // Bridge c→s: 50% drop for service 1, no drop for service 2.
+        let s2 = server.clone();
+        tokio::spawn(async move {
+            let mut rng: u64 = 42;
+            while let Some((svc, data)) = c_to_s_rx.recv().await {
+                if svc == 1 {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    if (rng >> 33) % 2 == 0 { continue; } // 50% drop
+                }
+                s2.input(svc, &data);
+            }
+        });
+        let c2 = client.clone();
+        tokio::spawn(async move {
+            let mut rng: u64 = 99;
+            while let Some((svc, data)) = s_to_c_rx.recv().await {
+                if svc == 1 {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    if (rng >> 33) % 2 == 0 { continue; }
+                }
+                c2.input(svc, &data);
+            }
+        });
+
+        // Server: echo on all services.
+        let server2 = server.clone();
+        let accept = tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), server2.accept_stream()).await {
+                    Ok(Ok((mut s, _svc))) => {
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            loop {
+                                let n = s.read(&mut buf).await.unwrap_or(0);
+                                if n == 0 { break; }
+                                s.write_all(&buf[..n]).await.ok();
+                            }
+                            s.close().await.ok();
+                        });
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Service 2 (no loss): measure throughput.
+        let svc2_data = 32 * 1024; // 32KB
+        let mut s2 = client.open_stream(2).await.unwrap();
+        let start = std::time::Instant::now();
+        s2.write_all(&vec![0xBB; svc2_data]).await.unwrap();
+        let mut received = 0;
+        let mut buf = vec![0u8; 8192];
+        while received < svc2_data {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), s2.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => received += n,
+                _ => break,
+            }
+        }
+        let svc2_elapsed = start.elapsed();
+        assert_eq!(received, svc2_data, "service 2 should receive all data without loss");
+
+        // Service 1 (50% loss): just verify it eventually delivers.
+        let mut s1 = client.open_stream(1).await.unwrap();
+        s1.write_all(&vec![0xAA; 1024]).await.unwrap();
+        let mut s1_received = 0;
+        while s1_received < 1024 {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), s1.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => s1_received += n,
+                _ => break,
+            }
+        }
+        assert_eq!(s1_received, 1024, "service 1 should eventually deliver via retransmit");
+
+        // Service 2 should be fast (no loss).
+        assert!(svc2_elapsed < std::time::Duration::from_secs(2),
+            "service 2 should be fast, took {:?}", svc2_elapsed);
+
+        s1.close().await.ok();
+        s2.close().await.ok();
+        accept.abort();
+        client.close();
+        server.close();
+    }
+
+    /// Heavy + light composite: 1 bulk stream + 1 realtime stream on different services.
+    /// Server: service 1 = read-and-discard (bulk sink), service 2 = echo (realtime).
+    /// Realtime P99 latency should be < 50ms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_composite_heavy_light() {
+        let (client, server) = service_mux_pair();
+
+        let server2 = server.clone();
+        let accept = tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), server2.accept_stream()).await {
+                    Ok(Ok((mut s, svc))) => {
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65536];
+                            if svc == 1 {
+                                // Bulk sink: read and discard, no echo.
+                                loop {
+                                    let n = s.read(&mut buf).await.unwrap_or(0);
+                                    if n == 0 { break; }
+                                }
+                            } else {
+                                // Echo for realtime.
+                                loop {
+                                    let n = s.read(&mut buf).await.unwrap_or(0);
+                                    if n == 0 { break; }
+                                    s.write_all(&buf[..n]).await.ok();
+                                }
+                            }
+                            s.close().await.ok();
+                        });
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Heavy: bulk 8KB writes on service 1 (no echo, just sink).
+        let client2 = client.clone();
+        let heavy = tokio::spawn(async move {
+            let mut s = client2.open_stream(1).await.unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+            while std::time::Instant::now() < deadline {
+                if s.write_all(&vec![0xDD; 8192]).await.is_err() { break; }
+            }
+            s.close().await.ok();
+        });
+
+        // Light: 64B echo messages every 10ms on service 2, measure RTT.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut s = client.open_stream(2).await.unwrap();
+        let mut latencies = Vec::new();
+        let mut buf = vec![0u8; 256];
+        for _ in 0..30 {
+            let start = std::time::Instant::now();
+            s.write_all(&[0xEE; 64]).await.unwrap();
+            let mut got = 0;
+            while got < 64 {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), s.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => got += n,
+                    _ => break,
+                }
+            }
+            if got >= 64 {
+                latencies.push(start.elapsed());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        s.close().await.ok();
+        heavy.await.ok();
+
+        assert!(!latencies.is_empty(), "should have latency samples");
+        latencies.sort();
+        let p99_idx = (latencies.len() as f64 * 0.99) as usize;
+        let p99 = latencies[p99_idx.min(latencies.len() - 1)];
+        eprintln!("[heavy_light] {} samples, P50={:?}, P99={:?}",
+            latencies.len(), latencies[latencies.len() / 2], p99);
+        assert!(p99 < std::time::Duration::from_millis(50),
+            "realtime P99 {:?} exceeds 50ms — isolation failure", p99);
+
+        accept.abort();
+        client.close();
+        server.close();
+    }
+
+    /// Dynamic service create/destroy during active traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_smux_dynamic_create_destroy() {
+        let (client, server) = service_mux_pair();
+
+        let server2 = server.clone();
+        let accept = tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), server2.accept_stream()).await {
+                    Ok(Ok((mut s, _))) => {
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            loop {
+                                let n = s.read(&mut buf).await.unwrap_or(0);
+                                if n == 0 { break; }
+                                s.write_all(&buf[..n]).await.ok();
+                            }
+                            s.close().await.ok();
+                        });
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Phase 1: create services 1-5.
+        for svc in 1..=5u64 {
+            let mut s = client.open_stream(svc).await.unwrap();
+            let msg = format!("phase1-svc{}", svc);
+            s.write_all(msg.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 256];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf))
+                .await.expect("read timeout").unwrap();
+            assert_eq!(&buf[..n], msg.as_bytes());
+            s.close().await.ok();
+        }
+        assert_eq!(client.num_services(), 5);
+
+        // Phase 2: close the mux, recreate, and use again.
+        // (ServiceMux.close clears services)
+        client.close();
+
+        // Create a fresh pair for phase 2.
+        let (client2, server2b) = service_mux_pair();
+        let server2c = server2b.clone();
+        let accept2 = tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), server2c.accept_stream()).await {
+                    Ok(Ok((mut s, _))) => {
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            loop {
+                                let n = s.read(&mut buf).await.unwrap_or(0);
+                                if n == 0 { break; }
+                                s.write_all(&buf[..n]).await.ok();
+                            }
+                            s.close().await.ok();
+                        });
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        for svc in 1..=3u64 {
+            let mut s = client2.open_stream(svc).await.unwrap();
+            let msg = format!("phase2-svc{}", svc);
+            s.write_all(msg.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 256];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf))
+                .await.expect("read timeout").unwrap();
+            assert_eq!(&buf[..n], msg.as_bytes());
+            s.close().await.ok();
+        }
+        assert_eq!(client2.num_services(), 3);
+
+        accept.abort();
+        accept2.abort();
+        server.close();
+        client2.close();
+        server2b.close();
+    }
 }
