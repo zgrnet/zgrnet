@@ -163,26 +163,31 @@ fn contextDir(allocator: Allocator, base_dir: []const u8, name: []const u8) ![]c
     return try fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
 }
 
-fn currentContextName(allocator: Allocator, base_dir: []const u8) ![]const u8 {
+fn currentContextName(allocator: Allocator, base_dir: []const u8) error{ NoCurrentContext, OutOfMemory }![]const u8 {
     const path = try fmt.allocPrint(allocator, "{s}/current", .{base_dir});
     defer allocator.free(path);
 
     const data = fs.cwd().readFileAlloc(allocator, path, 1024) catch {
-        print("error: no current context set (run: zigor ctx create <name>)\n", .{});
-        std.process.exit(1);
+        return error.NoCurrentContext;
     };
     defer allocator.free(data);
 
     const name = mem.trim(u8, data, &std.ascii.whitespace);
     if (name.len == 0) {
-        print("error: current context file is empty\n", .{});
-        std.process.exit(1);
+        return error.NoCurrentContext;
     }
     return try allocator.dupe(u8, name);
 }
 
+fn currentContextNameOrExit(allocator: Allocator, base_dir: []const u8) []const u8 {
+    return currentContextName(allocator, base_dir) catch {
+        print("error: no current context set (run: zigor ctx create <name>)\n", .{});
+        std.process.exit(1);
+    };
+}
+
 fn contextConfigPath(allocator: Allocator, base_dir: []const u8, name: ?[]const u8) ![]const u8 {
-    const ctx = if (name) |n| try allocator.dupe(u8, n) else try currentContextName(allocator, base_dir);
+    const ctx = if (name) |n| try allocator.dupe(u8, n) else currentContextNameOrExit(allocator, base_dir);
     defer allocator.free(ctx);
     return try fmt.allocPrint(allocator, "{s}/{s}/config.json", .{ base_dir, ctx });
 }
@@ -250,7 +255,7 @@ fn runCtx(allocator: Allocator, base_dir: []const u8, args: []const []const u8) 
             print("(no contexts — run: zigor ctx create <name>)\n", .{});
         }
     } else if (mem.eql(u8, args[0], "show")) {
-        const name = try currentContextName(allocator, base_dir);
+        const name = currentContextNameOrExit(allocator, base_dir);
         defer allocator.free(name);
         print("{s}\n", .{name});
     } else if (mem.eql(u8, args[0], "use")) {
@@ -376,7 +381,7 @@ fn runKey(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, args: []
         std.process.exit(1);
     }
 
-    const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else try currentContextName(allocator, base_dir);
+    const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else currentContextNameOrExit(allocator, base_dir);
     defer allocator.free(ctx_name);
 
     if (mem.eql(u8, args[0], "show")) {
@@ -462,7 +467,7 @@ fn runHost(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_add
         print("error: host up not implemented in Zig build (use Go build)\n", .{});
         std.process.exit(1);
     } else if (mem.eql(u8, args[0], "down")) {
-        const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else try currentContextName(allocator, base_dir);
+        const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else currentContextNameOrExit(allocator, base_dir);
         defer allocator.free(ctx_name);
 
         const pid_path = try fmt.allocPrint(allocator, "{s}/{s}/data/zigor.pid", .{ base_dir, ctx_name });
@@ -487,16 +492,31 @@ fn runHost(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_add
         fs.cwd().deleteFile(pid_path) catch {};
         print("host stopped\n", .{});
     } else if (mem.eql(u8, args[0], "status")) {
-        const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else try currentContextName(allocator, base_dir);
+        const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else currentContextNameOrExit(allocator, base_dir);
         defer allocator.free(ctx_name);
 
         const pid_path = try fmt.allocPrint(allocator, "{s}/{s}/data/zigor.pid", .{ base_dir, ctx_name });
         defer allocator.free(pid_path);
 
-        _ = fs.cwd().readFileAlloc(allocator, pid_path, 64) catch {
+        const pid_data = fs.cwd().readFileAlloc(allocator, pid_path, 64) catch {
             print("host is not running (context \"{s}\")\n", .{ctx_name});
             return;
         };
+        defer allocator.free(pid_data);
+
+        const pid_str = mem.trim(u8, pid_data, &std.ascii.whitespace);
+        const pid = fmt.parseInt(posix.pid_t, pid_str, 10) catch {
+            print("host is not running (invalid pidfile)\n", .{});
+            fs.cwd().deleteFile(pid_path) catch {};
+            return;
+        };
+
+        const alive = if (posix.kill(pid, 0)) |_| true else |_| false;
+        if (!alive) {
+            print("host is not running (stale pidfile, pid {d})\n", .{pid});
+            fs.cwd().deleteFile(pid_path) catch {};
+            return;
+        }
 
         const addr = try resolveApiAddr(allocator, base_dir, ctx, api_addr);
         defer allocator.free(addr);
@@ -504,7 +524,7 @@ fn runHost(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_add
             defer allocator.free(body);
             printJsonOutput(body, json_output);
         } else |_| {
-            print("host is running but API unreachable\n", .{});
+            print("host is running (pid {d}) but API unreachable\n", .{pid});
         }
     } else if (mem.eql(u8, args[0], "peers")) {
         const addr = try resolveApiAddr(allocator, base_dir, ctx, api_addr);

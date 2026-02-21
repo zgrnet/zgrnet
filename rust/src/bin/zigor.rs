@@ -238,11 +238,21 @@ fn run_host(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args:
             };
             match cli::read_pidfile(base_dir, &ctx_name) {
                 Ok(pid) => {
-                    let addr = cli::resolve_api_addr(base_dir, &ctx_name, api_addr);
-                    let c = cli::Client::new(&addr);
-                    match c.status() {
-                        Ok(data) => print_json(&data, json_output),
-                        Err(e) => println!("host is running (pid {pid}) but API unreachable: {e}"),
+                    #[cfg(unix)]
+                    let alive = unsafe { libc::kill(pid, 0) == 0 };
+                    #[cfg(not(unix))]
+                    let alive = true;
+
+                    if !alive {
+                        println!("host is not running (stale pidfile, pid {pid})");
+                        cli::remove_pidfile(base_dir, &ctx_name);
+                    } else {
+                        let addr = cli::resolve_api_addr(base_dir, &ctx_name, api_addr);
+                        let c = cli::Client::new(&addr);
+                        match c.status() {
+                            Ok(data) => print_json(&data, json_output),
+                            Err(e) => println!("host is running (pid {pid}) but API unreachable: {e}"),
+                        }
                     }
                 }
                 Err(_) => println!("host is not running (context {ctx_name:?})"),
@@ -298,21 +308,21 @@ fn run_peers(c: &cli::Client, json_output: bool, args: &[String]) -> Result<(), 
             if pk.is_empty() {
                 return Err("usage: zigor peers add <pubkey> [--alias <a>] [--endpoint <e>]".into());
             }
-            let body = format!(r#"{{"pubkey":"{pk}","alias":"{alias}","endpoint":"{endpoint}"}}"#);
+            let body = serde_json::json!({"pubkey": pk, "alias": alias, "endpoint": endpoint}).to_string();
             print_json(&c.peers_add(&body)?, json_output);
         }
         "update" => {
             let pk = args.get(1).ok_or("usage: zigor peers update <pubkey> [--alias <a>] [--endpoint <e>]")?;
-            let mut fields = Vec::new();
+            let mut fields = serde_json::Map::new();
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--alias" => { fields.push(format!(r#""alias":"{}""#, args.get(i+1).cloned().unwrap_or_default())); i += 2; }
-                    "--endpoint" => { fields.push(format!(r#""endpoint":"{}""#, args.get(i+1).cloned().unwrap_or_default())); i += 2; }
+                    "--alias" => { fields.insert("alias".into(), serde_json::Value::String(args.get(i+1).cloned().unwrap_or_default())); i += 2; }
+                    "--endpoint" => { fields.insert("endpoint".into(), serde_json::Value::String(args.get(i+1).cloned().unwrap_or_default())); i += 2; }
                     _ => { i += 1; }
                 }
             }
-            let body = format!("{{{}}}", fields.join(","));
+            let body = serde_json::Value::Object(fields).to_string();
             print_json(&c.peers_update(pk, &body)?, json_output);
         }
         "remove" => {
@@ -345,7 +355,7 @@ fn run_lans(c: &cli::Client, json_output: bool, args: &[String]) -> Result<(), S
             if domain.is_empty() || pubkey.is_empty() || endpoint.is_empty() {
                 return Err("usage: zigor lans join --domain <d> --pubkey <pk> --endpoint <e>".into());
             }
-            let body = format!(r#"{{"domain":"{domain}","pubkey":"{pubkey}","endpoint":"{endpoint}"}}"#);
+            let body = serde_json::json!({"domain": domain, "pubkey": pubkey, "endpoint": endpoint}).to_string();
             print_json(&c.lans_join(&body)?, json_output);
         }
         "leave" => {
@@ -400,7 +410,7 @@ fn run_routes(c: &cli::Client, json_output: bool, args: &[String]) -> Result<(),
             if domain.is_empty() || peer.is_empty() {
                 return Err("usage: zigor routes add --domain <pattern> --peer <alias>".into());
             }
-            let body = format!(r#"{{"domain":"{domain}","peer":"{peer}"}}"#);
+            let body = serde_json::json!({"domain": domain, "peer": peer}).to_string();
             print_json(&c.routes_add(&body)?, json_output);
         }
         "remove" => {
