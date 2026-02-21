@@ -41,7 +41,7 @@ pub fn KcpConn(comptime Rt: type) type {
         // State.
         closed: std.atomic.Value(bool),
         last_recv_ms: std.atomic.Value(u64),
-        run_thread: ?std.Thread,
+        run_thread: ?Rt.Thread,
 
         // Output callback.
         output_fn: *const fn ([]const u8, ?*anyopaque) void,
@@ -82,7 +82,7 @@ pub fn KcpConn(comptime Rt: type) type {
             };
 
             // Spawn run loop thread.
-            self.run_thread = try std.Thread.spawn(.{}, runLoop, .{self});
+            self.run_thread = Rt.Thread.spawn(.{}, runLoop, .{self}) catch null;
 
             return self;
         }
@@ -299,6 +299,7 @@ const TestRuntime = if (@import("builtin").os.tag != .freestanding) struct {
     pub fn nowMs() u64 {
         return @intCast(std.time.milliTimestamp());
     }
+    pub const Thread = std.Thread;
     pub fn sleepMs(ms: u32) void {
         std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
     }
