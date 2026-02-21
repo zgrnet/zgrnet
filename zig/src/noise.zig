@@ -186,6 +186,7 @@ test {
     _ = noise;
     _ = net;
     _ = kcp_mod;
+    _ = kcp_mod.conn_mod;
     _ = relay_mod;
     _ = host;
     _ = node_mod;

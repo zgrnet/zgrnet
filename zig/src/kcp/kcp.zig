@@ -135,6 +135,11 @@ pub const Kcp = struct {
     }
 
     /// Get number of bytes waiting to be sent.
+    /// Returns the KCP state. -1 (0xFFFFFFFF unsigned) means dead link.
+    pub fn state(self: *Kcp) i32 {
+        return @bitCast(self.kcp.*.state);
+    }
+
     pub fn waitSnd(self: *Kcp) i32 {
         return c.ikcp_waitsnd(self.kcp);
     }
