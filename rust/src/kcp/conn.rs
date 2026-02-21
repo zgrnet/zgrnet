@@ -52,6 +52,11 @@ impl KcpInput {
     pub fn input(&self, data: &[u8]) {
         let _ = self.input_tx.send(Bytes::copy_from_slice(data));
     }
+
+    /// Zero-copy input from an owned Vec (used by bridge tasks).
+    pub fn input_owned(&self, data: Vec<u8>) {
+        let _ = self.input_tx.send(Bytes::from(data));
+    }
 }
 
 /// Async KCP connection. Implements futures::io::AsyncRead/AsyncWrite for yamux.
@@ -226,8 +231,8 @@ impl futures::io::AsyncWrite for KcpConn {
 
 impl Unpin for KcpConn {}
 
-/// Run loop: exclusively owns the KCP instance. Drains coalesced write buffer
-/// and input channel, forwards recv data to read channel.
+/// Run loop: exclusively owns the KCP instance. Processes events in tight
+/// loops with yield points to catch echo-style patterns in fewer cycles.
 async fn run_loop(
     mut kcp: kcp::Kcp<KcpOutput>,
     write_buf: Arc<std::sync::Mutex<WriteBuffer>>,
@@ -247,30 +252,37 @@ async fn run_loop(
         let check = kcp.check(now);
         let delay = if check <= now { 1 } else { (check - now).min(50) };
 
+        // Wait for any event.
         tokio::select! {
             biased;
-
-            _ = write_notify.notified() => {
-                drain_write_buf(&write_buf, &mut kcp);
-                let _ = kcp.flush();
-                drain_recv(&mut kcp, &read_tx);
-            }
-
+            _ = write_notify.notified() => {}
             Some(data) = input_rx.recv() => {
                 let _ = kcp.input(&data);
-                while let Ok(more) = input_rx.try_recv() {
-                    let _ = kcp.input(&more);
-                }
-                drain_write_buf(&write_buf, &mut kcp);
-                let _ = kcp.flush();
-                drain_recv(&mut kcp, &read_tx);
             }
-
             _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {
-                drain_write_buf(&write_buf, &mut kcp);
                 let _ = kcp.update(now_ms());
-                drain_recv(&mut kcp, &read_tx);
             }
+        }
+
+        // Process all pending work in a tight loop.
+        // After draining, yield to let consumers (yamux echo etc.) react,
+        // then check for new work they produced. This catches echo patterns
+        // in 1 run_loop cycle instead of 2.
+        for _ in 0..4 {
+            while let Ok(data) = input_rx.try_recv() {
+                let _ = kcp.input(&data);
+            }
+            drain_write_buf(&write_buf, &mut kcp);
+            let _ = kcp.flush();
+            drain_recv(&mut kcp, &read_tx);
+
+            // Yield to let other tasks react (e.g., yamux echo writes back).
+            tokio::task::yield_now().await;
+
+            // Check if new work appeared.
+            let has_write = { !write_buf.lock().unwrap().data.is_empty() };
+            let has_input = !input_rx.is_empty();
+            if !has_write && !has_input { break; }
         }
     }
 }
@@ -323,7 +335,7 @@ fn lossy_bridge(
 ) {
     tokio::spawn(async move {
         let mut rng_state: u64 = 12345;
-        let mut delayed: Option<Bytes> = None;
+        let mut delayed: Option<Vec<u8>> = None;
         while let Some(data) = rx.recv().await {
             rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let r = ((rng_state >> 33) % 100) as u8;
@@ -331,14 +343,14 @@ fn lossy_bridge(
             if r < loss_pct { continue; }
 
             if reorder && r % 10 == 0 && delayed.is_none() {
-                delayed = Some(Bytes::from(data));
+                delayed = Some(data);
                 continue;
             }
 
-            input.input(&data);
             if let Some(d) = delayed.take() {
-                input.input(&d);
+                input.input_owned(d);
             }
+            input.input_owned(data);
         }
     });
 }
