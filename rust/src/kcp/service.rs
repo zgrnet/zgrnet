@@ -33,7 +33,7 @@ pub struct ServiceMux {
 
 impl ServiceMux {
     pub fn new(config: ServiceMuxConfig) -> Arc<Self> {
-        let (accept_tx, accept_rx) = tokio::sync::mpsc::channel(4096);
+        let (accept_tx, accept_rx) = tokio::sync::mpsc::channel(65536);
         Arc::new(ServiceMux {
             config,
             services: RwLock::new(HashMap::new()),
@@ -45,7 +45,7 @@ impl ServiceMux {
 
     pub fn input(&self, service: u64, data: &[u8]) {
         if self.closed.load(Ordering::Relaxed) { return; }
-        let _guard = self.config.runtime.as_ref().map(|h| h.enter());
+        let _rt_guard = self.config.runtime.as_ref().map(|h| h.enter());
         let entry = {
             let s = self.services.read().unwrap();
             s.get(&service).cloned()
@@ -59,7 +59,10 @@ impl ServiceMux {
 
     pub async fn open_stream(&self, service: u64) -> Result<yamux::Stream, String> {
         if self.closed.load(Ordering::Relaxed) { return Err("closed".into()); }
-        let entry = self.ensure_service(service)?;
+        let entry = {
+            let _guard = self.config.runtime.as_ref().map(|h| h.enter());
+            self.ensure_service(service)?
+        };
         let (tx, rx) = tokio::sync::oneshot::channel();
         entry.open_tx.send(tx).await.map_err(|_| "channel closed".to_string())?;
         rx.await.map_err(|_| "cancelled".to_string())
@@ -104,11 +107,10 @@ impl ServiceMux {
         let (open_tx, open_rx) = tokio::sync::mpsc::channel(64);
         let accept_tx = self.accept_tx.clone();
 
-        if self.config.is_client {
-            tokio::spawn(client_driver(yamux_conn, open_rx, accept_tx, service));
-        } else {
-            tokio::spawn(server_driver(yamux_conn, accept_tx, service));
-        }
+        // Always use client_driver — it handles both open requests AND inbound streams.
+        // The is_client flag only affects yamux Mode (Client sends odd stream IDs,
+        // Server sends even). Both sides need poll_new_outbound + poll_next_inbound.
+        tokio::spawn(client_driver(yamux_conn, open_rx, accept_tx, service));
 
         let entry = Arc::new(ServiceEntry { input_handle, open_tx });
         services.insert(service, entry.clone());
@@ -158,21 +160,6 @@ async fn client_driver(
     }).await;
 }
 
-/// Server driver: accepts inbound yamux streams.
-async fn server_driver(
-    mut conn: yamux::Connection<KcpConn>,
-    accept_tx: tokio::sync::mpsc::Sender<(yamux::Stream, u64)>,
-    service: u64,
-) {
-    futures::stream::poll_fn(|cx| conn.poll_next_inbound(cx))
-        .try_for_each_concurrent(None, |stream| {
-            let accept_tx = accept_tx.clone();
-            async move {
-                let _ = accept_tx.send((stream, service)).await;
-                Ok(())
-            }
-        }).await.ok();
-}
 
 #[cfg(test)]
 mod tests {

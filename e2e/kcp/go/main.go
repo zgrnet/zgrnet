@@ -15,7 +15,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	znet "github.com/vibing/zgrnet/pkg/net"
@@ -39,9 +38,12 @@ type HostInfo struct {
 
 // TestConfig represents test parameters.
 type TestConfig struct {
+	Mode         string `json:"mode"` // "echo", "streaming", "multi_stream", "delayed_write"
 	EchoMessage  string `json:"echo_message"`
 	ThroughputMB int    `json:"throughput_mb"`
 	ChunkKB      int    `json:"chunk_kb"`
+	NumStreams   int    `json:"num_streams"`
+	DelayMs      int    `json:"delay_ms"`
 }
 
 var (
@@ -163,172 +165,170 @@ func main() {
 }
 
 func runOpenerTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, testCfg TestConfig) {
-	log.Printf("[opener] Opening stream to %s with proto=TCP_PROXY(69)...", peerName)
-
-	// Encode test Address as metadata: IPv4 127.0.0.1:8080
-	testAddr := &noise.Address{Type: noise.AddressTypeIPv4, Host: "127.0.0.1", Port: 8080}
-	metadata := testAddr.Encode()
-	if metadata == nil {
-		log.Fatalf("[opener] Failed to encode test address")
+	mode := testCfg.Mode
+	if mode == "" {
+		mode = "echo"
 	}
-	log.Printf("[opener] Metadata: %x (Address IPv4 127.0.0.1:8080)", metadata)
 
 	stream, err := udp.OpenStream(peerKey, noise.ServiceProxy)
 	if err != nil {
 		log.Fatalf("[opener] Failed to open stream: %v", err)
 	}
 	defer stream.Close()
+	log.Printf("[opener] Opened stream (mode=%s)", mode)
 
-	log.Printf("[opener] Opened stream on service=%d", noise.ServiceProxy)
-
-	// Echo test
-	log.Printf("[opener] Running echo test...")
-	echoMsg := []byte(testCfg.EchoMessage)
-	n, err := stream.Write(echoMsg)
-	if err != nil {
-		log.Fatalf("[opener] Failed to write echo: %v", err)
-	}
-	log.Printf("[opener] Sent %d bytes: %q", n, testCfg.EchoMessage)
-
-	// Read echo response
-	buf := make([]byte, 1024)
-	n, err = readWithTimeout(stream, buf, 5*time.Second)
-	if err != nil {
-		log.Fatalf("[opener] Failed to read echo response: %v", err)
-	}
-	response := string(buf[:n])
-	log.Printf("[opener] Received echo response: %q", response)
-
-	// Bidirectional throughput test
-	runBidirectionalTest(stream, "opener", testCfg)
-
-	// Wait for peer to finish receiving
-	time.Sleep(2 * time.Second)
-}
-
-func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, testCfg TestConfig) {
-	// Wait for peer to connect and establish session
-	log.Printf("[accepter] Waiting for %s to connect...", peerName)
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		info := udp.PeerInfo(peerKey)
-		if info != nil && info.State == znet.PeerStateEstablished {
-			log.Printf("[accepter] Session established with %s", peerName)
-			break
+	switch mode {
+	case "echo":
+		msg := []byte(testCfg.EchoMessage)
+		if _, err := stream.Write(msg); err != nil {
+			log.Fatalf("[opener] write echo: %v", err)
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
+		log.Printf("[opener] Sent: %q", testCfg.EchoMessage)
 
-	// Give mux time to initialize
-	time.Sleep(100 * time.Millisecond)
+		buf := make([]byte, 4096)
+		n, err := readWithTimeout(stream, buf, 10*time.Second)
+		if err != nil {
+			log.Fatalf("[opener] read echo: %v", err)
+		}
+		log.Printf("[opener] Response: %q", string(buf[:n]))
 
-	log.Printf("[accepter] Waiting to accept stream from %s...", peerName)
-
-	stream, service, err := udp.AcceptStream(peerKey)
-	if err != nil {
-		log.Fatalf("[accepter] Failed to accept stream: %v", err)
-	}
-	defer stream.Close()
-
-	log.Printf("[accepter] Accepted stream on service=%d", service)
-	log.Printf("[accepter] PASS: stream accepted")
-
-	// Echo test - receive and echo back
-	buf := make([]byte, 1024)
-	n, err := readWithTimeout(stream, buf, 5*time.Second)
-	if err != nil {
-		log.Fatalf("[accepter] Failed to read echo: %v", err)
-	}
-	received := string(buf[:n])
-	log.Printf("[accepter] Received echo: %q", received)
-
-	// Echo back with prefix
-	response := fmt.Sprintf("Echo from %s: %s", "accepter", received)
-	_, err = stream.Write([]byte(response))
-	if err != nil {
-		log.Fatalf("[accepter] Failed to write echo response: %v", err)
-	}
-	log.Printf("[accepter] Sent echo response: %q", response)
-
-	// Bidirectional throughput test
-	runBidirectionalTest(stream, "accepter", testCfg)
-}
-
-func runBidirectionalTest(stream io.ReadWriteCloser, role string, testCfg TestConfig) {
-	totalBytes := int64(testCfg.ThroughputMB) * 1024 * 1024
-	chunkSize := testCfg.ChunkKB * 1024
-
-	log.Printf("[%s] Starting bidirectional test: %d MB each direction, %d KB chunks",
-		role, testCfg.ThroughputMB, testCfg.ChunkKB)
-
-	var wg sync.WaitGroup
-	var sentBytes, recvBytes atomic.Int64
-	start := time.Now()
-
-	// Writer goroutine
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	case "streaming":
+		totalBytes := int64(testCfg.ThroughputMB) * 1024 * 1024
+		chunkSize := testCfg.ChunkKB * 1024
+		if chunkSize == 0 { chunkSize = 8192 }
 		chunk := make([]byte, chunkSize)
-		for i := range chunk {
-			chunk[i] = byte(i % 256)
-		}
+		for i := range chunk { chunk[i] = byte(i % 256) }
 
 		var sent int64
 		for sent < totalBytes {
 			n, err := stream.Write(chunk)
-			if err != nil {
-				log.Printf("[%s] Write error: %v", role, err)
-				return
-			}
+			if err != nil { log.Fatalf("[opener] write: %v", err) }
 			sent += int64(n)
-			sentBytes.Store(sent)
-
-			// Progress every 10%
-			if sent%(totalBytes/10) < int64(chunkSize) {
-				log.Printf("[%s] TX: %.1f%%", role, float64(sent)/float64(totalBytes)*100)
-			}
 		}
-		log.Printf("[%s] TX complete: %d bytes", role, sent)
-	}()
+		log.Printf("[opener] Sent %d bytes", sent)
 
-	// Reader goroutine
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, chunkSize*2)
+	case "multi_stream":
+		numStreams := testCfg.NumStreams
+		if numStreams == 0 { numStreams = 10 }
+		chunkSize := testCfg.ChunkKB * 1024
+		if chunkSize == 0 { chunkSize = 8192 }
 
+		// First stream already open — write 100KB
+		data := make([]byte, 100*1024)
+		for i := range data { data[i] = byte(i % 256) }
+		stream.Write(data)
+
+		// Open additional streams
+		var wg sync.WaitGroup
+		for i := 1; i < numStreams; i++ {
+			s, err := udp.OpenStream(peerKey, noise.ServiceProxy)
+			if err != nil { log.Fatalf("[opener] open stream %d: %v", i, err) }
+			wg.Add(1)
+			go func(idx int, s net.Conn) {
+				defer wg.Done()
+				defer s.Close()
+				s.Write(data)
+				log.Printf("[opener] stream %d: sent %d bytes", idx, len(data))
+			}(i, s)
+		}
+		wg.Wait()
+		log.Printf("[opener] all %d streams done", numStreams)
+
+	case "delayed_write":
+		delayMs := testCfg.DelayMs
+		if delayMs == 0 { delayMs = 2000 }
+		log.Printf("[opener] delaying %dms before writing...", delayMs)
+		time.Sleep(time.Duration(delayMs) * time.Millisecond)
+		if _, err := stream.Write([]byte("delayed hello")); err != nil {
+			log.Fatalf("[opener] delayed write: %v", err)
+		}
+		buf := make([]byte, 4096)
+		n, err := readWithTimeout(stream, buf, 10*time.Second)
+		if err != nil {
+			log.Fatalf("[opener] delayed read: %v", err)
+		}
+		log.Printf("[opener] delayed response: %q", string(buf[:n]))
+	}
+
+	time.Sleep(time.Second)
+}
+
+func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, testCfg TestConfig) {
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		info := udp.PeerInfo(peerKey)
+		if info != nil && info.State == znet.PeerStateEstablished {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	mode := testCfg.Mode
+	if mode == "" {
+		mode = "echo"
+	}
+
+	switch mode {
+	case "echo", "delayed_write":
+		stream, _, err := udp.AcceptStream(peerKey)
+		if err != nil { log.Fatalf("[accepter] accept: %v", err) }
+		defer stream.Close()
+
+		buf := make([]byte, 4096)
+		n, err := readWithTimeout(stream, buf, 30*time.Second)
+		if err != nil { log.Fatalf("[accepter] read: %v", err) }
+		log.Printf("[accepter] Received: %q", string(buf[:n]))
+
+		response := fmt.Sprintf("Echo: %s", string(buf[:n]))
+		stream.Write([]byte(response))
+		log.Printf("[accepter] Sent: %q", response)
+
+	case "streaming":
+		stream, _, err := udp.AcceptStream(peerKey)
+		if err != nil { log.Fatalf("[accepter] accept: %v", err) }
+		defer stream.Close()
+
+		totalBytes := int64(testCfg.ThroughputMB) * 1024 * 1024
+		buf := make([]byte, 65536)
 		var recv int64
 		for recv < totalBytes {
 			n, err := stream.Read(buf)
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				log.Printf("[%s] Read error: %v", role, err)
-				return
-			}
+			if err != nil { break }
 			recv += int64(n)
-			recvBytes.Store(recv)
 		}
-		log.Printf("[%s] RX complete: %d bytes", role, recv)
-	}()
+		log.Printf("[accepter] Received %d / %d bytes", recv, totalBytes)
+		if recv < totalBytes {
+			log.Fatalf("[accepter] incomplete: got %d, want %d", recv, totalBytes)
+		}
 
-	wg.Wait()
-	elapsed := time.Since(start)
+	case "multi_stream":
+		numStreams := testCfg.NumStreams
+		if numStreams == 0 { numStreams = 10 }
 
-	sent := sentBytes.Load()
-	recv := recvBytes.Load()
-	totalTransfer := sent + recv
-	throughput := float64(totalTransfer) / elapsed.Seconds() / 1024 / 1024
+		var wg sync.WaitGroup
+		for i := 0; i < numStreams; i++ {
+			stream, _, err := udp.AcceptStream(peerKey)
+			if err != nil { log.Fatalf("[accepter] accept %d: %v", i, err) }
+			wg.Add(1)
+			go func(idx int, s net.Conn) {
+				defer wg.Done()
+				defer s.Close()
+				buf := make([]byte, 65536)
+				var total int64
+				for {
+					n, err := s.Read(buf)
+					if err != nil || n == 0 { break }
+					total += int64(n)
+				}
+				log.Printf("[accepter] stream %d: received %d bytes", idx, total)
+			}(i, stream)
+		}
+		wg.Wait()
+		log.Printf("[accepter] all %d streams done", numStreams)
+	}
 
-	log.Printf("[%s] ========== Bidirectional Results ==========", role)
-	log.Printf("[%s] Sent:       %d bytes (%.2f GB)", role, sent, float64(sent)/1024/1024/1024)
-	log.Printf("[%s] Received:   %d bytes (%.2f GB)", role, recv, float64(recv)/1024/1024/1024)
-	log.Printf("[%s] Total:      %d bytes (%.2f GB)", role, totalTransfer, float64(totalTransfer)/1024/1024/1024)
-	log.Printf("[%s] Time:       %v", role, elapsed)
-	log.Printf("[%s] Throughput: %.2f MB/s (bidirectional)", role, throughput)
-	log.Printf("[%s] ============================================", role)
+	time.Sleep(time.Second)
 }
 
 func readWithTimeout(stream io.Reader, buf []byte, timeout time.Duration) (int, error) {
