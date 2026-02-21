@@ -558,4 +558,101 @@ mod tests {
         client.close();
         server.close();
     }
+
+    /// Benchmark: 100 services × 100 yamux streams = 10,000 concurrent echo round-trips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_bench_100x100() {
+        let (client, server) = service_mux_pair();
+
+        let total_services: u64 = 100;
+        let streams_per_svc: usize = 100;
+        let total_streams = total_services as usize * streams_per_svc;
+
+        // Server: accept all streams, echo back.
+        let server2 = server.clone();
+        let accept = tokio::spawn(async move {
+            let mut count = 0usize;
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    server2.accept_stream(),
+                ).await {
+                    Ok(Ok((mut s, _svc))) => {
+                        count += 1;
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 1024];
+                            loop {
+                                let n = s.read(&mut buf).await.unwrap_or(0);
+                                if n == 0 { break; }
+                                s.write_all(&buf[..n]).await.ok();
+                            }
+                            s.close().await.ok();
+                        });
+                    }
+                    _ => break,
+                }
+            }
+            count
+        });
+
+        let start = std::time::Instant::now();
+
+        // Launch all 10,000 streams concurrently.
+        let mut handles = Vec::with_capacity(total_streams);
+        for svc in 0..total_services {
+            for si in 0..streams_per_svc {
+                let c = client.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut s = c.open_stream(svc).await.map_err(|e| {
+                        format!("svc={} si={}: open failed: {}", svc, si, e)
+                    })?;
+                    let msg = format!("s{:03}x{:03}", svc, si);
+                    s.write_all(msg.as_bytes()).await.map_err(|e| format!("write: {}", e))?;
+                    let mut buf = vec![0u8; 256];
+                    let n = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        s.read(&mut buf),
+                    ).await
+                        .map_err(|_| format!("svc={} si={}: read timed out", svc, si))?
+                        .map_err(|e| format!("read: {}", e))?;
+                    if &buf[..n] != msg.as_bytes() {
+                        return Err(format!("svc={} si={}: echo mismatch", svc, si));
+                    }
+                    s.close().await.ok();
+                    Ok::<(), String>(())
+                }));
+            }
+        }
+
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        for h in handles {
+            match h.await {
+                Ok(Ok(())) => ok += 1,
+                Ok(Err(e)) => { eprintln!("[100x100] FAIL: {}", e); fail += 1; }
+                Err(e) => { eprintln!("[100x100] JOIN ERR: {}", e); fail += 1; }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let rate = ok as f64 / elapsed.as_secs_f64();
+
+        eprintln!("=== 100x100 Benchmark ===");
+        eprintln!("  services:      {}", total_services);
+        eprintln!("  streams/svc:   {}", streams_per_svc);
+        eprintln!("  total streams: {}", total_streams);
+        eprintln!("  ok:            {}", ok);
+        eprintln!("  fail:          {}", fail);
+        eprintln!("  elapsed:       {:.2?}", elapsed);
+        eprintln!("  rate:          {:.0} streams/sec", rate);
+        eprintln!("  num_services:  {}", client.num_services());
+
+        assert_eq!(fail, 0, "{} streams failed out of {}", fail, total_streams);
+        assert_eq!(ok, total_streams);
+        assert_eq!(client.num_services(), total_services as usize);
+
+        accept.abort();
+        client.close();
+        server.close();
+    }
 }
