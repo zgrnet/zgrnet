@@ -390,4 +390,172 @@ mod tests {
         client.close();
         server.close();
     }
+
+    /// Isolation: service A has slow consumer, service B throughput unaffected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_smux_isolation_slow() {
+        let (client, server) = service_mux_pair();
+
+        let server2 = server.clone();
+        let accept = tokio::spawn(async move {
+            let mut count = 0;
+            loop {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    server2.accept_stream(),
+                ).await;
+                match result {
+                    Ok(Ok((mut s, svc))) => {
+                        count += 1;
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            if svc == 1 {
+                                // Service 1: slow consumer — sleep between reads.
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    let n = s.read(&mut buf).await.unwrap_or(0);
+                                    if n == 0 { break; }
+                                }
+                            } else {
+                                // Service 2: fast echo.
+                                loop {
+                                    let n = s.read(&mut buf).await.unwrap_or(0);
+                                    if n == 0 { break; }
+                                    s.write_all(&buf[..n]).await.ok();
+                                }
+                                s.close().await.ok();
+                            }
+                        });
+                    }
+                    _ => break,
+                }
+            }
+            count
+        });
+
+        // Service 1: write data that piles up (slow consumer on server).
+        let client2 = client.clone();
+        let slow_task = tokio::spawn(async move {
+            let mut s = client2.open_stream(1).await.unwrap();
+            for _ in 0..20 {
+                s.write_all(&[0xAA; 512]).await.unwrap();
+            }
+            s.close().await.ok();
+        });
+
+        // Service 2: fast echo — measure round-trip time.
+        let start = std::time::Instant::now();
+        let mut s2 = client.open_stream(2).await.unwrap();
+        s2.write_all(b"fast-ping").await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(5), s2.read(&mut buf)
+        ).await.expect("service 2 read timed out — isolation failure").unwrap();
+        let rtt = start.elapsed();
+        assert_eq!(&buf[..n], b"fast-ping");
+        s2.close().await.ok();
+
+        // Service 2 should respond fast even though service 1 is slow.
+        assert!(rtt < std::time::Duration::from_secs(2),
+            "service 2 RTT {:?} too slow — isolation failure", rtt);
+
+        slow_task.await.unwrap();
+        client.close();
+        server.close();
+        accept.abort();
+    }
+
+    /// Composite: 10 services × 10 streams = 100 concurrent streams.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_composite_10x10() {
+        let (client, server) = service_mux_pair();
+
+        let server2 = server.clone();
+        let accept = tokio::spawn(async move {
+            for _ in 0..100 {
+                let (mut s, _svc) = server2.accept_stream().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    if n > 0 { s.write_all(&buf[..n]).await.ok(); }
+                    s.close().await.ok();
+                });
+            }
+        });
+
+        let mut handles = Vec::new();
+        for svc in 0..10u64 {
+            for stream_idx in 0..10 {
+                let c = client.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut s = c.open_stream(svc).await.unwrap();
+                    let msg = format!("svc{}-s{}", svc, stream_idx);
+                    s.write_all(msg.as_bytes()).await.unwrap();
+                    let mut buf = vec![0u8; 256];
+                    let n = tokio::time::timeout(
+                        std::time::Duration::from_secs(10), s.read(&mut buf)
+                    ).await.expect("read timed out").unwrap();
+                    assert_eq!(&buf[..n], msg.as_bytes());
+                    s.close().await.ok();
+                }));
+            }
+        }
+
+        for h in handles { h.await.unwrap(); }
+        assert_eq!(client.num_services(), 10);
+        accept.abort();
+        client.close();
+        server.close();
+    }
+
+    /// Long-running stability: 10 seconds of continuous send/receive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_composite_long_running_10s() {
+        let (client, server) = service_mux_pair();
+
+        let server2 = server.clone();
+        let accept = tokio::spawn(async move {
+            loop {
+                match server2.accept_stream().await {
+                    Ok((mut s, _svc)) => {
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            loop {
+                                let n = s.read(&mut buf).await.unwrap_or(0);
+                                if n == 0 { break; }
+                                s.write_all(&buf[..n]).await.ok();
+                            }
+                            s.close().await.ok();
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut total_bytes = 0u64;
+        let mut stream_count = 0u32;
+
+        while std::time::Instant::now() < deadline {
+            let svc = (stream_count % 3) as u64 + 1;
+            let mut s = client.open_stream(svc).await.unwrap();
+            let msg = vec![0xBB; 256];
+            s.write_all(&msg).await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(5), s.read(&mut buf)
+            ).await.expect("read timed out in long-running").unwrap();
+            assert_eq!(n, 256);
+            total_bytes += n as u64;
+            stream_count += 1;
+            s.close().await.ok();
+        }
+
+        eprintln!("[long_running] {} streams, {} bytes in 10s", stream_count, total_bytes);
+        assert!(stream_count > 10, "should complete many streams in 10s, got {}", stream_count);
+        accept.abort();
+        client.close();
+        server.close();
+    }
 }
