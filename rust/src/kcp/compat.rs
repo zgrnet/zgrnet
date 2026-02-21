@@ -27,9 +27,12 @@ impl SyncStream {
 
     pub fn close(&self) {
         let inner = self.inner.clone();
-        let _ = self.rt.block_on(async {
-            let mut s = inner.lock().await;
-            s.close().await
+        let rt = self.rt.clone();
+        let _ = tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let mut s = inner.lock().await;
+                s.close().await
+            })
         });
     }
 }
@@ -46,9 +49,12 @@ impl Clone for SyncStream {
 impl io::Read for SyncStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let inner = self.inner.clone();
-        self.rt.block_on(async {
-            let mut s = inner.lock().await;
-            s.read(buf).await
+        let rt = self.rt.clone();
+        tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let mut s = inner.lock().await;
+                s.read(buf).await
+            })
         })
     }
 }
@@ -56,17 +62,23 @@ impl io::Read for SyncStream {
 impl io::Write for SyncStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let inner = self.inner.clone();
-        self.rt.block_on(async {
-            let mut s = inner.lock().await;
-            s.write(buf).await
+        let rt = self.rt.clone();
+        tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let mut s = inner.lock().await;
+                s.write(buf).await
+            })
         })
     }
 
     fn flush(&mut self) -> io::Result<()> {
         let inner = self.inner.clone();
-        self.rt.block_on(async {
-            let mut s = inner.lock().await;
-            s.flush().await
+        let rt = self.rt.clone();
+        tokio::task::block_in_place(|| {
+            rt.block_on(async {
+                let mut s = inner.lock().await;
+                s.flush().await
+            })
         })
     }
 }

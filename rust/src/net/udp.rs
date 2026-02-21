@@ -202,6 +202,10 @@ pub struct UDP {
 
     // State
     closed: AtomicBool,
+
+    // Tokio runtime handle for spawning async tasks (KcpConn run_loop, yamux driver).
+    // Captured at construction time so background threads can use it.
+    tokio_handle: Option<tokio::runtime::Handle>,
 }
 
 impl UDP {
@@ -232,6 +236,7 @@ impl UDP {
             total_tx: AtomicU64::new(0),
             last_seen: Mutex::new(None),
             closed: AtomicBool::new(false),
+            tokio_handle: tokio::runtime::Handle::try_current().ok(),
         })
     }
 
@@ -624,6 +629,19 @@ impl UDP {
     fn init_service_mux(&self, remote_pk: Key) {
         let is_client = self.is_kcp_client(&remote_pk);
 
+        // ServiceMux requires tokio for KcpConn run_loop and yamux driver tasks.
+        let handle = match &self.tokio_handle {
+            Some(h) => h.clone(),
+            None => match tokio::runtime::Handle::try_current() {
+                Ok(h) => h,
+                Err(_) => {
+                    eprintln!("[warn] no tokio runtime, cannot create ServiceMux");
+                    return;
+                }
+            },
+        };
+        let _guard = handle.enter();
+
         let peer_arc = {
             let peers = self.peers.read().unwrap();
             match peers.get(&remote_pk) {
@@ -637,6 +655,7 @@ impl UDP {
 
         let smux = ServiceMux::new(ServiceMuxConfig {
             is_client,
+            runtime: Some(handle.clone()),
             output: Arc::new(move |service: u64, data: &[u8]| {
                 let mut p = peers_for_output.lock().unwrap();
                 let endpoint = match p.endpoint {
