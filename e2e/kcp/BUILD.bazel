@@ -38,10 +38,8 @@ go_test(
     data = [
         "//e2e/kcp/go:kcp_test",
         "//e2e/kcp/rust:kcp_test",
-    ] + select({
-        "@platforms//os:macos": ["//e2e/kcp/zig:kcp_test"],
-        "//conditions:default": [],
-    }),
+        # Zig binary excluded until Phase 6 yamux implementation.
+    ],
     tags = [
         "local",
         "exclusive",
