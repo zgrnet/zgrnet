@@ -187,6 +187,7 @@ test {
     _ = net;
     _ = kcp_mod;
     _ = kcp_mod.conn_mod;
+    _ = kcp_mod.yamux_mod;
     _ = relay_mod;
     _ = host;
     _ = node_mod;

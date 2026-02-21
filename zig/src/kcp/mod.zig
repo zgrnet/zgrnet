@@ -50,6 +50,10 @@ pub const OnNewStreamFn = stream_mod.OnNewStreamFn;
 
 pub const RingBuffer = ring_buffer.RingBuffer;
 
-// New: KcpConn (Step 6.2)
+// New: KcpConn (Step 6.2) + yamux (Step 6.3)
 pub const conn_mod = @import("conn.zig");
 pub const KcpConn = conn_mod.KcpConn;
+pub const yamux_mod = @import("yamux.zig");
+pub const Yamux = yamux_mod.Yamux;
+pub const YamuxStream = yamux_mod.YamuxStream;
+pub const YamuxFrame = yamux_mod.Frame;
