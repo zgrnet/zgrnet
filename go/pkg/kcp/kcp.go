@@ -241,6 +241,16 @@ func (k *KCP) SetNodelay(nodelay, interval, resend, nc int) int {
 	return int(C.ikcp_nodelay(k.kcp, C.int(nodelay), C.int(interval), C.int(resend), C.int(nc)))
 }
 
+// State returns the KCP state. < 0 means dead link (too many retransmits).
+func (k *KCP) State() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.kcp == nil {
+		return -1
+	}
+	return int(k.kcp.state)
+}
+
 // WaitSnd returns the number of packets waiting to be sent.
 func (k *KCP) WaitSnd() int {
 	k.mu.Lock()

@@ -227,12 +227,36 @@ func (c *KCPConn) SetDeadline(t time.Time) error {
 	return nil
 }
 
+const (
+	idleTimeout     = 15 * time.Second
+	idleTimeoutPure = 30 * time.Second
+)
+
 // runLoop is the internal goroutine that exclusively owns all KCP operations.
-// No other goroutine touches the KCP instance directly.
+// Detects dead links (KCP retransmit exceeded) and idle timeout (no data received).
 func (c *KCPConn) runLoop() {
 	defer c.wg.Done()
 
+	lastRecv := time.Now()
+
 	for {
+		// Dead link detection: KCP marks state=-1 after too many retransmits.
+		if c.kcp.State() < 0 {
+			c.closeInternal()
+			return
+		}
+
+		// Idle timeout (matches Rust: 15s with pending sends, 30s pure idle).
+		idle := time.Since(lastRecv)
+		if idle > idleTimeout && c.kcp.WaitSnd() > 0 {
+			c.closeInternal()
+			return
+		}
+		if idle > idleTimeoutPure {
+			c.closeInternal()
+			return
+		}
+
 		now := uint32(time.Now().UnixMilli())
 		nextUpdate := c.kcp.Check(now)
 
@@ -240,7 +264,11 @@ func (c *KCPConn) runLoop() {
 		if nextUpdate <= now {
 			delay = time.Millisecond
 		} else {
-			delay = time.Duration(nextUpdate-now) * time.Millisecond
+			d := time.Duration(nextUpdate-now) * time.Millisecond
+			if d > 50*time.Millisecond {
+				d = 50 * time.Millisecond
+			}
+			delay = d
 		}
 
 		timer := time.NewTimer(delay)
@@ -252,6 +280,7 @@ func (c *KCPConn) runLoop() {
 			c.drainInputCh()
 			c.kcp.Update(uint32(time.Now().UnixMilli()))
 			c.drainRecv()
+			lastRecv = time.Now()
 
 		case req := <-c.writeCh:
 			timer.Stop()
@@ -273,6 +302,15 @@ func (c *KCPConn) runLoop() {
 			return
 		}
 	}
+}
+
+// closeInternal closes the connection due to dead link or idle timeout.
+func (c *KCPConn) closeInternal() {
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		close(c.closeCh)
+		c.recvCond.Broadcast()
+	})
 }
 
 // drainInputCh processes all queued packets in inputCh without blocking.
