@@ -119,8 +119,14 @@ const UDP_GRO: u32 = 104;
 const UDP_SEGMENT: u32 = 103;
 
 /// Check if UDP_SEGMENT (GSO) is available on a socket.
+/// Probes by setting and immediately clearing the option to avoid side effects.
 pub fn gsoSupported(fd: posix.socket_t) bool {
-    return trySetsockoptInt(fd, @intCast(std.posix.IPPROTO.UDP), UDP_SEGMENT, 1400);
+    const proto: i32 = @intCast(std.posix.IPPROTO.UDP);
+    if (trySetsockoptInt(fd, proto, UDP_SEGMENT, 1400)) {
+        _ = trySetsockoptInt(fd, proto, UDP_SEGMENT, 0);
+        return true;
+    }
+    return false;
 }
 
 fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *OptimizationReport) void {
@@ -198,12 +204,13 @@ pub const BatchReader = struct {
             return 1;
         }
 
-        const count = @min(buffers.len, self.batch_size);
+        const max_batch = 64;
+        const count = @min(buffers.len, @min(self.batch_size, max_batch));
         if (count == 0) return 0;
 
-        var msgs: [64]std.os.linux.mmsghdr_const = undefined;
-        var iovecs: [64]posix.iovec = undefined;
-        var addrs: [64]posix.sockaddr.in = undefined;
+        var msgs: [max_batch]std.os.linux.mmsghdr_const = undefined;
+        var iovecs: [max_batch]posix.iovec = undefined;
+        var addrs: [max_batch]posix.sockaddr.in = undefined;
 
         for (0..count) |i| {
             iovecs[i] = .{

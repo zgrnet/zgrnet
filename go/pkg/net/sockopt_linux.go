@@ -115,6 +115,7 @@ func (bc *batchConn) WriteBatch(buffers [][]byte, addrs []*net.UDPAddr) (int, er
 }
 
 // GSOSupported returns true if UDP_SEGMENT (GSO) is available.
+// Probes by setting and immediately clearing the option to avoid side effects.
 func GSOSupported(conn *net.UDPConn) bool {
 	raw, err := conn.SyscallConn()
 	if err != nil {
@@ -122,8 +123,10 @@ func GSOSupported(conn *net.UDPConn) bool {
 	}
 	var supported bool
 	raw.Control(func(fd uintptr) {
-		err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, 1400)
-		supported = (err == nil)
+		if syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, 1400) == nil {
+			supported = true
+			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, 0)
+		}
 	})
 	return supported
 }
