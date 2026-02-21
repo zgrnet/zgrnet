@@ -114,13 +114,15 @@ pub fn KcpConn(comptime Rt: type) type {
             self.allocator.destroy(self);
         }
 
-        /// Feed raw network packet to KCP. Non-blocking.
+        /// Feed raw network packet to KCP. Non-blocking. Signals run loop.
         pub fn input(self: *Self, data: []const u8) !void {
             if (self.closed.load(.acquire)) return error.Closed;
             const copy = try self.allocator.dupe(u8, data);
             self.input_mutex.lock();
-            defer self.input_mutex.unlock();
             try self.input_buf.append(self.allocator, copy);
+            self.input_mutex.unlock();
+            // Wake run loop immediately to process the input.
+            self.write_cond.signal();
         }
 
         /// Blocking read. Waits until recv_buf has data or connection closes.
@@ -143,15 +145,16 @@ pub fn KcpConn(comptime Rt: type) type {
             return n;
         }
 
-        /// Blocking write with coalescing. Appends to shared buffer, signals run loop.
+        /// Blocking write with coalescing. Only signals on empty→non-empty transition.
         pub fn write(self: *Self, data: []const u8) !usize {
             if (self.closed.load(.acquire)) return error.Closed;
 
             self.write_mutex.lock();
-            defer self.write_mutex.unlock();
-
+            const was_empty = self.write_buf.items.len == 0;
             try self.write_buf.appendSlice(self.allocator, data);
-            self.write_cond.signal();
+            self.write_mutex.unlock();
+
+            if (was_empty) self.write_cond.signal();
             return data.len;
         }
 
@@ -187,26 +190,33 @@ pub fn KcpConn(comptime Rt: type) type {
                     return;
                 }
 
-                // Process input packets.
+                // Drain all pending work (input + write coalescing).
                 self.drainInput();
-
-                // Drain coalesced write buffer into KCP (8KB chunks).
                 self.drainWriteBuf();
 
-                // KCP update + flush.
                 const now_ms: u32 = @intCast(Rt.nowMs() & 0xFFFFFFFF);
                 self.kcp.update(now_ms);
                 self.kcp.flush();
-
-                // Drain KCP recv queue → recv_buf.
                 self.drainRecv();
 
-                // Sleep until next check or signal.
+                // Check if there's pending work.
+                {
+                    self.input_mutex.lock();
+                    const has_input = self.input_buf.items.len > 0;
+                    self.input_mutex.unlock();
+                    self.write_mutex.lock();
+                    const has_write = self.write_buf.items.len > 0;
+                    self.write_mutex.unlock();
+
+                    if (has_input or has_write) continue; // process immediately
+                }
+
+                // No pending work. Wait for signal or KCP check time.
                 const check = self.kcp.check(now_ms);
-                const delay = if (check <= now_ms) @as(u32, 1) else @min(check - now_ms, 50);
+                const delay = if (check <= now_ms) @as(u32, 1) else @min(check - now_ms, 5);
 
                 self.write_mutex.lock();
-                if (self.write_buf.items.len == 0 and !self.closed.load(.acquire)) {
+                if (!self.closed.load(.acquire)) {
                     _ = self.write_cond.timedWait(&self.write_mutex, @as(u64, delay) * std.time.ns_per_ms);
                 }
                 self.write_mutex.unlock();
