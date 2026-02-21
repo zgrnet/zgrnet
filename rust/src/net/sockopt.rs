@@ -21,10 +21,8 @@ pub const DEFAULT_BATCH_SIZE: i32 = 64;
 pub struct SocketConfig {
     pub recv_buf_size: i32,
     pub send_buf_size: i32,
-    pub reuse_port: bool,
     pub busy_poll_us: i32,
     pub gro: bool,
-    pub gso_segment: i32,
 }
 
 impl Default for SocketConfig {
@@ -32,10 +30,8 @@ impl Default for SocketConfig {
         Self {
             recv_buf_size: DEFAULT_RECV_BUF_SIZE,
             send_buf_size: DEFAULT_SEND_BUF_SIZE,
-            reuse_port: false,
             busy_poll_us: 0,
             gro: false,
-            gso_segment: 0,
         }
     }
 }
@@ -46,10 +42,8 @@ impl SocketConfig {
         Self {
             recv_buf_size: DEFAULT_RECV_BUF_SIZE,
             send_buf_size: DEFAULT_SEND_BUF_SIZE,
-            reuse_port: false,
             busy_poll_us: DEFAULT_BUSY_POLL_US,
             gro: true,
-            gso_segment: DEFAULT_GSO_SEGMENT,
         }
     }
 }
@@ -612,7 +606,6 @@ mod tests {
         let cfg = SocketConfig::default();
         assert_eq!(cfg.recv_buf_size, DEFAULT_RECV_BUF_SIZE);
         assert_eq!(cfg.send_buf_size, DEFAULT_SEND_BUF_SIZE);
-        assert!(!cfg.reuse_port);
         assert_eq!(cfg.busy_poll_us, 0);
         assert!(!cfg.gro);
     }
