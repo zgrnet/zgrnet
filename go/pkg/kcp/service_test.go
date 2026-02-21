@@ -913,3 +913,85 @@ func TestServiceMux_BUG3_AcceptBackpressure(t *testing.T) {
 
 	t.Logf("all %d streams accepted (no drops)", total)
 }
+
+// ==================== Timeout / Dead Peer Tests ====================
+
+func TestServiceMux_AcceptThenClose(t *testing.T) {
+	_, server := serviceMuxPair(0)
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := server.AcceptStream()
+		done <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	server.Close()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("AcceptStream should return error after Close")
+		}
+		t.Logf("AcceptStream returned: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("AcceptStream didn't unblock after Close()")
+	}
+}
+
+func TestYamux_KeepaliveTimeout(t *testing.T) {
+	client, server := serviceMuxPair(0)
+
+	// Server echo in background.
+	go func() {
+		for {
+			s, _, err := server.AcceptStream()
+			if err != nil {
+				return
+			}
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					n, err := s.Read(buf)
+					if err != nil || n == 0 {
+						return
+					}
+					s.Write(buf[:n])
+				}
+			}()
+		}
+	}()
+
+	// Open stream and exchange data.
+	s, err := client.OpenStream(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Write([]byte("hello yamux"))
+	buf := make([]byte, 256)
+	n, err := s.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "hello yamux" {
+		t.Fatalf("echo mismatch: %q", buf[:n])
+	}
+
+	// Close server (simulates peer going away).
+	server.Close()
+
+	// Subsequent read should fail.
+	s.SetReadDeadline(time.Now().Add(10 * time.Second))
+	start := time.Now()
+	_, err = s.Read(buf)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error after peer close, got nil")
+	}
+	if elapsed > 15*time.Second {
+		t.Fatalf("Read took %v after peer close — no keepalive timeout", elapsed)
+	}
+	t.Logf("yamux read returned after %v: %v", elapsed, err)
+	client.Close()
+}
