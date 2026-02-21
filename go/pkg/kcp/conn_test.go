@@ -724,7 +724,6 @@ func TestKCPConn_BUG2_WriteDeadline(t *testing.T) {
 func TestKCPConn_ReadPeerDead(t *testing.T) {
 	a, b := connPair(0)
 
-	// Exchange data to establish KCP state.
 	a.Write([]byte("setup"))
 	buf := make([]byte, 256)
 	n, err := b.Read(buf)
@@ -732,12 +731,10 @@ func TestKCPConn_ReadPeerDead(t *testing.T) {
 		t.Fatal("setup failed")
 	}
 
-	// Simulate peer crash: close A without graceful shutdown.
+	// Simulate crash: close A. B's KCP will get no more ACKs.
 	a.Close()
 
-	// B's Read should detect dead peer and return.
-	// With KCP deadlink (20 retransmits) or read deadline, this should finish.
-	b.SetReadDeadline(time.Now().Add(10 * time.Second))
+	// NO SetDeadline — testing KCPConn's own idle timeout / dead link detection.
 	start := time.Now()
 	_, err = b.Read(buf)
 	elapsed := time.Since(start)
@@ -745,10 +742,10 @@ func TestKCPConn_ReadPeerDead(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error after peer death, got nil")
 	}
-	if elapsed > 15*time.Second {
-		t.Fatalf("Read took %v after peer death — too slow", elapsed)
+	if elapsed > 35*time.Second {
+		t.Fatalf("Read took %v — KCPConn has no self-timeout", elapsed)
 	}
-	t.Logf("Read returned after %v: %v", elapsed, err)
+	t.Logf("Read self-timed-out after %v: %v", elapsed, err)
 }
 
 func TestKCPConn_WritePeerDead(t *testing.T) {
@@ -758,10 +755,10 @@ func TestKCPConn_WritePeerDead(t *testing.T) {
 	buf := make([]byte, 256)
 	b.Read(buf)
 
-	// Close B (peer dies). A's writes should eventually fail.
+	// Close B. A's writes pile up with no ACKs.
 	b.Close()
 
-	a.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	// NO SetDeadline — testing idle timeout.
 	start := time.Now()
 	chunk := make([]byte, 8192)
 	var writeErr error
@@ -770,16 +767,16 @@ func TestKCPConn_WritePeerDead(t *testing.T) {
 		if writeErr != nil {
 			break
 		}
-		if time.Since(start) > 15*time.Second {
-			t.Fatal("Write didn't fail after 15s — no dead peer detection")
+		if time.Since(start) > 35*time.Second {
+			t.Fatal("Write didn't fail after 35s — no self-timeout")
 		}
 	}
 	elapsed := time.Since(start)
 
-	if elapsed > 15*time.Second {
+	if elapsed > 35*time.Second {
 		t.Fatalf("Write took %v to fail", elapsed)
 	}
-	t.Logf("Write failed after %v: %v", elapsed, writeErr)
+	t.Logf("Write self-timed-out after %v: %v", elapsed, writeErr)
 	a.Close()
 }
 

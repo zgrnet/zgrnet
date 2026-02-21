@@ -980,8 +980,7 @@ func TestYamux_KeepaliveTimeout(t *testing.T) {
 	// Close server (simulates peer going away).
 	server.Close()
 
-	// Subsequent read should fail.
-	s.SetReadDeadline(time.Now().Add(10 * time.Second))
+	// NO SetDeadline — testing KCPConn self-timeout propagation through yamux.
 	start := time.Now()
 	_, err = s.Read(buf)
 	elapsed := time.Since(start)
@@ -989,9 +988,54 @@ func TestYamux_KeepaliveTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error after peer close, got nil")
 	}
-	if elapsed > 15*time.Second {
-		t.Fatalf("Read took %v after peer close — no keepalive timeout", elapsed)
+	if elapsed > 35*time.Second {
+		t.Fatalf("Read took %v after peer close — no self-timeout", elapsed)
 	}
-	t.Logf("yamux read returned after %v: %v", elapsed, err)
+	t.Logf("yamux read self-timed-out after %v: %v", elapsed, err)
 	client.Close()
+}
+
+func TestServiceMux_OpenNoPeer(t *testing.T) {
+	mux := NewServiceMux(ServiceMuxConfig{
+		IsClient: true,
+		Output: func(service uint64, data []byte) error {
+			return nil
+		},
+	})
+	defer mux.Close()
+
+	// yamux optimistically creates the stream. But writing to it should
+	// eventually fail when the KcpConn idle-times-out (no peer ACKs).
+	s, err := mux.OpenStream(1)
+	if err != nil {
+		t.Logf("OpenStream failed immediately: %v (acceptable)", err)
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Write data — it goes into KCP but never gets ACKed.
+		start := time.Now()
+		buf := make([]byte, 256)
+		for {
+			_, err := s.Write([]byte("no peer"))
+			if err != nil {
+				t.Logf("Write failed after %v: %v", time.Since(start), err)
+				return
+			}
+			_, err = s.Read(buf)
+			if err != nil {
+				t.Logf("Read failed after %v: %v", time.Since(start), err)
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+		// Good — stream eventually failed.
+	case <-time.After(35 * time.Second):
+		t.Fatal("Stream with no peer hung forever — no timeout")
+	}
 }
