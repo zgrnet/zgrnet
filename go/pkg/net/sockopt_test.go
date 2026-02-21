@@ -2,7 +2,7 @@ package net
 
 import (
 	"net"
-	"syscall"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -25,17 +25,13 @@ func TestSocketBufferSize_SetAndVerify(t *testing.T) {
 		}
 	}
 
-	// Verify SO_RCVBUF was actually increased.
-	// Linux doubles the requested value; macOS may cap it.
-	actual := getSocketOptInt(conn, syscall.SOL_SOCKET, syscall.SO_RCVBUF)
-	if actual < DefaultRecvBufSize {
-		t.Logf("SO_RCVBUF: requested %d, got %d (OS-limited, acceptable)", DefaultRecvBufSize, actual)
-	}
+	// On Linux, kernel may cap at net.core.rmem_max (~208KB in CI).
+	// On macOS, limit is typically 8MB+. Just verify > 0.
+	actual := getSocketBufSize(conn, true)
+	t.Logf("SO_RCVBUF: requested %d, actual %d", DefaultRecvBufSize, actual)
 
-	actual = getSocketOptInt(conn, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
-	if actual < DefaultSendBufSize {
-		t.Logf("SO_SNDBUF: requested %d, got %d (OS-limited, acceptable)", DefaultSendBufSize, actual)
-	}
+	actual = getSocketBufSize(conn, false)
+	t.Logf("SO_SNDBUF: requested %d, actual %d", DefaultSendBufSize, actual)
 }
 
 func TestSocketBufferSize_CustomValues(t *testing.T) {
@@ -85,22 +81,11 @@ func TestSocketBufferSize_ZeroDefaults(t *testing.T) {
 	}
 }
 
-func TestOptimizationReport_String(t *testing.T) {
-	report := &OptimizationReport{
-		Entries: []OptimizationEntry{
-			{Name: "SO_RCVBUF", Applied: true, Detail: "SO_RCVBUF=4194304 (actual=8388608)"},
-			{Name: "SO_SNDBUF", Applied: true, Detail: "SO_SNDBUF=4194304 (actual=8388608)"},
-		},
-	}
-	s := report.String()
-	if len(s) == 0 {
-		t.Fatal("report should not be empty")
-	}
-	t.Log(s)
-}
-
 func TestReusePort_MultipleBind(t *testing.T) {
-	// Create first socket with SO_REUSEPORT
+	if runtime.GOOS == "windows" {
+		t.Skip("SO_REUSEPORT not supported on Windows")
+	}
+
 	conn1, err := ListenUDPReusePort("127.0.0.1:0")
 	if err != nil {
 		t.Skipf("SO_REUSEPORT not available: %v", err)
@@ -109,7 +94,6 @@ func TestReusePort_MultipleBind(t *testing.T) {
 
 	addr := conn1.LocalAddr().String()
 
-	// Create 3 more sockets on the same address
 	conns := []*net.UDPConn{conn1}
 	for i := 0; i < 3; i++ {
 		c, err := ListenUDPReusePort(addr)
@@ -123,19 +107,36 @@ func TestReusePort_MultipleBind(t *testing.T) {
 }
 
 func TestReusePort_WithoutFlag(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bind semantics differ on Windows")
+	}
+
 	conn1, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn1.Close()
 
-	// Try to bind a second socket to the same address without SO_REUSEPORT
 	addr := conn1.LocalAddr().(*net.UDPAddr)
 	_, err = net.ListenUDP("udp", addr)
 	if err == nil {
 		t.Fatal("expected EADDRINUSE error, but bind succeeded")
 	}
 	t.Logf("correctly got error without SO_REUSEPORT: %v", err)
+}
+
+func TestOptimizationReport_String(t *testing.T) {
+	report := &OptimizationReport{
+		Entries: []OptimizationEntry{
+			{Name: "SO_RCVBUF", Applied: true, Detail: "SO_RCVBUF=4194304 (actual=8388608)"},
+			{Name: "SO_SNDBUF", Applied: true, Detail: "SO_SNDBUF=4194304 (actual=8388608)"},
+		},
+	}
+	s := report.String()
+	if len(s) == 0 {
+		t.Fatal("report should not be empty")
+	}
+	t.Log(s)
 }
 
 func TestDefaultSocketConfig(t *testing.T) {
@@ -159,7 +160,6 @@ func TestFullSocketConfig_ApplyAll(t *testing.T) {
 	report := ApplySocketOptions(conn, cfg)
 	t.Log(report.String())
 
-	// SO_RCVBUF and SO_SNDBUF must always succeed
 	for _, e := range report.Entries {
 		if (e.Name == "SO_RCVBUF" || e.Name == "SO_SNDBUF") && !e.Applied {
 			t.Errorf("%s should be applied: %v", e.Name, e.Err)
@@ -174,11 +174,8 @@ func TestGracefulDegradation(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Apply full config — Linux-only options fail gracefully on macOS
 	report := ApplySocketOptions(conn, FullSocketConfig())
 
-	// Regardless of which optimizations were applied,
-	// basic send/recv must work
 	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)

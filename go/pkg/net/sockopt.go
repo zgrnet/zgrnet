@@ -1,11 +1,9 @@
 package net
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"strings"
-	"syscall"
 )
 
 const (
@@ -36,6 +34,18 @@ func DefaultSocketConfig() SocketConfig {
 	}
 }
 
+// FullSocketConfig returns a config with all optimizations enabled.
+func FullSocketConfig() SocketConfig {
+	return SocketConfig{
+		RecvBufSize: DefaultRecvBufSize,
+		SendBufSize: DefaultSendBufSize,
+		BusyPollUS:  DefaultBusyPollUS,
+		GRO:         true,
+		GSOSegment:  DefaultGSOSegment,
+		BatchSize:   DefaultBatchSize,
+	}
+}
+
 // OptimizationEntry records the result of a single socket optimization attempt.
 type OptimizationEntry struct {
 	Name    string
@@ -62,32 +72,6 @@ func (r *OptimizationReport) String() string {
 	return b.String()
 }
 
-// SetReusePort sets SO_REUSEPORT on a raw fd before bind.
-// Must be called via net.ListenConfig.Control before the socket is bound.
-func SetReusePort(fd uintptr) error {
-	return syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
-}
-
-// ListenUDPReusePort creates a UDP socket with SO_REUSEPORT set.
-// Multiple sockets can bind to the same address; the kernel load-balances
-// incoming packets across them.
-func ListenUDPReusePort(addr string) (*net.UDPConn, error) {
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			var err error
-			c.Control(func(fd uintptr) {
-				err = SetReusePort(fd)
-			})
-			return err
-		},
-	}
-	pc, err := lc.ListenPacket(context.Background(), "udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	return pc.(*net.UDPConn), nil
-}
-
 // ApplySocketOptions applies all configured optimizations to a UDP connection.
 // Each optimization is tried independently — failures don't block others.
 func ApplySocketOptions(conn *net.UDPConn, cfg SocketConfig) *OptimizationReport {
@@ -102,7 +86,7 @@ func ApplySocketOptions(conn *net.UDPConn, cfg SocketConfig) *OptimizationReport
 			Name: "SO_RCVBUF", Err: err,
 		})
 	} else {
-		actual := getSocketOptInt(conn, syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+		actual := getSocketBufSize(conn, true)
 		report.Entries = append(report.Entries, OptimizationEntry{
 			Name: "SO_RCVBUF", Applied: true,
 			Detail: fmt.Sprintf("SO_RCVBUF=%d (actual=%d)", recvBuf, actual),
@@ -118,7 +102,7 @@ func ApplySocketOptions(conn *net.UDPConn, cfg SocketConfig) *OptimizationReport
 			Name: "SO_SNDBUF", Err: err,
 		})
 	} else {
-		actual := getSocketOptInt(conn, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
+		actual := getSocketBufSize(conn, false)
 		report.Entries = append(report.Entries, OptimizationEntry{
 			Name: "SO_SNDBUF", Applied: true,
 			Detail: fmt.Sprintf("SO_SNDBUF=%d (actual=%d)", sendBuf, actual),
@@ -128,30 +112,4 @@ func ApplySocketOptions(conn *net.UDPConn, cfg SocketConfig) *OptimizationReport
 	applyPlatformOptions(conn, cfg, report)
 
 	return report
-}
-
-// FullSocketConfig returns a config with all optimizations enabled.
-// Suitable for high-throughput Linux servers.
-func FullSocketConfig() SocketConfig {
-	return SocketConfig{
-		RecvBufSize: DefaultRecvBufSize,
-		SendBufSize: DefaultSendBufSize,
-		BusyPollUS:  DefaultBusyPollUS,
-		GRO:         true,
-		GSOSegment:  DefaultGSOSegment,
-		BatchSize:   DefaultBatchSize,
-	}
-}
-
-// getSocketOptInt reads an integer socket option via SyscallConn.
-func getSocketOptInt(conn *net.UDPConn, level, opt int) int {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return 0
-	}
-	var val int
-	raw.Control(func(fd uintptr) {
-		val, _ = syscall.GetsockoptInt(int(fd), level, opt)
-	})
-	return val
 }
