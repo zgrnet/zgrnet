@@ -38,7 +38,7 @@ go_test(
     data = [
         "//e2e/kcp/go:kcp_test",
         "//e2e/kcp/rust:kcp_test",
-        # Zig binary excluded until Phase 6 yamux implementation.
+        "//e2e/kcp/zig:kcp_test",
     ],
     tags = [
         "local",
