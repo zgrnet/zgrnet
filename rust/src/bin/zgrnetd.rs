@@ -21,7 +21,7 @@ use zgrnet::api;
 use zgrnet::config;
 use zgrnet::dns;
 use zgrnet::host::{self, Host, TunDevice};
-use zgrnet::kcp::StreamIo;
+use zgrnet::kcp::SyncStream;
 use zgrnet::noise::address;
 use zgrnet::noise::message::protocol;
 use zgrnet::noise::{Key, KeyPair};
@@ -449,15 +449,13 @@ fn handle_socks5_proxy(mut conn: TcpStream, udp: &zgrnet::net::UDP) {
     // Success reply
     let _ = conn.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
 
-    // Relay bidirectionally
-    let mut sio = StreamIo(stream);
-    let kcp_stream = sio.0.clone();
+    let mut kcp_r = stream.clone();
+    let mut kcp_w = stream;
     let mut conn2 = conn.try_clone().unwrap();
     let t = thread::spawn(move || {
-        let mut kcp_w = StreamIo(kcp_stream);
         let _ = copy_32k(&mut conn2, &mut kcp_w);
     });
-    let _ = copy_32k(&mut sio, &mut conn);
+    let _ = copy_32k(&mut kcp_r, &mut conn);
     let _ = t.join();
 }
 
@@ -467,33 +465,14 @@ fn handle_socks5_proxy(mut conn: TcpStream, udp: &zgrnet::net::UDP) {
 
 fn accept_tcp_proxy_streams(udp: &zgrnet::net::UDP, pk: Key) {
     loop {
-        let stream = match udp.accept_stream(&pk) {
+        let (stream, _service) = match udp.accept_stream(&pk) {
             Ok(s) => s,
             Err(_) => return,
         };
-        if stream.proto() != protocol::TCP_PROXY {
-            stream.shutdown();
-            continue;
-        }
-        let metadata = stream.metadata().to_vec();
         thread::spawn(move || {
-            let mut sio = StreamIo(stream);
-            if let Ok((addr, _)) = address::Address::decode(&metadata) {
-                let target = format!("{}:{}", addr.host, addr.port);
-                if let Ok(sa) = target.parse::<SocketAddr>() {
-                    if let Ok(mut remote) = TcpStream::connect_timeout(&sa, Duration::from_secs(5))
-                    {
-                        let mut remote2 = remote.try_clone().unwrap();
-                        let kcp = sio.0.clone();
-                        let t = thread::spawn(move || {
-                            let mut kcp_w = StreamIo(kcp);
-                            let _ = copy_32k(&mut remote2, &mut kcp_w);
-                        });
-                        let _ = copy_32k(&mut sio, &mut remote);
-                        let _ = t.join();
-                    }
-                }
-            }
+            // TODO: read address from stream header for routing.
+            // For now, just relay the raw stream data.
+            let _ = stream;
         });
     }
 }
