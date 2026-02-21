@@ -1,12 +1,13 @@
 load("@rules_go//go:def.bzl", "go_binary")
 
 go_binary(
-    name = "zgrnetd",
+    name = "zigor",
     srcs = ["main.go"],
-    importpath = "github.com/vibing/zgrnet/cmd/zgrnetd",
+    importpath = "github.com/vibing/zgrnet/cmd/zigor",
     visibility = ["//visibility:public"],
     deps = [
         "//go/pkg/api",
+        "//go/pkg/cli",
         "//go/pkg/config",
         "//go/pkg/dns",
         "//go/pkg/dnsmgr",

@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -10,7 +11,6 @@ import (
 func TestCreateAndListContexts(t *testing.T) {
 	dir := t.TempDir()
 
-	// Initially empty
 	names, err := ListContexts(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -19,12 +19,10 @@ func TestCreateAndListContexts(t *testing.T) {
 		t.Fatalf("expected 0 contexts, got %d", len(names))
 	}
 
-	// Create context
 	if err := CreateContext(dir, "work"); err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify files
 	if _, err := os.Stat(filepath.Join(dir, "work", "config.yaml")); err != nil {
 		t.Fatal("config.yaml not created")
 	}
@@ -35,7 +33,6 @@ func TestCreateAndListContexts(t *testing.T) {
 		t.Fatal("data dir not created")
 	}
 
-	// List should show 1
 	names, err = ListContexts(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -51,21 +48,33 @@ func TestCreateDuplicateContext(t *testing.T) {
 	if err := CreateContext(dir, "test"); err != nil {
 		t.Fatal(err)
 	}
+
+	origKey, err := os.ReadFile(filepath.Join(dir, "test", "private.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if err := CreateContext(dir, "test"); err == nil {
 		t.Fatal("expected error for duplicate context")
+	}
+
+	afterKey, err := os.ReadFile(filepath.Join(dir, "test", "private.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(origKey) != string(afterKey) {
+		t.Fatal("private.key was modified by failed duplicate create")
 	}
 }
 
 func TestCurrentContext(t *testing.T) {
 	dir := t.TempDir()
 
-	// No current set
 	_, err := CurrentContextName(dir)
 	if err == nil {
 		t.Fatal("expected error when no current set")
 	}
 
-	// Create and set
 	if err := CreateContext(dir, "default"); err != nil {
 		t.Fatal(err)
 	}
@@ -100,9 +109,16 @@ func TestDeleteContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Should be gone
 	if _, err := os.Stat(filepath.Join(dir, "temp")); !os.IsNotExist(err) {
 		t.Fatal("context dir should be deleted")
+	}
+
+	names, err := ListContexts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("expected 0 after delete, got %d", len(names))
 	}
 }
 
@@ -214,19 +230,16 @@ func TestShowConfig(t *testing.T) {
 func TestResolveAPIAddr(t *testing.T) {
 	dir := t.TempDir()
 
-	// Override takes precedence
 	addr := ResolveAPIAddr(dir, "", "10.0.0.1:8080")
 	if addr != "10.0.0.1:8080" {
 		t.Fatalf("override should take precedence, got %q", addr)
 	}
 
-	// Fallback when no context
 	addr = ResolveAPIAddr(dir, "", "")
 	if addr != "100.64.0.1:80" {
 		t.Fatalf("expected fallback, got %q", addr)
 	}
 
-	// Read from config
 	if err := CreateContext(dir, "apitest"); err != nil {
 		t.Fatal(err)
 	}
@@ -240,18 +253,18 @@ func TestResolveAPIAddr(t *testing.T) {
 }
 
 func TestDefaultConfigDirEnvOverride(t *testing.T) {
-	t.Setenv("ZGRNET_HOME", "/tmp/custom-zgrnet")
+	t.Setenv("ZIGOR_CONFIG_DIR", "/tmp/custom-zigor")
 	dir, err := DefaultConfigDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dir != "/tmp/custom-zgrnet" {
-		t.Fatalf("expected /tmp/custom-zgrnet, got %q", dir)
+	if dir != "/tmp/custom-zigor" {
+		t.Fatalf("expected /tmp/custom-zigor, got %q", dir)
 	}
 }
 
 func TestDefaultConfigDirDefault(t *testing.T) {
-	t.Setenv("ZGRNET_HOME", "")
+	t.Setenv("ZIGOR_CONFIG_DIR", "")
 	dir, err := DefaultConfigDir()
 	if err != nil {
 		t.Fatal(err)
@@ -259,8 +272,7 @@ func TestDefaultConfigDirDefault(t *testing.T) {
 	if dir == "" {
 		t.Fatal("empty dir")
 	}
-	// Should end with .config/zgrnet (or .config\zgrnet on Windows)
-	expected := filepath.Join(".config", "zgrnet")
+	expected := filepath.Join(".config", "zigor")
 	if !strings.HasSuffix(dir, expected) {
 		t.Fatalf("unexpected dir: %q (expected suffix %q)", dir, expected)
 	}
@@ -277,7 +289,6 @@ func TestCurrentContextNameEmptyFile(t *testing.T) {
 
 func TestListContextsEmptyDir(t *testing.T) {
 	dir := t.TempDir()
-	// Dir with subdirs but no config.yaml
 	os.MkdirAll(filepath.Join(dir, "notacontext"), 0700)
 	names, err := ListContexts(dir)
 	if err != nil {
@@ -303,7 +314,6 @@ func TestShowPublicKeyBadKey(t *testing.T) {
 	if err := CreateContext(dir, "badkey"); err != nil {
 		t.Fatal(err)
 	}
-	// Overwrite with invalid key
 	os.WriteFile(filepath.Join(dir, "badkey", "private.key"), []byte("notahexkey\n"), 0600)
 	_, err := ShowPublicKey(dir, "badkey")
 	if err == nil {
@@ -361,5 +371,168 @@ func TestMultipleContextsSorted(t *testing.T) {
 	}
 	if names[0] != "alpha" || names[1] != "bravo" || names[2] != "charlie" {
 		t.Fatalf("not sorted: %v", names)
+	}
+}
+
+// ── Name validation tests ───────────────────────────────────────────────
+
+func TestCtxCreate_InvalidName(t *testing.T) {
+	dir := t.TempDir()
+
+	cases := []struct {
+		name string
+		desc string
+	}{
+		{"", "empty name"},
+		{"a/b", "contains slash"},
+		{"a\\b", "contains backslash"},
+		{"../evil", "path traversal"},
+		{"a b", "contains space"},
+		{"a\tb", "contains tab"},
+		{".hidden", "starts with dot"},
+		{"..double", "starts with dots"},
+	}
+	for _, tc := range cases {
+		err := CreateContext(dir, tc.name)
+		if err == nil {
+			t.Errorf("expected error for %s (%q), got nil", tc.desc, tc.name)
+		}
+	}
+}
+
+func TestCtxCreate_KeyUniqueness(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := CreateContext(dir, "test1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateContext(dir, "test2"); err != nil {
+		t.Fatal(err)
+	}
+
+	key1, err := os.ReadFile(filepath.Join(dir, "test1", "private.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key2, err := os.ReadFile(filepath.Join(dir, "test2", "private.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(key1) == string(key2) {
+		t.Fatal("two contexts generated the same private key")
+	}
+}
+
+func TestCtx_ConfigDirPermission(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file permissions not applicable on Windows")
+	}
+
+	dir := t.TempDir()
+
+	if err := CreateContext(dir, "permtest"); err != nil {
+		t.Fatal(err)
+	}
+
+	keyInfo, err := os.Stat(filepath.Join(dir, "permtest", "private.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	perm := keyInfo.Mode().Perm()
+	if perm != 0600 {
+		t.Fatalf("private.key permission = %o, want 0600", perm)
+	}
+
+	dirInfo, err := os.Stat(filepath.Join(dir, "permtest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	perm = dirInfo.Mode().Perm()
+	if perm != 0700 {
+		t.Fatalf("ctx dir permission = %o, want 0700", perm)
+	}
+}
+
+func TestCtx_CorruptedCurrentFile(t *testing.T) {
+	dir := t.TempDir()
+
+	os.WriteFile(filepath.Join(dir, "current"), []byte("nonexistent\n"), 0644)
+
+	name, err := CurrentContextName(dir)
+	if err != nil {
+		t.Fatalf("unexpected error reading current: %v", err)
+	}
+	if name != "nonexistent" {
+		t.Fatalf("expected 'nonexistent', got %q", name)
+	}
+
+	_, err = ContextConfigPath(dir, "")
+	if err == nil {
+		t.Fatal("expected error when current context dir doesn't exist")
+	}
+}
+
+func TestCtxList_ShowCurrent(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := CreateContext(dir, "test1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateContext(dir, "test2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetCurrentContext(dir, "test2"); err != nil {
+		t.Fatal(err)
+	}
+
+	current, _ := CurrentContextName(dir)
+	if current != "test2" {
+		t.Fatalf("expected current=test2, got %q", current)
+	}
+
+	names, err := ListContexts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 {
+		t.Fatalf("expected 2, got %d", len(names))
+	}
+}
+
+func TestCtxUse_NonExistent(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := CreateContext(dir, "real"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetCurrentContext(dir, "real"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := SetCurrentContext(dir, "ghost")
+	if err == nil {
+		t.Fatal("expected error for nonexistent context")
+	}
+
+	name, _ := CurrentContextName(dir)
+	if name != "real" {
+		t.Fatalf("current should still be 'real', got %q", name)
+	}
+}
+
+func TestValidateContextName(t *testing.T) {
+	valid := []string{"prod", "dev", "my-ctx", "node_1", "123"}
+	for _, name := range valid {
+		if err := ValidateContextName(name); err != nil {
+			t.Errorf("expected %q to be valid, got error: %v", name, err)
+		}
+	}
+
+	invalid := []string{"", "a/b", "a\\b", "../x", "a b", ".hidden", "..x", "current"}
+	for _, name := range invalid {
+		if err := ValidateContextName(name); err == nil {
+			t.Errorf("expected %q to be invalid", name)
+		}
 	}
 }

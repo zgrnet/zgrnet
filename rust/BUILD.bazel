@@ -56,25 +56,15 @@ rust_library(
     deps = all_crate_deps() + ["//third_party/kcp", "//zig/tun:lib", "//zig/dnsmgr:lib"],
 )
 
-# zgrnet CLI — offline management tool
+# zigor CLI — unified management tool (replaces zgrnet + zgrnetd)
 rust_binary(
-    name = "zgrnet_bin",
-    srcs = ["src/bin/zgrnet.rs"],
+    name = "zigor_bin",
+    srcs = ["src/bin/zigor.rs"],
     edition = "2021",
     deps = [":zgrnet"] + all_crate_deps(),
     visibility = ["//visibility:public"],
 )
 
-# zgrnetd daemon (macOS only — requires TUN device support)
-rust_binary(
-    name = "zgrnetd",
-    srcs = ["src/bin/zgrnetd.rs"],
-    edition = "2021",
-    crate_features = ["tun", "dnsmgr"],
-    target_compatible_with = ["@platforms//os:macos"],
-    deps = [":zgrnet_full"] + all_crate_deps(),
-    visibility = ["//visibility:public"],
-)
 
 # Smoke test (macOS only)
 rust_binary(

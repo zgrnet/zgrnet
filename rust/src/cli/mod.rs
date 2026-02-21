@@ -22,15 +22,15 @@ use crate::noise::KeyPair;
 // Context management
 // ============================================================================
 
-/// Returns the default zgrnet config directory.
-/// Uses $ZGRNET_HOME if set, otherwise ~/.config/zgrnet.
+/// Returns the default zigor config directory.
+/// Uses $ZIGOR_CONFIG_DIR if set, otherwise ~/.config/zigor.
 pub fn default_config_dir() -> Result<PathBuf, String> {
-    if let Ok(dir) = std::env::var("ZGRNET_HOME") {
+    if let Ok(dir) = std::env::var("ZIGOR_CONFIG_DIR") {
         return Ok(PathBuf::from(dir));
     }
     let home = std::env::var("HOME")
         .map_err(|_| "cannot determine home directory".to_string())?;
-    Ok(PathBuf::from(home).join(".config").join("zgrnet"))
+    Ok(PathBuf::from(home).join(".config").join("zigor"))
 }
 
 /// Returns the path to a specific context directory.
@@ -44,7 +44,7 @@ pub fn current_context_name(base_dir: &Path) -> Result<String, String> {
     let data = fs::read_to_string(&path)
         .map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
-                "no current context set (run: zgrnet context create <name>)".to_string()
+                "no current context set (run: zigor ctx create <name>)".to_string()
             } else {
                 format!("read current context: {e}")
             }
@@ -58,6 +58,7 @@ pub fn current_context_name(base_dir: &Path) -> Result<String, String> {
 
 /// Sets the current context.
 pub fn set_current_context(base_dir: &Path, name: &str) -> Result<(), String> {
+    validate_context_name(name)?;
     let dir = context_dir(base_dir, name);
     if !dir.exists() {
         return Err(format!("context {:?} does not exist", name));
@@ -93,8 +94,32 @@ pub fn list_contexts(base_dir: &Path) -> Result<Vec<String>, String> {
 
 const CONTEXT_TEMPLATE: &str = "net:\n  private_key: \"private.key\"\n  tun_ipv4: \"100.64.0.1\"\n  tun_mtu: 1400\n  listen_port: 51820\n";
 
+/// Validates that a context name is safe for use as a directory name.
+pub fn validate_context_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("context name cannot be empty".to_string());
+    }
+    if name == "current" {
+        return Err(format!("context name {:?} is reserved", name));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(format!("context name {:?} contains path separator", name));
+    }
+    if name.contains("..") {
+        return Err(format!("context name {:?} contains path traversal", name));
+    }
+    if name.chars().any(|c| c.is_whitespace()) {
+        return Err(format!("context name {:?} contains whitespace", name));
+    }
+    if name.starts_with('.') {
+        return Err(format!("context name {:?} cannot start with dot", name));
+    }
+    Ok(())
+}
+
 /// Creates a new context with a generated keypair and template config.
 pub fn create_context(base_dir: &Path, name: &str) -> Result<(), String> {
+    validate_context_name(name)?;
     let dir = context_dir(base_dir, name);
     if dir.exists() {
         return Err(format!("context {:?} already exists", name));
@@ -125,6 +150,7 @@ pub fn create_context(base_dir: &Path, name: &str) -> Result<(), String> {
 
 /// Deletes a context. Refuses to delete the current context.
 pub fn delete_context(base_dir: &Path, name: &str) -> Result<(), String> {
+    validate_context_name(name)?;
     if let Ok(current) = current_context_name(base_dir) {
         if current == name {
             return Err(format!("cannot delete the current context {:?} (switch to another first)", name));
@@ -319,6 +345,40 @@ impl Client {
     pub fn routes_remove(&self, id: &str) -> Result<(), String> { self.delete(&format!("/api/routes/{id}")) }
 }
 
+/// Returns the pidfile path for the given context.
+pub fn pidfile_path(base_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let ctx = if name.is_empty() {
+        current_context_name(base_dir)?
+    } else {
+        name.to_string()
+    };
+    Ok(context_dir(base_dir, &ctx).join("data").join("zigor.pid"))
+}
+
+/// Reads the PID from the context's pidfile.
+pub fn read_pidfile(base_dir: &Path, name: &str) -> Result<i32, String> {
+    let path = pidfile_path(base_dir, name)?;
+    let data = fs::read_to_string(&path)
+        .map_err(|_| format!("host is not running for context {:?} (no pidfile)", name))?;
+    data.trim().parse::<i32>()
+        .map_err(|_| "invalid pidfile content".to_string())
+}
+
+/// Writes the PID to the context's pidfile.
+pub fn write_pidfile(base_dir: &Path, name: &str, pid: u32) -> Result<(), String> {
+    let path = pidfile_path(base_dir, name)?;
+    let _ = fs::create_dir_all(path.parent().unwrap());
+    fs::write(&path, format!("{pid}\n"))
+        .map_err(|e| format!("write pidfile: {e}"))
+}
+
+/// Removes the context's pidfile.
+pub fn remove_pidfile(base_dir: &Path, name: &str) {
+    if let Ok(path) = pidfile_path(base_dir, name) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn extract_error(body: &str) -> String {
     // Try to extract "error" field from JSON
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
@@ -440,11 +500,8 @@ mod tests {
     #[test]
     fn test_resolve_api_addr() {
         let dir = temp_dir();
-        // Override
         assert_eq!(resolve_api_addr(&dir, "", "10.0.0.1:8080"), "10.0.0.1:8080");
-        // Fallback
         assert_eq!(resolve_api_addr(&dir, "", ""), "100.64.0.1:80");
-        // From config
         create_context(&dir, "apitest").unwrap();
         set_current_context(&dir, "apitest").unwrap();
         assert_eq!(resolve_api_addr(&dir, "", ""), "100.64.0.1:80");
@@ -478,6 +535,62 @@ mod tests {
         set_current_context(&dir, "pathtest").unwrap();
         let path = context_config_path(&dir, "").unwrap();
         assert!(path.ends_with("pathtest/config.yaml"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_validate_context_name() {
+        assert!(validate_context_name("prod").is_ok());
+        assert!(validate_context_name("dev").is_ok());
+        assert!(validate_context_name("my-ctx").is_ok());
+
+        assert!(validate_context_name("").is_err());
+        assert!(validate_context_name("current").is_err());
+        assert!(validate_context_name("a/b").is_err());
+        assert!(validate_context_name("a\\b").is_err());
+        assert!(validate_context_name("../evil").is_err());
+        assert!(validate_context_name("a b").is_err());
+        assert!(validate_context_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn test_create_invalid_name() {
+        let dir = temp_dir();
+        assert!(create_context(&dir, "").is_err());
+        assert!(create_context(&dir, "a/b").is_err());
+        assert!(create_context(&dir, "../evil").is_err());
+        assert!(create_context(&dir, "a b").is_err());
+        assert!(create_context(&dir, ".hidden").is_err());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_key_uniqueness() {
+        let dir = temp_dir();
+        create_context(&dir, "k1").unwrap();
+        create_context(&dir, "k2").unwrap();
+        let pk1 = show_public_key(&dir, "k1").unwrap();
+        let pk2 = show_public_key(&dir, "k2").unwrap();
+        assert_ne!(pk1, pk2);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_delete_nonexistent() {
+        let dir = temp_dir();
+        assert!(delete_context(&dir, "ghost").is_err());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_pidfile_roundtrip() {
+        let dir = temp_dir();
+        create_context(&dir, "pidtest").unwrap();
+        write_pidfile(&dir, "pidtest", 12345).unwrap();
+        let pid = read_pidfile(&dir, "pidtest").unwrap();
+        assert_eq!(pid, 12345);
+        remove_pidfile(&dir, "pidtest");
+        assert!(read_pidfile(&dir, "pidtest").is_err());
         cleanup(&dir);
     }
 }

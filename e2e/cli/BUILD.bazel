@@ -1,19 +1,19 @@
 load("@rules_go//go:def.bzl", "go_test")
 
 go_test(
-    name = "zgrnet_e2e_test",
+    name = "zigor_e2e_test",
     srcs = ["run.go"],
     data = [
-        "//go/cmd/zgrnet",
-        "//rust:zgrnet_bin",
-        "//zig:zgrnet_bin",
+        "//go/cmd/zigor",
+        "//rust:zigor_bin",
+        "//zig:zigor_bin",
         "testdata/cases.json",
         "testdata/seed_key.hex",
     ],
     env = {
-        "GO_ZGRNET_BIN": "$(rootpath //go/cmd/zgrnet)",
-        "RUST_ZGRNET_BIN": "$(rootpath //rust:zgrnet_bin)",
-        "ZIG_ZGRNET_BIN": "$(rootpath //zig:zgrnet_bin)",
+        "GO_ZIGOR_BIN": "$(rootpath //go/cmd/zigor)",
+        "RUST_ZIGOR_BIN": "$(rootpath //rust:zigor_bin)",
+        "ZIG_ZIGOR_BIN": "$(rootpath //zig:zigor_bin)",
     },
     deps = [
         "@org_golang_x_crypto//curve25519",

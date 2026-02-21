@@ -53,10 +53,9 @@ func TestDownInvalidPidFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write an invalid pid file
 	pidDir := filepath.Join(dir, "badpid", "data")
 	os.MkdirAll(pidDir, 0700)
-	os.WriteFile(filepath.Join(pidDir, "zgrnetd.pid"), []byte("notanumber\n"), 0644)
+	os.WriteFile(filepath.Join(pidDir, "zigor.pid"), []byte("notanumber\n"), 0644)
 
 	err := Down(dir, "badpid")
 	if err == nil {
@@ -70,27 +69,13 @@ func TestDownDeadProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write a pid file with a very unlikely PID
 	pidDir := filepath.Join(dir, "dead", "data")
 	os.MkdirAll(pidDir, 0700)
-	os.WriteFile(filepath.Join(pidDir, "zgrnetd.pid"), []byte("999999999\n"), 0644)
+	os.WriteFile(filepath.Join(pidDir, "zigor.pid"), []byte("999999999\n"), 0644)
 
-	// Should fail because process doesn't exist
 	err := Down(dir, "dead")
 	if err == nil {
 		t.Fatal("expected error for dead process")
-	}
-}
-
-func TestFindZgrnetdNotFound(t *testing.T) {
-	// Save and clear PATH to ensure zgrnetd can't be found
-	origPath := os.Getenv("PATH")
-	os.Setenv("PATH", t.TempDir()) // empty dir with no binaries
-	defer os.Setenv("PATH", origPath)
-
-	_, err := findZgrnetd()
-	if err == nil {
-		t.Fatal("expected error when zgrnetd not in PATH")
 	}
 }
 
@@ -103,7 +88,6 @@ func TestResolveAPIAddrFromConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write a custom config with different TUN IP
 	cfgPath := filepath.Join(dir, "custom", "config.yaml")
 	os.WriteFile(cfgPath, []byte(`net:
   private_key: "private.key"
@@ -127,7 +111,6 @@ func TestResolveAPIAddrQuotedIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// IP with single quotes
 	cfgPath := filepath.Join(dir, "quoted", "config.yaml")
 	os.WriteFile(cfgPath, []byte(`net:
   private_key: "private.key"
@@ -139,5 +122,43 @@ func TestResolveAPIAddrQuotedIP(t *testing.T) {
 	addr := ResolveAPIAddr(dir, "", "")
 	if addr != "100.64.2.2:80" {
 		t.Fatalf("expected 100.64.2.2:80, got %q", addr)
+	}
+}
+
+func TestPidfileRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	if err := CreateContext(dir, "pidtest"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WritePidfile(dir, "pidtest", 12345); err != nil {
+		t.Fatal(err)
+	}
+
+	pid, err := ReadPidfile(dir, "pidtest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != 12345 {
+		t.Fatalf("expected pid 12345, got %d", pid)
+	}
+
+	RemovePidfile(dir, "pidtest")
+
+	_, err = ReadPidfile(dir, "pidtest")
+	if err == nil {
+		t.Fatal("expected error after removing pidfile")
+	}
+}
+
+func TestReadPidfileNotRunning(t *testing.T) {
+	dir := t.TempDir()
+	if err := CreateContext(dir, "norun"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ReadPidfile(dir, "norun")
+	if err == nil {
+		t.Fatal("expected error when no pidfile")
 	}
 }
