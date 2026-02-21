@@ -76,6 +76,9 @@ impl UdpTransport {
     /// ```
     pub fn bind(addr: &str) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr)?;
+
+        super::sockopt::apply_socket_options(&socket, &super::sockopt::SocketConfig::default());
+
         let bound_addr = UdpAddr::new(socket.local_addr()?);
 
         Ok(Self {

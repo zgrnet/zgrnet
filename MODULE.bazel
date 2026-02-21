@@ -37,6 +37,7 @@ use_repo(
     "com_github_chromedp_chromedp",
     "in_gopkg_yaml_v3",
     "org_golang_x_crypto",
+    "org_golang_x_net",
 )
 
 # embed-zig: Bazel-native Zig build rules + Zig toolchain

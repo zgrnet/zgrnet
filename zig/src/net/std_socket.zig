@@ -10,6 +10,7 @@ const mem = std.mem;
 const socket_trait = @import("socket.zig");
 const SocketError = socket_trait.SocketError;
 const RecvFromResult = socket_trait.RecvFromResult;
+const sockopt_mod = @import("sockopt.zig");
 
 pub const StdUdpSocket = struct {
     fd: posix.socket_t,
@@ -39,6 +40,7 @@ pub const StdUdpSocket = struct {
         posix.bind(self.fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)) catch {
             return error.BindFailed;
         };
+        _ = sockopt_mod.applySocketOptions(self.fd, .{});
     }
 
     /// Send data to a specific address.
