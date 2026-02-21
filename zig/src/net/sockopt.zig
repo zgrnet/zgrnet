@@ -140,7 +140,7 @@ fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *Optimizatio
     }
 
     if (cfg.gro) {
-        if (trySetsockoptInt(fd, std.posix.IPPROTO.UDP, UDP_GRO, 1)) {
+        if (trySetsockoptInt(fd, @intCast(std.posix.IPPROTO.UDP), UDP_GRO, 1)) {
             report.add(.{ .name = "UDP_GRO", .applied = true, .actual_value = 1 });
         } else {
             report.add(.{ .name = "UDP_GRO", .applied = false });
@@ -191,7 +191,7 @@ pub const BatchReader = struct {
         results: []BatchRecvResult,
     ) !usize {
         if (comptime builtin.os.tag != .linux) {
-            // Non-Linux fallback: single recvfrom
+            if (buffers.len == 0 or results.len == 0) return 0;
             var from_addr: posix.sockaddr.in = undefined;
             var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
             const n = posix.recvfrom(self.fd, buffers[0], 0, @ptrCast(&from_addr), &from_len) catch return error.RecvFailed;
