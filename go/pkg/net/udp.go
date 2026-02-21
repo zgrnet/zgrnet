@@ -106,6 +106,10 @@ type packet struct {
 	// Atomic because ioLoop writes it while decryptWorker reads it concurrently.
 	inOutput atomic.Bool
 
+	// Release guard: prevents double-release when multiple goroutines
+	// race to release the same packet (e.g., during shutdown).
+	released atomic.Bool
+
 	// Synchronization
 	ready chan struct{} // closed when decryption is complete
 }
@@ -142,12 +146,17 @@ func acquirePacket() *packet {
 	p.payloadN = 0
 	p.err = nil
 	p.inOutput.Store(false)
+	p.released.Store(false)
 	p.ready = make(chan struct{})
 	return p
 }
 
 // releasePacket returns a packet to the pool.
+// Safe to call from multiple goroutines — only the first call takes effect.
 func releasePacket(p *packet) {
+	if !p.released.CompareAndSwap(false, true) {
+		return
+	}
 	outstandingPackets.Add(-1)
 	if p.data != nil {
 		bufferPool.Put(p.data)
