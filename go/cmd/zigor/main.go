@@ -345,6 +345,7 @@ func hostUpDaemon(baseDir, ctxName string) error {
 	}
 
 	if err := cli.WritePidfile(baseDir, ctxName, cmd.Process.Pid); err != nil {
+		cmd.Process.Kill()
 		return fmt.Errorf("write pidfile: %w", err)
 	}
 

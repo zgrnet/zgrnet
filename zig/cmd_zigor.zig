@@ -134,6 +134,8 @@ fn validateContextName(name: []const u8) bool {
     if (mem.indexOf(u8, name, "..") != null) return false;
     if (mem.indexOfScalar(u8, name, ' ') != null) return false;
     if (mem.indexOfScalar(u8, name, '\t') != null) return false;
+    if (mem.indexOfScalar(u8, name, '\n') != null) return false;
+    if (mem.indexOfScalar(u8, name, '\r') != null) return false;
     if (name[0] == '.') return false;
     return true;
 }
