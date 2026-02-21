@@ -49,3 +49,7 @@ pub const OutputFn = stream_mod.OutputFn;
 pub const OnNewStreamFn = stream_mod.OnNewStreamFn;
 
 pub const RingBuffer = ring_buffer.RingBuffer;
+
+// New: KcpConn (Step 6.2)
+pub const conn_mod = @import("conn.zig");
+pub const KcpConn = conn_mod.KcpConn;
