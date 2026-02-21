@@ -248,9 +248,15 @@ fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut Optimization
 }
 
 /// Check if UDP_SEGMENT (GSO) is available on a socket.
+/// Probes by setting and immediately clearing the option to avoid side effects.
 #[cfg(target_os = "linux")]
 pub fn gso_supported(fd: i32) -> bool {
-    setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, 1400).is_ok()
+    if setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, 1400).is_ok() {
+        let _ = setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, 0);
+        true
+    } else {
+        false
+    }
 }
 
 /// Batch reader using recvmmsg on Linux.
