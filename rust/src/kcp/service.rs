@@ -14,6 +14,8 @@ pub type ServiceOutputFn = Arc<dyn Fn(u64, &[u8]) -> Result<(), Box<dyn std::err
 pub struct ServiceMuxConfig {
     pub is_client: bool,
     pub output: ServiceOutputFn,
+    /// Tokio runtime handle. If None, uses Handle::try_current().
+    pub runtime: Option<tokio::runtime::Handle>,
 }
 
 struct ServiceEntry {
@@ -43,6 +45,7 @@ impl ServiceMux {
 
     pub fn input(&self, service: u64, data: &[u8]) {
         if self.closed.load(Ordering::Relaxed) { return; }
+        let _guard = self.config.runtime.as_ref().map(|h| h.enter());
         let entry = {
             let s = self.services.read().unwrap();
             s.get(&service).cloned()
@@ -184,6 +187,7 @@ mod tests {
 
         let client = ServiceMux::new(ServiceMuxConfig {
             is_client: true,
+            runtime: None,
             output: Arc::new(move |service, data| {
                 let _ = c_to_s_tx.send((service, data.to_vec()));
                 Ok(())
@@ -192,6 +196,7 @@ mod tests {
 
         let server = ServiceMux::new(ServiceMuxConfig {
             is_client: false,
+            runtime: None,
             output: Arc::new(move |service, data| {
                 let _ = s_to_c_tx.send((service, data.to_vec()));
                 Ok(())
