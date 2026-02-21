@@ -406,7 +406,7 @@ mod tests {
 
         // Step 1: A encrypts data with A-C session
         let original_data = b"hello through relay!";
-        let payload = encode_payload(protocol::CHAT, original_data);
+        let payload = encode_payload(protocol::CHAT, 0, original_data);
         let (ciphertext, nonce) = session_a.encrypt(&payload).unwrap();
 
         // Build Type 4 transport message
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(msg.receiver_index, session_c.local_index());
 
         let plaintext = session_c.decrypt(msg.ciphertext, msg.counter).unwrap();
-        let (proto, data) = decode_payload(&plaintext).unwrap();
+        let (proto, _svc, data) = decode_payload(&plaintext).unwrap();
         assert_eq!(proto, protocol::CHAT);
         assert_eq!(data, original_data);
     }
@@ -468,7 +468,7 @@ mod tests {
 
         // Step 1: A encrypts
         let original_data = b"multi-hop relay with real encryption!";
-        let payload = encode_payload(0, original_data); // 0 = RAW
+        let payload = encode_payload(0, 0, original_data); // protocol=RAW, service=0
         let (ciphertext, nonce) = session_a.encrypt(&payload).unwrap();
         let type4msg = build_transport_message(session_a.remote_index(), nonce, &ciphertext);
 
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(msg.receiver_index, session_d.local_index());
 
         let plaintext = session_d.decrypt(msg.ciphertext, msg.counter).unwrap();
-        let (proto, data) = decode_payload(&plaintext).unwrap();
+        let (proto, _svc, data) = decode_payload(&plaintext).unwrap();
         assert_eq!(proto, 0); // 0 = RAW
         assert_eq!(data, original_data);
     }

@@ -168,10 +168,8 @@ func main() {
 	udpA := hostA.UDP()
 	udpB := hostB.UDP()
 
-	// Proxy A: SOCKS5 → KCP stream (proto=69) → B
 	proxyA := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
-		metadata := addr.Encode()
-		stream, err := udpA.OpenStream(keyB.Public, noise.ProtocolTCPProxy, metadata)
+		stream, err := udpA.OpenStream(keyB.Public, noise.ServiceProxy)
 		if err != nil {
 			return nil, fmt.Errorf("open stream: %w", err)
 		}
@@ -180,29 +178,22 @@ func main() {
 	go proxyA.ListenAndServe()
 	defer proxyA.Close()
 
-	// B accepts TCP_PROXY streams and dials real targets
 	go func() {
 		for {
-			stream, err := udpB.AcceptStream(keyA.Public)
+			stream, _, err := udpB.AcceptStream(keyA.Public)
 			if err != nil {
 				return
 			}
-			if stream.Proto() != noise.ProtocolTCPProxy {
-				stream.Close()
-				continue
-			}
 			go func() {
-				if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
+				if err := proxy.HandleTCPProxy(stream, nil, nil, nil); err != nil {
 					log.Printf("tcp_proxy: %v", err)
 				}
 			}()
 		}
 	}()
 
-	// Proxy B: SOCKS5 → KCP stream (proto=69) → A
 	proxyB := proxy.NewServer("127.0.0.1:0", func(addr *noise.Address) (io.ReadWriteCloser, error) {
-		metadata := addr.Encode()
-		stream, err := udpB.OpenStream(keyA.Public, noise.ProtocolTCPProxy, metadata)
+		stream, err := udpB.OpenStream(keyA.Public, noise.ServiceProxy)
 		if err != nil {
 			return nil, fmt.Errorf("open stream: %w", err)
 		}
@@ -211,19 +202,14 @@ func main() {
 	go proxyB.ListenAndServe()
 	defer proxyB.Close()
 
-	// A accepts TCP_PROXY streams and dials real targets
 	go func() {
 		for {
-			stream, err := udpA.AcceptStream(keyB.Public)
+			stream, _, err := udpA.AcceptStream(keyB.Public)
 			if err != nil {
 				return
 			}
-			if stream.Proto() != noise.ProtocolTCPProxy {
-				stream.Close()
-				continue
-			}
 			go func() {
-				if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
+				if err := proxy.HandleTCPProxy(stream, nil, nil, nil); err != nil {
 					log.Printf("tcp_proxy: %v", err)
 				}
 			}()

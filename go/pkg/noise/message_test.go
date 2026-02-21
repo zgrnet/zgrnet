@@ -53,20 +53,16 @@ func TestTransportMessageWrongType(t *testing.T) {
 
 func TestPayloadEncodeDecode(t *testing.T) {
 	protocol := ProtocolUDP
+	service := uint64(1)
 	payload := []byte("hello world")
 
-	encoded := EncodePayload(protocol, payload)
+	encoded := EncodePayload(protocol, service, payload)
 
 	if encoded[0] != protocol {
 		t.Errorf("encoded[0] = %d, want %d", encoded[0], protocol)
 	}
 
-	if !bytes.Equal(encoded[1:], payload) {
-		t.Errorf("encoded payload mismatch")
-	}
-
-	// Decode
-	decodedProto, decodedPayload, err := DecodePayload(encoded)
+	decodedProto, decodedSvc, decodedPayload, err := DecodePayload(encoded)
 	if err != nil {
 		t.Fatalf("DecodePayload() error = %v", err)
 	}
@@ -75,30 +71,98 @@ func TestPayloadEncodeDecode(t *testing.T) {
 		t.Errorf("decoded protocol = %d, want %d", decodedProto, protocol)
 	}
 
+	if decodedSvc != service {
+		t.Errorf("decoded service = %d, want %d", decodedSvc, service)
+	}
+
 	if !bytes.Equal(decodedPayload, payload) {
 		t.Errorf("decoded payload mismatch")
 	}
 }
 
 func TestPayloadDecodeEmpty(t *testing.T) {
-	_, _, err := DecodePayload([]byte{})
+	_, _, _, err := DecodePayload([]byte{})
 	if err != ErrMessageTooShort {
 		t.Errorf("DecodePayload() error = %v, want ErrMessageTooShort", err)
 	}
 }
 
 func TestPayloadDecodeProtocolOnly(t *testing.T) {
-	proto, payload, err := DecodePayload([]byte{ProtocolTCP})
+	_, _, _, err := DecodePayload([]byte{ProtocolTCP})
+	if err != ErrMessageTooShort {
+		t.Errorf("DecodePayload(protocol-only) error = %v, want ErrMessageTooShort", err)
+	}
+}
+
+func TestPayload_Service0(t *testing.T) {
+	encoded := EncodePayload(ProtocolRelay0, ServiceRelay, []byte("relay data"))
+	proto, svc, data, err := DecodePayload(encoded)
 	if err != nil {
-		t.Fatalf("DecodePayload() error = %v", err)
+		t.Fatalf("DecodePayload error: %v", err)
 	}
-
-	if proto != ProtocolTCP {
-		t.Errorf("protocol = %d, want %d", proto, ProtocolTCP)
+	if proto != ProtocolRelay0 {
+		t.Errorf("protocol = %d, want %d", proto, ProtocolRelay0)
 	}
+	if svc != ServiceRelay {
+		t.Errorf("service = %d, want %d", svc, ServiceRelay)
+	}
+	if !bytes.Equal(data, []byte("relay data")) {
+		t.Errorf("data mismatch")
+	}
+}
 
-	if len(payload) != 0 {
-		t.Errorf("payload length = %d, want 0", len(payload))
+func TestPayload_LargeService(t *testing.T) {
+	encoded := EncodePayload(ProtocolKCP, 100000, []byte("data"))
+	proto, svc, data, err := DecodePayload(encoded)
+	if err != nil {
+		t.Fatalf("DecodePayload error: %v", err)
+	}
+	if proto != ProtocolKCP {
+		t.Errorf("protocol = %d, want %d", proto, ProtocolKCP)
+	}
+	if svc != 100000 {
+		t.Errorf("service = %d, want 100000", svc)
+	}
+	if !bytes.Equal(data, []byte("data")) {
+		t.Errorf("data mismatch")
+	}
+}
+
+func TestPayload_EmptyData(t *testing.T) {
+	encoded := EncodePayload(ProtocolPing, 0, nil)
+	proto, svc, data, err := DecodePayload(encoded)
+	if err != nil {
+		t.Fatalf("DecodePayload error: %v", err)
+	}
+	if proto != ProtocolPing {
+		t.Errorf("protocol = %d, want %d", proto, ProtocolPing)
+	}
+	if svc != 0 {
+		t.Errorf("service = %d, want 0", svc)
+	}
+	if len(data) != 0 {
+		t.Errorf("data length = %d, want 0", len(data))
+	}
+}
+
+func TestPayload_LargeData(t *testing.T) {
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i)
+	}
+	encoded := EncodePayload(ProtocolKCP, ServiceProxy, largeData)
+	proto, svc, data, err := DecodePayload(encoded)
+	if err != nil {
+		t.Fatalf("DecodePayload error: %v", err)
+	}
+	if proto != ProtocolKCP {
+		t.Errorf("protocol = %d, want %d", proto, ProtocolKCP)
+	}
+	if svc != ServiceProxy {
+		t.Errorf("service = %d, want %d", svc, ServiceProxy)
+	}
+	if !bytes.Equal(data, largeData) {
+		t.Errorf("data mismatch (len got=%d want=%d)", len(data), len(largeData))
 	}
 }
 
@@ -232,7 +296,6 @@ func TestGetMessageType(t *testing.T) {
 }
 
 func TestProtocolConstants(t *testing.T) {
-	// Verify protocol constants match expected values
 	tests := []struct {
 		name     string
 		protocol byte
@@ -247,6 +310,8 @@ func TestProtocolConstants(t *testing.T) {
 		{"Relay0", ProtocolRelay0, 66},
 		{"Relay1", ProtocolRelay1, 67},
 		{"Relay2", ProtocolRelay2, 68},
+		{"Ping", ProtocolPing, 70},
+		{"Pong", ProtocolPong, 71},
 		{"Chat", ProtocolChat, 128},
 		{"File", ProtocolFile, 129},
 		{"Media", ProtocolMedia, 130},
@@ -275,5 +340,33 @@ func TestMessageTypeConstants(t *testing.T) {
 	}
 	if MessageTypeTransport != 4 {
 		t.Errorf("MessageTypeTransport = %d, want 4", MessageTypeTransport)
+	}
+}
+
+func TestServiceConstants(t *testing.T) {
+	tests := []struct {
+		name    string
+		service uint64
+		want    uint64
+	}{
+		{"Relay", ServiceRelay, 0},
+		{"Proxy", ServiceProxy, 1},
+		{"TUN", ServiceTUN, 2},
+		{"DNS", ServiceDNS, 3},
+		{"Admin", ServiceAdmin, 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.service != tt.want {
+				t.Errorf("Service%s = %d, want %d", tt.name, tt.service, tt.want)
+			}
+		})
+	}
+
+	if VarintLen(ServiceRelay) != 1 {
+		t.Errorf("ServiceRelay varint should be 1 byte")
+	}
+	if VarintLen(ServiceAdmin) != 1 {
+		t.Errorf("ServiceAdmin varint should be 1 byte")
 	}
 }

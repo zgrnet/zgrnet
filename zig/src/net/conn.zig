@@ -294,7 +294,10 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
 
         /// Sends an encrypted message to the remote peer.
         pub fn send(self: *Self, protocol: Protocol, payload: []const u8) ConnError!void {
-            // Phase 1: Check state and encrypt (with lock)
+            return self.sendWithService(protocol, 0, payload);
+        }
+
+        pub fn sendWithService(self: *Self, protocol: Protocol, service: u64, payload: []const u8) ConnError!void {
             var remote_addr: Addr = undefined;
             const msg = blk: {
                 self.mutex.lock();
@@ -307,11 +310,12 @@ pub fn Conn(comptime Crypto: type, comptime Rt: type) type {
 
                 var session = &(self.current orelse return ConnError.NotEstablished);
 
-                // Encode payload with protocol byte
-                const plaintext = self.allocator.alloc(u8, 1 + payload.len) catch return ConnError.OutOfMemory;
+                const svc_len = message.varintLen(service);
+                const plaintext = self.allocator.alloc(u8, 1 + svc_len + payload.len) catch return ConnError.OutOfMemory;
                 defer self.allocator.free(plaintext);
                 plaintext[0] = @intFromEnum(protocol);
-                @memcpy(plaintext[1..], payload);
+                _ = message.encodeVarint(plaintext[1..], service);
+                @memcpy(plaintext[1 + svc_len ..], payload);
 
                 // Encrypt
                 const ciphertext = self.allocator.alloc(u8, plaintext.len + session_mod.tag_size) catch return ConnError.OutOfMemory;

@@ -467,7 +467,7 @@ test "relay chain with noise session A->B->C" {
 
     // Step 1: A encrypts data with A-C session
     const original_data = "hello through relay!";
-    const payload_enc = try noise_message.encodePayload(allocator, .chat, original_data);
+    const payload_enc = try noise_message.encodePayload(allocator, .chat, 0, original_data);
     defer allocator.free(payload_enc);
 
     var cipher_buf: [1024]u8 = undefined;
@@ -544,7 +544,7 @@ test "relay multi-hop with noise session A->B->C->D" {
 
     // Step 1: A encrypts
     const original_data = "multi-hop relay with real encryption!";
-    const payload_enc = try noise_message.encodePayload(allocator, .icmp, original_data);
+    const payload_enc = try noise_message.encodePayload(allocator, .icmp, 0, original_data);
     defer allocator.free(payload_enc);
 
     var cipher_buf: [1024]u8 = undefined;

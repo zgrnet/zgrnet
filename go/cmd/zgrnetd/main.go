@@ -304,9 +304,7 @@ func run(cfgPath string) error {
 			return net.DialTimeout("tcp", target, 10*time.Second)
 		}
 
-		// Open KCP stream with TCP_PROXY proto + target address as metadata
-		metadata := addr.Encode()
-		stream, err := udpTransport.OpenStream(targetPK, noise.ProtocolTCPProxy, metadata)
+		stream, err := udpTransport.OpenStream(targetPK, noise.ServiceProxy)
 		if err != nil {
 			return nil, fmt.Errorf("open stream to %s: %w", targetPK.ShortString(), err)
 		}
@@ -419,16 +417,12 @@ func run(cfgPath string) error {
 // This makes this node an "exit node" for the peer's proxy traffic.
 func acceptTCPProxyStreams(udp *znet.UDP, pk noise.PublicKey) {
 	for {
-		stream, err := udp.AcceptStream(pk)
+		stream, _, err := udp.AcceptStream(pk)
 		if err != nil {
-			return // peer gone or UDP closed
-		}
-		if stream.Proto() != noise.ProtocolTCPProxy {
-			stream.Close()
-			continue
+			return
 		}
 		go func() {
-			if err := proxy.HandleTCPProxy(stream, stream.Metadata(), nil, nil); err != nil {
+			if err := proxy.HandleTCPProxy(stream, nil, nil, nil); err != nil {
 				log.Printf("tcp_proxy from %s: %v", pk.ShortString(), err)
 			}
 		}()

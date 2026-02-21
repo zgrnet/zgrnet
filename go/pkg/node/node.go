@@ -25,7 +25,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vibing/zgrnet/pkg/kcp"
 	znet "github.com/vibing/zgrnet/pkg/net"
 	"github.com/vibing/zgrnet/pkg/noise"
 	"github.com/vibing/zgrnet/pkg/relay"
@@ -242,12 +241,13 @@ func (n *Node) Connect(pk noise.PublicKey) error {
 //
 // If the peer is not yet connected, Dial automatically initiates a handshake
 // and waits for it to complete before opening the stream.
-func (n *Node) Dial(pk noise.PublicKey, port uint16) (*Stream, error) {
+// Dial opens a yamux stream to a peer on the given service.
+// Applications negotiate target addresses on the stream itself (e.g., via SOCKS5).
+func (n *Node) Dial(pk noise.PublicKey, service uint64) (*Stream, error) {
 	if n.State() != StateRunning {
 		return nil, ErrNotRunning
 	}
 
-	// Ensure peer is connected.
 	info := n.udp.PeerInfo(pk)
 	if info == nil {
 		return nil, ErrPeerNotFound
@@ -258,44 +258,12 @@ func (n *Node) Dial(pk noise.PublicKey, port uint16) (*Stream, error) {
 		}
 	}
 
-	// Build target address metadata.
-	addr := &noise.Address{
-		Type: noise.AddressTypeIPv4,
-		Host: "127.0.0.1",
-		Port: port,
-	}
-	metadata := addr.Encode()
-
-	raw, err := n.udp.OpenStream(pk, noise.ProtocolTCPProxy, metadata)
+	raw, err := n.udp.OpenStream(pk, service)
 	if err != nil {
-		return nil, fmt.Errorf("node: open stream to %s:%d: %w", pk.ShortString(), port, err)
+		return nil, fmt.Errorf("node: open stream to %s service=%d: %w", pk.ShortString(), service, err)
 	}
 
-	return &Stream{Stream: raw, remotePK: pk}, nil
-}
-
-// OpenStream opens a raw KCP stream to a peer with custom proto and metadata.
-// Use Dial for the common case of TCP_PROXY streams.
-func (n *Node) OpenStream(pk noise.PublicKey, proto byte, metadata []byte) (*Stream, error) {
-	if n.State() != StateRunning {
-		return nil, ErrNotRunning
-	}
-
-	info := n.udp.PeerInfo(pk)
-	if info == nil {
-		return nil, ErrPeerNotFound
-	}
-	if info.State != znet.PeerStateEstablished {
-		if err := n.udp.Connect(pk); err != nil {
-			return nil, fmt.Errorf("node: connect: %w", err)
-		}
-	}
-
-	raw, err := n.udp.OpenStream(pk, proto, metadata)
-	if err != nil {
-		return nil, err
-	}
-	return &Stream{Stream: raw, remotePK: pk}, nil
+	return &Stream{Conn: raw, remotePK: pk, service: service}, nil
 }
 
 // DialRelay connects to a remote peer through a relay and opens a KCP stream.
@@ -309,20 +277,15 @@ func (n *Node) OpenStream(pk noise.PublicKey, proto byte, metadata []byte) (*Str
 //
 // Both this node and the relay must have established sessions (call AddPeer +
 // Connect for the relay first).
-func (n *Node) DialRelay(dst noise.PublicKey, relayPK noise.PublicKey, port uint16) (*Stream, error) {
+func (n *Node) DialRelay(dst noise.PublicKey, relayPK noise.PublicKey, service uint64) (*Stream, error) {
 	if n.State() != StateRunning {
 		return nil, ErrNotRunning
 	}
 
-	// Register relay route: dst → relay
 	n.udp.RouteTable().AddRoute(dst, relayPK)
-
-	// Register the peer without an endpoint (relay-only).
-	// AddPeer is idempotent if the peer is already registered.
 	n.AddPeer(PeerConfig{PublicKey: dst})
 
-	// Dial goes through initiateHandshake (relay-aware) then OpenStream.
-	return n.Dial(dst, port)
+	return n.Dial(dst, service)
 }
 
 // RouteTable returns the node's relay route table.
@@ -429,13 +392,11 @@ func (n *Node) acceptLoopForPeer(pk noise.PublicKey, stop <-chan struct{}) {
 	// Phase 2: Accept streams. AcceptStream blocks until a stream arrives
 	// or the UDP instance is closed, so this is not a busy loop.
 	for {
-		raw, err := n.udp.AcceptStream(pk)
+		raw, service, err := n.udp.AcceptStream(pk)
 		if err != nil {
 			if errors.Is(err, znet.ErrClosed) || errors.Is(err, znet.ErrPeerNotFound) {
 				return
 			}
-			// Session may have been reset (rekey, reconnect). Go back to
-			// waiting for re-establishment.
 			select {
 			case <-stop:
 				return
@@ -446,7 +407,7 @@ func (n *Node) acceptLoopForPeer(pk noise.PublicKey, stop <-chan struct{}) {
 			}
 		}
 
-		s := &Stream{Stream: raw, remotePK: pk}
+		s := &Stream{Conn: raw, remotePK: pk, service: service}
 		select {
 		case n.acceptCh <- s:
 		case <-stop:
@@ -459,10 +420,16 @@ func (n *Node) acceptLoopForPeer(pk noise.PublicKey, stop <-chan struct{}) {
 	}
 }
 
-// Stream wraps a KCP stream with the remote peer's public key.
+// Stream wraps a yamux stream with the remote peer's public key and service ID.
 type Stream struct {
-	*kcp.Stream
+	net.Conn
 	remotePK noise.PublicKey
+	service  uint64
+}
+
+// Service returns the service ID this stream belongs to.
+func (s *Stream) Service() uint64 {
+	return s.service
 }
 
 // RemotePubkey returns the public key of the peer on the other end.
