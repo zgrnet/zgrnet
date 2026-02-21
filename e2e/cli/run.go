@@ -332,11 +332,11 @@ func runCmd(t *testing.T, binPath string, args []string, home string) (stdout, s
 	t.Helper()
 
 	cmd := exec.Command(binPath, args...)
-	// Build a clean environment: inherit parent env but remove ZGRNET_HOME
-	// (all three languages check ZGRNET_HOME before HOME) and override HOME.
+	// Build a clean environment: inherit parent env but remove ZIGOR_CONFIG_DIR
+	// (all three languages check ZIGOR_CONFIG_DIR before HOME) and override HOME.
 	var env []string
 	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "ZGRNET_HOME=") {
+		if strings.HasPrefix(e, "ZIGOR_CONFIG_DIR=") {
 			continue
 		}
 		env = append(env, e)

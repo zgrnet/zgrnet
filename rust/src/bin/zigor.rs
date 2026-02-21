@@ -200,27 +200,7 @@ fn run_host(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args:
     }
     match args[0].as_str() {
         "up" => {
-            let daemon = args[1..].iter().any(|a| a == "-d" || a == "--daemon");
-            let _cfg_path = cli::context_config_path(base_dir, ctx)?;
-            let ctx_name = if ctx.is_empty() {
-                cli::current_context_name(base_dir)?
-            } else {
-                ctx.to_string()
-            };
-
-            if daemon {
-                let self_path = std::env::current_exe()
-                    .map_err(|e| format!("find self: {e}"))?;
-                let child = std::process::Command::new(&self_path)
-                    .args(["--ctx", &ctx_name, "host", "up"])
-                    .spawn()
-                    .map_err(|e| format!("start daemon: {e}"))?;
-                cli::write_pidfile(base_dir, &ctx_name, child.id())?;
-                println!("host started in background (pid {})", child.id());
-            } else {
-                return Err("foreground host not implemented in Rust build (use Go build or run with -d)".into());
-            }
-            Ok(())
+            Err("host up not implemented in Rust build (use Go build)".into())
         }
         "down" => {
             let ctx_name = if ctx.is_empty() {

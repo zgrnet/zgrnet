@@ -450,30 +450,8 @@ fn runHost(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_add
     }
 
     if (mem.eql(u8, args[0], "up")) {
-        var daemon = false;
-        for (args[1..]) |a| {
-            if (mem.eql(u8, a, "-d") or mem.eql(u8, a, "--daemon")) daemon = true;
-        }
-
-        if (daemon) {
-            const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else try currentContextName(allocator, base_dir);
-            defer allocator.free(ctx_name);
-
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const self_path = std.fs.selfExePath(&path_buf) catch {
-                print("error: cannot determine self path\n", .{});
-                std.process.exit(1);
-            };
-            var child = std.process.Child.init(
-                &[_][]const u8{ self_path, "--ctx", ctx_name, "host", "up" },
-                allocator,
-            );
-            try child.spawn();
-            print("host started in background (pid {d})\n", .{child.id});
-        } else {
-            print("error: foreground host not implemented in Zig build (use Go build or run with -d)\n", .{});
-            std.process.exit(1);
-        }
+        print("error: host up not implemented in Zig build (use Go build)\n", .{});
+        std.process.exit(1);
     } else if (mem.eql(u8, args[0], "down")) {
         const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else try currentContextName(allocator, base_dir);
         defer allocator.free(ctx_name);
