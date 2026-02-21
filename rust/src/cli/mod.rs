@@ -98,6 +98,9 @@ pub fn validate_context_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("context name cannot be empty".to_string());
     }
+    if name == "current" {
+        return Err(format!("context name {:?} is reserved", name));
+    }
     if name.contains('/') || name.contains('\\') {
         return Err(format!("context name {:?} contains path separator", name));
     }
@@ -540,6 +543,7 @@ mod tests {
         assert!(validate_context_name("my-ctx").is_ok());
 
         assert!(validate_context_name("").is_err());
+        assert!(validate_context_name("current").is_err());
         assert!(validate_context_name("a/b").is_err());
         assert!(validate_context_name("a\\b").is_err());
         assert!(validate_context_name("../evil").is_err());

@@ -529,7 +529,7 @@ func TestValidateContextName(t *testing.T) {
 		}
 	}
 
-	invalid := []string{"", "a/b", "a\\b", "../x", "a b", ".hidden", "..x"}
+	invalid := []string{"", "a/b", "a\\b", "../x", "a b", ".hidden", "..x", "current"}
 	for _, name := range invalid {
 		if err := ValidateContextName(name); err == nil {
 			t.Errorf("expected %q to be invalid", name)

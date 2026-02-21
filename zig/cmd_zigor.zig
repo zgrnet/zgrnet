@@ -128,6 +128,7 @@ fn defaultConfigDir(allocator: Allocator) ![]const u8 {
 
 fn validateContextName(name: []const u8) bool {
     if (name.len == 0) return false;
+    if (mem.eql(u8, name, "current")) return false;
     if (mem.indexOfScalar(u8, name, '/') != null) return false;
     if (mem.indexOfScalar(u8, name, '\\') != null) return false;
     if (mem.indexOf(u8, name, "..") != null) return false;

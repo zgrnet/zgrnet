@@ -58,9 +58,10 @@
     "name": "ctx_create_invalid_name",
     "description": "Invalid context names are rejected",
     "steps": [
-      {"args": ["ctx", "create", "a/b"],    "expect_exit": 1},
-      {"args": ["ctx", "create", "../evil"], "expect_exit": 1},
-      {"args": ["ctx", "create", ".hidden"], "expect_exit": 1}
+      {"args": ["ctx", "create", "a/b"],     "expect_exit": 1},
+      {"args": ["ctx", "create", "../evil"],  "expect_exit": 1},
+      {"args": ["ctx", "create", ".hidden"],  "expect_exit": 1},
+      {"args": ["ctx", "create", "current"],  "expect_exit": 1}
     ]
   },
   {

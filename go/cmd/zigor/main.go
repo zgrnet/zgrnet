@@ -323,13 +323,13 @@ func hostUp(baseDir, ctxName string, daemon bool) error {
 	}
 
 	if daemon {
-		return hostUpDaemon(baseDir, ctxName, cfgPath)
+		return hostUpDaemon(baseDir, ctxName)
 	}
 
 	return hostUpForeground(baseDir, ctxName, cfgPath)
 }
 
-func hostUpDaemon(baseDir, ctxName, cfgPath string) error {
+func hostUpDaemon(baseDir, ctxName string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("find self: %w", err)
@@ -473,16 +473,6 @@ func hostUpForeground(baseDir, ctxName, cfgPath string) error {
 		} else {
 			log.Printf("dns: OS configured to resolve *.zigor.net via %s", tunIP)
 		}
-	}
-
-	aliasToPubkey := make(map[string]noise.PublicKey)
-	for domain, peerCfg := range cfg.Peers {
-		hexPK, _ := pubkeyFromDomain(domain)
-		pk, _ := noise.KeyFromHex(hexPK)
-		if peerCfg.Alias != "" {
-			aliasToPubkey[peerCfg.Alias] = pk
-		}
-		aliasToPubkey[domain] = pk
 	}
 
 	proxyAddr := net.JoinHostPort(tunIP.String(), "1080")

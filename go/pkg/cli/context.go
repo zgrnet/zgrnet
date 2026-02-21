@@ -97,6 +97,9 @@ func ValidateContextName(name string) error {
 	if name == "" {
 		return fmt.Errorf("context name cannot be empty")
 	}
+	if name == "current" {
+		return fmt.Errorf("context name %q is reserved", name)
+	}
 	if strings.ContainsAny(name, "/\\") {
 		return fmt.Errorf("context name %q contains path separator", name)
 	}
