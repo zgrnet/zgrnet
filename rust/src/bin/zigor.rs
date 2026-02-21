@@ -201,7 +201,7 @@ fn run_host(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args:
     match args[0].as_str() {
         "up" => {
             let daemon = args[1..].iter().any(|a| a == "-d" || a == "--daemon");
-            let cfg_path = cli::context_config_path(base_dir, ctx)?;
+            let _cfg_path = cli::context_config_path(base_dir, ctx)?;
             let ctx_name = if ctx.is_empty() {
                 cli::current_context_name(base_dir)?
             } else {
