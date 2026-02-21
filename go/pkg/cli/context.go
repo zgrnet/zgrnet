@@ -51,7 +51,9 @@ func CurrentContextName(baseDir string) (string, error) {
 
 // SetCurrentContext writes the current context name.
 func SetCurrentContext(baseDir, name string) error {
-	// Verify the context exists
+	if err := ValidateContextName(name); err != nil {
+		return err
+	}
 	dir := ContextDir(baseDir, name)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return fmt.Errorf("context %q does not exist", name)
@@ -153,6 +155,9 @@ func CreateContext(baseDir, name string) error {
 // DeleteContext removes a context directory.
 // Refuses to delete the current context.
 func DeleteContext(baseDir, name string) error {
+	if err := ValidateContextName(name); err != nil {
+		return err
+	}
 	current, _ := CurrentContextName(baseDir)
 	if current == name {
 		return fmt.Errorf("cannot delete the current context %q (switch to another first)", name)

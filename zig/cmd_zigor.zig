@@ -258,6 +258,10 @@ fn runCtx(allocator: Allocator, base_dir: []const u8, args: []const []const u8) 
             print("usage: zigor ctx use <name>\n", .{});
             std.process.exit(1);
         }
+        if (!validateContextName(args[1])) {
+            print("error: invalid context name \"{s}\"\n", .{args[1]});
+            std.process.exit(1);
+        }
         const dir = try contextDir(allocator, base_dir, args[1]);
         defer allocator.free(dir);
         fs.cwd().access(dir, .{}) catch {
@@ -339,7 +343,10 @@ fn runCtx(allocator: Allocator, base_dir: []const u8, args: []const []const u8) 
             print("usage: zigor ctx delete <name>\n", .{});
             std.process.exit(1);
         }
-        // Check not current
+        if (!validateContextName(args[1])) {
+            print("error: invalid context name \"{s}\"\n", .{args[1]});
+            std.process.exit(1);
+        }
         const current = currentContextName(allocator, base_dir) catch null;
         defer if (current) |c| allocator.free(c);
         if (current != null and mem.eql(u8, args[1], current.?)) {

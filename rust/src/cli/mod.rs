@@ -58,6 +58,7 @@ pub fn current_context_name(base_dir: &Path) -> Result<String, String> {
 
 /// Sets the current context.
 pub fn set_current_context(base_dir: &Path, name: &str) -> Result<(), String> {
+    validate_context_name(name)?;
     let dir = context_dir(base_dir, name);
     if !dir.exists() {
         return Err(format!("context {:?} does not exist", name));
@@ -149,6 +150,7 @@ pub fn create_context(base_dir: &Path, name: &str) -> Result<(), String> {
 
 /// Deletes a context. Refuses to delete the current context.
 pub fn delete_context(base_dir: &Path, name: &str) -> Result<(), String> {
+    validate_context_name(name)?;
     if let Ok(current) = current_context_name(base_dir) {
         if current == name {
             return Err(format!("cannot delete the current context {:?} (switch to another first)", name));
