@@ -246,6 +246,9 @@ async fn run_loop(
                     let _ = kcp.send(&more);
                 }
                 let _ = kcp.flush();
+                // Also drain recv — update after flush may have ACKs that
+                // complete reassembly of incoming data.
+                drain_recv(&mut kcp, &read_tx);
             }
 
             Some(data) = input_rx.recv() => {
@@ -258,6 +261,7 @@ async fn run_loop(
 
             Some(()) = flush_rx.recv() => {
                 let _ = kcp.flush();
+                drain_recv(&mut kcp, &read_tx);
             }
 
             _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {
