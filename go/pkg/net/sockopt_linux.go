@@ -104,6 +104,9 @@ func (bc *batchConn) ReceivedFrom(i int) *net.UDPAddr {
 
 func (bc *batchConn) WriteBatch(buffers [][]byte, addrs []*net.UDPAddr) (int, error) {
 	count := len(buffers)
+	if count > len(addrs) {
+		count = len(addrs)
+	}
 	if count > bc.batchSize {
 		count = bc.batchSize
 	}
