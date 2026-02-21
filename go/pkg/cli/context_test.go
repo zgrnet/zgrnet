@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -424,6 +425,10 @@ func TestCtxCreate_KeyUniqueness(t *testing.T) {
 }
 
 func TestCtx_ConfigDirPermission(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file permissions not applicable on Windows")
+	}
+
 	dir := t.TempDir()
 
 	if err := CreateContext(dir, "permtest"); err != nil {
