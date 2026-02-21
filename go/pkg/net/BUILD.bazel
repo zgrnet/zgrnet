@@ -13,6 +13,8 @@ go_library(
         "sockopt.go",
         "sockopt_linux.go",
         "sockopt_other.go",
+        "sockopt_unix.go",
+        "sockopt_windows.go",
         "transport_mock.go",
         "transport_udp.go",
         "udp.go",
