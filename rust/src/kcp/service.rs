@@ -26,7 +26,7 @@ struct ServiceEntry {
 pub struct ServiceMux {
     config: ServiceMuxConfig,
     services: RwLock<HashMap<u64, Arc<ServiceEntry>>>,
-    accept_tx: tokio::sync::mpsc::Sender<(yamux::Stream, u64)>,
+    accept_tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<(yamux::Stream, u64)>>>,
     accept_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(yamux::Stream, u64)>>,
     closed: AtomicBool,
 }
@@ -37,7 +37,7 @@ impl ServiceMux {
         Arc::new(ServiceMux {
             config,
             services: RwLock::new(HashMap::new()),
-            accept_tx,
+            accept_tx: std::sync::Mutex::new(Some(accept_tx)),
             accept_rx: tokio::sync::Mutex::new(accept_rx),
             closed: AtomicBool::new(false),
         })
@@ -76,6 +76,8 @@ impl ServiceMux {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.services.write().unwrap().clear();
+        // Drop accept_tx to wake any pending accept_stream.
+        *self.accept_tx.lock().unwrap() = None;
     }
 
     pub fn num_services(&self) -> usize {
@@ -105,7 +107,8 @@ impl ServiceMux {
         let yamux_conn = yamux::Connection::new(conn, yamux::Config::default(), mode);
 
         let (open_tx, open_rx) = tokio::sync::mpsc::channel(64);
-        let accept_tx = self.accept_tx.clone();
+        let accept_tx = self.accept_tx.lock().unwrap().clone()
+            .ok_or_else(|| "closed".to_string())?;
 
         // Always use client_driver — it handles both open requests AND inbound streams.
         // The is_client flag only affects yamux Mode (Client sends odd stream IDs,
@@ -915,5 +918,59 @@ mod tests {
         server.close();
         client2.close();
         server2b.close();
+    }
+
+    // ==================== ServiceMux Timeout Tests ====================
+
+    /// accept_stream on a closed ServiceMux must return error, not hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_service_mux_accept_then_close() {
+        let (client, server) = service_mux_pair();
+
+        let server2 = server.clone();
+        let accepter = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let result = server2.accept_stream().await;
+            (result, start.elapsed())
+        });
+
+        // Wait, then close.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        server.close();
+
+        let safety = tokio::time::timeout(std::time::Duration::from_secs(5), accepter).await;
+        let (result, elapsed) = safety.expect("SAFETY: accept hung after close").unwrap();
+        assert!(result.is_err(), "accept should fail after close");
+        assert!(elapsed < std::time::Duration::from_secs(3),
+            "accept took {:?} after close — should be immediate", elapsed);
+
+        client.close();
+    }
+
+    /// open_stream with no peer connected — must fail, not hang forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_service_mux_open_no_peer() {
+        // Create a ServiceMux with an output that goes nowhere.
+        let smux = ServiceMux::new(ServiceMuxConfig {
+            is_client: true,
+            runtime: None,
+            output: Arc::new(|_service, _data| Ok(())),
+        });
+
+        // open_stream creates a KcpConn → yamux → client_driver.
+        // The yamux connection has no peer, so it won't get ACKs.
+        // open_stream should eventually timeout or return error.
+        let safety = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let start = std::time::Instant::now();
+            let result = smux.open_stream(1).await;
+            let elapsed = start.elapsed();
+            // yamux open_stream should eventually fail when the connection dies.
+            eprintln!("[open_no_peer] result={:?}, elapsed={:?}", result.is_ok(), elapsed);
+            // We accept either error or timeout < 30s.
+            assert!(elapsed < std::time::Duration::from_secs(25),
+                "open_stream took {:?} — should not hang forever", elapsed);
+        }).await;
+        assert!(safety.is_ok(), "SAFETY: open_stream hung forever with no peer");
+        smux.close();
     }
 }

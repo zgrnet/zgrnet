@@ -104,6 +104,11 @@ impl KcpConn {
     }
 
     pub fn tag(&self) -> usize { 0 }
+
+    /// Returns a handle that can close this connection from another task.
+    pub fn close_handle(&self) -> Arc<AtomicBool> {
+        self.closed.clone()
+    }
 }
 
 // Shared write logic: append to coalescing buffer, conditionally notify run loop.
@@ -142,9 +147,11 @@ fn do_close(closed: &AtomicBool) -> Poll<io::Result<()>> {
 }
 
 // Shared read logic: drain from recv_buf, then poll read channel.
+// Returns EOF (Ok(0)) when the connection is closed or the run_loop exited.
 fn do_read(
     recv_buf: &mut BytesMut,
     read_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    closed: &AtomicBool,
     cx: &mut Context<'_>,
     buf: &mut [u8],
 ) -> Poll<io::Result<usize>> {
@@ -163,8 +170,15 @@ fn do_read(
             }
             Poll::Ready(Ok(n))
         }
-        Poll::Ready(None) => Poll::Ready(Ok(0)),
-        Poll::Pending => Poll::Pending,
+        Poll::Ready(None) => Poll::Ready(Ok(0)), // run_loop exited
+        Poll::Pending => {
+            if closed.load(Ordering::Relaxed) {
+                // Connection closed but run_loop hasn't exited yet — return EOF.
+                Poll::Ready(Ok(0))
+            } else {
+                Poll::Pending
+            }
+        }
     }
 }
 
@@ -176,22 +190,13 @@ impl AsyncRead for KcpConn {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let me = &mut *self;
-        if !me.recv_buf.is_empty() {
-            let n = std::cmp::min(buf.remaining(), me.recv_buf.len());
-            buf.put_slice(&me.recv_buf[..n]);
-            me.recv_buf.advance(n);
-            return Poll::Ready(Ok(()));
-        }
-        match me.read_rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                let n = std::cmp::min(buf.remaining(), data.len());
-                buf.put_slice(&data[..n]);
-                if n < data.len() {
-                    me.recv_buf.extend_from_slice(&data[n..]);
-                }
+        let mut tmp = vec![0u8; buf.remaining()];
+        match do_read(&mut me.recv_buf, &mut me.read_rx, &me.closed, cx, &mut tmp) {
+            Poll::Ready(Ok(n)) => {
+                buf.put_slice(&tmp[..n]);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -213,7 +218,7 @@ impl AsyncWrite for KcpConn {
 impl futures::io::AsyncRead for KcpConn {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         let me = &mut *self;
-        do_read(&mut me.recv_buf, &mut me.read_rx, cx, buf)
+        do_read(&mut me.recv_buf, &mut me.read_rx, &me.closed, cx, buf)
     }
 }
 
@@ -231,8 +236,12 @@ impl futures::io::AsyncWrite for KcpConn {
 
 impl Unpin for KcpConn {}
 
+
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Run loop: exclusively owns the KCP instance. Processes events in tight
 /// loops with yield points to catch echo-style patterns in fewer cycles.
+/// Detects dead links (KCP retransmit timeout) and idle timeout (no data received).
 async fn run_loop(
     mut kcp: kcp::Kcp<KcpOutput>,
     write_buf: Arc<std::sync::Mutex<WriteBuffer>>,
@@ -244,42 +253,62 @@ async fn run_loop(
     let start = Instant::now();
     let now_ms = || start.elapsed().as_millis() as u32;
     let _ = kcp.update(now_ms());
+    let mut last_recv = Instant::now();
 
     loop {
-        if closed.load(Ordering::Relaxed) { return; }
+        let die = |wb: &std::sync::Mutex<WriteBuffer>, closed: &AtomicBool| {
+            closed.store(true, Ordering::Relaxed);
+            let mut wb = wb.lock().unwrap();
+            if let Some(w) = wb.waker.take() { w.wake(); }
+        };
+
+        if closed.load(Ordering::Relaxed) {
+            die(&write_buf, &closed);
+            return;
+        }
+
+        if kcp.is_dead_link() {
+            die(&write_buf, &closed);
+            return;
+        }
+
+        let idle = last_recv.elapsed();
+        if idle > IDLE_TIMEOUT && kcp.wait_snd() > 0 {
+            die(&write_buf, &closed);
+            return;
+        }
+        if idle > IDLE_TIMEOUT * 2 {
+            die(&write_buf, &closed);
+            return;
+        }
 
         let now = now_ms();
         let check = kcp.check(now);
         let delay = if check <= now { 1 } else { (check - now).min(50) };
 
-        // Wait for any event.
         tokio::select! {
             biased;
             _ = write_notify.notified() => {}
             Some(data) = input_rx.recv() => {
                 let _ = kcp.input(&data);
+                last_recv = Instant::now();
             }
             _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {
                 let _ = kcp.update(now_ms());
             }
         }
 
-        // Process all pending work in a tight loop.
-        // After draining, yield to let consumers (yamux echo etc.) react,
-        // then check for new work they produced. This catches echo patterns
-        // in 1 run_loop cycle instead of 2.
         for _ in 0..4 {
             while let Ok(data) = input_rx.try_recv() {
                 let _ = kcp.input(&data);
+                last_recv = Instant::now();
             }
             drain_write_buf(&write_buf, &mut kcp);
             let _ = kcp.flush();
             drain_recv(&mut kcp, &read_tx);
 
-            // Yield to let other tasks react (e.g., yamux echo writes back).
             tokio::task::yield_now().await;
 
-            // Check if new work appeared.
             let has_write = { !write_buf.lock().unwrap().data.is_empty() };
             let has_input = !input_rx.is_empty();
             if !has_write && !has_input { break; }
@@ -1188,9 +1217,127 @@ mod tests {
             let result = a.write_all(b"fail").await;
             assert!(result.is_err());
 
-            // b should see EOF after a is shut down
             b.shutdown().await.unwrap();
         }).await;
         assert!(result.is_ok(), "shutdown should complete within 2 seconds");
+    }
+
+    // ==================== Timeout / Dead Peer Tests ====================
+    // These tests verify KcpConn's OWN timeout behavior, not external wrappers.
+    // Each test has a 60s safety timeout to prevent CI deadlock, but the real
+    // assertion is that the component returns within a much shorter time.
+
+    /// Peer crashes → read must return EOF via idle timeout detection.
+    #[tokio::test]
+    async fn test_kcpconn_read_peer_dead() {
+        let (mut a, mut b) = conn_pair();
+        a.write_all(b"setup").await.unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = b.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"setup");
+
+        // Simulate crash: explicitly close A and its run_loop.
+        a.closed.store(true, Ordering::Relaxed);
+
+        let safety = tokio::time::timeout(Duration::from_secs(60), async {
+            let start = std::time::Instant::now();
+            let mut buf = vec![0u8; 256];
+            let result = b.read(&mut buf).await;
+            let elapsed = start.elapsed();
+            // KcpConn should self-detect dead peer and return EOF.
+            // IDLE_TIMEOUT=15s, doubled for truly idle = 30s max.
+            assert!(elapsed < Duration::from_secs(35),
+                "read took {:?} — KcpConn didn't self-timeout", elapsed);
+            match result {
+                Ok(0) => {} // EOF — correct
+                Ok(n) => panic!("unexpected data after peer drop: {} bytes", n),
+                Err(_) => {} // Error — also acceptable
+            }
+        }).await;
+        assert!(safety.is_ok(), "SAFETY TIMEOUT: KcpConn read hung forever after peer drop");
+    }
+
+    /// Peer crashes → write must eventually return error (idle timeout).
+    #[tokio::test]
+    async fn test_kcpconn_write_peer_dead() {
+        let (mut a, mut b) = conn_pair();
+        a.write_all(b"setup").await.unwrap();
+        let mut buf = vec![0u8; 256];
+        b.read(&mut buf).await.unwrap();
+
+        // Simulate crash: kill B's run_loop so it stops sending ACKs.
+        b.closed.store(true, Ordering::Relaxed);
+
+        let safety = tokio::time::timeout(Duration::from_secs(60), async {
+            let start = std::time::Instant::now();
+            let chunk = vec![0xAA; 8192];
+            loop {
+                match a.write_all(&chunk).await {
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+                if start.elapsed() > Duration::from_secs(45) {
+                    panic!("write didn't fail after 45s — KcpConn has no dead link detection");
+                }
+            }
+            let elapsed = start.elapsed();
+            assert!(elapsed < Duration::from_secs(35),
+                "write took {:?} to fail", elapsed);
+        }).await;
+        assert!(safety.is_ok(), "SAFETY TIMEOUT: KcpConn write hung forever after peer drop");
+    }
+
+    /// close() must unblock a pending read immediately.
+    #[tokio::test]
+    async fn test_kcpconn_close_unblocks_read() {
+        let (_a, mut b) = conn_pair();
+        let close_flag = b.close_handle();
+
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 256];
+            let start = std::time::Instant::now();
+            let result = b.read(&mut buf).await;
+            (result, start.elapsed())
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        close_flag.store(true, Ordering::Relaxed);
+
+        let safety = tokio::time::timeout(Duration::from_secs(5), reader).await;
+        let (result, elapsed) = safety.expect("SAFETY: reader hung").unwrap();
+        assert!(elapsed < Duration::from_secs(3), "read took {:?} after close", elapsed);
+        match result {
+            Ok(0) | Err(_) => {} // EOF or error — both acceptable
+            Ok(n) => panic!("unexpected {} bytes after close", n),
+        }
+    }
+
+    /// close() must unblock a pending write.
+    #[tokio::test]
+    async fn test_kcpconn_close_unblocks_write() {
+        let (mut a, _b) = conn_pair();
+        let close_flag = a.close_handle();
+
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0xBB; 8192];
+            let start = std::time::Instant::now();
+            loop {
+                match a.write_all(&chunk).await {
+                    Ok(()) => {}
+                    Err(_) => return (true, start.elapsed()),
+                }
+                if start.elapsed() > Duration::from_secs(10) {
+                    return (false, start.elapsed());
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        close_flag.store(true, Ordering::Relaxed);
+
+        let safety = tokio::time::timeout(Duration::from_secs(5), writer).await;
+        let (got_error, elapsed) = safety.expect("SAFETY: writer hung").unwrap();
+        assert!(got_error, "write should fail after close");
+        assert!(elapsed < Duration::from_secs(3), "write took {:?} after close", elapsed);
     }
 }
