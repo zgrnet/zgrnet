@@ -23,7 +23,6 @@ type SocketConfig struct {
 	BusyPollUS  int  // SO_BUSY_POLL in μs (Linux, 0 = disabled)
 	GRO         bool // UDP_GRO (Linux 4.18+)
 	GSOSegment  int  // UDP_SEGMENT for GSO (Linux 4.18+, 0 = disabled)
-	BatchSize   int  // recvmmsg/sendmmsg batch (Linux, 0 = disabled)
 }
 
 // DefaultSocketConfig returns recommended defaults for high-throughput use.
@@ -42,7 +41,6 @@ func FullSocketConfig() SocketConfig {
 		BusyPollUS:  DefaultBusyPollUS,
 		GRO:         true,
 		GSOSegment:  DefaultGSOSegment,
-		BatchSize:   DefaultBatchSize,
 	}
 }
 
