@@ -148,14 +148,29 @@ func TestInterop_RustOpener_NoImmediateWrite(t *testing.T) {
 	})
 }
 
-// === Zig placeholders ===
+// === Go ↔ Zig ===
+
+func zigBin(t *testing.T) string {
+	t.Helper()
+	b := findBinary(t, "e2e/kcp/zig/kcp_test")
+	if b == "" {
+		t.Skip("Zig binary not found")
+	}
+	return b
+}
 
 func TestInterop_GoZig(t *testing.T) {
-	t.Skip("Zig Phase 6 not yet implemented")
+	runInterop(t, goBin(t), zigBin(t), "go", "zig", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello Go-Zig!",
+	})
 }
 
 func TestInterop_RustZig(t *testing.T) {
-	t.Skip("Zig Phase 6 not yet implemented")
+	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello Rust-Zig!",
+	})
 }
 
 // === Infrastructure ===
