@@ -1,28 +1,28 @@
-//! KcpConn — async KCP connection using pure Rust KCP + SpinMutex + Notify.
+//! KcpConn — async KCP connection using tokio task + channel (zero-lock hot path).
 //!
-//! Architecture based on tokio_kcp:
-//! - Pure Rust KCP (kcp crate) instead of C ikcp.c FFI
-//! - SpinMutex for lock-free access from poll context
-//! - tokio::sync::Notify to wake update loop on send
-//! - Manual Waker storage for poll_read/poll_write
+//! Architecture matches Go's KCPConn.runLoop:
+//! - One tokio task exclusively owns the KCP instance
+//! - poll_write sends data via bounded channel → run loop calls kcp.send()
+//! - poll_read receives from unbounded channel ← run loop calls kcp.recv()
+//! - input() sends raw packets via unbounded channel → run loop calls kcp.input()
+//! - No locks on the hot path. All synchronization through channels.
 
-use std::io::{self, Cursor, Write};
+use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use spin::Mutex as SpinMutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Notify;
+use tokio_util::sync::PollSender;
 
 /// Output function: called when KCP wants to send a packet over the wire.
 pub type OutputFn = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// KCP output adapter implementing std::io::Write.
-struct KcpOutput {
-    output_fn: OutputFn,
+pub(crate) struct KcpOutput {
+    pub(crate) output_fn: OutputFn,
 }
 
 impl Write for KcpOutput {
@@ -33,125 +33,64 @@ impl Write for KcpOutput {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
-/// Internal KCP state protected by SpinMutex.
-pub(crate) struct KcpInner {
-    kcp: kcp::Kcp<KcpOutput>,
-    pending_reader: Option<Waker>,
-    pending_writer: Option<Waker>,
-    closed: bool,
-    start: Instant,
+/// Handle for feeding raw network packets into a KcpConn's run loop.
+#[derive(Clone)]
+pub struct KcpInput {
+    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 }
 
-impl KcpInner {
-    fn now_ms(&self) -> u32 {
-        self.start.elapsed().as_millis() as u32
-    }
-
-    fn try_wake_pending(&mut self) {
-        // Always wake reader when new data arrives — yamux may need
-        // to re-poll even if KCP recv queue is empty (internal yamux state).
-        if let Some(w) = self.pending_reader.take() {
-            w.wake();
-        }
-        if let Some(w) = self.pending_writer.take() {
-            w.wake();
-        }
-    }
-
-    fn wake_all(&mut self) {
-        if let Some(w) = self.pending_reader.take() { w.wake(); }
-        if let Some(w) = self.pending_writer.take() { w.wake(); }
+impl KcpInput {
+    pub fn input(&self, data: &[u8]) {
+        let _ = self.input_tx.send(data.to_vec());
     }
 }
 
-/// Async KCP connection.
+/// Async KCP connection. Implements futures::io::AsyncRead/AsyncWrite for yamux.
 pub struct KcpConn {
-    inner: Arc<SpinMutex<KcpInner>>,
+    write_tx: PollSender<Vec<u8>>,
+    flush_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    read_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     closed: Arc<AtomicBool>,
-    notifier: Arc<Notify>,
     recv_buf: Vec<u8>,
 }
 
 impl KcpConn {
-    /// Create a new KcpConn with the given conv and output function.
-    pub fn new(conv: u32, output: OutputFn) -> Self {
+    /// Create a new KcpConn. Returns the connection and an input handle for feeding
+    /// raw network packets (used by ServiceMux bridge tasks).
+    pub fn new(conv: u32, output: OutputFn) -> (Self, KcpInput) {
         let kcp_output = KcpOutput { output_fn: output };
         let mut kcp_instance = kcp::Kcp::new(conv, kcp_output);
         kcp_instance.set_nodelay(true, 1, 2, true);
         kcp_instance.set_wndsize(4096, 4096);
         let _ = kcp_instance.set_mtu(1400);
 
-        let start = Instant::now();
-        let _ = kcp_instance.update(start.elapsed().as_millis() as u32);
-
-        let inner = Arc::new(SpinMutex::new(KcpInner {
-            kcp: kcp_instance,
-            pending_reader: None,
-            pending_writer: None,
-            closed: false,
-            start,
-        }));
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let (read_tx, read_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let closed = Arc::new(AtomicBool::new(false));
-        let notifier = Arc::new(Notify::new());
 
-        // Spawn update loop
         {
-            let inner = inner.clone();
             let closed = closed.clone();
-            let notifier = notifier.clone();
-            tokio::spawn(async move {
-                update_loop(inner, closed, notifier).await;
-            });
+            tokio::spawn(run_loop(kcp_instance, write_rx, read_tx, input_rx, flush_rx, closed));
         }
 
-        KcpConn {
-            inner,
+        let conn = KcpConn {
+            write_tx: PollSender::new(write_tx),
+            flush_tx,
+            read_rx,
             closed,
-            notifier,
             recv_buf: Vec::new(),
-        }
+        };
+        let input = KcpInput { input_tx };
+        (conn, input)
     }
 
-    pub fn tag(&self) -> usize {
-        Arc::as_ptr(&self.inner) as usize % 10000
-    }
-
-    /// Feed incoming data from the network.
-    pub fn input(&self, data: &[u8]) {
-        if self.closed.load(Ordering::Relaxed) { return; }
-        let mut inner = self.inner.lock();
-        let _ = inner.kcp.input(data);
-        inner.try_wake_pending();
-        drop(inner);
-        self.notifier.notify_one();
-    }
-
-    /// Get a clone of the inner for sharing (used by ServiceMux).
-    pub fn inner_ref(&self) -> Arc<SpinMutex<KcpInner>> {
-        self.inner.clone()
-    }
-
-    /// Get the notifier (used by ServiceMux).
-    pub fn notifier_ref(&self) -> Arc<Notify> {
-        self.notifier.clone()
-    }
-
-    /// Get the closed flag.
-    pub fn closed_ref(&self) -> Arc<AtomicBool> {
-        self.closed.clone()
-    }
-
-    /// Create a KcpConn from existing inner (for ServiceMux input handle).
-    pub fn from_parts(
-        inner: Arc<SpinMutex<KcpInner>>,
-        closed: Arc<AtomicBool>,
-        notifier: Arc<Notify>,
-    ) -> Self {
-        KcpConn { inner, closed, notifier, recv_buf: Vec::new() }
-    }
+    pub fn tag(&self) -> usize { 0 }
 }
 
+// tokio::io traits
 impl AsyncRead for KcpConn {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -164,75 +103,51 @@ impl AsyncRead for KcpConn {
             self.recv_buf.drain(..n);
             return Poll::Ready(Ok(()));
         }
-
-        let mut inner = self.inner.lock();
-        if inner.closed { return Poll::Ready(Ok(())); }
-
-        match inner.kcp.peeksize() {
-            Ok(peek) if peek > 0 => {
-                let mut tmp = vec![0u8; peek];
-                match inner.kcp.recv(&mut tmp) {
-                    Ok(n) => {
-                        drop(inner);
-                        let data = &tmp[..n];
-                        let copy_n = std::cmp::min(buf.remaining(), data.len());
-                        buf.put_slice(&data[..copy_n]);
-                        if copy_n < data.len() {
-                            self.recv_buf.extend_from_slice(&data[copy_n..]);
-                        }
-                        Poll::Ready(Ok(()))
-                    }
-                    Err(_) => {
-                        inner.pending_reader = Some(cx.waker().clone());
-                        Poll::Pending
-                    }
+        match self.read_rx.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                let n = std::cmp::min(buf.remaining(), data.len());
+                buf.put_slice(&data[..n]);
+                if n < data.len() {
+                    self.recv_buf.extend_from_slice(&data[n..]);
                 }
+                Poll::Ready(Ok(()))
             }
-            _ => {
-                inner.pending_reader = Some(cx.waker().clone());
-                Poll::Pending
-            }
+            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl AsyncWrite for KcpConn {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut inner = self.inner.lock();
-        if inner.closed {
+        if self.closed.load(Ordering::Relaxed) {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
         }
-
-        match inner.kcp.send(buf) {
-            Ok(n) => {
-                drop(inner);
-                self.notifier.notify_one();
-                Poll::Ready(Ok(n))
+        match self.write_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let len = buf.len();
+                self.write_tx.send_item(buf.to_vec())
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "closed"))?;
+                Poll::Ready(Ok(len))
             }
-            Err(_) => {
-                inner.pending_writer = Some(cx.waker().clone());
-                Poll::Pending
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut inner = self.inner.lock();
-        let _ = inner.kcp.flush();
-        drop(inner);
-        self.notifier.notify_one();
+        let _ = self.flush_tx.send(());
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.closed.store(true, Ordering::Relaxed);
-        let mut inner = self.inner.lock();
-        inner.closed = true;
-        inner.wake_all();
         Poll::Ready(Ok(()))
     }
 }
@@ -250,117 +165,124 @@ impl futures::io::AsyncRead for KcpConn {
             self.recv_buf.drain(..n);
             return Poll::Ready(Ok(n));
         }
-
-        let mut inner = self.inner.lock();
-        if inner.closed { return Poll::Ready(Ok(0)); }
-
-        match inner.kcp.peeksize() {
-            Ok(peek) if peek > 0 => {
-                let mut tmp = vec![0u8; peek];
-                match inner.kcp.recv(&mut tmp) {
-                    Ok(n) => {
-                        drop(inner);
-                        let data = &tmp[..n];
-                        let cn = std::cmp::min(buf.len(), data.len());
-                        buf[..cn].copy_from_slice(&data[..cn]);
-                        if cn < data.len() {
-                            self.recv_buf.extend_from_slice(&data[cn..]);
-                        }
-                        Poll::Ready(Ok(cn))
-                    }
-                    Err(_) => {
-                        inner.pending_reader = Some(cx.waker().clone());
-                        Poll::Pending
-                    }
+        match self.read_rx.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                let n = std::cmp::min(buf.len(), data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                if n < data.len() {
+                    self.recv_buf.extend_from_slice(&data[n..]);
                 }
+                Poll::Ready(Ok(n))
             }
-            _ => {
-                inner.pending_reader = Some(cx.waker().clone());
-                Poll::Pending
-            }
+            Poll::Ready(None) => Poll::Ready(Ok(0)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl futures::io::AsyncWrite for KcpConn {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut inner = self.inner.lock();
-        if inner.closed {
+        if self.closed.load(Ordering::Relaxed) {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
         }
-        match inner.kcp.send(buf) {
-            Ok(n) => {
-                drop(inner);
-                self.notifier.notify_one();
-                Poll::Ready(Ok(n))
+        match self.write_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let len = buf.len();
+                self.write_tx.send_item(buf.to_vec())
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "closed"))?;
+                Poll::Ready(Ok(len))
             }
-            Err(_) => {
-                inner.pending_writer = Some(cx.waker().clone());
-                Poll::Pending
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")))
             }
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut inner = self.inner.lock();
-        let _ = inner.kcp.flush();
-        drop(inner);
-        self.notifier.notify_one();
+        let _ = self.flush_tx.send(());
         Poll::Ready(Ok(()))
     }
 
     fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.closed.store(true, Ordering::Relaxed);
-        let mut inner = self.inner.lock();
-        inner.closed = true;
-        inner.wake_all();
         Poll::Ready(Ok(()))
     }
 }
 
 impl Unpin for KcpConn {}
 
-/// Background task that periodically calls KCP update.
-async fn update_loop(
-    inner: Arc<SpinMutex<KcpInner>>,
+/// Run loop: exclusively owns the KCP instance. All KCP operations happen here.
+async fn run_loop(
+    mut kcp: kcp::Kcp<KcpOutput>,
+    mut write_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    read_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut flush_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     closed: Arc<AtomicBool>,
-    notifier: Arc<Notify>,
 ) {
+    let start = Instant::now();
+    let now_ms = || start.elapsed().as_millis() as u32;
+
+    let _ = kcp.update(now_ms());
+
     loop {
         if closed.load(Ordering::Relaxed) { return; }
 
-        let next = {
-            let mut kcp = inner.lock();
-            if kcp.closed { return; }
-
-            let now = kcp.now_ms();
-            let wait_before = kcp.kcp.wait_snd();
-            match kcp.kcp.update(now) {
-                Ok(()) => {}
-                Err(_) => {}
-            }
-            let wait_after = kcp.kcp.wait_snd();
-
-            // Only wake pending writer if send queue drained (backpressure relief).
-            // Never spuriously wake pending reader — that causes hot loops.
-            if wait_after < wait_before {
-                if let Some(w) = kcp.pending_writer.take() {
-                    w.wake();
-                }
-            }
-
-            let check = kcp.kcp.check(now);
-            let delay = if check <= now { 1 } else { (check - now).min(100) };
-            Duration::from_millis(delay as u64)
-        };
+        let now = now_ms();
+        let check = kcp.check(now);
+        let delay = if check <= now { 1 } else { (check - now).min(50) };
 
         tokio::select! {
-            _ = tokio::time::sleep(next) => {}
-            _ = notifier.notified() => {}
+            biased;
+
+            Some(data) = write_rx.recv() => {
+                let _ = kcp.send(&data);
+                while let Ok(more) = write_rx.try_recv() {
+                    let _ = kcp.send(&more);
+                }
+                let _ = kcp.flush();
+            }
+
+            Some(data) = input_rx.recv() => {
+                let _ = kcp.input(&data);
+                while let Ok(more) = input_rx.try_recv() {
+                    let _ = kcp.input(&more);
+                }
+                drain_recv(&mut kcp, &read_tx);
+            }
+
+            Some(()) = flush_rx.recv() => {
+                let _ = kcp.flush();
+            }
+
+            _ = tokio::time::sleep(Duration::from_millis(delay as u64)) => {
+                let _ = kcp.update(now_ms());
+                drain_recv(&mut kcp, &read_tx);
+            }
+        }
+    }
+}
+
+/// Drain all available data from KCP recv queue and forward to the read channel.
+fn drain_recv(kcp: &mut kcp::Kcp<KcpOutput>, read_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+    loop {
+        match kcp.peeksize() {
+            Ok(n) if n > 0 => {
+                let mut buf = vec![0u8; n];
+                match kcp.recv(&mut buf) {
+                    Ok(sz) => {
+                        buf.truncate(sz);
+                        if read_tx.send(buf).is_err() { return; }
+                    }
+                    Err(_) => return,
+                }
+            }
+            _ => return,
         }
     }
 }
@@ -368,10 +290,9 @@ async fn update_loop(
 // --- Test infrastructure ---
 
 #[cfg(test)]
-fn bridge_task(
+fn lossy_bridge(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    inner: Arc<SpinMutex<KcpInner>>,
-    notifier: Arc<Notify>,
+    input: KcpInput,
     loss_pct: u8,
     reorder: bool,
 ) {
@@ -379,28 +300,20 @@ fn bridge_task(
         let mut rng_state: u64 = 12345;
         let mut delayed: Option<Vec<u8>> = None;
         while let Some(data) = rx.recv().await {
-            // Simple PRNG for deterministic loss simulation.
             rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let r = ((rng_state >> 33) % 100) as u8;
 
-            if r < loss_pct { continue; } // drop
+            if r < loss_pct { continue; }
 
-            if reorder {
-                // 10% chance to delay and deliver next packet first.
-                if r % 10 == 0 && delayed.is_none() {
-                    delayed = Some(data);
-                    continue;
-                }
+            if reorder && r % 10 == 0 && delayed.is_none() {
+                delayed = Some(data);
+                continue;
             }
 
-            let mut kcp = inner.lock();
-            let _ = kcp.kcp.input(&data);
+            input.input(&data);
             if let Some(d) = delayed.take() {
-                let _ = kcp.kcp.input(&d);
+                input.input(&d);
             }
-            kcp.try_wake_pending();
-            drop(kcp);
-            notifier.notify_one();
         }
     });
 }
@@ -415,16 +328,16 @@ pub fn lossy_conn_pair(loss_pct: u8, reorder: bool) -> (KcpConn, KcpConn) {
     let (a_to_b_tx, a_to_b_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let (b_to_a_tx, b_to_a_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-    let a = KcpConn::new(1, Arc::new(move |data: &[u8]| {
+    let (a, a_input) = KcpConn::new(1, Arc::new(move |data: &[u8]| {
         let _ = a_to_b_tx.send(data.to_vec());
     }));
 
-    let b = KcpConn::new(1, Arc::new(move |data: &[u8]| {
+    let (b, b_input) = KcpConn::new(1, Arc::new(move |data: &[u8]| {
         let _ = b_to_a_tx.send(data.to_vec());
     }));
 
-    bridge_task(a_to_b_rx, b.inner_ref(), b.notifier_ref(), loss_pct, reorder);
-    bridge_task(b_to_a_rx, a.inner_ref(), a.notifier_ref(), loss_pct, reorder);
+    lossy_bridge(a_to_b_rx, b_input, loss_pct, reorder);
+    lossy_bridge(b_to_a_rx, a_input, loss_pct, reorder);
 
     (a, b)
 }

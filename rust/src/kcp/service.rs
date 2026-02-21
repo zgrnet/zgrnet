@@ -7,7 +7,7 @@ use std::task::Poll;
 
 use futures::TryStreamExt;
 
-use super::conn::KcpConn;
+use super::conn::{KcpConn, KcpInput};
 
 pub type ServiceOutputFn = Arc<dyn Fn(u64, &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>;
 
@@ -17,7 +17,7 @@ pub struct ServiceMuxConfig {
 }
 
 struct ServiceEntry {
-    input_conn: KcpConn,
+    input_handle: KcpInput,
     open_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<yamux::Stream>>,
 }
 
@@ -48,9 +48,9 @@ impl ServiceMux {
             s.get(&service).cloned()
         };
         if let Some(e) = entry {
-            e.input_conn.input(data);
+            e.input_handle.input(data);
         } else if let Ok(e) = self.create_service(service) {
-            e.input_conn.input(data);
+            e.input_handle.input(data);
         }
     }
 
@@ -91,31 +91,23 @@ impl ServiceMux {
 
         let output = self.config.output.clone();
         let svc = service;
-        let conn = KcpConn::new(service as u32, Arc::new(move |data: &[u8]| {
+        let (conn, input_handle) = KcpConn::new(service as u32, Arc::new(move |data: &[u8]| {
             let _ = output(svc, data);
         }));
-
-        let inner_ref = conn.inner_ref();
-        let closed_ref = conn.closed_ref();
-        let notifier_ref = conn.notifier_ref();
 
         let mode = if self.config.is_client { yamux::Mode::Client } else { yamux::Mode::Server };
         let yamux_conn = yamux::Connection::new(conn, yamux::Config::default(), mode);
 
         let (open_tx, open_rx) = tokio::sync::mpsc::channel(64);
         let accept_tx = self.accept_tx.clone();
-        let is_client = self.config.is_client;
 
-        if is_client {
-            // Client: driver pattern with open requests + poll_next_inbound
+        if self.config.is_client {
             tokio::spawn(client_driver(yamux_conn, open_rx, accept_tx, service));
         } else {
-            // Server: stream::poll_fn + try_for_each_concurrent
             tokio::spawn(server_driver(yamux_conn, accept_tx, service));
         }
 
-        let input_conn = KcpConn::from_parts(inner_ref, closed_ref, notifier_ref);
-        let entry = Arc::new(ServiceEntry { input_conn, open_tx });
+        let entry = Arc::new(ServiceEntry { input_handle, open_tx });
         services.insert(service, entry.clone());
         Ok(entry)
     }

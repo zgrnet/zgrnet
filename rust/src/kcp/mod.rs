@@ -20,7 +20,7 @@ pub use kcp::{Kcp, Frame, Cmd, FrameError, FRAME_HEADER_SIZE, MAX_PAYLOAD_SIZE};
 pub use fec::{Encoder as FecEncoder, Decoder as FecDecoder};
 
 // Re-export new conn types
-pub use conn::KcpConn;
+pub use conn::{KcpConn, KcpInput};
 pub use service::{ServiceMux, ServiceMuxConfig, ServiceOutputFn};
 
 // Legacy re-exports (to be removed in Step 5.4)
