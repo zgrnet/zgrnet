@@ -190,16 +190,14 @@ pub fn KcpConn(comptime Rt: type) type {
                     return;
                 }
 
-                // Drain all pending work (input + write coalescing).
                 self.drainInput();
                 self.drainWriteBuf();
 
                 const now_ms: u32 = @intCast(Rt.nowMs() & 0xFFFFFFFF);
                 self.kcp.update(now_ms);
-                self.kcp.flush();
                 self.drainRecv();
 
-                // Check if there's pending work.
+                // Check for more pending work before sleeping.
                 {
                     self.input_mutex.lock();
                     const has_input = self.input_buf.items.len > 0;
@@ -207,11 +205,10 @@ pub fn KcpConn(comptime Rt: type) type {
                     self.write_mutex.lock();
                     const has_write = self.write_buf.items.len > 0;
                     self.write_mutex.unlock();
-
-                    if (has_input or has_write) continue; // process immediately
+                    if (has_input or has_write) continue;
                 }
 
-                // No pending work. Wait for signal or KCP check time.
+                // Idle — adaptive sleep until signal or KCP check time.
                 const check = self.kcp.check(now_ms);
                 const delay = if (check <= now_ms) @as(u32, 1) else @min(check - now_ms, 5);
 
@@ -245,13 +242,15 @@ pub fn KcpConn(comptime Rt: type) type {
                 self.write_mutex.unlock();
                 return;
             }
+            // toOwnedSlice releases lock immediately — writer can keep writing
+            // while we do kcp.send. The alloc cost is outweighed by reduced
+            // lock contention in the write-heavy benchmark.
             const data = self.write_buf.toOwnedSlice(self.allocator) catch {
                 self.write_mutex.unlock();
                 return;
             };
             self.write_mutex.unlock();
 
-            // Send in 8KB chunks for incremental delivery.
             var offset: usize = 0;
             while (offset < data.len) {
                 const end = @min(offset + 8192, data.len);
@@ -262,16 +261,24 @@ pub fn KcpConn(comptime Rt: type) type {
         }
 
         fn drainRecv(self: *Self) void {
-            var buf: [65536]u8 = undefined;
             var received = false;
             while (true) {
                 const peek = self.kcp.peekSize();
                 if (peek <= 0) break;
-                const n = self.kcp.recv(&buf);
-                if (n <= 0) break;
 
+                // Recv directly into recv_buf's spare capacity.
                 self.recv_mutex.lock();
-                self.recv_buf.appendSlice(self.allocator, buf[0..@intCast(n)]) catch {};
+                self.recv_buf.ensureTotalCapacity(self.allocator, self.recv_buf.items.len + @as(usize, @intCast(peek))) catch {
+                    self.recv_mutex.unlock();
+                    break;
+                };
+                const spare = self.recv_buf.items.ptr[self.recv_buf.items.len .. self.recv_buf.capacity];
+                const n = self.kcp.recv(spare);
+                if (n <= 0) {
+                    self.recv_mutex.unlock();
+                    break;
+                }
+                self.recv_buf.items.len += @intCast(n);
                 self.recv_mutex.unlock();
                 received = true;
             }
@@ -614,4 +621,30 @@ test "bench yamux streaming" {
     const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
     const mbps = @as(f64, @floatFromInt(sent)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
     std.debug.print("[yamux streaming] {d:.1} MB/s\n", .{mbps});
+}
+
+test "kcpconn read peer dead" {
+    if (@import("builtin").os.tag == .freestanding) return;
+    const pair = try connPair();
+    defer pair.b.deinit();
+
+    // Exchange data to establish KCP state.
+    _ = try pair.a.write("setup");
+    var buf: [256]u8 = undefined;
+    _ = try pair.b.read(&buf);
+
+    // Kill peer A (simulates crash).
+    pair.a.close();
+    pair.a.deinit();
+
+    // B's read should detect dead peer via idle timeout and return EOF.
+    // No external timeout — testing KcpConn's own detection.
+    const start = std.time.nanoTimestamp();
+    const n = try pair.b.read(&buf);
+    const elapsed_ms = @divFloor(@as(u64, @intCast(std.time.nanoTimestamp() - start)), std.time.ns_per_ms);
+
+    // Should return EOF (0) within 35 seconds.
+    try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expect(elapsed_ms < 35_000);
+    std.debug.print("[read_peer_dead] returned in {d}ms\n", .{elapsed_ms});
 }
