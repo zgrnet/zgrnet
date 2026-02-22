@@ -156,4 +156,3 @@ func (bc *batchConn) ReceivedFrom(i int) *net.UDPAddr {
 	}
 	return nil
 }
-
