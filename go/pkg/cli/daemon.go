@@ -1,12 +1,13 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // ShowConfig prints the config.yaml contents for the current context.
@@ -22,48 +23,77 @@ func ShowConfig(baseDir, ctxName string) (string, error) {
 	return string(data), nil
 }
 
-// EditConfig opens the config in $EDITOR.
-func EditConfig(baseDir, ctxName string) error {
-	path, err := ContextConfigPath(baseDir, ctxName)
-	if err != nil {
-		return err
+// PidfilePath returns the path to the pidfile for the given context.
+func PidfilePath(baseDir, ctxName string) (string, error) {
+	if ctxName == "" {
+		var err error
+		ctxName, err = CurrentContextName(baseDir)
+		if err != nil {
+			return "", err
+		}
 	}
-
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "vi"
-	}
-
-	cmd := exec.Command(editor, path)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return filepath.Join(ContextDir(baseDir, ctxName), "data", "zigor.pid"), nil
 }
 
-// Up starts zgrnetd with the current context's config.
-// If daemon is true, the process is started in the background.
-func Up(baseDir, ctxName string, daemon bool) error {
-	cfgPath, err := ContextConfigPath(baseDir, ctxName)
+// WritePidfile writes the current process PID to the context's pidfile.
+func WritePidfile(baseDir, ctxName string, pid int) error {
+	pidPath, err := PidfilePath(baseDir, ctxName)
 	if err != nil {
 		return err
 	}
-
-	// Find zgrnetd binary — look in PATH and next to the zgrnet binary
-	zgrnetd, err := findZgrnetd()
-	if err != nil {
-		return err
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0700); err != nil {
+		return fmt.Errorf("create pid dir: %w", err)
 	}
-
-	if daemon {
-		return startDaemon(zgrnetd, cfgPath, baseDir, ctxName)
-	}
-
-	// Foreground: exec replaces current process
-	return execProcess(zgrnetd, cfgPath)
+	return os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", pid)), 0644)
 }
 
-// Down sends SIGTERM to the running zgrnetd process.
+// ReadPidfile reads the PID from the context's pidfile.
+// Returns 0 and an error if the pidfile doesn't exist or is invalid.
+func ReadPidfile(baseDir, ctxName string) (int, error) {
+	pidPath, err := PidfilePath(baseDir, ctxName)
+	if err != nil {
+		return 0, err
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, fmt.Errorf("host is not running for context %q (no pidfile)", ctxName)
+		}
+		return 0, fmt.Errorf("read pidfile: %w", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("invalid pidfile content: %w", err)
+	}
+	return pid, nil
+}
+
+// RemovePidfile removes the context's pidfile.
+func RemovePidfile(baseDir, ctxName string) {
+	RemovePidfileIfOwner(baseDir, ctxName, 0)
+}
+
+// RemovePidfileIfOwner removes the pidfile only if it contains the given PID.
+// If expectedPid is 0, it removes unconditionally (used by Down).
+func RemovePidfileIfOwner(baseDir, ctxName string, expectedPid int) {
+	pidPath, _ := PidfilePath(baseDir, ctxName)
+	if pidPath == "" {
+		return
+	}
+	if expectedPid > 0 {
+		data, err := os.ReadFile(pidPath)
+		if err != nil {
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || pid != expectedPid {
+			return
+		}
+	}
+	os.Remove(pidPath)
+}
+
+// Down sends SIGTERM to the running host process.
 func Down(baseDir, ctxName string) error {
 	if ctxName == "" {
 		var err error
@@ -73,18 +103,9 @@ func Down(baseDir, ctxName string) error {
 		}
 	}
 
-	pidPath := filepath.Join(ContextDir(baseDir, ctxName), "data", "zgrnetd.pid")
-	data, err := os.ReadFile(pidPath)
+	pid, err := ReadPidfile(baseDir, ctxName)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("no running zgrnetd found for context %q (no pid file)", ctxName)
-		}
-		return fmt.Errorf("read pid file: %w", err)
-	}
-
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return fmt.Errorf("invalid pid file: %w", err)
+		return err
 	}
 
 	proc, err := os.FindProcess(pid)
@@ -93,77 +114,27 @@ func Down(baseDir, ctxName string) error {
 	}
 
 	if err := signalTerminate(proc); err != nil {
+		if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
+			RemovePidfile(baseDir, ctxName)
+			return fmt.Errorf("host was not running (stale pidfile cleaned up)")
+		}
 		return fmt.Errorf("terminate pid %d: %w", pid, err)
 	}
 
-	// Clean up pid file
-	os.Remove(pidPath)
-
+	RemovePidfile(baseDir, ctxName)
 	return nil
 }
 
-// findZgrnetd locates the zgrnetd binary.
-func findZgrnetd() (string, error) {
-	// Try PATH first
-	if path, err := exec.LookPath("zgrnetd"); err == nil {
-		return path, nil
-	}
-
-	// Try next to the current executable
-	self, err := os.Executable()
-	if err == nil {
-		dir := filepath.Dir(self)
-		candidate := filepath.Join(dir, "zgrnetd")
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, nil
-		}
-	}
-
-	return "", fmt.Errorf("zgrnetd not found in PATH or alongside this binary")
-}
-
-// startDaemon starts zgrnetd in the background and writes a PID file.
-func startDaemon(zgrnetd, cfgPath, baseDir, ctxName string) error {
-	if ctxName == "" {
-		var err error
-		ctxName, err = CurrentContextName(baseDir)
-		if err != nil {
-			return err
-		}
-	}
-
-	cmd := exec.Command(zgrnetd, "-c", cfgPath)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	setSysProcAttr(cmd)
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start zgrnetd: %w", err)
-	}
-
-	// Write PID file
-	pidPath := filepath.Join(ContextDir(baseDir, ctxName), "data", "zgrnetd.pid")
-	os.MkdirAll(filepath.Dir(pidPath), 0700)
-	pidStr := fmt.Sprintf("%d\n", cmd.Process.Pid)
-	if err := os.WriteFile(pidPath, []byte(pidStr), 0644); err != nil {
-		return fmt.Errorf("write pid file: %w", err)
-	}
-
-	return nil
-}
-
-// ResolveAPIAddr determines the zgrnetd API address from context config.
+// ResolveAPIAddr determines the host API address from context config.
 func ResolveAPIAddr(baseDir, ctxName, override string) string {
 	if override != "" {
 		return override
 	}
 
-	// Try to read tun_ipv4 from config
 	cfgPath, err := ContextConfigPath(baseDir, ctxName)
 	if err == nil {
 		data, err := os.ReadFile(cfgPath)
 		if err == nil {
-			// Quick parse: find tun_ipv4 line
 			for _, line := range strings.Split(string(data), "\n") {
 				line = strings.TrimSpace(line)
 				if strings.HasPrefix(line, "tun_ipv4:") {

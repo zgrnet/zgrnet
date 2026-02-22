@@ -1,22 +1,19 @@
-//! zgrnet — management tool for zgrnet (Zig implementation).
+//! zigor — unified zgrnet management tool (Zig implementation).
 //!
-//! Provides offline context/config management and online API commands
-//! for interacting with a running zgrnetd daemon.
+//! Replaces both zgrnet (CLI) and zgrnetd (daemon) with a single binary.
 //!
-//! Context directory: ~/.config/zgrnet/ (or $ZGRNET_HOME)
+//! Context directory: ~/.config/zigor/ (or $ZIGOR_CONFIG_DIR)
 //! Config format: JSON (matching Zig config parser)
 //!
 //! Usage:
-//!   zgrnet context list|use|create|current|delete
-//!   zgrnet key generate|show
-//!   zgrnet config show|path|net|reload
-//!   zgrnet up [--context <name>] [-d]
-//!   zgrnet down
-//!   zgrnet status
-//!   zgrnet peers list|add|get|remove
-//!   zgrnet lans list|join|leave
-//!   zgrnet policy show|add-rule|remove-rule
-//!   zgrnet routes list|add|remove
+//!   zigor ctx list|create|delete|show|use
+//!   zigor key generate|show
+//!   zigor config show|path|net|reload
+//!   zigor [--ctx <name>] host up|down|status|peers
+//!   zigor peers list|add|get|remove
+//!   zigor lans list|join|leave
+//!   zigor policy show|add-rule|remove-rule
+//!   zigor routes list|add|remove
 
 const std = @import("std");
 const posix = std.posix;
@@ -28,6 +25,10 @@ const Key = noise.Key;
 const KeyPair = noise.KeyPair;
 
 const Allocator = std.mem.Allocator;
+
+fn jsonStringify(allocator: Allocator, value: anytype) ![]const u8 {
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
+}
 
 /// Write pre-formatted data directly to stdout, handling partial writes.
 fn writeStdout(data: []const u8) void {
@@ -74,7 +75,7 @@ pub fn main() !void {
         if (mem.eql(u8, args[i], "--api") and i + 1 < args.len) {
             api_addr = args[i + 1];
             i += 1;
-        } else if (mem.eql(u8, args[i], "--context") and i + 1 < args.len) {
+        } else if (mem.eql(u8, args[i], "--ctx") and i + 1 < args.len) {
             ctx_override = args[i + 1];
             i += 1;
         } else if (mem.eql(u8, args[i], "--json")) {
@@ -95,24 +96,24 @@ pub fn main() !void {
     const cmd = filtered.items[0];
     const sub = filtered.items[1..];
 
-    if (mem.eql(u8, cmd, "context")) {
-        try runContext(allocator, base_dir, sub);
+    if (mem.eql(u8, cmd, "ctx")) {
+        try runCtx(allocator, base_dir, sub);
     } else if (mem.eql(u8, cmd, "key")) {
         try runKey(allocator, base_dir, ctx_override, sub);
     } else if (mem.eql(u8, cmd, "config")) {
         try runConfig(allocator, base_dir, ctx_override, api_addr, json_output, sub);
-    } else if (mem.eql(u8, cmd, "up")) {
-        try runUp(allocator, base_dir, ctx_override, sub);
-    } else if (mem.eql(u8, cmd, "down")) {
-        try runDown(allocator, base_dir, ctx_override);
-    } else if (mem.eql(u8, cmd, "status") or mem.eql(u8, cmd, "peers") or
+    } else if (mem.eql(u8, cmd, "host")) {
+        try runHost(allocator, base_dir, ctx_override, api_addr, json_output, sub);
+    } else if (mem.eql(u8, cmd, "peers") or
         mem.eql(u8, cmd, "lans") or mem.eql(u8, cmd, "policy") or mem.eql(u8, cmd, "routes"))
     {
         try runOnline(allocator, base_dir, ctx_override, api_addr, json_output, cmd, sub);
     } else if (mem.eql(u8, cmd, "help") or mem.eql(u8, cmd, "-h") or mem.eql(u8, cmd, "--help")) {
         printUsage();
+    } else if (mem.eql(u8, cmd, "version") or mem.eql(u8, cmd, "--version")) {
+        print("zigor 0.1.0\n", .{});
     } else {
-        print("error: unknown command \"{s}\" (run 'zgrnet help')\n", .{cmd});
+        print("error: unknown command \"{s}\" (run 'zigor help')\n", .{cmd});
         std.process.exit(1);
     }
 }
@@ -122,11 +123,25 @@ pub fn main() !void {
 // ============================================================================
 
 fn defaultConfigDir(allocator: Allocator) ![]const u8 {
-    if (std.posix.getenv("ZGRNET_HOME")) |dir| {
+    if (std.posix.getenv("ZIGOR_CONFIG_DIR")) |dir| {
         return try allocator.dupe(u8, dir);
     }
     const home = std.posix.getenv("HOME") orelse return error.NoHome;
-    return try fmt.allocPrint(allocator, "{s}/.config/zgrnet", .{home});
+    return try fmt.allocPrint(allocator, "{s}/.config/zigor", .{home});
+}
+
+fn validateContextName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (mem.eql(u8, name, "current")) return false;
+    if (mem.indexOfScalar(u8, name, '/') != null) return false;
+    if (mem.indexOfScalar(u8, name, '\\') != null) return false;
+    if (mem.indexOf(u8, name, "..") != null) return false;
+    if (mem.indexOfScalar(u8, name, ' ') != null) return false;
+    if (mem.indexOfScalar(u8, name, '\t') != null) return false;
+    if (mem.indexOfScalar(u8, name, '\n') != null) return false;
+    if (mem.indexOfScalar(u8, name, '\r') != null) return false;
+    if (name[0] == '.') return false;
+    return true;
 }
 
 /// Counts contexts by iterating directories that contain a private.key file.
@@ -152,26 +167,31 @@ fn contextDir(allocator: Allocator, base_dir: []const u8, name: []const u8) ![]c
     return try fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, name });
 }
 
-fn currentContextName(allocator: Allocator, base_dir: []const u8) ![]const u8 {
+fn currentContextName(allocator: Allocator, base_dir: []const u8) error{ NoCurrentContext, OutOfMemory }![]const u8 {
     const path = try fmt.allocPrint(allocator, "{s}/current", .{base_dir});
     defer allocator.free(path);
 
     const data = fs.cwd().readFileAlloc(allocator, path, 1024) catch {
-        print("error: no current context set (run: zgrnet context create <name>)\n", .{});
-        std.process.exit(1);
+        return error.NoCurrentContext;
     };
     defer allocator.free(data);
 
     const name = mem.trim(u8, data, &std.ascii.whitespace);
     if (name.len == 0) {
-        print("error: current context file is empty\n", .{});
-        std.process.exit(1);
+        return error.NoCurrentContext;
     }
     return try allocator.dupe(u8, name);
 }
 
+fn currentContextNameOrExit(allocator: Allocator, base_dir: []const u8) []const u8 {
+    return currentContextName(allocator, base_dir) catch {
+        print("error: no current context set (run: zigor ctx create <name>)\n", .{});
+        std.process.exit(1);
+    };
+}
+
 fn contextConfigPath(allocator: Allocator, base_dir: []const u8, name: ?[]const u8) ![]const u8 {
-    const ctx = if (name) |n| try allocator.dupe(u8, n) else try currentContextName(allocator, base_dir);
+    const ctx = if (name) |n| try allocator.dupe(u8, n) else currentContextNameOrExit(allocator, base_dir);
     defer allocator.free(ctx);
     return try fmt.allocPrint(allocator, "{s}/{s}/config.json", .{ base_dir, ctx });
 }
@@ -192,16 +212,16 @@ const config_template =
 // Context commands
 // ============================================================================
 
-fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const u8) !void {
+fn runCtx(allocator: Allocator, base_dir: []const u8, args: []const []const u8) !void {
     if (args.len == 0) {
-        print("usage: zgrnet context <list|use|create|current|delete>\n", .{});
+        print("usage: zigor ctx <list|create|delete|show|use>\n", .{});
         std.process.exit(1);
     }
 
     if (mem.eql(u8, args[0], "list")) {
         // List contexts
         var dir = fs.cwd().openDir(base_dir, .{ .iterate = true }) catch {
-            print("(no contexts — run: zgrnet context create <name>)\n", .{});
+            print("(no contexts — run: zigor ctx create <name>)\n", .{});
             return;
         };
         defer dir.close();
@@ -236,15 +256,19 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
             print("{s}{s}\n", .{ marker, name });
         }
         if (names.items.len == 0) {
-            print("(no contexts — run: zgrnet context create <name>)\n", .{});
+            print("(no contexts — run: zigor ctx create <name>)\n", .{});
         }
-    } else if (mem.eql(u8, args[0], "current")) {
-        const name = try currentContextName(allocator, base_dir);
+    } else if (mem.eql(u8, args[0], "show")) {
+        const name = currentContextNameOrExit(allocator, base_dir);
         defer allocator.free(name);
         print("{s}\n", .{name});
     } else if (mem.eql(u8, args[0], "use")) {
         if (args.len < 2) {
-            print("usage: zgrnet context use <name>\n", .{});
+            print("usage: zigor ctx use <name>\n", .{});
+            std.process.exit(1);
+        }
+        if (!validateContextName(args[1])) {
+            print("error: invalid context name \"{s}\"\n", .{args[1]});
             std.process.exit(1);
         }
         const dir = try contextDir(allocator, base_dir, args[1]);
@@ -262,10 +286,14 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
         print("switched to context \"{s}\"\n", .{args[1]});
     } else if (mem.eql(u8, args[0], "create")) {
         if (args.len < 2) {
-            print("usage: zgrnet context create <name>\n", .{});
+            print("usage: zigor ctx create <name>\n", .{});
             std.process.exit(1);
         }
         const name = args[1];
+        if (!validateContextName(name)) {
+            print("error: invalid context name \"{s}\"\n", .{name});
+            std.process.exit(1);
+        }
         const dir = try contextDir(allocator, base_dir, name);
         defer allocator.free(dir);
 
@@ -321,10 +349,13 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
         print("public key: {s}\n", .{&pub_hex});
     } else if (mem.eql(u8, args[0], "delete")) {
         if (args.len < 2) {
-            print("usage: zgrnet context delete <name>\n", .{});
+            print("usage: zigor ctx delete <name>\n", .{});
             std.process.exit(1);
         }
-        // Check not current
+        if (!validateContextName(args[1])) {
+            print("error: invalid context name \"{s}\"\n", .{args[1]});
+            std.process.exit(1);
+        }
         const current = currentContextName(allocator, base_dir) catch null;
         defer if (current) |c| allocator.free(c);
         if (current != null and mem.eql(u8, args[1], current.?)) {
@@ -350,11 +381,11 @@ fn runContext(allocator: Allocator, base_dir: []const u8, args: []const []const 
 
 fn runKey(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, args: []const []const u8) !void {
     if (args.len == 0) {
-        print("usage: zgrnet key <generate|show>\n", .{});
+        print("usage: zigor key <generate|show>\n", .{});
         std.process.exit(1);
     }
 
-    const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else try currentContextName(allocator, base_dir);
+    const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else currentContextNameOrExit(allocator, base_dir);
     defer allocator.free(ctx_name);
 
     if (mem.eql(u8, args[0], "show")) {
@@ -393,7 +424,7 @@ fn runKey(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, args: []
 
 fn runConfig(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_addr: ?[]const u8, json_output: bool, args: []const []const u8) !void {
     if (args.len == 0) {
-        print("usage: zgrnet config <show|path|net|reload>\n", .{});
+        print("usage: zigor config <show|path|net|reload>\n", .{});
         std.process.exit(1);
     }
 
@@ -430,51 +461,90 @@ fn runConfig(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_a
 // Up / Down
 // ============================================================================
 
-fn runUp(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, args: []const []const u8) !void {
-    var daemon = false;
-    for (args) |a| {
-        if (mem.eql(u8, a, "-d") or mem.eql(u8, a, "--daemon")) daemon = true;
+fn runHost(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_addr: ?[]const u8, json_output: bool, args: []const []const u8) !void {
+    if (args.len == 0) {
+        print("usage: zigor host <up|down|status|peers>\n", .{});
+        std.process.exit(1);
     }
 
-    const cfg_path = try contextConfigPath(allocator, base_dir, ctx);
-    defer allocator.free(cfg_path);
+    if (mem.eql(u8, args[0], "up")) {
+        print("error: host up not implemented in Zig build (use Go build)\n", .{});
+        std.process.exit(1);
+    } else if (mem.eql(u8, args[0], "down")) {
+        const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else currentContextNameOrExit(allocator, base_dir);
+        defer allocator.free(ctx_name);
 
-    if (daemon) {
-        var child = std.process.Child.init(&[_][]const u8{ "zgrnetd", "-c", cfg_path }, allocator);
-        try child.spawn();
-        print("zgrnetd started in background (pid {d})\n", .{child.id});
+        const pid_path = try fmt.allocPrint(allocator, "{s}/{s}/data/zigor.pid", .{ base_dir, ctx_name });
+        defer allocator.free(pid_path);
+
+        const data = fs.cwd().readFileAlloc(allocator, pid_path, 64) catch {
+            print("error: host is not running (no pidfile)\n", .{});
+            std.process.exit(1);
+        };
+        defer allocator.free(data);
+
+        const pid_str = mem.trim(u8, data, &std.ascii.whitespace);
+        const pid = fmt.parseInt(posix.pid_t, pid_str, 10) catch {
+            print("error: invalid pidfile\n", .{});
+            std.process.exit(1);
+        };
+
+        posix.kill(pid, posix.SIG.TERM) catch |e| {
+            if (e == error.ProcessNotFound) {
+                fs.cwd().deleteFile(pid_path) catch {};
+                print("error: host was not running (stale pidfile cleaned up)\n", .{});
+                std.process.exit(1);
+            }
+            print("error: send SIGTERM to pid {d}: {}\n", .{ pid, e });
+            std.process.exit(1);
+        };
+        fs.cwd().deleteFile(pid_path) catch {};
+        print("host stopped\n", .{});
+    } else if (mem.eql(u8, args[0], "status")) {
+        const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else currentContextNameOrExit(allocator, base_dir);
+        defer allocator.free(ctx_name);
+
+        const pid_path = try fmt.allocPrint(allocator, "{s}/{s}/data/zigor.pid", .{ base_dir, ctx_name });
+        defer allocator.free(pid_path);
+
+        const pid_data = fs.cwd().readFileAlloc(allocator, pid_path, 64) catch {
+            print("host is not running (context \"{s}\")\n", .{ctx_name});
+            return;
+        };
+        defer allocator.free(pid_data);
+
+        const pid_str = mem.trim(u8, pid_data, &std.ascii.whitespace);
+        const pid = fmt.parseInt(posix.pid_t, pid_str, 10) catch {
+            print("host is not running (invalid pidfile)\n", .{});
+            fs.cwd().deleteFile(pid_path) catch {};
+            return;
+        };
+
+        const dead = if (posix.kill(pid, 0)) |_| false else |err| (err == error.ProcessNotFound);
+        if (dead) {
+            print("host is not running (stale pidfile, pid {d})\n", .{pid});
+            fs.cwd().deleteFile(pid_path) catch {};
+            return;
+        }
+
+        const addr = try resolveApiAddr(allocator, base_dir, ctx, api_addr);
+        defer allocator.free(addr);
+        if (httpGet(allocator, addr, "/api/whoami")) |body| {
+            defer allocator.free(body);
+            printJsonOutput(body, json_output);
+        } else |_| {
+            print("host is running (pid {d}) but API unreachable\n", .{pid});
+        }
+    } else if (mem.eql(u8, args[0], "peers")) {
+        const addr = try resolveApiAddr(allocator, base_dir, ctx, api_addr);
+        defer allocator.free(addr);
+        const body = try httpGet(allocator, addr, "/api/peers");
+        defer allocator.free(body);
+        printJsonOutput(body, json_output);
     } else {
-        const err = std.process.execve(allocator, &[_][]const u8{ "zgrnetd", "-c", cfg_path }, null);
-        print("error: exec zgrnetd: {}\n", .{err});
+        print("error: unknown host subcommand \"{s}\"\n", .{args[0]});
         std.process.exit(1);
     }
-}
-
-fn runDown(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8) !void {
-    const ctx_name = if (ctx) |c| try allocator.dupe(u8, c) else try currentContextName(allocator, base_dir);
-    defer allocator.free(ctx_name);
-
-    const pid_path = try fmt.allocPrint(allocator, "{s}/{s}/data/zgrnetd.pid", .{ base_dir, ctx_name });
-    defer allocator.free(pid_path);
-
-    const data = fs.cwd().readFileAlloc(allocator, pid_path, 64) catch {
-        print("error: no running zgrnetd found (no pid file)\n", .{});
-        std.process.exit(1);
-    };
-    defer allocator.free(data);
-
-    const pid_str = mem.trim(u8, data, &std.ascii.whitespace);
-    const pid = fmt.parseInt(posix.pid_t, pid_str, 10) catch {
-        print("error: invalid pid file\n", .{});
-        std.process.exit(1);
-    };
-
-    posix.kill(pid, posix.SIG.TERM) catch |e| {
-        print("error: send SIGTERM to pid {d}: {}\n", .{ pid, e });
-        std.process.exit(1);
-    };
-    fs.cwd().deleteFile(pid_path) catch {};
-    print("zgrnetd stopped\n", .{});
 }
 
 // ============================================================================
@@ -502,7 +572,7 @@ fn runOnline(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_a
 
 fn runPeers(allocator: Allocator, addr: []const u8, json_output: bool, args: []const []const u8) !void {
     if (args.len == 0) {
-        print("usage: zgrnet peers <list|add|get|remove>\n", .{});
+        print("usage: zigor peers <list|add|get|remove>\n", .{});
         std.process.exit(1);
     }
     if (mem.eql(u8, args[0], "list")) {
@@ -510,7 +580,7 @@ fn runPeers(allocator: Allocator, addr: []const u8, json_output: bool, args: []c
         defer allocator.free(body);
         printJsonOutput(body, json_output);
     } else if (mem.eql(u8, args[0], "get")) {
-        if (args.len < 2) { print("usage: zgrnet peers get <pubkey>\n", .{}); std.process.exit(1); }
+        if (args.len < 2) { print("usage: zigor peers get <pubkey>\n", .{}); std.process.exit(1); }
         const path = try fmt.allocPrint(allocator, "/api/peers/{s}", .{args[1]});
         defer allocator.free(path);
         const body = try httpGet(allocator, addr, path);
@@ -524,14 +594,15 @@ fn runPeers(allocator: Allocator, addr: []const u8, json_output: bool, args: []c
         while (j < args.len) : (j += 1) {
             if (mem.eql(u8, args[j], "--alias") and j + 1 < args.len) { alias = args[j + 1]; j += 1; } else if (mem.eql(u8, args[j], "--endpoint") and j + 1 < args.len) { endpoint = args[j + 1]; j += 1; } else if (pubkey == null) { pubkey = args[j]; }
         }
-        if (pubkey == null) { print("usage: zgrnet peers add <pubkey> [--alias <a>] [--endpoint <e>]\n", .{}); std.process.exit(1); }
-        const req = try fmt.allocPrint(allocator, "{{\"pubkey\":\"{s}\",\"alias\":\"{s}\",\"endpoint\":\"{s}\"}}", .{ pubkey.?, alias, endpoint });
+        if (pubkey == null) { print("usage: zigor peers add <pubkey> [--alias <a>] [--endpoint <e>]\n", .{}); std.process.exit(1); }
+        const obj = .{ .pubkey = pubkey.?, .alias = alias, .endpoint = endpoint };
+        const req = try jsonStringify(allocator, obj);
         defer allocator.free(req);
         const body = try httpPost(allocator, addr, "/api/peers", req);
         defer allocator.free(body);
         printJsonOutput(body, json_output);
     } else if (mem.eql(u8, args[0], "remove")) {
-        if (args.len < 2) { print("usage: zgrnet peers remove <pubkey>\n", .{}); std.process.exit(1); }
+        if (args.len < 2) { print("usage: zigor peers remove <pubkey>\n", .{}); std.process.exit(1); }
         const path = try fmt.allocPrint(allocator, "/api/peers/{s}", .{args[1]});
         defer allocator.free(path);
         try httpDelete(allocator, addr, path);
@@ -543,7 +614,7 @@ fn runPeers(allocator: Allocator, addr: []const u8, json_output: bool, args: []c
 }
 
 fn runLans(allocator: Allocator, addr: []const u8, json_output: bool, args: []const []const u8) !void {
-    if (args.len == 0) { print("usage: zgrnet lans <list|join|leave>\n", .{}); std.process.exit(1); }
+    if (args.len == 0) { print("usage: zigor lans <list|join|leave>\n", .{}); std.process.exit(1); }
     if (mem.eql(u8, args[0], "list")) {
         const body = try httpGet(allocator, addr, "/api/lans");
         defer allocator.free(body);
@@ -556,14 +627,15 @@ fn runLans(allocator: Allocator, addr: []const u8, json_output: bool, args: []co
         while (j < args.len) : (j += 1) {
             if (mem.eql(u8, args[j], "--domain") and j + 1 < args.len) { domain = args[j + 1]; j += 1; } else if (mem.eql(u8, args[j], "--pubkey") and j + 1 < args.len) { pubkey = args[j + 1]; j += 1; } else if (mem.eql(u8, args[j], "--endpoint") and j + 1 < args.len) { endpoint = args[j + 1]; j += 1; }
         }
-        if (domain.len == 0 or pubkey.len == 0 or endpoint.len == 0) { print("usage: zgrnet lans join --domain <d> --pubkey <pk> --endpoint <e>\n", .{}); std.process.exit(1); }
-        const req = try fmt.allocPrint(allocator, "{{\"domain\":\"{s}\",\"pubkey\":\"{s}\",\"endpoint\":\"{s}\"}}", .{ domain, pubkey, endpoint });
+        if (domain.len == 0 or pubkey.len == 0 or endpoint.len == 0) { print("usage: zigor lans join --domain <d> --pubkey <pk> --endpoint <e>\n", .{}); std.process.exit(1); }
+        const obj = .{ .domain = domain, .pubkey = pubkey, .endpoint = endpoint };
+        const req = try jsonStringify(allocator, obj);
         defer allocator.free(req);
         const body = try httpPost(allocator, addr, "/api/lans", req);
         defer allocator.free(body);
         printJsonOutput(body, json_output);
     } else if (mem.eql(u8, args[0], "leave")) {
-        if (args.len < 2) { print("usage: zgrnet lans leave <domain>\n", .{}); std.process.exit(1); }
+        if (args.len < 2) { print("usage: zigor lans leave <domain>\n", .{}); std.process.exit(1); }
         const path = try fmt.allocPrint(allocator, "/api/lans/{s}", .{args[1]});
         defer allocator.free(path);
         try httpDelete(allocator, addr, path);
@@ -575,18 +647,18 @@ fn runLans(allocator: Allocator, addr: []const u8, json_output: bool, args: []co
 }
 
 fn runPolicy(allocator: Allocator, addr: []const u8, json_output: bool, args: []const []const u8) !void {
-    if (args.len == 0) { print("usage: zgrnet policy <show|add-rule|remove-rule>\n", .{}); std.process.exit(1); }
+    if (args.len == 0) { print("usage: zigor policy <show|add-rule|remove-rule>\n", .{}); std.process.exit(1); }
     if (mem.eql(u8, args[0], "show")) {
         const body = try httpGet(allocator, addr, "/api/policy");
         defer allocator.free(body);
         printJsonOutput(body, json_output);
     } else if (mem.eql(u8, args[0], "add-rule")) {
-        if (args.len < 2) { print("usage: zgrnet policy add-rule '<json>'\n", .{}); std.process.exit(1); }
+        if (args.len < 2) { print("usage: zigor policy add-rule '<json>'\n", .{}); std.process.exit(1); }
         const body = try httpPost(allocator, addr, "/api/policy/rules", args[1]);
         defer allocator.free(body);
         printJsonOutput(body, json_output);
     } else if (mem.eql(u8, args[0], "remove-rule")) {
-        if (args.len < 2) { print("usage: zgrnet policy remove-rule <name>\n", .{}); std.process.exit(1); }
+        if (args.len < 2) { print("usage: zigor policy remove-rule <name>\n", .{}); std.process.exit(1); }
         const path = try fmt.allocPrint(allocator, "/api/policy/rules/{s}", .{args[1]});
         defer allocator.free(path);
         try httpDelete(allocator, addr, path);
@@ -598,7 +670,7 @@ fn runPolicy(allocator: Allocator, addr: []const u8, json_output: bool, args: []
 }
 
 fn runRoutes(allocator: Allocator, addr: []const u8, json_output: bool, args: []const []const u8) !void {
-    if (args.len == 0) { print("usage: zgrnet routes <list|add|remove>\n", .{}); std.process.exit(1); }
+    if (args.len == 0) { print("usage: zigor routes <list|add|remove>\n", .{}); std.process.exit(1); }
     if (mem.eql(u8, args[0], "list")) {
         const body = try httpGet(allocator, addr, "/api/routes");
         defer allocator.free(body);
@@ -610,14 +682,15 @@ fn runRoutes(allocator: Allocator, addr: []const u8, json_output: bool, args: []
         while (j < args.len) : (j += 1) {
             if (mem.eql(u8, args[j], "--domain") and j + 1 < args.len) { domain = args[j + 1]; j += 1; } else if (mem.eql(u8, args[j], "--peer") and j + 1 < args.len) { peer = args[j + 1]; j += 1; }
         }
-        if (domain.len == 0 or peer.len == 0) { print("usage: zgrnet routes add --domain <pattern> --peer <alias>\n", .{}); std.process.exit(1); }
-        const req = try fmt.allocPrint(allocator, "{{\"domain\":\"{s}\",\"peer\":\"{s}\"}}", .{ domain, peer });
+        if (domain.len == 0 or peer.len == 0) { print("usage: zigor routes add --domain <pattern> --peer <alias>\n", .{}); std.process.exit(1); }
+        const obj = .{ .domain = domain, .peer = peer };
+        const req = try jsonStringify(allocator, obj);
         defer allocator.free(req);
         const body = try httpPost(allocator, addr, "/api/routes", req);
         defer allocator.free(body);
         printJsonOutput(body, json_output);
     } else if (mem.eql(u8, args[0], "remove")) {
-        if (args.len < 2) { print("usage: zgrnet routes remove <id>\n", .{}); std.process.exit(1); }
+        if (args.len < 2) { print("usage: zigor routes remove <id>\n", .{}); std.process.exit(1); }
         const path = try fmt.allocPrint(allocator, "/api/routes/{s}", .{args[1]});
         defer allocator.free(path);
         try httpDelete(allocator, addr, path);
@@ -736,16 +809,22 @@ fn printJsonOutput(data: []const u8, raw: bool) void {
 
 fn printUsage() void {
     print(
-        \\zgrnet — zgrnet management tool (Zig)
+        \\zigor — zgrnet management tool (Zig)
         \\
-        \\Usage: zgrnet <command> [options]
+        \\Usage: zigor [--ctx <name>] <command> [options]
         \\
         \\Context management (offline):
-        \\  context list                 List all contexts
-        \\  context use <name>           Switch to a context
-        \\  context create <name>        Create a new context (generates keypair)
-        \\  context current              Show current context name
-        \\  context delete <name>        Delete a context
+        \\  ctx list                     List all contexts
+        \\  ctx create <name>            Create a new context (generates keypair)
+        \\  ctx delete <name>            Delete a context
+        \\  ctx show                     Show current context name
+        \\  ctx use <name>               Switch to a context
+        \\
+        \\Host control:
+        \\  host up [-d]                 Start host (-d for background)
+        \\  host down                    Stop running host
+        \\  host status                  Show host status
+        \\  host peers                   List connected peers
         \\
         \\Key management:
         \\  key show                     Show public key of current context
@@ -757,38 +836,11 @@ fn printUsage() void {
         \\  config net                   Show network config (via API)
         \\  config reload                Reload config from disk (via API)
         \\
-        \\Daemon control:
-        \\  up [--context <name>] [-d]   Start zgrnetd (-d for background)
-        \\  down                         Stop running zgrnetd
-        \\
-        \\Status (via API):
-        \\  status                       Show node info (pubkey, TUN IP, uptime)
-        \\
-        \\Peer management (via API):
-        \\  peers list                   List all peers
-        \\  peers get <pubkey>           Show peer details
-        \\  peers add <pubkey> [--alias <a>] [--endpoint <e>]
-        \\  peers remove <pubkey>        Remove a peer
-        \\
-        \\Lan management (via API):
-        \\  lans list                    List all lans
-        \\  lans join --domain <d> --pubkey <pk> --endpoint <e>
-        \\  lans leave <domain>          Leave a lan
-        \\
-        \\Policy management (via API):
-        \\  policy show                  Show inbound policy
-        \\  policy add-rule '<json>'     Add an inbound rule
-        \\  policy remove-rule <name>    Remove an inbound rule
-        \\
-        \\Route management (via API):
-        \\  routes list                  List route rules
-        \\  routes add --domain <pattern> --peer <alias>
-        \\  routes remove <id>           Remove a route by index
-        \\
         \\Global flags:
-        \\  --api <addr>                 Override API address (default: from config)
-        \\  --context <name>             Override context
+        \\  --ctx <name>                 Override context
+        \\  --api <addr>                 Override API address
         \\  --json                       Output raw JSON
+        \\  --version                    Show version
         \\
     , .{});
 }

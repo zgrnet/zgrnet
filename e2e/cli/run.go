@@ -62,16 +62,16 @@ func findBinaries(t *testing.T) []Binary {
 		paths []string
 	}{
 		{"go", []string{
-			os.Getenv("GO_ZGRNET_BIN"),
-			"go/cmd/zgrnet/zgrnet_/zgrnet",
+			os.Getenv("GO_ZIGOR_BIN"),
+			"go/cmd/zigor/zigor_/zigor",
 		}},
 		{"rust", []string{
-			os.Getenv("RUST_ZGRNET_BIN"),
-			"rust/zgrnet_bin",
+			os.Getenv("RUST_ZIGOR_BIN"),
+			"rust/zigor_bin",
 		}},
 		{"zig", []string{
-			os.Getenv("ZIG_ZGRNET_BIN"),
-			"zig/zgrnet_bin",
+			os.Getenv("ZIG_ZIGOR_BIN"),
+			"zig/zigor_bin",
 		}},
 	}
 
@@ -124,7 +124,7 @@ func findBinaries(t *testing.T) []Binary {
 	}
 
 	if len(bins) == 0 {
-		t.Fatal("no zgrnet binaries found; build with: bazel build //go/cmd/zgrnet //rust:zgrnet_bin //zig:zgrnet_bin")
+		t.Fatal("no zigor binaries found; build with: bazel build //go/cmd/zigor //rust:zigor_bin //zig:zigor_bin")
 	}
 	return bins
 }
@@ -160,17 +160,15 @@ func loadSeedKey(t *testing.T) (privateHex string, publicHex string) {
 func testdataPath(t *testing.T, name string) string {
 	t.Helper()
 
-	// Try relative to the test source
 	candidates := []string{
-		filepath.Join("e2e", "zgrnet", "testdata", name),
+		filepath.Join("e2e", "cli", "testdata", name),
 		filepath.Join("testdata", name),
 	}
 
-	// Bazel runfiles
 	if srcDir := os.Getenv("TEST_SRCDIR"); srcDir != "" {
 		ws := os.Getenv("TEST_WORKSPACE")
 		candidates = append([]string{
-			filepath.Join(srcDir, ws, "e2e", "zgrnet", "testdata", name),
+			filepath.Join(srcDir, ws, "e2e", "cli", "testdata", name),
 		}, candidates...)
 	}
 
@@ -265,7 +263,7 @@ func runTestCase(t *testing.T, bin Binary, tc TestCase, seedPriv, seedPub string
 
 	// Create isolated HOME
 	home := t.TempDir()
-	storeRoot := filepath.Join(home, ".config", "zgrnet")
+	storeRoot := filepath.Join(home, ".config", "zigor")
 
 	var outputs []string
 
@@ -278,8 +276,8 @@ func runTestCase(t *testing.T, bin Binary, tc TestCase, seedPriv, seedPub string
 				i, step.Args, exitCode, step.ExpectExit, stdout, stderr)
 		}
 
-		// After context create + seed_key: inject known private key
-		if tc.SeedKey && len(step.Args) >= 3 && step.Args[0] == "context" && step.Args[1] == "create" {
+		// After ctx create + seed_key: inject known private key
+		if tc.SeedKey && len(step.Args) >= 3 && step.Args[0] == "ctx" && step.Args[1] == "create" {
 			ctxName := step.Args[2]
 			keyPath := filepath.Join(storeRoot, ctxName, "private.key")
 			if err := os.WriteFile(keyPath, []byte(seedPriv+"\n"), 0600); err != nil {
@@ -334,11 +332,11 @@ func runCmd(t *testing.T, binPath string, args []string, home string) (stdout, s
 	t.Helper()
 
 	cmd := exec.Command(binPath, args...)
-	// Build a clean environment: inherit parent env but remove ZGRNET_HOME
-	// (all three languages check ZGRNET_HOME before HOME) and override HOME.
+	// Build a clean environment: inherit parent env but remove ZIGOR_CONFIG_DIR
+	// (all three languages check ZIGOR_CONFIG_DIR before HOME) and override HOME.
 	var env []string
 	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "ZGRNET_HOME=") {
+		if strings.HasPrefix(e, "ZIGOR_CONFIG_DIR=") {
 			continue
 		}
 		env = append(env, e)
