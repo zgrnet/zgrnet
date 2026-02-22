@@ -1,18 +1,21 @@
 //! KcpConn — KCP connection driven by a dedicated Rt.Thread.
 //!
-//! Architecture (matches Go's KCPConn.runLoop):
+//! Architecture:
 //! - One Rt.Thread exclusively owns the KCP instance (the run loop)
-//! - write() appends to shared write_buf (Rt.Mutex protected, O(1) memcpy)
-//!   and wakes the run loop
+//! - write() pushes to a lock-free SPSC ring buffer (no mutex!)
 //! - read() blocks on recv_cond until recv_buf has data
 //! - input() sends raw packets via Channel (bounded ring buffer)
-//! - Write coalescing: N small writes become fewer kcp.send() calls
+//! - Write coalescing: run loop drains entire ring in one batch → fewer kcp.send()
 //! - Dead peer detection: kcp.state() < 0 + idle timeout (15s/30s)
 //!
+//! Hot path is lock-free:
+//!   writer thread → SpscRing.push (atomic store) → no mutex
+//!   run loop      → SpscRing.pop  (atomic load)  → no mutex
+//!
 //! Run loop idle strategy (3 tiers):
-//!   1. Data flowing → tight loop, no sleep
-//!   2. Pending retransmits (waitSnd > 0) → 1ms sleep poll
-//!   3. Truly idle → block on wake condition until signaled
+//!   1. Data flowing → tight loop (check ring.len() > 0, no lock)
+//!   2. Pending retransmits (waitSnd > 0) → 1ms timedWait
+//!   3. Truly idle → 1s timedWait (idle timeout check)
 //!
 //! Generic over `comptime Rt: type` for ESP32 compatibility.
 
@@ -22,29 +25,97 @@ const channel_pkg = @import("channel");
 
 const idle_timeout_ms: u64 = 15_000;
 const idle_timeout_pure_ms: u64 = 30_000;
+const write_ring_capacity: usize = 512 * 1024;
+
+// ============================================================================
+// SPSC Ring Buffer — lock-free single-producer single-consumer byte queue
+// ============================================================================
+
+fn SpscRing(comptime capacity: usize) type {
+    if (capacity == 0 or (capacity & (capacity - 1)) != 0)
+        @compileError("SpscRing capacity must be power of 2");
+
+    return struct {
+        const mask = capacity - 1;
+        const Self = @This();
+
+        buf: [capacity]u8,
+        head: std.atomic.Value(usize), // writer position
+        tail: std.atomic.Value(usize), // reader position
+
+        fn init() Self {
+            return .{
+                .buf = undefined,
+                .head = std.atomic.Value(usize).init(0),
+                .tail = std.atomic.Value(usize).init(0),
+            };
+        }
+
+        /// Writer: push data into the ring. Returns bytes actually written (may be < data.len if full).
+        fn push(self: *Self, data: []const u8) usize {
+            const h = self.head.load(.monotonic);
+            const t = self.tail.load(.acquire);
+            const space = capacity - (h -% t);
+            const n = @min(data.len, space);
+            if (n == 0) return 0;
+
+            const start = h & mask;
+            const first = @min(n, capacity - start);
+            @memcpy(self.buf[start..][0..first], data[0..first]);
+            if (n > first) {
+                @memcpy(self.buf[0..n - first], data[first..n]);
+            }
+            self.head.store(h +% n, .release);
+            return n;
+        }
+
+        /// Reader: pop up to out.len bytes. Returns bytes actually read.
+        fn pop(self: *Self, out: []u8) usize {
+            const t = self.tail.load(.monotonic);
+            const h = self.head.load(.acquire);
+            const avail = h -% t;
+            const n = @min(out.len, avail);
+            if (n == 0) return 0;
+
+            const start = t & mask;
+            const first = @min(n, capacity - start);
+            @memcpy(out[0..first], self.buf[start..][0..first]);
+            if (n > first) {
+                @memcpy(out[first..n], self.buf[0..n - first]);
+            }
+            self.tail.store(t +% n, .release);
+            return n;
+        }
+
+        /// Available bytes to read.
+        fn len(self: *Self) usize {
+            return self.head.load(.acquire) -% self.tail.load(.acquire);
+        }
+    };
+}
+
+// ============================================================================
+// KcpConn
+// ============================================================================
 
 pub fn KcpConn(comptime Rt: type) type {
     return struct {
         const Self = @This();
         const InputChan = channel_pkg.Channel([]u8, 256, Rt);
-        const has_notify = @hasDecl(Rt, "Notify");
+        const WriteRing = SpscRing(write_ring_capacity);
 
         allocator: std.mem.Allocator,
         kcp: *kcp_mod.Kcp,
 
-        write_buf: std.ArrayListUnmanaged(u8),
-        write_scratch: std.ArrayListUnmanaged(u8),
-        write_mutex: Rt.Mutex,
+        write_ring: WriteRing,
 
         input_ch: InputChan,
 
-        // Wake mechanism — comptime-selected:
-        //   Rt.Notify (pipe/eventfd): 1 syscall signal, poll-based wait, no mutex
-        //   Fallback (Condition+Mutex): 3+ syscall signal, mutex-based wait
-        wake_notify: if (has_notify) Rt.Notify else void,
-        wake_mutex: if (!has_notify) Rt.Mutex else void,
-        wake_cond: if (!has_notify) Rt.Condition else void,
-        wake_signaled: if (!has_notify) bool else void,
+        // Wake mechanism for tier 2/3 idle blocking.
+        // Not on the hot path — tier 1 checks ring.len() without locking.
+        wake_mutex: Rt.Mutex,
+        wake_cond: Rt.Condition,
+        wake_signaled: bool,
 
         recv_buf: std.ArrayListUnmanaged(u8),
         recv_mutex: Rt.Mutex,
@@ -76,14 +147,11 @@ pub fn KcpConn(comptime Rt: type) type {
             self.* = Self{
                 .allocator = allocator,
                 .kcp = kcp,
-                .write_buf = .{},
-                .write_scratch = .{},
-                .write_mutex = Rt.Mutex.init(),
+                .write_ring = WriteRing.init(),
                 .input_ch = InputChan.init(),
-                .wake_notify = if (has_notify) Rt.Notify.init() else {},
-                .wake_mutex = if (!has_notify) Rt.Mutex.init() else {},
-                .wake_cond = if (!has_notify) Rt.Condition.init() else {},
-                .wake_signaled = if (!has_notify) false else {},
+                .wake_mutex = Rt.Mutex.init(),
+                .wake_cond = Rt.Condition.init(),
+                .wake_signaled = false,
                 .recv_buf = .{},
                 .recv_mutex = Rt.Mutex.init(),
                 .recv_cond = Rt.Condition.init(),
@@ -111,16 +179,9 @@ pub fn KcpConn(comptime Rt: type) type {
             }
             self.input_ch.deinit();
 
-            self.write_buf.deinit(self.allocator);
-            self.write_scratch.deinit(self.allocator);
             self.recv_buf.deinit(self.allocator);
-            self.write_mutex.deinit();
-            if (has_notify) {
-                self.wake_notify.deinit();
-            } else {
-                self.wake_mutex.deinit();
-                self.wake_cond.deinit();
-            }
+            self.wake_mutex.deinit();
+            self.wake_cond.deinit();
             self.recv_mutex.deinit();
             self.recv_cond.deinit();
 
@@ -159,18 +220,21 @@ pub fn KcpConn(comptime Rt: type) type {
             return n;
         }
 
-        /// Blocking write with coalescing. Wakes run loop only on empty→non-empty.
+        /// Lock-free write. Pushes to SPSC ring buffer, spins if full.
         pub fn write(self: *Self, data: []const u8) !usize {
             if (self.closed.load(.acquire)) return error.Closed;
 
-            self.write_mutex.lock();
-            const was_empty = self.write_buf.items.len == 0;
-            self.write_buf.appendSlice(self.allocator, data) catch {
-                self.write_mutex.unlock();
-                return error.OutOfMemory;
-            };
-            self.write_mutex.unlock();
-
+            const was_empty = self.write_ring.len() == 0;
+            var offset: usize = 0;
+            while (offset < data.len) {
+                if (self.closed.load(.acquire)) return error.Closed;
+                const n = self.write_ring.push(data[offset..]);
+                if (n > 0) {
+                    offset += n;
+                } else {
+                    std.atomic.spinLoopHint();
+                }
+            }
             if (was_empty) self.notifyWake();
             return data.len;
         }
@@ -186,44 +250,37 @@ pub fn KcpConn(comptime Rt: type) type {
             return self.closed.load(.acquire);
         }
 
-        // ── Wake mechanism ─────────────────────────────────────────────
-        // Comptime-selected: Notify (pipe, 1 syscall) or Condition (3+ syscalls).
+        // ── Wake mechanism (only for tier 2/3) ──────────────────────────
 
         fn notifyWake(self: *Self) void {
-            if (has_notify) {
-                self.wake_notify.signal();
-            } else {
-                self.wake_mutex.lock();
-                if (!self.wake_signaled) {
-                    self.wake_signaled = true;
-                    self.wake_cond.signal();
-                }
-                self.wake_mutex.unlock();
+            self.wake_mutex.lock();
+            if (!self.wake_signaled) {
+                self.wake_signaled = true;
+                self.wake_cond.signal();
             }
+            self.wake_mutex.unlock();
         }
 
         fn timedWaitWake(self: *Self, timeout_ms: u64) void {
-            if (has_notify) {
-                _ = self.wake_notify.timedWait(timeout_ms * std.time.ns_per_ms);
-            } else {
-                self.wake_mutex.lock();
-                if (!self.wake_signaled and !self.closed.load(.acquire)) {
-                    if (comptime @hasDecl(Rt.Condition, "timedWait")) {
-                        _ = self.wake_cond.timedWait(&self.wake_mutex, timeout_ms * std.time.ns_per_ms);
-                    } else {
-                        self.wake_mutex.unlock();
-                        std.Thread.sleep(timeout_ms * std.time.ns_per_ms);
-                        self.wake_mutex.lock();
-                    }
+            self.wake_mutex.lock();
+            if (!self.wake_signaled and !self.closed.load(.acquire)) {
+                if (comptime @hasDecl(Rt.Condition, "timedWait")) {
+                    _ = self.wake_cond.timedWait(&self.wake_mutex, timeout_ms * std.time.ns_per_ms);
+                } else {
+                    self.wake_mutex.unlock();
+                    std.Thread.sleep(timeout_ms * std.time.ns_per_ms);
+                    self.wake_mutex.lock();
                 }
-                self.wake_signaled = false;
-                self.wake_mutex.unlock();
             }
+            self.wake_signaled = false;
+            self.wake_mutex.unlock();
         }
 
         // ── Run loop ────────────────────────────────────────────────────
 
         fn runLoop(self: *Self) void {
+            var scratch: [8192]u8 = undefined;
+
             while (!self.closed.load(.acquire)) {
                 if (self.kcp.state() < 0) {
                     self.close();
@@ -243,7 +300,6 @@ pub fn KcpConn(comptime Rt: type) type {
 
                 var did_work = false;
 
-                // Drain input channel (non-blocking ring buffer reads).
                 while (self.input_ch.tryRecv()) |pkt| {
                     _ = self.kcp.input(pkt);
                     self.allocator.free(pkt);
@@ -251,51 +307,30 @@ pub fn KcpConn(comptime Rt: type) type {
                     did_work = true;
                 }
 
-                self.drainWriteBuf();
+                // Drain write ring — lock-free pop.
+                while (true) {
+                    const n = self.write_ring.pop(&scratch);
+                    if (n == 0) break;
+                    _ = self.kcp.send(scratch[0..n]);
+                    did_work = true;
+                }
 
                 const now_ms: u32 = @intCast(Rt.nowMs() & 0xFFFFFFFF);
                 self.kcp.update(now_ms);
                 self.drainRecv();
 
-                // Tier 1: data flowing → loop immediately.
-                if (did_work or !self.input_ch.isEmpty()) continue;
-                {
-                    self.write_mutex.lock();
-                    const has = self.write_buf.items.len > 0;
-                    self.write_mutex.unlock();
-                    if (has) continue;
-                }
+                // Tier 1: data flowing → loop immediately (no lock check!).
+                if (did_work or !self.input_ch.isEmpty() or self.write_ring.len() > 0) continue;
 
-                // Tier 2: pending retransmits → 1ms bounded wait (instant wake on signal).
+                // Tier 2: pending retransmits → 1ms bounded wait.
                 if (self.kcp.waitSnd() > 0) {
                     self.timedWaitWake(1);
                     continue;
                 }
 
-                // Tier 3: truly idle → bounded wait (1s max) to check idle timeouts.
+                // Tier 3: truly idle → 1s bounded wait.
                 self.timedWaitWake(1000);
             }
-        }
-
-        fn drainWriteBuf(self: *Self) void {
-            self.write_mutex.lock();
-            if (self.write_buf.items.len == 0) {
-                self.write_mutex.unlock();
-                return;
-            }
-            // O(1) swap: move write_buf → scratch, give writer a fresh buffer.
-            // scratch retains capacity across drains — zero alloc after warmup.
-            std.mem.swap(std.ArrayListUnmanaged(u8), &self.write_buf, &self.write_scratch);
-            self.write_mutex.unlock();
-
-            const data = self.write_scratch.items;
-            var offset: usize = 0;
-            while (offset < data.len) {
-                const end = @min(offset + 8192, data.len);
-                _ = self.kcp.send(data[offset..end]);
-                offset = end;
-            }
-            self.write_scratch.clearRetainingCapacity();
         }
 
         fn drainRecv(self: *Self) void {
@@ -349,43 +384,6 @@ const TestRuntime = if (@import("builtin").os.tag != .freestanding) struct {
         }
         pub fn signal(self: *Condition) void { self.inner.signal(); }
         pub fn broadcast(self: *Condition) void { self.inner.broadcast(); }
-    };
-    pub const Notify = struct {
-        read_fd: std.posix.fd_t,
-        write_fd: std.posix.fd_t,
-        pub fn init() Notify {
-            const fds = std.posix.pipe() catch unreachable;
-            return .{ .read_fd = fds[0], .write_fd = fds[1] };
-        }
-        pub fn deinit(self: *Notify) void {
-            std.posix.close(self.read_fd);
-            std.posix.close(self.write_fd);
-        }
-        pub fn signal(self: *Notify) void {
-            _ = std.posix.write(self.write_fd, &[_]u8{1}) catch {};
-        }
-        pub fn wait(self: *Notify) void {
-            var buf: [8]u8 = undefined;
-            _ = std.posix.read(self.read_fd, &buf) catch {};
-        }
-        pub fn timedWait(self: *Notify, timeout_ns: u64) bool {
-            const timeout_ms: i32 = if (timeout_ns >= @as(u64, @intCast(std.math.maxInt(i32))) * std.time.ns_per_ms)
-                std.math.maxInt(i32)
-            else
-                @intCast(timeout_ns / std.time.ns_per_ms);
-            var pfd = [1]std.posix.pollfd{.{
-                .fd = self.read_fd,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ret = std.posix.poll(&pfd, timeout_ms) catch return false;
-            if (ret > 0) {
-                var buf: [8]u8 = undefined;
-                _ = std.posix.read(self.read_fd, &buf) catch {};
-                return true;
-            }
-            return false;
-        }
     };
     pub fn nowMs() u64 {
         return @intCast(std.time.milliTimestamp());
@@ -495,11 +493,9 @@ test "kcpconn close eof" {
     const n = try pair.b.read(&buf);
     try std.testing.expectEqualStrings("before close", buf[0..n]);
 
-    // Close and deinit A. B has no FIN mechanism — it detects via idle timeout.
     pair.a.close();
     pair.a.deinit();
 
-    // Close B explicitly (no KCP-level FIN propagation).
     pair.b.close();
     const n2 = try pair.b.read(&buf);
     try std.testing.expectEqual(@as(usize, 0), n2);
