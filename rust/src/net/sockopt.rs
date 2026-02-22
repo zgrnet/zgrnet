@@ -470,10 +470,9 @@ pub fn bind_reuseport(addr: &str) -> io::Result<UdpSocket> {
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    let domain = if bind_addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
+    let v4 = match bind_addr {
+        std::net::SocketAddr::V4(v4) => v4,
+        _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "IPv6 not implemented")),
     };
 
     #[cfg(target_os = "linux")]
@@ -481,7 +480,7 @@ pub fn bind_reuseport(addr: &str) -> io::Result<UdpSocket> {
     #[cfg(not(target_os = "linux"))]
     let sock_flags = libc::SOCK_DGRAM;
 
-    let fd = unsafe { libc::socket(domain, sock_flags, 0) };
+    let fd = unsafe { libc::socket(libc::AF_INET, sock_flags, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -492,22 +491,12 @@ pub fn bind_reuseport(addr: &str) -> io::Result<UdpSocket> {
     }
 
     let mut sa_storage: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let sa_len: libc::socklen_t;
-
-    match bind_addr {
-        std::net::SocketAddr::V4(v4) => {
-            sa_storage.sin_family = libc::AF_INET as libc::sa_family_t;
-            sa_storage.sin_port = v4.port().to_be();
-            sa_storage.sin_addr = libc::in_addr {
-                s_addr: u32::from(*v4.ip()).to_be(),
-            };
-            sa_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        }
-        _ => {
-            unsafe { libc::close(fd) };
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "IPv6 not implemented"));
-        }
-    }
+    sa_storage.sin_family = libc::AF_INET as libc::sa_family_t;
+    sa_storage.sin_port = v4.port().to_be();
+    sa_storage.sin_addr = libc::in_addr {
+        s_addr: u32::from(*v4.ip()).to_be(),
+    };
+    let sa_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
 
     let ret = unsafe {
         libc::bind(

@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -63,16 +64,30 @@ func applyPlatformOptions(conn *net.UDPConn, cfg SocketConfig, report *Optimizat
 	}
 }
 
-func newBatchConn(conn *net.UDPConn, batchSize int) *batchConn {
-	pc := ipv4.NewPacketConn(conn)
-	msgs := make([]ipv4.Message, batchSize)
-	return &batchConn{pc: pc, msgs: msgs, batchSize: batchSize}
+// batchConn wraps a UDPConn for batch I/O using recvmmsg/sendmmsg.
+// Supports both IPv4 and IPv6 sockets — detects the address family
+// from the bound local address.
+type batchConn struct {
+	v4        *ipv4.PacketConn // non-nil for IPv4 sockets
+	v6        *ipv6.PacketConn // non-nil for IPv6/dual-stack sockets
+	msgs4     []ipv4.Message
+	msgs6     []ipv6.Message
+	batchSize int
 }
 
-type batchConn struct {
-	pc        *ipv4.PacketConn
-	msgs      []ipv4.Message
-	batchSize int
+func newBatchConn(conn *net.UDPConn, batchSize int) *batchConn {
+	bc := &batchConn{batchSize: batchSize}
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	if localAddr.IP.To4() != nil {
+		bc.v4 = ipv4.NewPacketConn(conn)
+		bc.msgs4 = make([]ipv4.Message, batchSize)
+	} else {
+		bc.v6 = ipv6.NewPacketConn(conn)
+		bc.msgs6 = make([]ipv6.Message, batchSize)
+	}
+
+	return bc
 }
 
 func (bc *batchConn) ReadBatch(buffers [][]byte) (n int, err error) {
@@ -80,23 +95,46 @@ func (bc *batchConn) ReadBatch(buffers [][]byte) (n int, err error) {
 	if count > bc.batchSize {
 		count = bc.batchSize
 	}
-	for i := 0; i < count; i++ {
-		bc.msgs[i].Buffers = [][]byte{buffers[i]}
-		bc.msgs[i].N = 0
-		bc.msgs[i].Addr = nil
+
+	if bc.v4 != nil {
+		for i := 0; i < count; i++ {
+			bc.msgs4[i].Buffers = [][]byte{buffers[i]}
+			bc.msgs4[i].N = 0
+			bc.msgs4[i].Addr = nil
+		}
+		return bc.v4.ReadBatch(bc.msgs4[:count], 0)
 	}
-	return bc.pc.ReadBatch(bc.msgs[:count], 0)
+
+	for i := 0; i < count; i++ {
+		bc.msgs6[i].Buffers = [][]byte{buffers[i]}
+		bc.msgs6[i].N = 0
+		bc.msgs6[i].Addr = nil
+	}
+	return bc.v6.ReadBatch(bc.msgs6[:count], 0)
 }
 
 func (bc *batchConn) ReceivedN(i int) int {
-	return bc.msgs[i].N
+	if bc.v4 != nil {
+		return bc.msgs4[i].N
+	}
+	return bc.msgs6[i].N
 }
 
 func (bc *batchConn) ReceivedFrom(i int) *net.UDPAddr {
-	if bc.msgs[i].Addr == nil {
+	if bc.v4 != nil {
+		if bc.msgs4[i].Addr == nil {
+			return nil
+		}
+		if addr, ok := bc.msgs4[i].Addr.(*net.UDPAddr); ok {
+			return addr
+		}
 		return nil
 	}
-	if addr, ok := bc.msgs[i].Addr.(*net.UDPAddr); ok {
+
+	if bc.msgs6[i].Addr == nil {
+		return nil
+	}
+	if addr, ok := bc.msgs6[i].Addr.(*net.UDPAddr); ok {
 		return addr
 	}
 	return nil
@@ -110,11 +148,20 @@ func (bc *batchConn) WriteBatch(buffers [][]byte, addrs []*net.UDPAddr) (int, er
 	if count > bc.batchSize {
 		count = bc.batchSize
 	}
-	for i := 0; i < count; i++ {
-		bc.msgs[i].Buffers = [][]byte{buffers[i]}
-		bc.msgs[i].Addr = addrs[i]
+
+	if bc.v4 != nil {
+		for i := 0; i < count; i++ {
+			bc.msgs4[i].Buffers = [][]byte{buffers[i]}
+			bc.msgs4[i].Addr = addrs[i]
+		}
+		return bc.v4.WriteBatch(bc.msgs4[:count], 0)
 	}
-	return bc.pc.WriteBatch(bc.msgs[:count], 0)
+
+	for i := 0; i < count; i++ {
+		bc.msgs6[i].Buffers = [][]byte{buffers[i]}
+		bc.msgs6[i].Addr = addrs[i]
+	}
+	return bc.v6.WriteBatch(bc.msgs6[:count], 0)
 }
 
 // GSOSupported returns true if UDP_SEGMENT (GSO) is available.
