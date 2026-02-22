@@ -70,10 +70,27 @@ func ReadPidfile(baseDir, ctxName string) (int, error) {
 
 // RemovePidfile removes the context's pidfile.
 func RemovePidfile(baseDir, ctxName string) {
+	RemovePidfileIfOwner(baseDir, ctxName, 0)
+}
+
+// RemovePidfileIfOwner removes the pidfile only if it contains the given PID.
+// If expectedPid is 0, it removes unconditionally (used by Down).
+func RemovePidfileIfOwner(baseDir, ctxName string, expectedPid int) {
 	pidPath, _ := PidfilePath(baseDir, ctxName)
-	if pidPath != "" {
-		os.Remove(pidPath)
+	if pidPath == "" {
+		return
 	}
+	if expectedPid > 0 {
+		data, err := os.ReadFile(pidPath)
+		if err != nil {
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil || pid != expectedPid {
+			return
+		}
+	}
+	os.Remove(pidPath)
 }
 
 // Down sends SIGTERM to the running host process.

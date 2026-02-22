@@ -385,11 +385,11 @@ func hostUpForeground(baseDir, ctxName, cfgPath string) error {
 		return fmt.Errorf("create data dir %s: %w", dataDir, err)
 	}
 
-	// Write pidfile for this foreground process
-	if err := cli.WritePidfile(baseDir, ctxName, os.Getpid()); err != nil {
+	myPid := os.Getpid()
+	if err := cli.WritePidfile(baseDir, ctxName, myPid); err != nil {
 		log.Printf("warning: write pidfile: %v", err)
 	}
-	defer cli.RemovePidfile(baseDir, ctxName)
+	defer cli.RemovePidfileIfOwner(baseDir, ctxName, myPid)
 
 	log.Printf("creating TUN device...")
 	tunDev, err := tun.Create("")
