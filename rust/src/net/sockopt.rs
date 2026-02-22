@@ -245,7 +245,7 @@ fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut Optimization
 /// Probes by setting and immediately clearing the option to avoid side effects.
 #[cfg(target_os = "linux")]
 pub fn gso_supported(fd: i32) -> bool {
-    if setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, 1400).is_ok() {
+    if setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, DEFAULT_GSO_SEGMENT).is_ok() {
         let _ = setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, 0);
         true
     } else {

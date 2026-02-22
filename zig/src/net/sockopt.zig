@@ -203,7 +203,7 @@ pub const BatchReader = struct {
         const count = @min(buffers.len, @min(results.len, @min(self.batch_size, max_batch)));
         if (count == 0) return 0;
 
-        var msgs: [max_batch]std.os.linux.mmsghdr_const = undefined;
+        var msgs: [max_batch]std.os.linux.mmsghdr = undefined;
         var iovecs: [max_batch]posix.iovec = undefined;
         var addrs: [max_batch]posix.sockaddr.in = undefined;
 
@@ -214,21 +214,22 @@ pub const BatchReader = struct {
             };
             addrs[i] = std.mem.zeroes(posix.sockaddr.in);
             msgs[i] = .{
-                .msg_hdr = .{
+                .hdr = .{
                     .name = @ptrCast(&addrs[i]),
                     .namelen = @sizeOf(posix.sockaddr.in),
                     .iov = @ptrCast(&iovecs[i]),
                     .iovlen = 1,
-                    .control = .{ .len = 0, .ptr = null },
+                    .control = null,
+                    .controllen = 0,
                     .flags = 0,
                 },
-                .msg_len = 0,
+                .len = 0,
             };
         }
 
         const rc = std.os.linux.recvmmsg(
             self.fd,
-            &msgs,
+            @ptrCast(&msgs),
             count,
             0,
             null,
@@ -241,7 +242,7 @@ pub const BatchReader = struct {
         const received: usize = @intCast(rc);
         for (0..received) |i| {
             results[i] = .{
-                .n = msgs[i].msg_len,
+                .n = msgs[i].len,
                 .src_addr = @bitCast(addrs[i].addr),
                 .src_port = std.mem.bigToNative(u16, addrs[i].port),
             };
