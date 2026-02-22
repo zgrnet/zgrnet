@@ -1,11 +1,13 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // ShowConfig prints the config.yaml contents for the current context.
@@ -95,6 +97,10 @@ func Down(baseDir, ctxName string) error {
 	}
 
 	if err := signalTerminate(proc); err != nil {
+		if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) {
+			RemovePidfile(baseDir, ctxName)
+			return fmt.Errorf("host was not running (stale pidfile cleaned up)")
+		}
 		return fmt.Errorf("terminate pid %d: %w", pid, err)
 	}
 
