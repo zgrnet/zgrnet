@@ -19,6 +19,7 @@ pub const SocketConfig = struct {
     send_buf_size: u32 = default_send_buf_size,
     busy_poll_us: u32 = 0,
     gro: bool = false,
+    gso: bool = false,
 
     /// Returns a config with all optimizations enabled.
     pub fn full() SocketConfig {
@@ -27,6 +28,7 @@ pub const SocketConfig = struct {
             .send_buf_size = default_send_buf_size,
             .busy_poll_us = default_busy_poll_us,
             .gro = true,
+            .gso = true,
         };
     }
 };
@@ -115,17 +117,6 @@ const SO_BUSY_POLL: u32 = 46;
 const UDP_GRO: u32 = 104;
 const UDP_SEGMENT: u32 = 103;
 
-/// Check if UDP_SEGMENT (GSO) is available on a socket.
-/// Probes by setting and immediately clearing the option to avoid side effects.
-pub fn gsoSupported(fd: posix.socket_t) bool {
-    const proto: i32 = @intCast(std.posix.IPPROTO.UDP);
-    if (trySetsockoptInt(fd, proto, UDP_SEGMENT, 1400)) {
-        _ = trySetsockoptInt(fd, proto, UDP_SEGMENT, 0);
-        return true;
-    }
-    return false;
-}
-
 fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *OptimizationReport) void {
     if (cfg.busy_poll_us > 0) {
         const val: i32 = @intCast(cfg.busy_poll_us);
@@ -141,6 +132,14 @@ fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *Optimizatio
             report.add(.{ .name = "UDP_GRO", .applied = true, .actual_value = 1 });
         } else {
             report.add(.{ .name = "UDP_GRO", .applied = false });
+        }
+    }
+
+    if (cfg.gso) {
+        if (trySetsockoptInt(fd, @intCast(std.posix.IPPROTO.UDP), UDP_SEGMENT, @intCast(default_gso_segment))) {
+            report.add(.{ .name = "UDP_GSO", .applied = true, .actual_value = default_gso_segment });
+        } else {
+            report.add(.{ .name = "UDP_GSO", .applied = false });
         }
     }
 }

@@ -23,6 +23,7 @@ pub struct SocketConfig {
     pub send_buf_size: i32,
     pub busy_poll_us: i32,
     pub gro: bool,
+    pub gso: bool,
 }
 
 impl Default for SocketConfig {
@@ -32,6 +33,7 @@ impl Default for SocketConfig {
             send_buf_size: DEFAULT_SEND_BUF_SIZE,
             busy_poll_us: 0,
             gro: false,
+            gso: false,
         }
     }
 }
@@ -44,6 +46,7 @@ impl SocketConfig {
             send_buf_size: DEFAULT_SEND_BUF_SIZE,
             busy_poll_us: DEFAULT_BUSY_POLL_US,
             gro: true,
+            gso: true,
         }
     }
 }
@@ -239,17 +242,27 @@ fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut Optimization
             }
         }
     }
-}
 
-/// Check if UDP_SEGMENT (GSO) is available on a socket.
-/// Probes by setting and immediately clearing the option to avoid side effects.
-#[cfg(target_os = "linux")]
-pub fn gso_supported(fd: i32) -> bool {
-    if setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, DEFAULT_GSO_SEGMENT).is_ok() {
-        let _ = setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, 0);
-        true
-    } else {
-        false
+    // UDP_GSO (send segmentation)
+    if cfg.gso {
+        match setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, DEFAULT_GSO_SEGMENT) {
+            Ok(()) => {
+                report.entries.push(OptimizationEntry {
+                    name: "UDP_GSO",
+                    applied: true,
+                    detail: format!("UDP_SEGMENT={}", DEFAULT_GSO_SEGMENT),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                report.entries.push(OptimizationEntry {
+                    name: "UDP_GSO",
+                    applied: false,
+                    detail: String::new(),
+                    error: Some(e),
+                });
+            }
+        }
     }
 }
 

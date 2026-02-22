@@ -62,6 +62,23 @@ func applyPlatformOptions(conn *net.UDPConn, cfg SocketConfig, report *Optimizat
 			})
 		}
 	}
+
+	if cfg.GSO {
+		var setErr error
+		raw.Control(func(fd uintptr) {
+			setErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, DefaultGSOSegment)
+		})
+		if setErr != nil {
+			report.Entries = append(report.Entries, OptimizationEntry{
+				Name: "UDP_GSO", Err: setErr,
+			})
+		} else {
+			report.Entries = append(report.Entries, OptimizationEntry{
+				Name: "UDP_GSO", Applied: true,
+				Detail: fmt.Sprintf("UDP_SEGMENT=%d", DefaultGSOSegment),
+			})
+		}
+	}
 }
 
 // batchConn wraps a UDPConn for batch I/O using recvmmsg/sendmmsg.
@@ -140,43 +157,3 @@ func (bc *batchConn) ReceivedFrom(i int) *net.UDPAddr {
 	return nil
 }
 
-func (bc *batchConn) WriteBatch(buffers [][]byte, addrs []*net.UDPAddr) (int, error) {
-	count := len(buffers)
-	if count > len(addrs) {
-		count = len(addrs)
-	}
-	if count > bc.batchSize {
-		count = bc.batchSize
-	}
-
-	if bc.v4 != nil {
-		for i := 0; i < count; i++ {
-			bc.msgs4[i].Buffers = [][]byte{buffers[i]}
-			bc.msgs4[i].Addr = addrs[i]
-		}
-		return bc.v4.WriteBatch(bc.msgs4[:count], 0)
-	}
-
-	for i := 0; i < count; i++ {
-		bc.msgs6[i].Buffers = [][]byte{buffers[i]}
-		bc.msgs6[i].Addr = addrs[i]
-	}
-	return bc.v6.WriteBatch(bc.msgs6[:count], 0)
-}
-
-// GSOSupported returns true if UDP_SEGMENT (GSO) is available.
-// Probes by setting and immediately clearing the option to avoid side effects.
-func GSOSupported(conn *net.UDPConn) bool {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return false
-	}
-	var supported bool
-	raw.Control(func(fd uintptr) {
-		if syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, DefaultGSOSegment) == nil {
-			supported = true
-			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, 0)
-		}
-	})
-	return supported
-}

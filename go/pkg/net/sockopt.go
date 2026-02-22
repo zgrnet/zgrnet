@@ -20,7 +20,8 @@ type SocketConfig struct {
 	RecvBufSize int  // SO_RCVBUF in bytes (0 → DefaultRecvBufSize)
 	SendBufSize int  // SO_SNDBUF in bytes (0 → DefaultSendBufSize)
 	BusyPollUS  int  // SO_BUSY_POLL in μs (Linux, 0 = disabled)
-	GRO         bool // UDP_GRO (Linux 4.18+)
+	GRO         bool // UDP_GRO receive coalescing (Linux 4.18+)
+	GSO         bool // UDP_SEGMENT send segmentation (Linux 4.18+)
 }
 
 // DefaultSocketConfig returns recommended defaults for high-throughput use.
@@ -38,6 +39,7 @@ func FullSocketConfig() SocketConfig {
 		SendBufSize: DefaultSendBufSize,
 		BusyPollUS:  DefaultBusyPollUS,
 		GRO:         true,
+		GSO:         true,
 	}
 }
 
