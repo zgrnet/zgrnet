@@ -317,6 +317,7 @@ pub fn KcpConn(comptime Rt: type) type {
 
                 const now_ms: u32 = @intCast(Rt.nowMs() & 0xFFFFFFFF);
                 self.kcp.update(now_ms);
+                self.kcp.flush();
                 self.drainRecv();
 
                 // Tier 1: data flowing → loop immediately (no lock check!).
