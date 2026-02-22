@@ -342,8 +342,8 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             while (!self.done.signaled) {
                 // Convert ms to ns for timedWait
                 const timeout_ns = timeout_ms * std.time.ns_per_ms;
-                const result = self.done.cond.timedWait(&self.done.mutex, timeout_ns);
-                if (result == .timed_out) return false;
+                const timed_out = self.done.cond.timedWait(&self.done.mutex, timeout_ns);
+                if (timed_out) return false;
             }
             self.done.signaled = false;
             return true;

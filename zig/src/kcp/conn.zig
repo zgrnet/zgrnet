@@ -27,6 +27,7 @@ pub fn KcpConn(comptime Rt: type) type {
     return struct {
         const Self = @This();
         const InputChan = channel_pkg.Channel([]u8, 256, Rt);
+        const has_notify = @hasDecl(Rt, "Notify");
 
         allocator: std.mem.Allocator,
         kcp: *kcp_mod.Kcp,
@@ -37,12 +38,13 @@ pub fn KcpConn(comptime Rt: type) type {
 
         input_ch: InputChan,
 
-        // Wake mechanism: Condition+Mutex with coalesced signaling.
-        // Only calls cond.signal when transitioning false→true,
-        // avoiding redundant pthread_cond_signal syscalls on the hot path.
-        wake_mutex: Rt.Mutex,
-        wake_cond: Rt.Condition,
-        wake_signaled: bool,
+        // Wake mechanism — comptime-selected:
+        //   Rt.Notify (pipe/eventfd): 1 syscall signal, poll-based wait, no mutex
+        //   Fallback (Condition+Mutex): 3+ syscall signal, mutex-based wait
+        wake_notify: if (has_notify) Rt.Notify else void,
+        wake_mutex: if (!has_notify) Rt.Mutex else void,
+        wake_cond: if (!has_notify) Rt.Condition else void,
+        wake_signaled: if (!has_notify) bool else void,
 
         recv_buf: std.ArrayListUnmanaged(u8),
         recv_mutex: Rt.Mutex,
@@ -78,9 +80,10 @@ pub fn KcpConn(comptime Rt: type) type {
                 .write_scratch = .{},
                 .write_mutex = Rt.Mutex.init(),
                 .input_ch = InputChan.init(),
-                .wake_mutex = Rt.Mutex.init(),
-                .wake_cond = Rt.Condition.init(),
-                .wake_signaled = false,
+                .wake_notify = if (has_notify) Rt.Notify.init() else {},
+                .wake_mutex = if (!has_notify) Rt.Mutex.init() else {},
+                .wake_cond = if (!has_notify) Rt.Condition.init() else {},
+                .wake_signaled = if (!has_notify) false else {},
                 .recv_buf = .{},
                 .recv_mutex = Rt.Mutex.init(),
                 .recv_cond = Rt.Condition.init(),
@@ -112,8 +115,12 @@ pub fn KcpConn(comptime Rt: type) type {
             self.write_scratch.deinit(self.allocator);
             self.recv_buf.deinit(self.allocator);
             self.write_mutex.deinit();
-            self.wake_mutex.deinit();
-            self.wake_cond.deinit();
+            if (has_notify) {
+                self.wake_notify.deinit();
+            } else {
+                self.wake_mutex.deinit();
+                self.wake_cond.deinit();
+            }
             self.recv_mutex.deinit();
             self.recv_cond.deinit();
 
@@ -180,32 +187,38 @@ pub fn KcpConn(comptime Rt: type) type {
         }
 
         // ── Wake mechanism ─────────────────────────────────────────────
+        // Comptime-selected: Notify (pipe, 1 syscall) or Condition (3+ syscalls).
 
         fn notifyWake(self: *Self) void {
-            self.wake_mutex.lock();
-            if (!self.wake_signaled) {
-                self.wake_signaled = true;
-                self.wake_cond.signal();
+            if (has_notify) {
+                self.wake_notify.signal();
+            } else {
+                self.wake_mutex.lock();
+                if (!self.wake_signaled) {
+                    self.wake_signaled = true;
+                    self.wake_cond.signal();
+                }
+                self.wake_mutex.unlock();
             }
-            self.wake_mutex.unlock();
         }
 
-        /// Bounded wait: blocks until signaled OR timeout.
-        /// Uses Rt.Condition.timedWait if available (instant wake on signal),
-        /// falls back to Thread.sleep on ESP32 (bounded wake latency).
         fn timedWaitWake(self: *Self, timeout_ms: u64) void {
-            self.wake_mutex.lock();
-            if (!self.wake_signaled and !self.closed.load(.acquire)) {
-                if (comptime @hasDecl(Rt.Condition, "timedWait")) {
-                    _ = self.wake_cond.timedWait(&self.wake_mutex, timeout_ms * std.time.ns_per_ms);
-                } else {
-                    self.wake_mutex.unlock();
-                    std.Thread.sleep(timeout_ms * std.time.ns_per_ms);
-                    self.wake_mutex.lock();
+            if (has_notify) {
+                _ = self.wake_notify.timedWait(timeout_ms * std.time.ns_per_ms);
+            } else {
+                self.wake_mutex.lock();
+                if (!self.wake_signaled and !self.closed.load(.acquire)) {
+                    if (comptime @hasDecl(Rt.Condition, "timedWait")) {
+                        _ = self.wake_cond.timedWait(&self.wake_mutex, timeout_ms * std.time.ns_per_ms);
+                    } else {
+                        self.wake_mutex.unlock();
+                        std.Thread.sleep(timeout_ms * std.time.ns_per_ms);
+                        self.wake_mutex.lock();
+                    }
                 }
+                self.wake_signaled = false;
+                self.wake_mutex.unlock();
             }
-            self.wake_signaled = false;
-            self.wake_mutex.unlock();
         }
 
         // ── Run loop ────────────────────────────────────────────────────
@@ -336,6 +349,43 @@ const TestRuntime = if (@import("builtin").os.tag != .freestanding) struct {
         }
         pub fn signal(self: *Condition) void { self.inner.signal(); }
         pub fn broadcast(self: *Condition) void { self.inner.broadcast(); }
+    };
+    pub const Notify = struct {
+        read_fd: std.posix.fd_t,
+        write_fd: std.posix.fd_t,
+        pub fn init() Notify {
+            const fds = std.posix.pipe() catch unreachable;
+            return .{ .read_fd = fds[0], .write_fd = fds[1] };
+        }
+        pub fn deinit(self: *Notify) void {
+            std.posix.close(self.read_fd);
+            std.posix.close(self.write_fd);
+        }
+        pub fn signal(self: *Notify) void {
+            _ = std.posix.write(self.write_fd, &[_]u8{1}) catch {};
+        }
+        pub fn wait(self: *Notify) void {
+            var buf: [8]u8 = undefined;
+            _ = std.posix.read(self.read_fd, &buf) catch {};
+        }
+        pub fn timedWait(self: *Notify, timeout_ns: u64) bool {
+            const timeout_ms: i32 = if (timeout_ns >= @as(u64, @intCast(std.math.maxInt(i32))) * std.time.ns_per_ms)
+                std.math.maxInt(i32)
+            else
+                @intCast(timeout_ns / std.time.ns_per_ms);
+            var pfd = [1]std.posix.pollfd{.{
+                .fd = self.read_fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ret = std.posix.poll(&pfd, timeout_ms) catch return false;
+            if (ret > 0) {
+                var buf: [8]u8 = undefined;
+                _ = std.posix.read(self.read_fd, &buf) catch {};
+                return true;
+            }
+            return false;
+        }
     };
     pub fn nowMs() u64 {
         return @intCast(std.time.milliTimestamp());

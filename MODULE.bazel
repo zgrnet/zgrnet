@@ -48,6 +48,8 @@ git_override(
     module_name = "embed_zig",
     remote = "https://github.com/haivivi/embed-zig.git",
     commit = "682a5f7e350e9fe3b4864f956dbbaa6da219833c",  # main: unified spawner, complete socket trait, remove legacy thread.zig
+    patches = ["//patches:embed-zig-notify.patch"],
+    patch_strip = 1,
 )
 
 # Zig toolchain (provided by embed-zig, needed by //third_party/kcp for zig cc)
