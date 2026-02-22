@@ -580,9 +580,11 @@ func hostUpForeground(baseDir, ctxName, cfgPath string) error {
 		select {
 		case s := <-sigCh:
 			log.Printf("received %s again, force exit", s)
+			cli.RemovePidfileIfOwner(baseDir, ctxName, myPid)
 			os.Exit(1)
 		case <-time.After(5 * time.Second):
 			log.Printf("shutdown timeout (5s), force exit")
+			cli.RemovePidfileIfOwner(baseDir, ctxName, myPid)
 			os.Exit(1)
 		}
 	}()
