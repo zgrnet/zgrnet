@@ -541,42 +541,41 @@ mod tests {
 
     #[test]
     fn test_create_invalid_name() {
-        let dir = temp_dir();
-        assert!(create_context(&dir, "").is_err());
-        assert!(create_context(&dir, "a/b").is_err());
-        assert!(create_context(&dir, "../evil").is_err());
-        assert!(create_context(&dir, "a b").is_err());
-        assert!(create_context(&dir, ".hidden").is_err());
-        cleanup(&dir);
+        let td = test_dir();
+        let dir = td.path();
+        assert!(create_context(dir, "").is_err());
+        assert!(create_context(dir, "a/b").is_err());
+        assert!(create_context(dir, "../evil").is_err());
+        assert!(create_context(dir, "a b").is_err());
+        assert!(create_context(dir, ".hidden").is_err());
     }
 
     #[test]
     fn test_key_uniqueness() {
-        let dir = temp_dir();
-        create_context(&dir, "k1").unwrap();
-        create_context(&dir, "k2").unwrap();
-        let pk1 = show_public_key(&dir, "k1").unwrap();
-        let pk2 = show_public_key(&dir, "k2").unwrap();
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "k1").unwrap();
+        create_context(dir, "k2").unwrap();
+        let pk1 = show_public_key(dir, "k1").unwrap();
+        let pk2 = show_public_key(dir, "k2").unwrap();
         assert_ne!(pk1, pk2);
-        cleanup(&dir);
     }
 
     #[test]
     fn test_delete_nonexistent() {
-        let dir = temp_dir();
-        assert!(delete_context(&dir, "ghost").is_err());
-        cleanup(&dir);
+        let td = test_dir();
+        assert!(delete_context(td.path(), "ghost").is_err());
     }
 
     #[test]
     fn test_pidfile_roundtrip() {
-        let dir = temp_dir();
-        create_context(&dir, "pidtest").unwrap();
-        write_pidfile(&dir, "pidtest", 12345).unwrap();
-        let pid = read_pidfile(&dir, "pidtest").unwrap();
+        let td = test_dir();
+        let dir = td.path();
+        create_context(dir, "pidtest").unwrap();
+        write_pidfile(dir, "pidtest", 12345).unwrap();
+        let pid = read_pidfile(dir, "pidtest").unwrap();
         assert_eq!(pid, 12345);
-        remove_pidfile(&dir, "pidtest");
-        assert!(read_pidfile(&dir, "pidtest").is_err());
-        cleanup(&dir);
+        remove_pidfile(dir, "pidtest");
+        assert!(read_pidfile(dir, "pidtest").is_err());
     }
 }
