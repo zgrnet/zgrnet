@@ -126,7 +126,7 @@ func GSOSupported(conn *net.UDPConn) bool {
 	}
 	var supported bool
 	raw.Control(func(fd uintptr) {
-		if syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, 1400) == nil {
+		if syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, DefaultGSOSegment) == nil {
 			supported = true
 			syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, 0)
 		}

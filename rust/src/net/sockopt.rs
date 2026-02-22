@@ -476,7 +476,12 @@ pub fn bind_reuseport(addr: &str) -> io::Result<UdpSocket> {
         libc::AF_INET6
     };
 
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
+    #[cfg(target_os = "linux")]
+    let sock_flags = libc::SOCK_DGRAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let sock_flags = libc::SOCK_DGRAM;
+
+    let fd = unsafe { libc::socket(domain, sock_flags, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

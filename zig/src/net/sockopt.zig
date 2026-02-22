@@ -161,8 +161,6 @@ pub fn setReusePort(fd: posix.socket_t) bool {
 // Batch I/O (Linux recvmmsg / sendmmsg)
 // ============================================================================
 
-pub const default_batch_count: u32 = 64;
-
 /// Result of a single received message in a batch.
 pub const BatchRecvResult = struct {
     n: usize,
