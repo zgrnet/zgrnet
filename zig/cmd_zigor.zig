@@ -26,6 +26,10 @@ const KeyPair = noise.KeyPair;
 
 const Allocator = std.mem.Allocator;
 
+fn jsonStringify(allocator: Allocator, value: anytype) ![]const u8 {
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
+}
+
 /// Write pre-formatted data directly to stdout, handling partial writes.
 fn writeStdout(data: []const u8) void {
     var remaining = data;
@@ -486,6 +490,11 @@ fn runHost(allocator: Allocator, base_dir: []const u8, ctx: ?[]const u8, api_add
         };
 
         posix.kill(pid, posix.SIG.TERM) catch |e| {
+            if (e == error.ProcessNotFound) {
+                fs.cwd().deleteFile(pid_path) catch {};
+                print("error: host was not running (stale pidfile cleaned up)\n", .{});
+                std.process.exit(1);
+            }
             print("error: send SIGTERM to pid {d}: {}\n", .{ pid, e });
             std.process.exit(1);
         };
@@ -586,7 +595,8 @@ fn runPeers(allocator: Allocator, addr: []const u8, json_output: bool, args: []c
             if (mem.eql(u8, args[j], "--alias") and j + 1 < args.len) { alias = args[j + 1]; j += 1; } else if (mem.eql(u8, args[j], "--endpoint") and j + 1 < args.len) { endpoint = args[j + 1]; j += 1; } else if (pubkey == null) { pubkey = args[j]; }
         }
         if (pubkey == null) { print("usage: zigor peers add <pubkey> [--alias <a>] [--endpoint <e>]\n", .{}); std.process.exit(1); }
-        const req = try fmt.allocPrint(allocator, "{{\"pubkey\":\"{s}\",\"alias\":\"{s}\",\"endpoint\":\"{s}\"}}", .{ pubkey.?, alias, endpoint });
+        const obj = .{ .pubkey = pubkey.?, .alias = alias, .endpoint = endpoint };
+        const req = try jsonStringify(allocator, obj);
         defer allocator.free(req);
         const body = try httpPost(allocator, addr, "/api/peers", req);
         defer allocator.free(body);
@@ -618,7 +628,8 @@ fn runLans(allocator: Allocator, addr: []const u8, json_output: bool, args: []co
             if (mem.eql(u8, args[j], "--domain") and j + 1 < args.len) { domain = args[j + 1]; j += 1; } else if (mem.eql(u8, args[j], "--pubkey") and j + 1 < args.len) { pubkey = args[j + 1]; j += 1; } else if (mem.eql(u8, args[j], "--endpoint") and j + 1 < args.len) { endpoint = args[j + 1]; j += 1; }
         }
         if (domain.len == 0 or pubkey.len == 0 or endpoint.len == 0) { print("usage: zigor lans join --domain <d> --pubkey <pk> --endpoint <e>\n", .{}); std.process.exit(1); }
-        const req = try fmt.allocPrint(allocator, "{{\"domain\":\"{s}\",\"pubkey\":\"{s}\",\"endpoint\":\"{s}\"}}", .{ domain, pubkey, endpoint });
+        const obj = .{ .domain = domain, .pubkey = pubkey, .endpoint = endpoint };
+        const req = try jsonStringify(allocator, obj);
         defer allocator.free(req);
         const body = try httpPost(allocator, addr, "/api/lans", req);
         defer allocator.free(body);
@@ -672,7 +683,8 @@ fn runRoutes(allocator: Allocator, addr: []const u8, json_output: bool, args: []
             if (mem.eql(u8, args[j], "--domain") and j + 1 < args.len) { domain = args[j + 1]; j += 1; } else if (mem.eql(u8, args[j], "--peer") and j + 1 < args.len) { peer = args[j + 1]; j += 1; }
         }
         if (domain.len == 0 or peer.len == 0) { print("usage: zigor routes add --domain <pattern> --peer <alias>\n", .{}); std.process.exit(1); }
-        const req = try fmt.allocPrint(allocator, "{{\"domain\":\"{s}\",\"peer\":\"{s}\"}}", .{ domain, peer });
+        const obj = .{ .domain = domain, .peer = peer };
+        const req = try jsonStringify(allocator, obj);
         defer allocator.free(req);
         const body = try httpPost(allocator, addr, "/api/routes", req);
         defer allocator.free(body);

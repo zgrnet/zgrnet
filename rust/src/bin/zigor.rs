@@ -213,7 +213,12 @@ fn run_host(base_dir: &Path, ctx: &str, api_addr: &str, json_output: bool, args:
             #[cfg(unix)]
             unsafe {
                 if libc::kill(pid, libc::SIGTERM) != 0 {
-                    return Err(format!("send SIGTERM to pid {pid}: {}", std::io::Error::last_os_error()));
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::ESRCH) {
+                        cli::remove_pidfile(base_dir, &ctx_name);
+                        return Err("host was not running (stale pidfile cleaned up)".into());
+                    }
+                    return Err(format!("send SIGTERM to pid {pid}: {err}"));
                 }
             }
             #[cfg(windows)]
