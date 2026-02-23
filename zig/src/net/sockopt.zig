@@ -251,8 +251,68 @@ pub const BatchReader = struct {
 };
 
 // ============================================================================
-// Tests
+// GSO (Generic Segmentation Offload)
 // ============================================================================
+
+/// Send data using GSO (Generic Segmentation Offload) via sendmsg with UDP_SEGMENT cmsg.
+/// Only works on Linux 4.18+ with supported NICs.
+/// Returns the number of bytes sent, or error.
+pub fn sendToGSO(fd: posix.socket_t, data: []const u8, dest_addr: [4]u8, dest_port: u16, segment_size: u16) !usize {
+    if (comptime builtin.os.tag != .linux) {
+        return error.GsoNotSupported;
+    }
+
+    const linux = std.os.linux;
+
+    // Prepare destination sockaddr
+    const sa = posix.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, dest_port),
+        .addr = @bitCast(dest_addr),
+    };
+
+    // Prepare iovec
+    var iov: posix.iovec = .{
+        .base = @constCast(data.ptr),
+        .len = data.len,
+    };
+
+    // Prepare cmsg buffer for UDP_SEGMENT
+    // CMSG_SPACE(sizeof(u16)) gives us the aligned size needed
+    const cmsg_data_len = @sizeOf(u16);
+    const cmsg_space = linux.CMSG_SPACE(cmsg_data_len);
+    var cmsg_buf: [cmsg_space]u8 align(@alignOf(linux.cmsghdr)) = [_]u8{0} ** cmsg_space;
+
+    // Fill in the cmsghdr
+    const cmsg: *linux.cmsghdr = @ptrCast(@alignCast(&cmsg_buf[0]));
+    cmsg.len = linux.CMSG_LEN(cmsg_data_len);
+    cmsg.level = @intCast(std.posix.IPPROTO.UDP);
+    cmsg.type = UDP_SEGMENT;
+
+    // Write segment size into cmsg data area
+    const cmsg_data: [*]u8 = linux.CMSG_DATA(cmsg);
+    std.mem.writeInt(u16, cmsg_data[0..2], segment_size, .little);
+
+    // Prepare msghdr
+    const msg = linux.msghdr{
+        .name = @ptrCast(@constCast(&sa)),
+        .namelen = @sizeOf(posix.sockaddr.in),
+        .iov = @ptrCast(&iov),
+        .iovlen = 1,
+        .control = @ptrCast(&cmsg_buf),
+        .controllen = cmsg_space,
+        .flags = 0,
+    };
+
+    const rc = linux.sendmsg(fd, &msg, 0);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .INVAL => return error.InvalidArgument,
+        .OPNOTSUPP => return error.GsoNotSupported,
+        .NOBUFS => return error.NoBufferSpace,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
 
 test "applySocketOptions: SO_RCVBUF and SO_SNDBUF" {
     const fd = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch |err| {

@@ -405,7 +405,7 @@ impl UDP {
         use std::mem;
 
         let fd = self.socket.as_raw_fd();
-        let segment_size: i32 = super::sockopt::DEFAULT_GSO_SEGMENT;
+        let segment_size: u16 = super::sockopt::DEFAULT_GSO_SEGMENT as u16;
 
         // Prepare iovec
         let iov = libc::iovec {
@@ -413,8 +413,8 @@ impl UDP {
             iov_len: data.len(),
         };
 
-        // Prepare cmsg buffer: cmsghdr + int32 segment size
-        let cmsg_len = unsafe { libc::CMSG_SPACE(mem::size_of::<i32>() as u32) } as usize;
+        // Prepare cmsg buffer: cmsghdr + u16 segment size
+        let cmsg_len = unsafe { libc::CMSG_SPACE(mem::size_of::<u16>() as u32) } as usize;
         let mut cmsg_buf = vec![0u8; cmsg_len];
 
         // Fill cmsg header
@@ -423,10 +423,10 @@ impl UDP {
             unsafe {
                 (*cmsg_hdr).cmsg_level = libc::IPPROTO_UDP;
                 (*cmsg_hdr).cmsg_type = super::sockopt::UDP_SEGMENT;
-                (*cmsg_hdr).cmsg_len = libc::CMSG_LEN(mem::size_of::<i32>() as u32) as usize;
+                (*cmsg_hdr).cmsg_len = libc::CMSG_LEN(mem::size_of::<u16>() as u32) as usize;
 
                 // Copy segment size into cmsg data
-                let data_ptr = libc::CMSG_DATA(cmsg_hdr) as *mut i32;
+                let data_ptr = libc::CMSG_DATA(cmsg_hdr) as *mut u16;
                 ptr::write_unaligned(data_ptr, segment_size);
             }
         }
@@ -437,7 +437,7 @@ impl UDP {
                 let sa = libc::sockaddr_in {
                     sin_family: libc::AF_INET as libc::sa_family_t,
                     sin_port: v4.port().to_be(),
-                    sin_addr: mem::transmute::<[u8; 4], libc::in_addr>(v4.ip().octets()),
+                    sin_addr: unsafe { mem::transmute::<[u8; 4], libc::in_addr>(v4.ip().octets()) },
                     sin_zero: [0; 8],
                 };
                 let sa_bytes = unsafe {
@@ -461,7 +461,7 @@ impl UDP {
                     sin6_family: libc::AF_INET6 as libc::sa_family_t,
                     sin6_port: v6.port().to_be(),
                     sin6_flowinfo: v6.flowinfo(),
-                    sin6_addr: mem::transmute::<[u8; 16], libc::in6_addr>(v6.ip().octets()),
+                    sin6_addr: unsafe { mem::transmute::<[u8; 16], libc::in6_addr>(v6.ip().octets()) },
                     sin6_scope_id: v6.scope_id(),
                 };
                 let sa_bytes = unsafe {

@@ -5,14 +5,15 @@ package net
 import (
 	"encoding/binary"
 	"net"
-	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // sendToGSO sends a message using GSO (Generic Segmentation Offload).
 // Uses sendmsg with UDP_SEGMENT cmsg to enable per-send segmentation.
 // Only works on Linux 4.18+ with supported NICs.
 func (u *UDP) sendToGSO(data []byte, addr *net.UDPAddr) (int, error) {
-	// Get raw file descriptor
 	rawConn, err := u.socket.SyscallConn()
 	if err != nil {
 		return 0, err
@@ -22,31 +23,35 @@ func (u *UDP) sendToGSO(data []byte, addr *net.UDPAddr) (int, error) {
 	var sendErr error
 
 	rawConn.Control(func(fd uintptr) {
-		// Prepare cmsg: cmsghdr + uint16 segment size
-		// cmsg format: { level, type, len, data }
-		const cmsgSize = 16 // sizeof(cmsghdr) + sizeof(uint16) + padding
-		var cmsgBuf [cmsgSize]byte
+		// Prepare cmsg buffer using unix.CmsgSpace for correct alignment
+		// UDP_SEGMENT expects a uint16 segment size
+		cmsgBuf := make([]byte, unix.CmsgSpace(2))
 
-		// Fill cmsghdr (platform-specific layout)
-		// On Linux: { len (4), level (4), type (4) }
-		binary.LittleEndian.PutUint32(cmsgBuf[0:4], cmsgSize)
-		binary.LittleEndian.PutUint32(cmsgBuf[4:8], syscall.IPPROTO_UDP)
-		binary.LittleEndian.PutUint32(cmsgBuf[8:12], 103) // UDP_SEGMENT
-		binary.LittleEndian.PutUint16(cmsgBuf[12:14], uint16(DefaultGSOSegment))
+		// Fill cmsghdr using unix.CmsgLen for correct length
+		cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&cmsgBuf[0]))
+		cmsg.Level = unix.IPPROTO_UDP
+		cmsg.Type = unix.UDP_SEGMENT
+		cmsg.Len = uint64(unix.CmsgLen(2))
 
-		// Send via sendmsg using syscall
-		var sa syscall.Sockaddr
+		// Write segment size (uint16) into cmsg data area
+		// unix.CmsgData returns unsafe.Pointer to the data portion
+		dataPtr := unsafe.Pointer(uintptr(unsafe.Pointer(cmsg)) + unix.SizeofCmsghdr)
+		dataBuf := (*[2]byte)(dataPtr)
+		binary.LittleEndian.PutUint16(dataBuf[:], uint16(DefaultGSOSegment))
+
+		// Prepare sockaddr
+		var sa unix.Sockaddr
 		if addr.IP.To4() != nil {
-			sa4 := &syscall.SockaddrInet4{Port: addr.Port}
+			sa4 := &unix.SockaddrInet4{Port: addr.Port}
 			copy(sa4.Addr[:], addr.IP.To4())
 			sa = sa4
 		} else {
-			sa6 := &syscall.SockaddrInet6{Port: addr.Port}
+			sa6 := &unix.SockaddrInet6{Port: addr.Port}
 			copy(sa6.Addr[:], addr.IP)
 			sa = sa6
 		}
 
-		n, sendErr = syscall.SendmsgN(int(fd), data, cmsgBuf[:], sa, 0)
+		n, sendErr = unix.SendmsgN(int(fd), data, cmsgBuf, sa, 0)
 	})
 
 	if sendErr != nil {

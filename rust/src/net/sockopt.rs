@@ -195,7 +195,7 @@ fn getsockopt_int(fd: i32, level: i32, optname: i32) -> io::Result<i32> {
 #[cfg(target_os = "linux")]
 const UDP_GRO: i32 = 104;
 #[cfg(target_os = "linux")]
-const UDP_SEGMENT: i32 = 103;
+pub const UDP_SEGMENT: i32 = 103;
 
 #[cfg(target_os = "linux")]
 fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut OptimizationReport) {
