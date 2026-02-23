@@ -38,7 +38,8 @@ int co_resume(co_coroutine_t* co);
 void co_yield(void);
 
 /* Get current coroutine (NULL if called from main thread) */
-co_coroutine_t* co_self(void);
+/* Note: renamed to avoid conflict with libco's co_self */
+co_coroutine_t* mini_co_self(void);
 
 /* Release a coroutine */
 void co_release(co_coroutine_t* co);

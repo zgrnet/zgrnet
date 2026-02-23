@@ -63,8 +63,8 @@ static void* co_entry_wrapper(void* arg) {
 void co_init_thread(void) {
     if (t_inited) return;
 
-    /* Initialize libco for this thread */
-    co_hook_sys_call::co_init_curr_thread_env();
+    /* Initialize libco for this thread - use co_self to init env */
+    (void)co_self();
 
     t_inited = 1;
 }
@@ -73,7 +73,8 @@ int co_thread_inited(void) {
     return t_inited;
 }
 
-co_coroutine_t* co_self(void) {
+/* Note: co_self is provided by libco, we use our own wrapper function */
+static co_coroutine_t* get_current_coro(void) {
     return t_current_coro;
 }
 
@@ -95,7 +96,8 @@ int co_create(co_coroutine_t** co_out, co_routine_fn_t fn, void* arg) {
     attr.stack_size = CO_STACK_SIZE;
     attr.share_stack = nullptr;
 
-    int rc = co_create(&co->co, &attr, co_entry_wrapper, co);
+    /* Call libco's co_create */
+    int rc = ::co_create(&co->co, &attr, co_entry_wrapper, co);
     if (rc != 0) {
         delete co;
         return -1;
@@ -113,7 +115,7 @@ int co_resume(co_coroutine_t* co) {
     }
 
     t_current_coro = co;
-    co_resume(co->co);
+    ::co_resume(co->co);
     t_current_coro = nullptr;
 
     return co->completed ? 1 : 0;
@@ -125,11 +127,15 @@ void co_yield(void) {
     }
 }
 
+co_coroutine_t* mini_co_self(void) {
+    return t_current_coro;
+}
+
 void co_release(co_coroutine_t* co) {
     if (!co) return;
 
     if (co->co) {
-        co_release(co->co);
+        ::co_release(co->co);
     }
     delete co;
 }
@@ -139,7 +145,7 @@ int co_reset(co_coroutine_t* co) {
 
     /* libco doesn't have a direct reset, so we recreate */
     if (co->co) {
-        co_release(co->co);
+        ::co_release(co->co);
     }
 
     co->ret = nullptr;
@@ -149,7 +155,7 @@ int co_reset(co_coroutine_t* co) {
     attr.stack_size = CO_STACK_SIZE;
     attr.share_stack = nullptr;
 
-    return co_create(&co->co, &attr, co_entry_wrapper, co);
+    return ::co_create(&co->co, &attr, co_entry_wrapper, co);
 }
 
 /*

@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <vector>
 
 static int counter = 0;
 static int active_coroutines = 0;
@@ -90,17 +92,15 @@ int test_stress_coroutines(void) {
     active_coroutines = 100;
     const int num_coroutines = 100;
 
-    // Create coroutines
-    std::vector<co_coroutine_t*> cos;
+    // Create coroutines (use simple array instead of vector for simplicity)
+    co_coroutine_t* cos[100];
     for (int i = 0; i < num_coroutines; i++) {
-        co_coroutine_t* co;
-        int rc = co_create(&co, worker_coroutine, (void*)(size_t)i);
+        int rc = co_create(&cos[i], worker_coroutine, (void*)(size_t)i);
         if (rc != 0) {
             fprintf(stderr, "Failed to create coroutine %d\n", i);
             return 1;
         }
-        co_scheduler_enqueue(sched, co);
-        cos.push_back(co);
+        co_scheduler_enqueue(sched, cos[i]);
     }
 
     // Run scheduler
@@ -110,14 +110,14 @@ int test_stress_coroutines(void) {
 
     printf("Scheduler finished with %d coroutines remaining\n", remaining);
     printf("Final counter: %d (expected: %d)\n", counter, num_coroutines * 1000);
-    printf("Elapsed: %ld ms\n", elapsed);
+    printf("Elapsed: %lld ms\n", (long long)elapsed);
 
     assert(counter == num_coroutines * 1000);
     assert(remaining == 0);
 
     // Cleanup
-    for (auto co : cos) {
-        co_release(co);
+    for (int i = 0; i < num_coroutines; i++) {
+        co_release(cos[i]);
     }
 
     co_scheduler_destroy(sched);
@@ -137,17 +137,17 @@ int test_yield_from_main(void) {
 }
 
 int test_self(void) {
-    printf("\n=== Test: co_self() ===\n");
+    printf("\n=== Test: mini_co_self() ===\n");
 
     // From main thread, should return NULL
-    assert(co_self() == NULL);
+    assert(mini_co_self() == NULL);
 
     co_init_thread();
 
     // Still NULL (no coroutine running)
-    assert(co_self() == NULL);
+    assert(mini_co_self() == NULL);
 
-    printf("co_self test: PASSED\n");
+    printf("mini_co_self test: PASSED\n");
     return 0;
 }
 

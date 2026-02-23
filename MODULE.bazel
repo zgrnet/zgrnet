@@ -82,30 +82,30 @@ http_archive(
     build_file_content = """
 load("@rules_cc//cc:defs.bzl", "cc_library")
 
-# libco core library (without hooks for simplicity)
+# libco core library - full build
 cc_library(
     name = "libco",
     srcs = [
         "co_routine.cpp",
-        "co_hook_sys_call.cpp",
         "coctx.cpp",
+        "co_epoll.cpp",
         "coctx_swap.S",
     ],
     hdrs = [
         "co_routine.h",
         "co_routine_inner.h",
         "coctx.h",
-        "co_hook_sys_call.h",
+        "co_epoll.h",
+        "co_closure.h",
     ],
     copts = [
         "-O3",
         "-fPIC",
         "-fno-sanitize=undefined",
-        "-DLIBCO_MINI",  # Define to disable epoll hooks for minimal build
     ],
     linkopts = select({
         "@platforms//os:macos": [],
-        "@platforms//os:linux": ["-ldl"],
+        "@platforms//os:linux": ["-ldl", "-pthread"],
         "//conditions:default": [],
     }),
     visibility = ["//visibility:public"],

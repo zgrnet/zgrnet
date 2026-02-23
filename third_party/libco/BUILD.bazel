@@ -1,6 +1,8 @@
 # Bazel build for libco wrapper layer
 # Uses Tencent libco from @libco external repository
 
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
 package(default_visibility = ["//visibility:public"])
 
 # libco_mini: Simplified wrapper around Tencent libco
