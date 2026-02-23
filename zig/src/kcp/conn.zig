@@ -686,6 +686,448 @@ test "bench yamux streaming" {
     std.debug.print("[yamux streaming] {d:.1} MB/s\n", .{mbps});
 }
 
+// ============================================================================
+// Diagnostic Tests — Performance Bottleneck Analysis
+// ============================================================================
+
+test "bench yamux memory pipe" {
+    // Purpose: Test Yamux performance with in-memory pipe (not TCP/KCP)
+    // This isolates Yamux framing overhead from network/transport layer
+    if (@import("builtin").os.tag == .freestanding) return;
+    const yamux_m = @import("yamux.zig");
+    const allocator = std.testing.allocator;
+    const YMux = yamux_m.Yamux(TestRuntime);
+
+    // Memory pipe: two SPSC queues connected back-to-back
+    const Pipe = struct {
+        a_to_b: std.ArrayListUnmanaged(u8),
+        b_to_a: std.ArrayListUnmanaged(u8),
+        mtx: TestRuntime.Mutex,
+
+        fn init() @This() {
+            return .{ .a_to_b = .{}, .b_to_a = .{}, .mtx = TestRuntime.Mutex.init() };
+        }
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            self.a_to_b.clearAndFree(alloc);
+            self.b_to_a.clearAndFree(alloc);
+        }
+    };
+
+    var pipe = Pipe.init();
+    defer pipe.deinit(allocator);
+
+    // Server transport functions (read from a_to_b, write to b_to_a)
+    const ServerTA = struct {
+        fn rd(ctx: *anyopaque, buf: []u8) anyerror!usize {
+            const p = @as(*Pipe, @ptrCast(@alignCast(ctx)));
+            p.mtx.lock();
+            defer p.mtx.unlock();
+            const avail = p.a_to_b.items.len;
+            if (avail == 0) return 0;
+            const n = @min(buf.len, avail);
+            @memcpy(buf[0..n], p.a_to_b.items[0..n]);
+            // Shift remaining data to front (inefficient but simple for test)
+            const remaining = p.a_to_b.items[n..];
+            @memcpy(p.a_to_b.items[0..remaining.len], remaining);
+            p.a_to_b.shrinkRetainingCapacity(remaining.len);
+            return n;
+        }
+        fn wr(ctx: *anyopaque, data: []const u8) anyerror!void {
+            const p = @as(*Pipe, @ptrCast(@alignCast(ctx)));
+            p.mtx.lock();
+            defer p.mtx.unlock();
+            try p.b_to_a.appendSlice(allocator, data);
+        }
+    };
+
+    // Client transport functions (read from b_to_a, write to a_to_b)
+    const ClientTA = struct {
+        fn rd(ctx: *anyopaque, buf: []u8) anyerror!usize {
+            const p = @as(*Pipe, @ptrCast(@alignCast(ctx)));
+            p.mtx.lock();
+            defer p.mtx.unlock();
+            const avail = p.b_to_a.items.len;
+            if (avail == 0) return 0;
+            const n = @min(buf.len, avail);
+            @memcpy(buf[0..n], p.b_to_a.items[0..n]);
+            // Shift remaining data to front
+            const remaining = p.b_to_a.items[n..];
+            @memcpy(p.b_to_a.items[0..remaining.len], remaining);
+            p.b_to_a.shrinkRetainingCapacity(remaining.len);
+            return n;
+        }
+        fn wr(ctx: *anyopaque, data: []const u8) anyerror!void {
+            const p = @as(*Pipe, @ptrCast(@alignCast(ctx)));
+            p.mtx.lock();
+            defer p.mtx.unlock();
+            try p.a_to_b.appendSlice(allocator, data);
+        }
+    };
+
+    const server = try YMux.init(allocator, .server, @ptrCast(&pipe), ServerTA.rd, ServerTA.wr);
+    defer server.deinit();
+    const client = try YMux.init(allocator, .client, @ptrCast(&pipe), ClientTA.rd, ClientTA.wr);
+    defer client.deinit();
+
+    const total: usize = 4 * 1024 * 1024;
+
+    // Server sink
+    const ServerFn = struct {
+        fn run(s: *YMux, t: usize) void {
+            var ss = s.accept() catch return;
+            defer ss.close();
+            var buf: [65536]u8 = undefined;
+            var recv: usize = 0;
+            while (recv < t) {
+                const n = ss.read(&buf) catch break;
+                if (n == 0) break;
+                recv += n;
+            }
+        }
+    };
+    const st = std.Thread.spawn(.{}, ServerFn.run, .{ server, total }) catch return;
+
+    var cs = try client.open();
+    defer cs.close();
+
+    const chunk = try allocator.alloc(u8, 8192);
+    defer allocator.free(chunk);
+    @memset(chunk, 0x58);
+
+    const start = std.time.nanoTimestamp();
+    var sent: usize = 0;
+    while (sent < total) {
+        sent += try cs.write(chunk);
+    }
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+    st.join();
+
+    const mbps = @as(f64, @floatFromInt(sent)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+    std.debug.print("[yamux memory pipe] {d:.1} MB/s (Yamux pure overhead, no IO)\n", .{mbps});
+}
+
+test "bench spsc ring baseline" {
+    // Purpose: Test raw SPSC ring buffer performance (channel vs direct memcpy)
+    if (@import("builtin").os.tag == .freestanding) return;
+    const allocator = std.testing.allocator;
+
+    const ring_capacity: usize = 512 * 1024; // 512KB ring
+    const chunk_size: usize = 8192;
+    const total: usize = 4 * 1024 * 1024;
+
+    // Test 1: Direct memory copy (baseline)
+    {
+        const buffer = try allocator.alloc(u8, total);
+        defer allocator.free(buffer);
+        const src = try allocator.alloc(u8, chunk_size);
+        defer allocator.free(src);
+        @memset(src, 0x58);
+
+        const start = std.time.nanoTimestamp();
+        var offset: usize = 0;
+        while (offset < total) : (offset += chunk_size) {
+            @memcpy(buffer[offset..offset + chunk_size], src);
+        }
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+        const mbps = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+        std.debug.print("[baseline memcpy] {d:.1} MB/s\n", .{mbps});
+    }
+
+    // Test 2: SPSC ring with atomic operations (simulating current KcpConn)
+    // NOTE: This uses a simple ring that drops data when full (no blocking)
+    //       to measure raw throughput without blocking overhead
+    {
+        const Ring = struct {
+            buf: []u8,
+            head: std.atomic.Value(usize), // read position
+            tail: std.atomic.Value(usize), // write position
+            capacity: usize,
+
+            fn init(alloc: std.mem.Allocator, cap: usize) !@This() {
+                return .{
+                    .buf = try alloc.alloc(u8, cap),
+                    .head = std.atomic.Value(usize).init(0),
+                    .tail = std.atomic.Value(usize).init(0),
+                    .capacity = cap,
+                };
+            }
+            fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                alloc.free(self.buf);
+            }
+
+            fn write(self: *@This(), data: []const u8) bool {
+                const tail = self.tail.load(.monotonic);
+                const head = self.head.load(.acquire);
+                const used = if (tail >= head) tail - head else self.capacity - head + tail;
+                const available = self.capacity - used - 1; // -1 to distinguish full from empty
+
+                if (available < data.len) return false; // ring full
+
+                // Write with wrap-around handling
+                for (data, 0..) |b, i| {
+                    const idx = (tail + i) % self.capacity;
+                    self.buf[idx] = b;
+                }
+                self.tail.store((tail + data.len) % self.capacity, .release);
+                return true;
+            }
+
+            fn read(self: *@This(), out: []u8) usize {
+                const head = self.head.load(.monotonic);
+                const tail = self.tail.load(.acquire);
+                const available = if (tail >= head) tail - head else self.capacity - head + tail;
+                if (available == 0) return 0;
+
+                const to_read = @min(out.len, available);
+                // Read with wrap-around handling
+                for (0..to_read) |i| {
+                    const idx = (head + i) % self.capacity;
+                    out[i] = self.buf[idx];
+                }
+                self.head.store((head + to_read) % self.capacity, .release);
+                return to_read;
+            }
+        };
+
+        var ring = try Ring.init(allocator, ring_capacity);
+        defer ring.deinit(allocator);
+
+        const src = try allocator.alloc(u8, chunk_size);
+        defer allocator.free(src);
+        @memset(src, 0x58);
+
+        const Writer = struct {
+            fn run(r: *Ring, data: []const u8, t: usize) void {
+                var sent: usize = 0;
+                while (sent < t) {
+                    while (!r.write(data)) {
+                        std.atomic.spinLoopHint(); // Spin wait for space
+                    }
+                    sent += data.len;
+                }
+            }
+        };
+
+        const Reader = struct {
+            fn run(r: *Ring, t: usize) void {
+                var buf: [8192]u8 = undefined;
+                var recv: usize = 0;
+                while (recv < t) {
+                    const n = r.read(&buf);
+                    if (n == 0) {
+                        std.atomic.spinLoopHint();
+                        continue;
+                    }
+                    recv += n;
+                }
+            }
+        };
+
+        const start = std.time.nanoTimestamp();
+        const wt = std.Thread.spawn(.{}, Writer.run, .{ &ring, src, total }) catch return;
+        const rt = std.Thread.spawn(.{}, Reader.run, .{ &ring, total }) catch return;
+        wt.join();
+        rt.join();
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+        const mbps = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+        std.debug.print("[spsc ring atomic] {d:.1} MB/s (ratio to memcpy shows overhead)\n", .{mbps});
+    }
+}
+
+test "bench yamux varying chunks" {
+    // Purpose: Find the optimal chunk size for Yamux over KCP
+    if (@import("builtin").os.tag == .freestanding) return;
+    const yamux_m = @import("yamux.zig");
+    const allocator = std.testing.allocator;
+    const Conn = KcpConn(TestRuntime);
+    const YMux = yamux_m.Yamux(TestRuntime);
+
+    const Ctx = struct {
+        var a_ptr: ?*Conn = null;
+        var b_ptr: ?*Conn = null;
+        fn outA(data: []const u8, _: ?*anyopaque) void { if (b_ptr) |b| b.input(data) catch {}; }
+        fn outB(data: []const u8, _: ?*anyopaque) void { if (a_ptr) |a| a.input(data) catch {}; }
+    };
+    Ctx.a_ptr = null;
+    Ctx.b_ptr = null;
+    const a = try Conn.init(allocator, 1, Ctx.outA, null);
+    defer a.deinit();
+    const b = try Conn.init(allocator, 1, Ctx.outB, null);
+    defer b.deinit();
+    Ctx.a_ptr = a;
+    Ctx.b_ptr = b;
+
+    const TA = struct {
+        fn rd(ctx: *anyopaque, buf: []u8) anyerror!usize {
+            return @as(*Conn, @ptrCast(@alignCast(ctx))).read(buf);
+        }
+        fn wr(ctx: *anyopaque, data: []const u8) anyerror!void {
+            _ = try @as(*Conn, @ptrCast(@alignCast(ctx))).write(data);
+        }
+    };
+    const client = try YMux.init(allocator, .client, @ptrCast(a), TA.rd, TA.wr);
+    defer client.deinit();
+    const server = try YMux.init(allocator, .server, @ptrCast(b), TA.rd, TA.wr);
+    defer server.deinit();
+
+    const sizes = [_]usize{ 128, 512, 1024, 4096, 8192, 16384, 32768, 65536 };
+    std.debug.print("[yamux chunk sweep]\n", .{});
+
+    for (sizes) |chunk_size| {
+        const total: usize = 4 * 1024 * 1024;
+        const chunk = try allocator.alloc(u8, chunk_size);
+        defer allocator.free(chunk);
+        @memset(chunk, 0x58);
+
+        const SinkFn = struct {
+            fn run(s: *YMux, t: usize) void {
+                var ss = s.accept() catch return;
+                defer ss.close();
+                var buf: [65536]u8 = undefined;
+                var recv: usize = 0;
+                while (recv < t) { const n = ss.read(&buf) catch break; if (n == 0) break; recv += n; }
+            }
+        };
+        const st = std.Thread.spawn(.{}, SinkFn.run, .{ server, total }) catch continue;
+
+        var cs = try client.open();
+        defer cs.close();
+
+        const start = std.time.nanoTimestamp();
+        var sent: usize = 0;
+        while (sent < total) { sent += try cs.write(chunk); }
+        st.join();
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+        const mbps = @as(f64, @floatFromInt(sent)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+        std.debug.print("  chunk={d:>5}B {d:.1} MB/s\n", .{ chunk_size, mbps });
+    }
+}
+
+test "bench kcpconn unidirectional" {
+    // Purpose: Fair comparison with Yamux streaming (single direction, single writer)
+    if (@import("builtin").os.tag == .freestanding) return;
+    const allocator = std.testing.allocator;
+
+    const pair = try connPair();
+    defer pair.a.deinit();
+    defer pair.b.deinit();
+
+    const chunk_size: usize = 8192;
+    const total: usize = 4 * 1024 * 1024;
+    const chunk = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(chunk);
+    @memset(chunk, 0x58);
+
+    // Sink thread (just read and discard)
+    const SinkFn = struct {
+        fn run(c: *KcpConn(TestRuntime), t: usize) void {
+            var buf: [65536]u8 = undefined;
+            var recv: usize = 0;
+            while (recv < t) {
+                const n = c.read(&buf) catch break;
+                if (n == 0) break;
+                recv += n;
+            }
+        }
+    };
+    const rt = std.Thread.spawn(.{}, SinkFn.run, .{ pair.b, total }) catch return;
+
+    const start = std.time.nanoTimestamp();
+    var sent: usize = 0;
+    while (sent < total) {
+        sent += pair.a.write(chunk) catch break;
+    }
+    rt.join();
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+
+    const mbps = @as(f64, @floatFromInt(sent)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+    std.debug.print("[kcpconn unidirectional] {d:.1} MB/s (fair comparison to yamux)\n", .{mbps});
+}
+
+test "bench yamux multi-stream" {
+    // Purpose: Test if multiple streams improve throughput
+    if (@import("builtin").os.tag == .freestanding) return;
+    const yamux_m = @import("yamux.zig");
+    const allocator = std.testing.allocator;
+    const Conn = KcpConn(TestRuntime);
+    const YMux = yamux_m.Yamux(TestRuntime);
+
+    const Ctx = struct {
+        var a_ptr: ?*Conn = null;
+        var b_ptr: ?*Conn = null;
+        fn outA(data: []const u8, _: ?*anyopaque) void { if (b_ptr) |b| b.input(data) catch {}; }
+        fn outB(data: []const u8, _: ?*anyopaque) void { if (a_ptr) |a| a.input(data) catch {}; }
+    };
+    Ctx.a_ptr = null;
+    Ctx.b_ptr = null;
+    const a = try Conn.init(allocator, 1, Ctx.outA, null);
+    defer a.deinit();
+    const b = try Conn.init(allocator, 1, Ctx.outB, null);
+    defer b.deinit();
+    Ctx.a_ptr = a;
+    Ctx.b_ptr = b;
+
+    const TA = struct {
+        fn rd(ctx: *anyopaque, buf: []u8) anyerror!usize {
+            return @as(*Conn, @ptrCast(@alignCast(ctx))).read(buf);
+        }
+        fn wr(ctx: *anyopaque, data: []const u8) anyerror!void {
+            _ = try @as(*Conn, @ptrCast(@alignCast(ctx))).write(data);
+        }
+    };
+    const client = try YMux.init(allocator, .client, @ptrCast(a), TA.rd, TA.wr);
+    defer client.deinit();
+    const server = try YMux.init(allocator, .server, @ptrCast(b), TA.rd, TA.wr);
+    defer server.deinit();
+
+    const num_streams: usize = 4;
+    const chunk_size: usize = 8192;
+    const total_per_stream: usize = 1 * 1024 * 1024; // 1MB per stream
+    const total = num_streams * total_per_stream;
+
+    const chunk = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(chunk);
+    @memset(chunk, 0x58);
+
+    // Server: accept and sink all streams
+    const ServerFn = struct {
+        fn run(s: *YMux, n: usize, t: usize) void {
+            for (0..n) |_| {
+                var ss = s.accept() catch continue;
+                defer ss.close();
+                var buf: [65536]u8 = undefined;
+                var recv: usize = 0;
+                while (recv < t) { const n_bytes = ss.read(&buf) catch break; if (n_bytes == 0) break; recv += n_bytes; }
+            }
+        }
+    };
+    const st = std.Thread.spawn(.{}, ServerFn.run, .{ server, num_streams, total_per_stream }) catch return;
+
+    // Client: open multiple streams and write concurrently
+    const ClientFn = struct {
+        fn run(mux: *YMux, t: usize, data: []const u8) void {
+            var s = mux.open() catch return;
+            defer s.close();
+            var sent: usize = 0;
+            while (sent < t) { sent += s.write(data) catch break; }
+        }
+    };
+
+    var threads: [4]std.Thread = undefined;
+    const start = std.time.nanoTimestamp();
+    for (0..num_streams) |i| {
+        threads[i] = std.Thread.spawn(.{}, ClientFn.run, .{ client, total_per_stream, chunk }) catch continue;
+    }
+    for (0..num_streams) |i| {
+        threads[i].join();
+    }
+    st.join();
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+
+    const mbps = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+    std.debug.print("[yamux {d} streams] {d:.1} MB/s total (vs single stream ~8 MB/s)\n", .{ num_streams, mbps });
+}
+
 test "kcpconn read peer dead" {
     if (@import("builtin").os.tag == .freestanding) return;
     const pair = try connPair();
