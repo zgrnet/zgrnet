@@ -1493,3 +1493,74 @@ test "bench multi-producer contention" {
     std.debug.print("\nConclusion: MPSC Channel [2] provides native multi-producer support\n", .{});
     std.debug.print("vs multiple SPSC rings [3] requiring complex polling/merging logic\n", .{});
 }
+
+// ============================================================================
+// Real KCP I/O Test — SPSC Ring vs MPSC Channel with actual KCP protocol
+// ============================================================================
+
+test "bench real kcp io spsc vs mpsc" {
+    // Purpose: Compare actual KCP throughput with SPSC Ring vs MPSC Channel
+    // This includes real ikcp_send/ikcp_flush/ikcp_input protocol overhead
+    if (@import("builtin").os.tag == .freestanding) return;
+
+    std.debug.print("\n[Real KCP I/O Test] Including full KCP protocol stack\n", .{});
+
+    const allocator = std.testing.allocator;
+    const chunk_size: usize = 8192;
+    const total: usize = 4 * 1024 * 1024; // 4MB
+
+    // Shared test data
+    const src = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(src);
+    @memset(src, 0x58);
+
+    // Test 1: Current KcpConn with SPSC Ring
+    {
+        // Create KCP pair with current implementation
+        const pair = try connPair();
+        defer pair.a.deinit();
+        defer pair.b.deinit();
+
+        // Writer thread
+        const Writer = struct {
+            fn run(conn: *KcpConn(TestRuntime), data: []const u8, t: usize) void {
+                var sent: usize = 0;
+                while (sent < t) {
+                    sent += conn.write(data) catch break;
+                }
+            }
+        };
+
+        // Reader thread
+        const Reader = struct {
+            fn run(conn: *KcpConn(TestRuntime), t: usize) void {
+                var buf: [65536]u8 = undefined;
+                var recv: usize = 0;
+                while (recv < t) {
+                    const n = conn.read(&buf) catch break;
+                    if (n == 0) break;
+                    recv += n;
+                }
+            }
+        };
+
+        const start = std.time.nanoTimestamp();
+        const wt = std.Thread.spawn(.{}, Writer.run, .{ pair.a, src, total }) catch return;
+        const rt = std.Thread.spawn(.{}, Reader.run, .{ pair.b, total }) catch return;
+        wt.join();
+        rt.join();
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+        const mbps = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+        std.debug.print("[1] KcpConn + SPSC Ring (current) : {d:>6.1} MB/s\n", .{mbps});
+    }
+
+    // Test 2: KcpConn with MPSC Channel (new implementation)
+    // Need to create a modified version or test harness
+    {
+        std.debug.print("[2] KcpConn + MPSC Channel        : TODO - requires implementation\n", .{});
+        std.debug.print("    (This will be tested after replacing SpscRing with Channel)\n", .{});
+    }
+
+    std.debug.print("\nNote: Compare [1] vs future [2] after implementing MPSC Channel\n", .{});
+    std.debug.print("Expectation: MPSC should have similar throughput but lower CPU usage\n", .{});
+}
