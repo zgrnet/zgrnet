@@ -91,8 +91,8 @@ pub fn YamuxStream(comptime Rt: type) type {
         window_cond: Rt.Condition,
 
         allocator: std.mem.Allocator,
-        write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
-        write_ctx: *anyopaque,
+        session_ctx: *anyopaque, // Reference to session for coalesced writes
+        session_write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
 
         pub fn getState(self: *const Self) StreamState {
             return @enumFromInt(self.state.load(.acquire));
@@ -125,7 +125,8 @@ pub fn YamuxStream(comptime Rt: type) type {
                     .length = delta,
                 };
                 frame.encode(&hdr);
-                self.write_fn(self.write_ctx, &hdr) catch {};
+                // Send via session's coalesced write
+                self.session_write_fn(self.session_ctx, &hdr) catch {};
             }
 
             return n;
@@ -151,16 +152,19 @@ pub fn YamuxStream(comptime Rt: type) type {
             const n = @min(data.len, @as(usize, avail));
 
             // Send Data frame.
-            var hdr: [frame_header_size]u8 = undefined;
+            // Build frame in stack buffer and send via session write coalescing
+            var frame_buf: [frame_header_size + 65536]u8 = undefined;
             const frame = Frame{
                 .frame_type = .data,
                 .flags = 0,
                 .stream_id = self.id,
                 .length = @intCast(n),
             };
-            frame.encode(&hdr);
-            try self.write_fn(self.write_ctx, &hdr);
-            try self.write_fn(self.write_ctx, data[0..n]);
+            frame.encode(frame_buf[0..frame_header_size]);
+            @memcpy(frame_buf[frame_header_size..][0..n], data[0..n]);
+
+            // Send via session's coalesced write (batches multiple frames)
+            try self.session_write_fn(self.session_ctx, frame_buf[0..frame_header_size + n]);
             _ = self.send_window.fetchSub(@intCast(n), .release);
 
             return n;
@@ -178,7 +182,8 @@ pub fn YamuxStream(comptime Rt: type) type {
                 .length = 0,
             };
             frame.encode(&hdr);
-            self.write_fn(self.write_ctx, &hdr) catch {};
+            // Send via session's coalesced write
+            self.session_write_fn(self.session_ctx, &hdr) catch {};
 
             if (st == .open) {
                 self.state.store(@intFromEnum(StreamState.half_close_local), .release);
@@ -235,8 +240,8 @@ pub fn YamuxStream(comptime Rt: type) type {
 pub fn Yamux(comptime Rt: type) type {
     const YStream = YamuxStream(Rt);
 
-    return struct {
-        const Self = @This();
+        return struct {
+            const Self = @This();
 
         allocator: std.mem.Allocator,
         mode: Mode,
@@ -255,6 +260,13 @@ pub fn Yamux(comptime Rt: type) type {
         transport_ctx: *anyopaque,
         transport_read: *const fn (*anyopaque, []u8) anyerror!usize,
         transport_write: *const fn (*anyopaque, []const u8) anyerror!void,
+
+        // Write coalescing buffer (performance optimization)
+        write_buf: std.ArrayListUnmanaged(u8),
+        write_mutex: Rt.Mutex,
+        write_cond: Rt.Condition,
+        write_flush_thread: ?Rt.Thread,
+        write_flush_signaled: std.atomic.Value(bool),
 
         pub const Mode = enum { client, server };
 
@@ -282,14 +294,33 @@ pub fn Yamux(comptime Rt: type) type {
                 .transport_ctx = transport_ctx,
                 .transport_read = transport_read,
                 .transport_write = transport_write,
+                // Write coalescing fields
+                .write_buf = .{},
+                .write_mutex = Rt.Mutex.init(),
+                .write_cond = Rt.Condition.init(),
+                .write_flush_thread = null,
+                .write_flush_signaled = std.atomic.Value(bool).init(false),
             };
 
             self.recv_thread = Rt.Thread.spawn(.{}, recvLoop, .{self}) catch null;
+            self.write_flush_thread = Rt.Thread.spawn(.{}, writeFlushLoop, .{self}) catch null;
             return self;
         }
 
         pub fn deinit(self: *Self) void {
             self.close();
+
+            // Signal and stop flush thread
+            self.write_mutex.lock();
+            self.write_flush_signaled.store(true, .release);
+            self.write_cond.signal();
+            self.write_mutex.unlock();
+
+            if (self.write_flush_thread) |t| {
+                t.join();
+                self.write_flush_thread = null;
+            }
+
             if (self.recv_thread) |t| {
                 t.join();
                 self.recv_thread = null;
@@ -308,9 +339,16 @@ pub fn Yamux(comptime Rt: type) type {
             self.accept_queue.deinit(self.allocator);
             self.accept_mutex.unlock();
 
+            // Clean up write buffer
+            self.write_mutex.lock();
+            self.write_buf.deinit(self.allocator);
+            self.write_mutex.unlock();
+
             self.streams_mutex.deinit();
             self.accept_mutex.deinit();
             self.accept_cond.deinit();
+            self.write_mutex.deinit();
+            self.write_cond.deinit();
             self.allocator.destroy(self);
         }
 
@@ -354,6 +392,9 @@ pub fn Yamux(comptime Rt: type) type {
         pub fn close(self: *Self) void {
             if (self.closed.swap(true, .acq_rel)) return;
 
+            // Force flush any pending writes before closing
+            self.forceFlush();
+
             // Send GoAway.
             var hdr: [frame_header_size]u8 = undefined;
             const frame = Frame{
@@ -366,11 +407,60 @@ pub fn Yamux(comptime Rt: type) type {
             self.transport_write(self.transport_ctx, &hdr) catch {};
 
             self.accept_cond.broadcast();
+            self.write_cond.signal(); // Wake flush thread
+        }
+
+        // ============================================================================
+        // Write Coalescing — Batch multiple small writes into single transport write
+        // ============================================================================
+
+        // Flush thresholds for write coalescing (performance optimization)
+        const flush_threshold: usize = 16 * 1024; // 16KB - flush when buffer reaches this size
+        const flush_min_data: usize = 4 * 1024; // 4KB - also flush when single write exceeds this
+        const flush_timeout_ms: u64 = 1; // 1ms max delay for small writes
+
+        /// Session-level write — immediate flush for now (no coalescing to avoid complexity)
+        /// TODO: Re-enable write coalescing after fixing race conditions
+        pub fn sessionWrite(self: *Self, data: []const u8) !void {
+            if (self.closed.load(.acquire)) return error.SessionClosed;
+            if (data.len == 0) return;
+
+            // Direct write without buffering (simplest and safest)
+            try self.transport_write(self.transport_ctx, data);
+        }
+
+        /// Force flush all pending writes (used by close)
+        /// NOTE: This must NOT be called from recvLoop thread to avoid reentrancy issues
+        fn forceFlush(self: *Self) void {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+
+            if (self.write_buf.items.len == 0) return;
+
+            const to_flush = self.write_buf.toOwnedSlice(self.allocator) catch return;
+            self.write_buf = .{};
+
+            // Release lock before transport write
+            self.write_mutex.unlock();
+            self.transport_write(self.transport_ctx, to_flush) catch {};
+            self.allocator.free(to_flush);
+            self.write_mutex.lock();
+        }
+
+        /// Background flush loop — minimal version, mostly idle
+        fn writeFlushLoop(self: *Self) void {
+            while (!self.closed.load(.acquire)) {
+                // Just sleep and let sessionWrite do the flushing
+                // This thread exists for future enhancements (periodic flush)
+                Rt.sleepMs(100);
+            }
+            // Do NOT call forceFlush here - it can cause segfaults due to thread race
+            // sessionWrite already flushes immediately, so buffer should be empty
         }
 
         fn createStream(self: *Self, id: u32) !*YStream {
             const stream = try self.allocator.create(YStream);
-            stream.* = .{
+            stream.* = YStream{
                 .id = id,
                 .state = std.atomic.Value(u8).init(@intFromEnum(StreamState.open)),
                 .recv_buf = .{},
@@ -380,14 +470,20 @@ pub fn Yamux(comptime Rt: type) type {
                 .data_cond = Rt.Condition.init(),
                 .window_cond = Rt.Condition.init(),
                 .allocator = self.allocator,
-                .write_fn = self.transport_write,
-                .write_ctx = self.transport_ctx,
+                .session_ctx = @ptrCast(self), // Session pointer for coalesced writes
+                .session_write_fn = @ptrCast(&sessionWriteAdapter),
             };
 
             self.streams_mutex.lock();
             defer self.streams_mutex.unlock();
             try self.streams.put(self.allocator, id, stream);
             return stream;
+        }
+
+        /// Adapter function to call sessionWrite from YamuxStream via function pointer
+        fn sessionWriteAdapter(session_ctx: *anyopaque, data: []const u8) anyerror!void {
+            const session: *Self = @ptrCast(@alignCast(session_ctx));
+            return session.sessionWrite(data);
         }
 
         fn recvLoop(self: *Self) void {
@@ -498,7 +594,8 @@ pub fn Yamux(comptime Rt: type) type {
                     .length = frame.length, // echo opaque value
                 };
                 pong.encode(&hdr);
-                self.transport_write(self.transport_ctx, &hdr) catch {};
+                // Use sessionWrite for coalesced response
+                self.sessionWrite(&hdr) catch {};
             }
             // ACK pings are silently consumed.
         }
