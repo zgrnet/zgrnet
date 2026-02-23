@@ -73,8 +73,47 @@ bazel_dep(name = "bazel_skylib", version = "1.9.0")
 # BoringSSL
 bazel_dep(name = "boringssl", version = "0.20251124.0")
 
-# Minicoro - single-header coroutine library
+# Tencent libco - production coroutine library
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(
+    name = "libco",
+    urls = ["https://github.com/Tencent/libco/archive/master.tar.gz"],
+    strip_prefix = "libco-master",
+    build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# libco core library (without hooks for simplicity)
+cc_library(
+    name = "libco",
+    srcs = [
+        "co_routine.cpp",
+        "co_hook_sys_call.cpp",
+        "coctx.cpp",
+        "coctx_swap.S",
+    ],
+    hdrs = [
+        "co_routine.h",
+        "co_routine_inner.h",
+        "coctx.h",
+        "co_hook_sys_call.h",
+    ],
+    copts = [
+        "-O3",
+        "-fPIC",
+        "-fno-sanitize=undefined",
+        "-DLIBCO_MINI",  # Define to disable epoll hooks for minimal build
+    ],
+    linkopts = select({
+        "@platforms//os:macos": [],
+        "@platforms//os:linux": ["-ldl"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+)
+""",
+)
+
+# Minicoro - single-header coroutine library (backup option)
 http_archive(
     name = "minicoro",
     urls = ["https://github.com/edubart/minicoro/archive/02dad0f8b7cbb12fe6e216ae7a76db15ca55cd7b.tar.gz"],

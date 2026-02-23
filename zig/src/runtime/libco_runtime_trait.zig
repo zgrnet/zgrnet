@@ -2,12 +2,6 @@
 //!
 //! This provides an alternative Runtime implementation that uses libco's M:N
 //! coroutine scheduling instead of OS threads (std.Thread).
-//!
-//! Key differences from StdRuntime:
-//! - Thread is implemented as a libco coroutine
-//! - All coroutines in one OS thread share the same scheduler
-//! - Context switch is ~50-100ns vs ~1-10μs for OS threads
-
 const std = @import("std");
 const libco = @import("libco_runtime.zig");
 
@@ -15,11 +9,11 @@ const libco = @import("libco_runtime.zig");
 /// This can be used as: `KcpConn(LibcoRuntime)` instead of `KcpConn(StdRuntime)`
 pub const LibcoRuntime = struct {
     // =============================================================================
-    // Time - same as std (using system time)
+    // Time
     // =============================================================================
     pub const Time = struct {
         pub fn nowMs() i64 {
-            return std.time.milliTimestamp();
+            return libco.nowMs();
         }
 
         pub fn sleepMs(ms: i64) void {
@@ -27,12 +21,7 @@ pub const LibcoRuntime = struct {
 
             // If called from within a coroutine, yield instead of blocking
             if (libco.self()) |_| {
-                // Yield multiple times to approximate sleep duration
-                // In production: use scheduler-aware sleep
-                const yield_count = @as(u32, @intCast(@min(ms, 100)));
-                for (0..yield_count) |_| {
-                    libco.yield();
-                }
+                libco.sleepMs(@intCast(ms));
             } else {
                 // Called from main thread, use OS sleep
                 std.time.sleep(@as(u64, @intCast(ms)) * std.time.ns_per_ms);
@@ -45,8 +34,6 @@ pub const LibcoRuntime = struct {
     // =============================================================================
     pub const Thread = struct {
         co: *libco.Coroutine,
-        started: std.atomic.Value(bool),
-        completed: std.atomic.Value(bool),
 
         /// Spawn a new coroutine
         pub fn spawn(comptime _: anytype, comptime f: anytype, args: anytype) !Thread {
@@ -66,8 +53,6 @@ pub const LibcoRuntime = struct {
 
             var thread = Thread{
                 .co = co,
-                .started = std.atomic.Value(bool).init(false),
-                .completed = std.atomic.Value(bool).init(false),
             };
 
             // Immediately enqueue to scheduler if available
@@ -77,7 +62,7 @@ pub const LibcoRuntime = struct {
                 // Create scheduler if none exists
                 const sched = try libco.schedulerCreate();
                 libco.schedulerEnqueue(sched, co);
-                // Note: caller must run scheduler or we have leak
+                // Note: caller must run scheduler
             }
 
             return thread;
@@ -86,7 +71,11 @@ pub const LibcoRuntime = struct {
         /// Wait for coroutine to complete
         pub fn join(self: *Thread) void {
             // Poll until completed
-            while (!self.completed.load(.acquire)) {
+            // In production: use proper completion notification
+            while (true) {
+                if (libco.resumeCo(self.co) catch true) {
+                    break; // Completed or error
+                }
                 if (libco.self()) |_| {
                     libco.yield();
                 } else {
@@ -96,21 +85,21 @@ pub const LibcoRuntime = struct {
             libco.release(self.co);
         }
 
-        /// Detach (coroutine will clean itself up)
+        /// Detach (coroutine will complete on its own)
         pub fn detach(self: *Thread) void {
-            self.completed.store(true, .release);
-            // Note: actual cleanup happens after completion
+            // In production: add to detached list for cleanup
+            _ = self;
         }
     };
 
     // =============================================================================
     // Mutex - use std.Thread.Mutex (coroutine-safe in single-threaded scheduler)
+    // In multi-threaded: need proper locking
     // =============================================================================
     pub const Mutex = std.Thread.Mutex;
 
     // =============================================================================
     // Condition - use std.Thread.Condition
-    // Note: This may need custom implementation for coroutine-aware waiting
     // =============================================================================
     pub const Condition = std.Thread.Condition;
 
@@ -122,7 +111,7 @@ pub const LibcoRuntime = struct {
     }
 
     // =============================================================================
-    // Allocator - use std.heap.c_allocator or page_allocator
+    // Allocator
     // =============================================================================
     pub const Allocator = std.mem.Allocator;
 
@@ -184,6 +173,7 @@ pub const LibcoRuntime = struct {
 
 test "LibcoRuntime time operations" {
     const rt = LibcoRuntime;
+    rt.init();
 
     const start = rt.Time.nowMs();
     rt.Time.sleepMs(10);

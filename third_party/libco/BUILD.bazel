@@ -1,88 +1,42 @@
-# libco-mini: Minimal coroutine library compiled with Zig CC
-# Provides M:N scheduler primitives for Zig STD platform
+# Bazel build for libco wrapper layer
+# Uses Tencent libco from @libco external repository
 
-# Use Zig CC as the C compiler for cross-platform compatibility
-# Zig CC = clang + zig's bundled libc + cross-compilation support
+package(default_visibility = ["//visibility:public"])
 
-# First, compile the assembly file with zig cc
-# The assembly uses System V AMD64 ABI which works on macOS and Linux
-
+# libco_mini: Simplified wrapper around Tencent libco
+# Provides minimal API for M:N coroutine scheduling
 cc_library(
     name = "libco_mini",
     srcs = [
-        "libco_mini.c",
-        "coctx.cpp",
-        "coctx_swap.S",
+        "libco_mini_wrapper.cpp",
     ],
     hdrs = [
         "libco_mini.h",
-        "coctx.h",
     ],
+    deps = ["@libco//:libco"],
     copts = [
-        # Use Zig CC for compilation
-        # Zig CC acts as a drop-in replacement for clang/gcc
-        "--target=x86_64-macos-none",
         "-O3",
         "-fPIC",
-        "-fno-sanitize=undefined",  # Disable UBSan (too strict for libco)
-        "-DLIBCO_MINI_STANDALONE",   # Standalone mode, no epoll hooks
+        "-fno-sanitize=undefined",
     ],
-    linkopts = [],
+    linkopts = select({
+        "@platforms//os:macos": [],
+        "@platforms//os:linux": ["-ldl", "-pthread"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 
-# Note: In a full implementation, we would use:
-# 1. A custom cc_toolchain that uses zig cc as the compiler
-# 2. Or a genrule that calls zig cc directly
-#
-# For now, we use standard cc_library with Zig-compatible flags.
-# The actual Zig CC compilation would be done in a genrule or custom rule.
-
-# Alternative: Use genrule with zig cc directly
-genrule(
-    name = "libco_mini_zig_cc",
-    srcs = [
-        "libco_mini.c",
-        "coctx.cpp",
-        "coctx_swap.S",
-        "libco_mini.h",
-        "coctx.h",
-    ],
-    outs = ["libco_mini.a"],
-    cmd = """
-        # Use zig cc if available, fallback to system cc
-        if command -v zig >/dev/null 2>&1; then
-            CC=\"zig cc\"
-            CXX=\"zig c++\"
-        else
-            CC=\"cc\"
-            CXX=\"c++\"
-        fi
-
-        # Create temp directory for object files
-        mkdir -p $(@D)/.libco_tmp
-
-        # Compile C file
-        $$CC -c -O3 -fPIC -I. $(location libco_mini.c) -o $(@D)/.libco_tmp/libco_mini.o
-
-        # Compile C++ file
-        $$CXX -c -O3 -fPIC -I. $(location coctx.cpp) -o $(@D)/.libco_tmp/coctx.o
-
-        # Compile assembly file
-        $$CC -c -fPIC $(location coctx_swap.S) -o $(@D)/.libco_tmp/coctx_swap.o
-
-        # Create static library
-        ar rcs $@ $(@D)/.libco_tmp/*.o
-
-        # Cleanup
-        rm -rf $(@D)/.libco_tmp
-    """,
-    visibility = ["//visibility:public"],
+# Test for libco wrapper
+cc_test(
+    name = "libco_mini_test",
+    srcs = ["libco_mini_test.cc"],
+    deps = [":libco_mini"],
+    copts = ["-O2"],
+    timeout = "short",
 )
 
 # Export headers
 exports_files([
     "libco_mini.h",
-    "coctx.h",
-    "co_routine.h",
 ])

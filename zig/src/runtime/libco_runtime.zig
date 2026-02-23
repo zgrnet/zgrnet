@@ -1,19 +1,16 @@
 //! libco_runtime.zig - Zig FFI wrapper for libco-mini
-//! Provides coroutine and M:N scheduler functionality
+//!
+//! Provides coroutine and M:N scheduler functionality based on Tencent libco.
 const std = @import("std");
 
-// C API declarations
-const c = @cImport({
-    @cIncludePath("third_party/libco");
-    @cInclude("libco_mini.h");
+// C API declarations - using libco-mini wrapper
+pub const c = @cImport({
+    @cInclude("third_party/libco/libco_mini.h");
 });
 
 // Re-export opaque types
 pub const Coroutine = c.co_coroutine_t;
 pub const Scheduler = c.co_scheduler_t;
-
-/// Coroutine entry function type
-pub const RoutineFn = *const fn (?*anyopaque) callconv(.C) ?*anyopaque;
 
 /// Error types for libco operations
 pub const Error = error{
@@ -45,6 +42,9 @@ pub fn self() ?*Coroutine {
     const ptr = c.co_self();
     return if (ptr) @ptrCast(ptr) else null;
 }
+
+/// Coroutine entry function type
+pub const RoutineFn = *const fn (?*anyopaque) callconv(.C) ?*anyopaque;
 
 /// Create a new coroutine
 /// The coroutine starts in suspended state, use resume() to start
@@ -137,6 +137,16 @@ pub fn setThreadScheduler(sched: ?*Scheduler) void {
     c.co_set_thread_scheduler(sched);
 }
 
+/// Get current time in milliseconds
+pub fn nowMs() i64 {
+    return c.co_now_ms();
+}
+
+/// Sleep/yield for specified milliseconds
+pub fn sleepMs(ms: i32) void {
+    c.co_sleep_ms(ms);
+}
+
 // =============================================================================
 // High-level abstractions
 // =============================================================================
@@ -146,52 +156,45 @@ pub fn setThreadScheduler(sched: ?*Scheduler) void {
 pub const SchedulerPool = struct {
     const Self = @This();
 
-    /// Thread pool entry
-    const ThreadEntry = struct {
-        thread: std.Thread,
-        scheduler: *Scheduler,
-        shutdown: std.atomic.Value(bool),
-    };
-
     allocator: std.mem.Allocator,
-    threads: []ThreadEntry,
-    next_thread: std.atomic.Value(usize),
+    threads: []std.Thread,
+    schedulers: []*Scheduler,
+    shutdown: std.atomic.Value(bool),
 
     /// Initialize pool with N OS threads
     pub fn init(allocator: std.mem.Allocator, num_threads: usize) Error!Self {
-        const threads = try allocator.alloc(ThreadEntry, num_threads);
+        const threads = try allocator.alloc(std.Thread, num_threads);
         errdefer allocator.free(threads);
+
+        const schedulers = try allocator.alloc(*Scheduler, num_threads);
+        errdefer allocator.free(schedulers);
+
+        var shutdown = std.atomic.Value(bool).init(false);
 
         for (0..num_threads) |i| {
             // Create scheduler for this thread
-            const sched = schedulerCreate() catch |err| {
+            schedulers[i] = schedulerCreate() catch |err| {
                 // Cleanup already created schedulers
                 for (0..i) |j| {
-                    threads[j].shutdown.store(true, .release);
-                    threads[j].thread.join();
-                    schedulerDestroy(threads[j].scheduler);
+                    schedulerDestroy(schedulers[j]);
                 }
+                allocator.free(schedulers);
                 allocator.free(threads);
                 return err;
             };
 
-            threads[i] = .{
-                .thread = undefined,
-                .scheduler = sched,
-                .shutdown = std.atomic.Value(bool).init(false),
-            };
-
             // Spawn OS thread that will run scheduler
-            threads[i].thread = std.Thread.spawn(.{}, schedulerThread, .{
-                &threads[i],
+            threads[i] = std.Thread.spawn(.{}, schedulerThread, .{
+                schedulers[i],
+                &shutdown,
             }) catch |err| {
                 // Cleanup
                 for (0..i) |j| {
-                    threads[j].shutdown.store(true, .release);
-                    threads[j].thread.join();
-                    schedulerDestroy(threads[j].scheduler);
+                    threads[j].join();
+                    schedulerDestroy(schedulers[j]);
                 }
-                schedulerDestroy(sched);
+                schedulerDestroy(schedulers[i]);
+                allocator.free(schedulers);
                 allocator.free(threads);
                 return if (err == error.OutOfMemory) error.OutOfMemory else error.SchedulerCreateFailed;
             };
@@ -200,40 +203,46 @@ pub const SchedulerPool = struct {
         return Self{
             .allocator = allocator,
             .threads = threads,
-            .next_thread = std.atomic.Value(usize).init(0),
+            .schedulers = schedulers,
+            .shutdown = shutdown,
         };
     }
 
     /// Shutdown pool and free resources
     pub fn deinit(self: *Self) void {
         // Signal all threads to shutdown
-        for (self.threads) |*entry| {
-            entry.shutdown.store(true, .release);
-        }
+        self.shutdown.store(true, .release);
 
         // Wait for all threads
-        for (self.threads) |*entry| {
-            entry.thread.join();
-            schedulerDestroy(entry.scheduler);
+        for (self.threads) |t| {
+            t.join();
         }
 
+        // Destroy schedulers
+        for (self.schedulers) |s| {
+            schedulerDestroy(s);
+        }
+
+        self.allocator.free(self.schedulers);
         self.allocator.free(self.threads);
     }
 
     /// Enqueue a coroutine to one of the schedulers (round-robin)
     pub fn enqueue(self: *Self, co: *Coroutine) void {
-        const idx = self.next_thread.fetchAdd(1, .monotonic) % self.threads.len;
-        schedulerEnqueue(self.threads[idx].scheduler, co);
+        // Simple round-robin distribution
+        // In production: use work-stealing queue
+        const idx = @mod(@intFromPtr(co), self.schedulers.len);
+        schedulerEnqueue(self.schedulers[idx], co);
     }
 
     /// Thread entry point that runs scheduler
-    fn schedulerThread(entry: *ThreadEntry) void {
+    fn schedulerThread(sched: *Scheduler, shutdown: *std.atomic.Value(bool)) void {
         // Set thread-local scheduler
-        setThreadScheduler(entry.scheduler);
+        setThreadScheduler(sched);
 
         // Run until shutdown
-        while (!entry.shutdown.load(.acquire)) {
-            const remaining = schedulerRunOnce(entry.scheduler);
+        while (!shutdown.load(.acquire)) {
+            const remaining = schedulerRunOnce(sched);
 
             // If no work, yield to prevent busy loop
             if (remaining == 0) {
@@ -242,7 +251,7 @@ pub const SchedulerPool = struct {
         }
 
         // Drain remaining work
-        _ = schedulerRun(entry.scheduler, 1000);
+        _ = schedulerRun(sched, 1000);
     }
 };
 
@@ -254,13 +263,13 @@ test "basic coroutine lifecycle" {
     initThread();
     try std.testing.expect(threadInited());
 
-    // Simple worker that increments counter
+    // Simple worker that sets counter
     var counter: u64 = 0;
     const Worker = struct {
         fn run(arg: ?*anyopaque) callconv(.C) ?*anyopaque {
             const ptr: *u64 = @ptrCast(@alignCast(arg.?));
             ptr.* = 42;
-            co_yield();
+            yield();
             ptr.* += 1;
             return null;
         }
@@ -296,7 +305,7 @@ test "scheduler basic operations" {
             const ptr: *u64 = @ptrCast(@alignCast(arg.?));
             for (0..100) |_| {
                 ptr.* += 1;
-                co_yield();
+                yield();
             }
             return null;
         }
@@ -335,7 +344,7 @@ test "M:N scheduler pool" {
             const ptr: *std.atomic.Value(u64) = @ptrCast(@alignCast(arg.?));
             for (0..1000) |_| {
                 _ = ptr.fetchAdd(1, .monotonic);
-                co_yield();
+                yield();
             }
             return null;
         }
@@ -367,4 +376,12 @@ test "M:N scheduler pool" {
 test "yield from outside coroutine (no-op)" {
     // Calling yield from main thread should not crash
     yield();
+}
+
+test "time functions" {
+    const start = nowMs();
+    sleepMs(10);
+    const end = nowMs();
+
+    try std.testing.expect(end >= start);
 }
