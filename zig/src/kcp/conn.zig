@@ -22,7 +22,7 @@ const channel_pkg = @import("channel");
 const idle_timeout_ms: u64 = 15_000;
 const idle_timeout_pure_ms: u64 = 30_000;
 const write_buf_capacity: usize = 16 * 1024 * 1024; // 16MB write buffer - large enough for all test data
-const max_send_chunk: usize = 65536; // 64KB chunks for KCP send (larger = fewer syscalls)
+const max_send_chunk: usize = 32 * 1024; // 32KB chunks
 
 // ============================================================================
 // KcpConn
@@ -157,16 +157,18 @@ pub fn KcpConn(comptime Rt: type) type {
         }
 
         /// Write with coalescing. Single-copy from user data to write_buf.
-        /// If write_buf is full, notifies run loop and retries immediately (no blocking).
+        /// If write_buf is full, waits for drainWriteBuf to swap it out.
         pub fn write(self: *Self, data: []const u8) !usize {
             if (self.closed.load(.acquire)) return error.Closed;
 
             self.write_mutex.lock();
-            defer self.write_mutex.unlock();
 
             var offset: usize = 0;
             while (offset < data.len) {
-                if (self.closed.load(.acquire)) return error.Closed;
+                if (self.closed.load(.acquire)) {
+                    self.write_mutex.unlock();
+                    return error.Closed;
+                }
 
                 const remaining = data.len - offset;
                 const available = write_buf_capacity - self.write_buf.items.len;
@@ -177,13 +179,18 @@ pub fn KcpConn(comptime Rt: type) type {
                     try self.write_buf.appendSlice(self.allocator, data[offset..][0..to_write]);
                     offset += to_write;
                 } else {
-                    // Buffer full: notify run loop to drain and retry immediately
-                    self.write_mutex.unlock();
-                    self.notifyWake();
-                    std.atomic.spinLoopHint();
-                    self.write_mutex.lock();
+                    // Buffer full: wait for drainWriteBuf to make space
+                    // drainWriteBuf will broadcast after swapping
+                    if (comptime @hasDecl(Rt.Condition, "timedWait")) {
+                        _ = self.write_cond.timedWait(&self.write_mutex, 5 * std.time.ns_per_ms);
+                    } else {
+                        self.write_mutex.unlock();
+                        Rt.sleepMs(5);
+                        self.write_mutex.lock();
+                    }
                 }
             }
+            self.write_mutex.unlock();
             // Notify run loop to process the new data
             self.notifyWake();
             return data.len;
@@ -227,37 +234,47 @@ pub fn KcpConn(comptime Rt: type) type {
         }
 
         /// Drain write_buf and send to KCP. Called under run loop's exclusive access.
-        /// Minimizes lock hold time by sending entire buffer at once.
-        fn drainWriteBuf(self: *Self) bool {
+        /// **Critical optimization**: swap buffer out and unlock BEFORE kcp.send()
+        /// to allow writer thread to continue appending data in parallel.
+        fn drainWriteBuf(self: *Self, swap_buf: *std.ArrayListUnmanaged(u8)) bool {
             self.write_mutex.lock();
-            defer self.write_mutex.unlock();
 
-            if (self.write_buf.items.len == 0) return false;
+            if (self.write_buf.items.len == 0) {
+                self.write_mutex.unlock();
+                return false;
+            }
 
-            // Copy data out of the mutex, then release lock before calling KCP
-            // This reduces contention with write()
-            const data_to_send = self.write_buf.items;
-            
-            // Note: We must send while still holding the lock because we clear after
-            // But we can optimize by sending in chunks to avoid holding lock too long
+            // Swap write_buf with the reusable swap_buf
+            // This moves all data to swap_buf and leaves write_buf empty with capacity
+            std.mem.swap(std.ArrayListUnmanaged(u8), &self.write_buf, swap_buf);
+
+            // CRITICAL: Unlock BEFORE kcp.send() to allow writer to continue!
+            // Signal any waiting writers that space is available
+            self.write_cond.broadcast();
+            self.write_mutex.unlock();
+
+            // Send all data (now without holding any lock)
+            // Send in 32KB chunks - balance between syscall overhead and KCP efficiency
             var offset: usize = 0;
-            while (offset < data_to_send.len) {
-                const end = @min(offset + max_send_chunk, data_to_send.len);
-                _ = self.kcp.send(data_to_send[offset..end]);
+            while (offset < swap_buf.items.len) {
+                const end = @min(offset + max_send_chunk, swap_buf.items.len);
+                _ = self.kcp.send(swap_buf.items[offset..end]);
                 offset = end;
             }
 
-            // Clear buffer but retain capacity
-            self.write_buf.clearRetainingCapacity();
-
-            // Signal writers that space is available (backpressure relief)
-            self.write_cond.broadcast();
+            // Clear but retain capacity for reuse (no deinit!)
+            swap_buf.clearRetainingCapacity();
             return true;
         }
 
         // ── Run loop ────────────────────────────────────────────────────
 
         fn runLoop(self: *Self) void {
+            // Reusable buffer for swapping with write_buf
+            // This avoids repeated allocation/deallocation
+            var swap_buf: std.ArrayListUnmanaged(u8) = .{};
+            defer swap_buf.deinit(self.allocator);
+
             while (!self.closed.load(.acquire)) {
                 if (self.kcp.state() < 0) {
                     self.close();
@@ -286,7 +303,7 @@ pub fn KcpConn(comptime Rt: type) type {
                 }
 
                 // Drain write buffer — single batch send (no scratch buffer!)
-                if (self.drainWriteBuf()) {
+                if (self.drainWriteBuf(&swap_buf)) {
                     did_work = true;
                 }
 
