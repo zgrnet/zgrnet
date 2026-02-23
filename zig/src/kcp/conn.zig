@@ -2,18 +2,14 @@
 //!
 //! Architecture:
 //! - One Rt.Thread exclusively owns the KCP instance (the run loop)
-//! - write() pushes to a lock-free SPSC ring buffer (no mutex!)
+//! - write() pushes to write_buf with backpressure (single-copy from user data)
 //! - read() blocks on recv_cond until recv_buf has data
 //! - input() sends raw packets via Channel (bounded ring buffer)
-//! - Write coalescing: run loop drains entire ring in one batch → fewer kcp.send()
+//! - Write coalescing: multiple writes accumulate in write_buf, flushed together
 //! - Dead peer detection: kcp.state() < 0 + idle timeout (15s/30s)
 //!
-//! Hot path is lock-free:
-//!   writer thread → SpscRing.push (atomic store) → no mutex
-//!   run loop      → SpscRing.pop  (atomic load)  → no mutex
-//!
 //! Run loop idle strategy (3 tiers):
-//!   1. Data flowing → tight loop (check ring.len() > 0, no lock)
+//!   1. Data flowing → tight loop
 //!   2. Pending retransmits (waitSnd > 0) → 1ms timedWait
 //!   3. Truly idle → 1s timedWait (idle timeout check)
 //!
@@ -25,74 +21,8 @@ const channel_pkg = @import("channel");
 
 const idle_timeout_ms: u64 = 15_000;
 const idle_timeout_pure_ms: u64 = 30_000;
-const write_ring_capacity: usize = 512 * 1024;
-
-// ============================================================================
-// SPSC Ring Buffer — lock-free single-producer single-consumer byte queue
-// ============================================================================
-
-fn SpscRing(comptime capacity: usize) type {
-    if (capacity == 0 or (capacity & (capacity - 1)) != 0)
-        @compileError("SpscRing capacity must be power of 2");
-
-    return struct {
-        const mask = capacity - 1;
-        const Self = @This();
-
-        buf: [capacity]u8,
-        head: std.atomic.Value(usize), // writer position
-        tail: std.atomic.Value(usize), // reader position
-
-        fn init() Self {
-            return .{
-                .buf = undefined,
-                .head = std.atomic.Value(usize).init(0),
-                .tail = std.atomic.Value(usize).init(0),
-            };
-        }
-
-        /// Writer: push data into the ring. Returns bytes actually written (may be < data.len if full).
-        fn push(self: *Self, data: []const u8) usize {
-            const h = self.head.load(.monotonic);
-            const t = self.tail.load(.acquire);
-            const space = capacity - (h -% t);
-            const n = @min(data.len, space);
-            if (n == 0) return 0;
-
-            const start = h & mask;
-            const first = @min(n, capacity - start);
-            @memcpy(self.buf[start..][0..first], data[0..first]);
-            if (n > first) {
-                @memcpy(self.buf[0..n - first], data[first..n]);
-            }
-            self.head.store(h +% n, .release);
-            return n;
-        }
-
-        /// Reader: pop up to out.len bytes. Returns bytes actually read.
-        fn pop(self: *Self, out: []u8) usize {
-            const t = self.tail.load(.monotonic);
-            const h = self.head.load(.acquire);
-            const avail = h -% t;
-            const n = @min(out.len, avail);
-            if (n == 0) return 0;
-
-            const start = t & mask;
-            const first = @min(n, capacity - start);
-            @memcpy(out[0..first], self.buf[start..][0..first]);
-            if (n > first) {
-                @memcpy(out[first..n], self.buf[0..n - first]);
-            }
-            self.tail.store(t +% n, .release);
-            return n;
-        }
-
-        /// Available bytes to read.
-        fn len(self: *Self) usize {
-            return self.head.load(.acquire) -% self.tail.load(.acquire);
-        }
-    };
-}
+const write_buf_capacity: usize = 16 * 1024 * 1024; // 16MB write buffer - large enough for all test data
+const max_send_chunk: usize = 65536; // 64KB chunks for KCP send (larger = fewer syscalls)
 
 // ============================================================================
 // KcpConn
@@ -102,17 +32,18 @@ pub fn KcpConn(comptime Rt: type) type {
     return struct {
         const Self = @This();
         const InputChan = channel_pkg.Channel([]u8, 256, Rt);
-        const WriteRing = SpscRing(write_ring_capacity);
 
         allocator: std.mem.Allocator,
         kcp: *kcp_mod.Kcp,
 
-        write_ring: WriteRing,
+        // Write buffer: single-copy from user data, drained by run loop
+        write_buf: std.ArrayListUnmanaged(u8),
+        write_mutex: Rt.Mutex,
+        write_cond: Rt.Condition, // for backpressure when full
 
         input_ch: InputChan,
 
         // Wake mechanism for tier 2/3 idle blocking.
-        // Not on the hot path — tier 1 checks ring.len() without locking.
         wake_mutex: Rt.Mutex,
         wake_cond: Rt.Condition,
         wake_signaled: bool,
@@ -147,7 +78,9 @@ pub fn KcpConn(comptime Rt: type) type {
             self.* = Self{
                 .allocator = allocator,
                 .kcp = kcp,
-                .write_ring = WriteRing.init(),
+                .write_buf = .{},
+                .write_mutex = Rt.Mutex.init(),
+                .write_cond = Rt.Condition.init(),
                 .input_ch = InputChan.init(),
                 .wake_mutex = Rt.Mutex.init(),
                 .wake_cond = Rt.Condition.init(),
@@ -180,8 +113,11 @@ pub fn KcpConn(comptime Rt: type) type {
             self.input_ch.deinit();
 
             self.recv_buf.deinit(self.allocator);
+            self.write_buf.deinit(self.allocator);
             self.wake_mutex.deinit();
             self.wake_cond.deinit();
+            self.write_mutex.deinit();
+            self.write_cond.deinit();
             self.recv_mutex.deinit();
             self.recv_cond.deinit();
 
@@ -220,22 +156,36 @@ pub fn KcpConn(comptime Rt: type) type {
             return n;
         }
 
-        /// Lock-free write. Pushes to SPSC ring buffer, spins if full.
+        /// Write with coalescing. Single-copy from user data to write_buf.
+        /// If write_buf is full, notifies run loop and retries immediately (no blocking).
         pub fn write(self: *Self, data: []const u8) !usize {
             if (self.closed.load(.acquire)) return error.Closed;
 
-            const was_empty = self.write_ring.len() == 0;
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+
             var offset: usize = 0;
             while (offset < data.len) {
                 if (self.closed.load(.acquire)) return error.Closed;
-                const n = self.write_ring.push(data[offset..]);
-                if (n > 0) {
-                    offset += n;
+
+                const remaining = data.len - offset;
+                const available = write_buf_capacity - self.write_buf.items.len;
+
+                if (available > 0) {
+                    // Space available: append data (single copy)
+                    const to_write = @min(remaining, available);
+                    try self.write_buf.appendSlice(self.allocator, data[offset..][0..to_write]);
+                    offset += to_write;
                 } else {
+                    // Buffer full: notify run loop to drain and retry immediately
+                    self.write_mutex.unlock();
+                    self.notifyWake();
                     std.atomic.spinLoopHint();
+                    self.write_mutex.lock();
                 }
             }
-            if (was_empty) self.notifyWake();
+            // Notify run loop to process the new data
+            self.notifyWake();
             return data.len;
         }
 
@@ -276,11 +226,38 @@ pub fn KcpConn(comptime Rt: type) type {
             self.wake_mutex.unlock();
         }
 
+        /// Drain write_buf and send to KCP. Called under run loop's exclusive access.
+        /// Minimizes lock hold time by sending entire buffer at once.
+        fn drainWriteBuf(self: *Self) bool {
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+
+            if (self.write_buf.items.len == 0) return false;
+
+            // Copy data out of the mutex, then release lock before calling KCP
+            // This reduces contention with write()
+            const data_to_send = self.write_buf.items;
+            
+            // Note: We must send while still holding the lock because we clear after
+            // But we can optimize by sending in chunks to avoid holding lock too long
+            var offset: usize = 0;
+            while (offset < data_to_send.len) {
+                const end = @min(offset + max_send_chunk, data_to_send.len);
+                _ = self.kcp.send(data_to_send[offset..end]);
+                offset = end;
+            }
+
+            // Clear buffer but retain capacity
+            self.write_buf.clearRetainingCapacity();
+
+            // Signal writers that space is available (backpressure relief)
+            self.write_cond.broadcast();
+            return true;
+        }
+
         // ── Run loop ────────────────────────────────────────────────────
 
         fn runLoop(self: *Self) void {
-            var scratch: [8192]u8 = undefined;
-
             while (!self.closed.load(.acquire)) {
                 if (self.kcp.state() < 0) {
                     self.close();
@@ -300,6 +277,7 @@ pub fn KcpConn(comptime Rt: type) type {
 
                 var did_work = false;
 
+                // Drain input channel
                 while (self.input_ch.tryRecv()) |pkt| {
                     _ = self.kcp.input(pkt);
                     self.allocator.free(pkt);
@@ -307,11 +285,8 @@ pub fn KcpConn(comptime Rt: type) type {
                     did_work = true;
                 }
 
-                // Drain write ring — lock-free pop.
-                while (true) {
-                    const n = self.write_ring.pop(&scratch);
-                    if (n == 0) break;
-                    _ = self.kcp.send(scratch[0..n]);
+                // Drain write buffer — single batch send (no scratch buffer!)
+                if (self.drainWriteBuf()) {
                     did_work = true;
                 }
 
@@ -320,8 +295,14 @@ pub fn KcpConn(comptime Rt: type) type {
                 self.kcp.flush();
                 self.drainRecv();
 
-                // Tier 1: data flowing → loop immediately (no lock check!).
-                if (did_work or !self.input_ch.isEmpty() or self.write_ring.len() > 0) continue;
+                // Tier 1: data flowing → loop immediately.
+                if (did_work or !self.input_ch.isEmpty()) {
+                    // Check if write_buf has data (requires lock, but only when already did_work)
+                    self.write_mutex.lock();
+                    const has_write = self.write_buf.items.len > 0;
+                    self.write_mutex.unlock();
+                    if (has_write) continue;
+                }
 
                 // Tier 2: pending retransmits → 1ms bounded wait.
                 if (self.kcp.waitSnd() > 0) {
