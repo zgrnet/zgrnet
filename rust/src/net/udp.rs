@@ -155,6 +155,9 @@ pub struct UdpOptions {
     pub bind_addr: Option<String>,
     /// Allow connections from unknown peers.
     pub allow_unknown: bool,
+    /// Socket configuration (buffer sizes, GSO, GRO, busy-poll).
+    /// If None, uses default configuration.
+    pub socket_config: Option<super::sockopt::SocketConfig>,
 }
 
 impl UdpOptions {
@@ -180,6 +183,7 @@ pub struct UDP {
     socket: UdpSocket,
     local_key: KeyPair,
     allow_unknown: bool,
+    socket_config: super::sockopt::SocketConfig,
 
     // Relay routing and forwarding
     route_table: RwLock<Option<Arc<relay::RouteTable>>>,
@@ -207,7 +211,9 @@ impl UDP {
         let bind_addr = opts.bind_addr.as_deref().unwrap_or("0.0.0.0:0");
         let socket = UdpSocket::bind(bind_addr)?;
 
-        super::sockopt::apply_socket_options(&socket, &super::sockopt::SocketConfig::default());
+        // Apply socket configuration (user-provided or default)
+        let socket_config = opts.socket_config.unwrap_or_default();
+        super::sockopt::apply_socket_options(&socket, &socket_config);
 
         // Set read timeout for non-blocking behavior in receive loop
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -216,6 +222,7 @@ impl UDP {
             socket,
             local_key: key,
             allow_unknown: opts.allow_unknown,
+            socket_config,
             route_table: RwLock::new(None),
             local_metrics: Mutex::new(relay::NodeMetrics::default()),
             peers: RwLock::new(HashMap::new()),
@@ -374,14 +381,134 @@ impl UDP {
         // Build transport message
         let msg = build_transport_message(session.remote_index(), nonce, &ciphertext);
 
-        // Send
-        let n = self.socket.send_to(&msg, endpoint)?;
+        // Use GSO for large messages if enabled (Linux only)
+        let n = if self.socket_config.gso && msg.len() > super::sockopt::DEFAULT_GSO_SEGMENT as usize {
+            self.send_to_gso(&msg, endpoint)?
+        } else {
+            self.socket.send_to(&msg, endpoint)?
+        };
 
         // Update stats
         self.total_tx.fetch_add(n as u64, Ordering::SeqCst);
         p.tx_bytes += n as u64;
 
         Ok(())
+    }
+
+    /// Sends a message using GSO (Generic Segmentation Offload).
+    /// Uses sendmsg with UDP_SEGMENT cmsg to enable per-send segmentation.
+    /// Only works on Linux 4.18+ with supported NICs.
+    #[cfg(target_os = "linux")]
+    fn send_to_gso(&self, data: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        use std::os::unix::io::AsRawFd;
+        use std::ptr;
+        use std::mem;
+
+        let fd = self.socket.as_raw_fd();
+        let segment_size: i32 = super::sockopt::DEFAULT_GSO_SEGMENT;
+
+        // Prepare iovec
+        let iov = libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        };
+
+        // Prepare cmsg buffer: cmsghdr + int32 segment size
+        let cmsg_len = unsafe { libc::CMSG_SPACE(mem::size_of::<i32>() as u32) } as usize;
+        let mut cmsg_buf = vec![0u8; cmsg_len];
+
+        // Fill cmsg header
+        let cmsg_hdr = unsafe { libc::CMSG_FIRSTHDR(&mut cmsg_buf as *mut _ as *mut libc::msghdr) };
+        if !cmsg_hdr.is_null() {
+            unsafe {
+                (*cmsg_hdr).cmsg_level = libc::IPPROTO_UDP;
+                (*cmsg_hdr).cmsg_type = super::sockopt::UDP_SEGMENT;
+                (*cmsg_hdr).cmsg_len = libc::CMSG_LEN(mem::size_of::<i32>() as u32) as usize;
+
+                // Copy segment size into cmsg data
+                let data_ptr = libc::CMSG_DATA(cmsg_hdr) as *mut i32;
+                ptr::write_unaligned(data_ptr, segment_size);
+            }
+        }
+
+        // Prepare sockaddr
+        let (sockaddr, sockaddr_len): (mem::MaybeUninit<libc::sockaddr_storage>, libc::socklen_t) = match addr {
+            SocketAddr::V4(v4) => {
+                let sa = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: mem::transmute::<[u8; 4], libc::in_addr>(v4.ip().octets()),
+                    sin_zero: [0; 8],
+                };
+                let sa_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &sa as *const _ as *const u8,
+                        mem::size_of::<libc::sockaddr_in>(),
+                    )
+                };
+                let mut storage = mem::MaybeUninit::<libc::sockaddr_storage>::uninit();
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        sa_bytes.as_ptr(),
+                        storage.as_mut_ptr() as *mut u8,
+                        sa_bytes.len(),
+                    );
+                }
+                (storage, mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+            }
+            SocketAddr::V6(v6) => {
+                let sa = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: mem::transmute::<[u8; 16], libc::in6_addr>(v6.ip().octets()),
+                    sin6_scope_id: v6.scope_id(),
+                };
+                let sa_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &sa as *const _ as *const u8,
+                        mem::size_of::<libc::sockaddr_in6>(),
+                    )
+                };
+                let mut storage = mem::MaybeUninit::<libc::sockaddr_storage>::uninit();
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        sa_bytes.as_ptr(),
+                        storage.as_mut_ptr() as *mut u8,
+                        sa_bytes.len(),
+                    );
+                }
+                (storage, mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+            }
+        };
+
+        // Prepare msghdr
+        let msg = libc::msghdr {
+            msg_name: sockaddr.as_ptr() as *mut libc::c_void,
+            msg_namelen: sockaddr_len,
+            msg_iov: &iov as *const _ as *mut libc::iovec,
+            msg_iovlen: 1,
+            msg_control: cmsg_buf.as_ptr() as *mut libc::c_void,
+            msg_controllen: cmsg_len,
+            msg_flags: 0,
+        };
+
+        // Send
+        let n = unsafe { libc::sendmsg(fd, &msg, 0) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    /// Non-Linux fallback: GSO not supported
+    #[cfg(not(target_os = "linux"))]
+    fn send_to_gso(&self, _data: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "GSO is only supported on Linux",
+        ))
     }
 
     /// Opens a new KCP stream to the specified peer.

@@ -171,6 +171,9 @@ type UDP struct {
 	socket   *net.UDPConn
 	localKey *noise.KeyPair
 
+	// Socket configuration (for GSO/GRO, busy-poll, buffer sizes)
+	socketConfig SocketConfig
+
 	// Options
 	allowUnknown bool
 
@@ -241,6 +244,7 @@ type options struct {
 	decryptedChanSize int // 0 = use DecryptedChanSize constant
 	routeTable        *relay.RouteTable
 	localMetrics      relay.NodeMetrics
+	socketConfig      SocketConfig
 }
 
 // WithBindAddr sets the local address to bind to.
@@ -307,6 +311,14 @@ func WithDecryptedChanSize(n int) Option {
 	}
 }
 
+// WithSocketConfig sets the socket configuration (GSO, GRO, busy-poll, buffer sizes).
+// Default is DefaultSocketConfig().
+func WithSocketConfig(cfg SocketConfig) Option {
+	return func(o *options) {
+		o.socketConfig = cfg
+	}
+}
+
 // NewUDP creates a new UDP network.
 func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 	if key == nil {
@@ -332,7 +344,9 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		return nil, err
 	}
 
-	ApplySocketOptions(socket, DefaultSocketConfig())
+	// Apply socket configuration (ApplySocketOptions handles zero values individually)
+	socketConfig := o.socketConfig
+	ApplySocketOptions(socket, socketConfig)
 
 	rawSize := o.rawChanSize
 	if rawSize <= 0 {
@@ -346,6 +360,7 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 	u := &UDP{
 		socket:       socket,
 		localKey:     key,
+		socketConfig: socketConfig,
 		allowUnknown: o.allowUnknown,
 		routeTable:   o.routeTable,
 		localMetrics: o.localMetrics,
