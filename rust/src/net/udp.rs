@@ -414,21 +414,20 @@ impl UDP {
         };
 
         // Prepare cmsg buffer: cmsghdr + u16 segment size
-        let cmsg_len = unsafe { libc::CMSG_SPACE(mem::size_of::<u16>() as u32) } as usize;
-        let mut cmsg_buf = vec![0u8; cmsg_len];
+        let cmsg_space = unsafe { libc::CMSG_SPACE(mem::size_of::<u16>() as u32) } as usize;
+        let mut cmsg_buf = vec![0u8; cmsg_space];
 
-        // Fill cmsg header
-        let cmsg_hdr = unsafe { libc::CMSG_FIRSTHDR(&mut cmsg_buf as *mut _ as *mut libc::msghdr) };
-        if !cmsg_hdr.is_null() {
-            unsafe {
-                (*cmsg_hdr).cmsg_level = libc::IPPROTO_UDP;
-                (*cmsg_hdr).cmsg_type = super::sockopt::UDP_SEGMENT;
-                (*cmsg_hdr).cmsg_len = libc::CMSG_LEN(mem::size_of::<u16>() as u32) as usize;
+        // Fill cmsg header directly (cmsg_buf starts with cmsghdr)
+        // This avoids the incorrect CMSG_FIRSTHDR usage on Vec<u8>
+        let cmsg_hdr = cmsg_buf.as_mut_ptr() as *mut libc::cmsghdr;
+        unsafe {
+            (*cmsg_hdr).cmsg_level = libc::IPPROTO_UDP;
+            (*cmsg_hdr).cmsg_type = super::sockopt::UDP_SEGMENT;
+            (*cmsg_hdr).cmsg_len = libc::CMSG_LEN(mem::size_of::<u16>() as u32) as usize;
 
-                // Copy segment size into cmsg data
-                let data_ptr = libc::CMSG_DATA(cmsg_hdr) as *mut u16;
-                ptr::write_unaligned(data_ptr, segment_size);
-            }
+            // Write segment size into cmsg data area
+            let data_ptr = libc::CMSG_DATA(cmsg_hdr) as *mut u16;
+            ptr::write_unaligned(data_ptr, segment_size);
         }
 
         // Prepare sockaddr
@@ -489,7 +488,7 @@ impl UDP {
             msg_iov: &iov as *const _ as *mut libc::iovec,
             msg_iovlen: 1,
             msg_control: cmsg_buf.as_ptr() as *mut libc::c_void,
-            msg_controllen: cmsg_len,
+            msg_controllen: cmsg_space,
             msg_flags: 0,
         };
 
