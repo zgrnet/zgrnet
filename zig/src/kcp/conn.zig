@@ -1346,3 +1346,150 @@ test "bench spsc ring vs mpsc channel" {
     std.debug.print("\nConclusion: Compare [1] vs [2] to see atomic vs blocking tradeoff\n", .{});
     std.debug.print("Expected: Channel [2] should be faster due to blocking (no spin CPU waste)\n", .{});
 }
+
+test "bench multi-producer contention" {
+    // Purpose: Test SPSC vs MPSC under multi-producer contention
+    // This simulates real KCP + Yamux scenario where:
+    // - recvLoop sends WindowUpdate frames
+    // - user thread writes data
+    // Both need to send through the same channel
+    if (@import("builtin").os.tag == .freestanding) return;
+    const allocator = std.testing.allocator;
+
+    const num_producers: usize = 4;
+    const chunk_size: usize = 4096;
+    const total_per_producer: usize = 2 * 1024 * 1024; // 2MB each
+    const total: usize = num_producers * total_per_producer;
+
+    // Prepare test data for each producer
+    const src = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(src);
+    @memset(src, 0x58);
+
+    std.debug.print("\n[Multi-Producer Test] {d} producers x {d}MB each\n", .{ num_producers, total_per_producer / 1024 / 1024 });
+
+    // Test 1: Multiple producers to single SPSC Ring (each producer has own ring?)
+    // Actually SPSC doesn't support multi-producer, so this shows the limitation
+    {
+        std.debug.print("[1] SPSC Ring - NOT SUPPORTED for multi-producer\n", .{});
+        std.debug.print("    (SPSC requires 1:1 mapping, would need {d} rings)\n", .{ num_producers });
+    }
+
+    // Test 2: Multiple producers to single MPSC Channel
+    {
+        const Chunk = struct {
+            data: [4096]u8,
+            len: usize,
+        };
+        const Ch = channel_pkg.Channel(Chunk, 256, TestRuntime); // Larger buffer for multi-producer
+
+        var ch = Ch.init();
+        defer ch.deinit();
+
+        const Producer = struct {
+            fn run(c: *Ch, data: []const u8, t: usize) void {
+                var sent: usize = 0;
+                while (sent < t) {
+                    var chunk: Chunk = undefined;
+                    const n = @min(data.len, 4096);
+                    @memcpy(&chunk.data, data[0..n]);
+                    chunk.len = n;
+                    c.send(chunk) catch return;
+                    sent += n;
+                }
+            }
+        };
+
+        const Consumer = struct {
+            fn run(c: *Ch, t: usize) void {
+                var recv: usize = 0;
+                while (recv < t) {
+                    const chunk = c.recv() orelse break;
+                    recv += chunk.len;
+                }
+            }
+        };
+
+        const start = std.time.nanoTimestamp();
+        var producers: [4]std.Thread = undefined;
+        for (0..num_producers) |i| {
+            producers[i] = std.Thread.spawn(.{}, Producer.run, .{ &ch, src, total_per_producer }) catch continue;
+        }
+        const consumer = std.Thread.spawn(.{}, Consumer.run, .{ &ch, total }) catch return;
+
+        for (0..num_producers) |i| {
+            producers[i].join();
+        }
+        // Close channel to signal consumer
+        ch.close();
+        consumer.join();
+
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+        const mbps = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+        std.debug.print("[2] MPSC Channel (multi-producer) : {d:>6.1} MB/s total\n", .{mbps});
+    }
+
+    // Test 3: Multiple SPSC rings (one per producer) merged by consumer
+    // This simulates the old approach: separate queues + selector
+    {
+        const Ring = SpscRing(128 * 1024); // 128KB per ring
+        const num_rings = 4;
+
+        var rings: [num_rings]Ring = undefined;
+        for (0..num_rings) |i| {
+            rings[i] = Ring.init();
+        }
+
+        const Producer = struct {
+            fn run(r: *Ring, data: []const u8, t: usize) void {
+                var sent: usize = 0;
+                while (sent < t) {
+                    const n = r.push(data);
+                    if (n == 0) {
+                        std.atomic.spinLoopHint();
+                        continue;
+                    }
+                    sent += n;
+                }
+            }
+        };
+
+        const Consumer = struct {
+            fn run(rings_ptr: *[num_rings]Ring, t: usize) void {
+                var buf: [4096]u8 = undefined;
+                var recv: usize = 0;
+                var idx: usize = 0;
+                while (recv < t) {
+                    // Round-robin poll all rings (simulating selector)
+                    const n = rings_ptr[idx].pop(&buf);
+                    if (n > 0) {
+                        recv += n;
+                    }
+                    idx = (idx + 1) % num_rings;
+                    if (n == 0) {
+                        std.atomic.spinLoopHint();
+                    }
+                }
+            }
+        };
+
+        const start = std.time.nanoTimestamp();
+        var producers: [num_rings]std.Thread = undefined;
+        for (0..num_rings) |i| {
+            producers[i] = std.Thread.spawn(.{}, Producer.run, .{ &rings[i], src, total_per_producer }) catch continue;
+        }
+        const consumer = std.Thread.spawn(.{}, Consumer.run, .{ &rings, total }) catch return;
+
+        for (0..num_rings) |i| {
+            producers[i].join();
+        }
+        consumer.join();
+
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+        const mbps = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+        std.debug.print("[3] {d}x SPSC Ring (round-robin poll) : {d:>6.1} MB/s total\n", .{ num_rings, mbps });
+    }
+
+    std.debug.print("\nConclusion: MPSC Channel [2] provides native multi-producer support\n", .{});
+    std.debug.print("vs multiple SPSC rings [3] requiring complex polling/merging logic\n", .{});
+}
