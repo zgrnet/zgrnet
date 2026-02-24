@@ -291,7 +291,7 @@ pub fn sendToGSO(fd: posix.socket_t, data: []const u8, dest_addr: [4]u8, dest_po
 
     // Write segment size into cmsg data area
     const cmsg_data: [*]u8 = linux.CMSG_DATA(cmsg);
-    std.mem.writeInt(u16, cmsg_data[0..2], segment_size, .little);
+    std.mem.writeInt(u16, cmsg_data[0..2], segment_size, .native);
 
     // Prepare msghdr
     const msg = linux.msghdr{

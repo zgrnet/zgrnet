@@ -40,8 +40,8 @@ func (u *UDP) sendToGSO(data []byte, addr *net.UDPAddr) (int, error) {
 		}
 
 		// Write segment size (uint16) into cmsg data area
-		// unix.CmsgData returns unsafe.Pointer to the data portion
-		dataPtr := unsafe.Pointer(uintptr(unsafe.Pointer(cmsg)) + unix.SizeofCmsghdr)
+		// cmsg data starts after the cmsghdr with proper alignment
+		dataPtr := unsafe.Pointer(uintptr(unsafe.Pointer(cmsg)) + uintptr(unix.SizeofCmsghdr))
 		dataBuf := (*[2]byte)(dataPtr)
 		binary.NativeEndian.PutUint16(dataBuf[:], uint16(DefaultGSOSegment))
 

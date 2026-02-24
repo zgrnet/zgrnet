@@ -183,14 +183,14 @@ func (u *UDP) sendDirect(peer *peerState, protocol byte, data []byte) error {
 	// Use GSO for large messages if enabled (Linux only)
 	if runtime.GOOS == "linux" && u.socketConfig.GSO && len(msg) > DefaultGSOSegment {
 		n, err := u.sendToGSO(msg, endpoint)
-		if err != nil {
-			return err
+		if err == nil {
+			u.totalTx.Add(uint64(n))
+			peer.mu.Lock()
+			peer.txBytes += uint64(n)
+			peer.mu.Unlock()
+			return nil
 		}
-		u.totalTx.Add(uint64(n))
-		peer.mu.Lock()
-		peer.txBytes += uint64(n)
-		peer.mu.Unlock()
-		return nil
+		// Fallback to regular UDP send if GSO fails
 	}
 
 	n, err := u.socket.WriteToUDP(msg, endpoint)
