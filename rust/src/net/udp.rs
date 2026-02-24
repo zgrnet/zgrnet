@@ -183,6 +183,7 @@ pub struct UDP {
     socket: UdpSocket,
     local_key: KeyPair,
     allow_unknown: bool,
+    #[allow(dead_code)] // retained for future per-send GSO batch API
     socket_config: super::sockopt::SocketConfig,
 
     // Relay routing and forwarding
@@ -396,6 +397,7 @@ impl UDP {
     /// Uses sendmsg with UDP_SEGMENT cmsg to enable per-send segmentation.
     /// Only works on Linux 4.18+ with supported NICs.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // retained for future batch-send API
     fn send_to_gso(&self, data: &[u8], addr: SocketAddr) -> io::Result<usize> {
         use std::os::unix::io::AsRawFd;
         use std::ptr;
@@ -500,6 +502,7 @@ impl UDP {
 
     /// Non-Linux fallback: GSO not supported
     #[cfg(not(target_os = "linux"))]
+    #[allow(dead_code)]
     fn send_to_gso(&self, _data: &[u8], _addr: SocketAddr) -> io::Result<usize> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
