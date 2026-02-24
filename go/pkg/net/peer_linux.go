@@ -22,7 +22,7 @@ func (u *UDP) sendToGSO(data []byte, addr *net.UDPAddr) (int, error) {
 	var n int
 	var sendErr error
 
-	ctlErr := rawConn.Control(func(fd uintptr) {
+	writeErr := rawConn.Write(func(fd uintptr) bool {
 		// Prepare cmsg buffer using unix.CmsgSpace for correct alignment
 		// UDP_SEGMENT expects a uint16 segment size
 		cmsgBuf := make([]byte, unix.CmsgSpace(2))
@@ -58,12 +58,14 @@ func (u *UDP) sendToGSO(data []byte, addr *net.UDPAddr) (int, error) {
 		}
 
 		n, sendErr = unix.SendmsgN(int(fd), data, cmsgBuf, sa, 0)
+		// Retry when socket is temporarily not writable.
+		return sendErr != unix.EAGAIN && sendErr != unix.EWOULDBLOCK
 	})
 
-	// Handle Control error - if Control fails, the closure may not run,
+	// Handle Write error - if Write fails, the closure may not run,
 	// leaving n=0 and sendErr=nil, causing silent packet loss
-	if ctlErr != nil {
-		return 0, ctlErr
+	if writeErr != nil {
+		return 0, writeErr
 	}
 
 	if sendErr != nil {

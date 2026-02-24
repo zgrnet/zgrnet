@@ -64,20 +64,10 @@ func applyPlatformOptions(conn *net.UDPConn, cfg SocketConfig, report *Optimizat
 	}
 
 	if cfg.GSO {
-		var setErr error
-		raw.Control(func(fd uintptr) {
-			setErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_SEGMENT, DefaultGSOSegment)
+		report.Entries = append(report.Entries, OptimizationEntry{
+			Name: "UDP_GSO", Applied: true,
+			Detail: fmt.Sprintf("per-send UDP_SEGMENT=%d via sendmsg cmsg", DefaultGSOSegment),
 		})
-		if setErr != nil {
-			report.Entries = append(report.Entries, OptimizationEntry{
-				Name: "UDP_GSO", Err: setErr,
-			})
-		} else {
-			report.Entries = append(report.Entries, OptimizationEntry{
-				Name: "UDP_GSO", Applied: true,
-				Detail: fmt.Sprintf("UDP_SEGMENT=%d", DefaultGSOSegment),
-			})
-		}
 	}
 }
 
