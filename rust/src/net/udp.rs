@@ -383,7 +383,10 @@ impl UDP {
 
         // Use GSO for large messages if enabled (Linux only)
         let n = if cfg!(target_os = "linux") && self.socket_config.gso && msg.len() > super::sockopt::DEFAULT_GSO_SEGMENT as usize {
-            self.send_to_gso(&msg, endpoint)?
+            match self.send_to_gso(&msg, endpoint) {
+                Ok(n) => n,
+                Err(_) => self.socket.send_to(&msg, endpoint)?, // Fallback to regular send
+            }
         } else {
             self.socket.send_to(&msg, endpoint)?
         };
