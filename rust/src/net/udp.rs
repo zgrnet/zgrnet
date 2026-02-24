@@ -439,7 +439,7 @@ impl UDP {
                 let sa = libc::sockaddr_in {
                     sin_family: libc::AF_INET as libc::sa_family_t,
                     sin_port: v4.port().to_be(),
-                    sin_addr: unsafe { mem::transmute::<[u8; 4], libc::in_addr>(v4.ip().octets()) },
+                    sin_addr: libc::in_addr { s_addr: u32::from_be_bytes(v4.ip().octets()).to_be() },
                     sin_zero: [0; 8],
                 };
                 let sa_bytes = unsafe {
