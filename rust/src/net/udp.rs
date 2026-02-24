@@ -382,7 +382,7 @@ impl UDP {
         let msg = build_transport_message(session.remote_index(), nonce, &ciphertext);
 
         // Use GSO for large messages if enabled (Linux only)
-        let n = if self.socket_config.gso && msg.len() > super::sockopt::DEFAULT_GSO_SEGMENT as usize {
+        let n = if cfg!(target_os = "linux") && self.socket_config.gso && msg.len() > super::sockopt::DEFAULT_GSO_SEGMENT as usize {
             self.send_to_gso(&msg, endpoint)?
         } else {
             self.socket.send_to(&msg, endpoint)?

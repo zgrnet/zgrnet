@@ -31,13 +31,13 @@ func (u *UDP) sendToGSO(data []byte, addr *net.UDPAddr) (int, error) {
 		cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&cmsgBuf[0]))
 		cmsg.Level = unix.IPPROTO_UDP
 		cmsg.Type = unix.UDP_SEGMENT
-		cmsg.Len = uint64(unix.CmsgLen(2))
+		cmsg.Len = unix.CmsgLen(2)
 
 		// Write segment size (uint16) into cmsg data area
 		// unix.CmsgData returns unsafe.Pointer to the data portion
 		dataPtr := unsafe.Pointer(uintptr(unsafe.Pointer(cmsg)) + unix.SizeofCmsghdr)
 		dataBuf := (*[2]byte)(dataPtr)
-		binary.LittleEndian.PutUint16(dataBuf[:], uint16(DefaultGSOSegment))
+		binary.NativeEndian.PutUint16(dataBuf[:], uint16(DefaultGSOSegment))
 
 		// Prepare sockaddr
 		var sa unix.Sockaddr
