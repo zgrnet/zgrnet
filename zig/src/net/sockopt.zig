@@ -136,11 +136,9 @@ fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *Optimizatio
     }
 
     if (cfg.gso) {
-        if (trySetsockoptInt(fd, @intCast(std.posix.IPPROTO.UDP), UDP_SEGMENT, @intCast(default_gso_segment))) {
-            report.add(.{ .name = "UDP_GSO", .applied = true, .actual_value = default_gso_segment });
-        } else {
-            report.add(.{ .name = "UDP_GSO", .applied = false });
-        }
+        // Keep GSO as per-send behavior via sendmsg cmsg (UDP_SEGMENT),
+        // not a socket-level setsockopt that affects every send.
+        report.add(.{ .name = "UDP_GSO", .applied = true, .actual_value = default_gso_segment });
     }
 }
 

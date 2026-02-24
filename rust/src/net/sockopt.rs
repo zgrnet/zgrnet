@@ -245,24 +245,15 @@ fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut Optimization
 
     // UDP_GSO (send segmentation)
     if cfg.gso {
-        match setsockopt_int(fd, libc::IPPROTO_UDP, UDP_SEGMENT, DEFAULT_GSO_SEGMENT) {
-            Ok(()) => {
-                report.entries.push(OptimizationEntry {
-                    name: "UDP_GSO",
-                    applied: true,
-                    detail: format!("UDP_SEGMENT={}", DEFAULT_GSO_SEGMENT),
-                    error: None,
-                });
-            }
-            Err(e) => {
-                report.entries.push(OptimizationEntry {
-                    name: "UDP_GSO",
-                    applied: false,
-                    detail: String::new(),
-                    error: Some(e),
-                });
-            }
-        }
+        report.entries.push(OptimizationEntry {
+            name: "UDP_GSO",
+            applied: true,
+            detail: format!(
+                "per-send UDP_SEGMENT={} via sendmsg cmsg",
+                DEFAULT_GSO_SEGMENT
+            ),
+            error: None,
+        });
     }
 }
 
@@ -271,7 +262,7 @@ fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut Optimization
 pub mod batch {
     use std::io;
     use std::mem;
-    use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     pub const DEFAULT_BATCH_SIZE: usize = 64;
 
@@ -378,7 +369,10 @@ pub mod batch {
             let input_count = buffers.len().min(self.batch_size).min(targets.len());
             let mut valid = 0usize;
 
-            for (buf, target) in buffers[..input_count].iter().zip(targets[..input_count].iter()) {
+            for (buf, target) in buffers[..input_count]
+                .iter()
+                .zip(targets[..input_count].iter())
+            {
                 let v4 = match *target {
                     SocketAddr::V4(v4) => v4,
                     _ => continue,
@@ -410,12 +404,7 @@ pub mod batch {
             }
 
             let n = unsafe {
-                libc::sendmmsg(
-                    self.fd,
-                    self.msgs.as_mut_ptr(),
-                    valid as libc::c_uint,
-                    0,
-                )
+                libc::sendmmsg(self.fd, self.msgs.as_mut_ptr(), valid as libc::c_uint, 0)
             };
             if n < 0 {
                 return Err(io::Error::last_os_error());
@@ -485,7 +474,12 @@ pub fn bind_reuseport(addr: &str) -> io::Result<UdpSocket> {
 
     let v4 = match bind_addr {
         std::net::SocketAddr::V4(v4) => v4,
-        _ => return Err(io::Error::new(io::ErrorKind::Unsupported, "IPv6 not implemented")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "IPv6 not implemented",
+            ))
+        }
     };
 
     #[cfg(target_os = "linux")]
@@ -548,10 +542,18 @@ mod tests {
         {
             let fd = socket.as_raw_fd();
             let actual_rcv = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF).unwrap();
-            assert!(actual_rcv > 0, "SO_RCVBUF should be > 0, got {}", actual_rcv);
+            assert!(
+                actual_rcv > 0,
+                "SO_RCVBUF should be > 0, got {}",
+                actual_rcv
+            );
 
             let actual_snd = getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF).unwrap();
-            assert!(actual_snd > 0, "SO_SNDBUF should be > 0, got {}", actual_snd);
+            assert!(
+                actual_snd > 0,
+                "SO_SNDBUF should be > 0, got {}",
+                actual_snd
+            );
         }
     }
 

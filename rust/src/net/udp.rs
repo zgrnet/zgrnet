@@ -381,15 +381,9 @@ impl UDP {
         // Build transport message
         let msg = build_transport_message(session.remote_index(), nonce, &ciphertext);
 
-        // Use GSO for large messages if enabled (Linux only)
-        let n = if cfg!(target_os = "linux") && self.socket_config.gso && msg.len() > super::sockopt::DEFAULT_GSO_SEGMENT as usize {
-            match self.send_to_gso(&msg, endpoint) {
-                Ok(n) => n,
-                Err(_) => self.socket.send_to(&msg, endpoint)?, // Fallback to regular send
-            }
-        } else {
-            self.socket.send_to(&msg, endpoint)?
-        };
+        // Transport messages are single datagrams at the protocol layer.
+        // Do not GSO-segment a single message into multiple UDP packets.
+        let n = self.socket.send_to(&msg, endpoint)?;
 
         // Update stats
         self.total_tx.fetch_add(n as u64, Ordering::SeqCst);
