@@ -31,7 +31,13 @@ func (u *UDP) sendToGSO(data []byte, addr *net.UDPAddr) (int, error) {
 		cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&cmsgBuf[0]))
 		cmsg.Level = unix.IPPROTO_UDP
 		cmsg.Type = unix.UDP_SEGMENT
-		cmsg.Len = unix.CmsgLen(2)
+		// Cmsghdr.Len is uint64 on 64-bit Linux, uint32 on 32-bit Linux
+		// Use unsafe.Sizeof to determine the correct type at compile time
+		if unsafe.Sizeof(cmsg.Len) == 8 {
+			*(*uint64)(unsafe.Pointer(&cmsg.Len)) = uint64(unix.CmsgLen(2))
+		} else {
+			*(*uint32)(unsafe.Pointer(&cmsg.Len)) = uint32(unix.CmsgLen(2))
+		}
 
 		// Write segment size (uint16) into cmsg data area
 		// unix.CmsgData returns unsafe.Pointer to the data portion
