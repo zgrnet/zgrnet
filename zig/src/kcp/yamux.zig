@@ -1,15 +1,16 @@
-//! yamux — Stream multiplexer protocol implementation from spec.
+//! yamux — Single-threaded stream multiplexer protocol implementation.
 //!
 //! Implements the yamux spec: https://github.com/hashicorp/yamux/blob/master/spec.md
 //! Generic over `comptime Rt: type` for ESP32 compatibility.
 //!
-//! Architecture:
+//! Architecture (Single-threaded):
 //! - Yamux session owns a transport (KcpConn read/write)
-//! - recv_thread reads frames from transport and dispatches to streams
+//! - User calls poll() to drive frame processing
 //! - Each YamuxStream has its own recv buffer + flow control window
 //! - open() immediately sends WindowUpdate+SYN (like Go, NOT like Rust yamux 0.13)
 
 const std = @import("std");
+const platform = @import("std_impl");
 
 // ============================================================================
 // Frame format (12 bytes, all multi-byte fields big-endian)
@@ -58,10 +59,18 @@ pub const Frame = struct {
         };
     }
 
-    pub fn hasSyn(self: Frame) bool { return self.flags & FrameFlags.syn != 0; }
-    pub fn hasAck(self: Frame) bool { return self.flags & FrameFlags.ack != 0; }
-    pub fn hasFin(self: Frame) bool { return self.flags & FrameFlags.fin != 0; }
-    pub fn hasRst(self: Frame) bool { return self.flags & FrameFlags.rst != 0; }
+    pub fn hasSyn(self: Frame) bool {
+        return self.flags & FrameFlags.syn != 0;
+    }
+    pub fn hasAck(self: Frame) bool {
+        return self.flags & FrameFlags.ack != 0;
+    }
+    pub fn hasFin(self: Frame) bool {
+        return self.flags & FrameFlags.fin != 0;
+    }
+    pub fn hasRst(self: Frame) bool {
+        return self.flags & FrameFlags.rst != 0;
+    }
 };
 
 pub const StreamState = enum(u8) {
@@ -80,22 +89,22 @@ pub fn YamuxStream(comptime Rt: type) type {
         const Self = @This();
 
         id: u32,
-        state: std.atomic.Value(u8),
+        state: u8, // No longer atomic - single threaded
 
         recv_buf: std.ArrayListUnmanaged(u8),
         recv_window: u32,
-        send_window: std.atomic.Value(u32),
+        send_window: u32, // No longer atomic
 
         mutex: Rt.Mutex,
         data_cond: Rt.Condition,
         window_cond: Rt.Condition,
 
         allocator: std.mem.Allocator,
-        session_ctx: *anyopaque, // Reference to session for coalesced writes
+        session_ctx: *anyopaque,
         session_write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
 
         pub fn getState(self: *const Self) StreamState {
-            return @enumFromInt(self.state.load(.acquire));
+            return @enumFromInt(self.state);
         }
 
         pub fn read(self: *Self, buf: []u8) !usize {
@@ -125,7 +134,6 @@ pub fn YamuxStream(comptime Rt: type) type {
                     .length = delta,
                 };
                 frame.encode(&hdr);
-                // Send via session's coalesced write
                 self.session_write_fn(self.session_ctx, &hdr) catch {};
             }
 
@@ -138,7 +146,7 @@ pub fn YamuxStream(comptime Rt: type) type {
 
             // Wait for send window.
             self.mutex.lock();
-            while (self.send_window.load(.acquire) == 0) {
+            while (self.send_window == 0) {
                 const s = self.getState();
                 if (s == .half_close_local or s == .closed) {
                     self.mutex.unlock();
@@ -148,11 +156,10 @@ pub fn YamuxStream(comptime Rt: type) type {
             }
             self.mutex.unlock();
 
-            const avail = self.send_window.load(.acquire);
+            const avail = self.send_window;
             const n = @min(data.len, @as(usize, avail));
 
             // Send Data frame.
-            // Build frame in stack buffer and send via session write coalescing
             var frame_buf: [frame_header_size + 65536]u8 = undefined;
             const frame = Frame{
                 .frame_type = .data,
@@ -163,9 +170,8 @@ pub fn YamuxStream(comptime Rt: type) type {
             frame.encode(frame_buf[0..frame_header_size]);
             @memcpy(frame_buf[frame_header_size..][0..n], data[0..n]);
 
-            // Send via session's coalesced write (batches multiple frames)
-            try self.session_write_fn(self.session_ctx, frame_buf[0..frame_header_size + n]);
-            _ = self.send_window.fetchSub(@intCast(n), .release);
+            try self.session_write_fn(self.session_ctx, frame_buf[0 .. frame_header_size + n]);
+            self.send_window -= @intCast(n);
 
             return n;
         }
@@ -182,25 +188,24 @@ pub fn YamuxStream(comptime Rt: type) type {
                 .length = 0,
             };
             frame.encode(&hdr);
-            // Send via session's coalesced write
             self.session_write_fn(self.session_ctx, &hdr) catch {};
 
             if (st == .open) {
-                self.state.store(@intFromEnum(StreamState.half_close_local), .release);
+                self.state = @intFromEnum(StreamState.half_close_local);
             } else {
-                self.state.store(@intFromEnum(StreamState.closed), .release);
+                self.state = @intFromEnum(StreamState.closed);
             }
             self.data_cond.broadcast();
         }
 
         pub fn close(self: *Self) void {
             self.closeWrite();
-            self.state.store(@intFromEnum(StreamState.closed), .release);
+            self.state = @intFromEnum(StreamState.closed);
             self.data_cond.broadcast();
             self.window_cond.broadcast();
         }
 
-        // Internal: called by recv_thread when data arrives.
+        // Internal: called by poll when data arrives.
         pub fn pushData(self: *Self, data: []const u8) void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -211,15 +216,15 @@ pub fn YamuxStream(comptime Rt: type) type {
         pub fn pushFin(self: *Self) void {
             const st = self.getState();
             if (st == .open) {
-                self.state.store(@intFromEnum(StreamState.half_close_remote), .release);
+                self.state = @intFromEnum(StreamState.half_close_remote);
             } else {
-                self.state.store(@intFromEnum(StreamState.closed), .release);
+                self.state = @intFromEnum(StreamState.closed);
             }
             self.data_cond.broadcast();
         }
 
         pub fn addSendWindow(self: *Self, delta: u32) void {
-            _ = self.send_window.fetchAdd(delta, .release);
+            self.send_window += delta;
             self.window_cond.broadcast();
         }
 
@@ -234,18 +239,18 @@ pub fn YamuxStream(comptime Rt: type) type {
 }
 
 // ============================================================================
-// Yamux Session
+// Yamux Session (Single-threaded)
 // ============================================================================
 
 pub fn Yamux(comptime Rt: type) type {
     const YStream = YamuxStream(Rt);
 
-        return struct {
-            const Self = @This();
+    return struct {
+        const Self = @This();
 
         allocator: std.mem.Allocator,
         mode: Mode,
-        next_stream_id: std.atomic.Value(u32),
+        next_stream_id: u32, // No longer atomic
         streams: std.AutoHashMapUnmanaged(u32, *YStream),
         streams_mutex: Rt.Mutex,
 
@@ -253,20 +258,14 @@ pub fn Yamux(comptime Rt: type) type {
         accept_mutex: Rt.Mutex,
         accept_cond: Rt.Condition,
 
-        closed: std.atomic.Value(bool),
-        recv_thread: ?Rt.Thread,
+        closed: bool, // No longer atomic
 
         // Transport I/O.
         transport_ctx: *anyopaque,
         transport_read: *const fn (*anyopaque, []u8) anyerror!usize,
         transport_write: *const fn (*anyopaque, []const u8) anyerror!void,
-
-        // Write coalescing buffer (performance optimization)
-        write_buf: std.ArrayListUnmanaged(u8),
-        write_mutex: Rt.Mutex,
-        write_cond: Rt.Condition,
-        write_flush_thread: ?Rt.Thread,
-        write_flush_signaled: std.atomic.Value(bool),
+        transport_poll: *const fn (*anyopaque) void,
+        transport_select_fd: ?*const fn (*anyopaque) std.posix.fd_t, // NEW: get fd for select
 
         pub const Mode = enum { client, server };
 
@@ -276,6 +275,8 @@ pub fn Yamux(comptime Rt: type) type {
             transport_ctx: *anyopaque,
             transport_read: *const fn (*anyopaque, []u8) anyerror!usize,
             transport_write: *const fn (*anyopaque, []const u8) anyerror!void,
+            transport_poll: *const fn (*anyopaque) void,
+            transport_select_fd: ?*const fn (*anyopaque) std.posix.fd_t, // NEW
         ) !*Self {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
@@ -283,48 +284,25 @@ pub fn Yamux(comptime Rt: type) type {
             self.* = .{
                 .allocator = allocator,
                 .mode = mode,
-                .next_stream_id = std.atomic.Value(u32).init(if (mode == .client) 1 else 2),
+                .next_stream_id = if (mode == .client) 1 else 2,
                 .streams = .{},
                 .streams_mutex = Rt.Mutex.init(),
                 .accept_queue = .{},
                 .accept_mutex = Rt.Mutex.init(),
                 .accept_cond = Rt.Condition.init(),
-                .closed = std.atomic.Value(bool).init(false),
-                .recv_thread = null,
+                .closed = false,
                 .transport_ctx = transport_ctx,
                 .transport_read = transport_read,
                 .transport_write = transport_write,
-                // Write coalescing fields
-                .write_buf = .{},
-                .write_mutex = Rt.Mutex.init(),
-                .write_cond = Rt.Condition.init(),
-                .write_flush_thread = null,
-                .write_flush_signaled = std.atomic.Value(bool).init(false),
+                .transport_poll = transport_poll,
+                .transport_select_fd = transport_select_fd,
             };
 
-            self.recv_thread = Rt.Thread.spawn(.{}, recvLoop, .{self}) catch null;
-            self.write_flush_thread = Rt.Thread.spawn(.{}, writeFlushLoop, .{self}) catch null;
             return self;
         }
 
         pub fn deinit(self: *Self) void {
             self.close();
-
-            // Signal and stop flush thread
-            self.write_mutex.lock();
-            self.write_flush_signaled.store(true, .release);
-            self.write_cond.signal();
-            self.write_mutex.unlock();
-
-            if (self.write_flush_thread) |t| {
-                t.join();
-                self.write_flush_thread = null;
-            }
-
-            if (self.recv_thread) |t| {
-                t.join();
-                self.recv_thread = null;
-            }
 
             // Clean up streams.
             self.streams_mutex.lock();
@@ -339,27 +317,21 @@ pub fn Yamux(comptime Rt: type) type {
             self.accept_queue.deinit(self.allocator);
             self.accept_mutex.unlock();
 
-            // Clean up write buffer
-            self.write_mutex.lock();
-            self.write_buf.deinit(self.allocator);
-            self.write_mutex.unlock();
-
             self.streams_mutex.deinit();
             self.accept_mutex.deinit();
             self.accept_cond.deinit();
-            self.write_mutex.deinit();
-            self.write_cond.deinit();
             self.allocator.destroy(self);
         }
 
         /// Open a new outbound stream. Immediately sends WindowUpdate+SYN.
         pub fn open(self: *Self) !*YStream {
-            if (self.closed.load(.acquire)) return error.SessionClosed;
+            if (self.closed) return error.SessionClosed;
 
-            const id = self.next_stream_id.fetchAdd(2, .release);
+            const id = self.next_stream_id;
+            self.next_stream_id += 2;
             const stream = try self.createStream(id);
 
-            // Send WindowUpdate with SYN flag (like Go hashicorp/yamux).
+            // Send WindowUpdate with SYN flag.
             var hdr: [frame_header_size]u8 = undefined;
             const frame = Frame{
                 .frame_type = .window_update,
@@ -379,7 +351,7 @@ pub fn Yamux(comptime Rt: type) type {
             defer self.accept_mutex.unlock();
 
             while (self.accept_queue.items.len == 0) {
-                if (self.closed.load(.acquire)) return error.SessionClosed;
+                if (self.closed) return error.SessionClosed;
                 _ = self.accept_cond.timedWait(&self.accept_mutex, 100 * std.time.ns_per_ms);
             }
 
@@ -390,9 +362,10 @@ pub fn Yamux(comptime Rt: type) type {
         }
 
         pub fn close(self: *Self) void {
-            if (self.closed.swap(true, .acq_rel)) return;
+            if (self.closed) return;
+            self.closed = true;
 
-            // Send GoAway frame first
+            // Send GoAway frame
             var hdr: [frame_header_size]u8 = undefined;
             const frame = Frame{
                 .frame_type = .go_away,
@@ -401,62 +374,136 @@ pub fn Yamux(comptime Rt: type) type {
                 .length = 0,
             };
             frame.encode(&hdr);
-            // Direct write without going through buffer to avoid reentrancy
             self.transport_write(self.transport_ctx, &hdr) catch {};
 
             self.accept_cond.broadcast();
-            self.write_cond.signal(); // Wake flush thread
-
-            // NOTE: Skip forceFlush in close to avoid reentrancy with recvLoop
-            // Buffered data will be lost on close - acceptable for now
-            // TODO: Implement safe deferred flush mechanism
         }
 
-        // ============================================================================
-        // Write Coalescing — Batch multiple small writes into single transport write
-        // ============================================================================
+        /// Poll the session - drive frame processing.
+        /// Must be called regularly to process incoming frames.
+        /// Returns true if any work was done.
+        pub fn poll(self: *Self) bool {
+            if (self.closed) return false;
 
-        // Flush thresholds for write coalescing (performance optimization)
-        // NOTE: threshold must be <= test chunk size to avoid infinite buffering
-        const flush_threshold: usize = 8 * 1024; // 8KB - flush when buffer reaches this size
-        const flush_min_data: usize = 4 * 1024; // 4KB - flush when single write exceeds this
-        const flush_timeout_ms: u64 = 5; // 5ms max delay for small writes
+            var did_work = false;
 
-        /// Session-level write — direct write without buffering
-        /// This is the safest and most performant approach for our workload.
-        /// The key optimization is in YamuxStream.write: header+data merged into one write.
-        pub fn sessionWrite(self: *Self, data: []const u8) !void {
-            if (self.closed.load(.acquire)) return error.SessionClosed;
-            if (data.len == 0) return;
+            // Poll the transport first (drive KCP)
+            self.transport_poll(self.transport_ctx);
+            did_work = true;
 
-            try self.transport_write(self.transport_ctx, data);
-        }
+            // Process all available frames (non-blocking)
+            while (true) {
+                var hdr_buf: [frame_header_size]u8 = undefined;
 
-        /// Force flush — no-op since we don't buffer
-        fn forceFlush(self: *Self) void {
-            _ = self;
-        }
+                // Try to read a frame header (non-blocking)
+                var read_total: usize = 0;
+                while (read_total < frame_header_size) {
+                    const n = self.transport_read(self.transport_ctx, hdr_buf[read_total..]) catch break;
+                    if (n == 0) break; // No more data available
+                    read_total += n;
+                }
 
-        /// Background flush loop — no-op since we don't buffer
-        fn writeFlushLoop(self: *Self) void {
-            while (!self.closed.load(.acquire)) {
-                Rt.sleepMs(100);
+                if (read_total < frame_header_size) {
+                    // Not enough data for a complete frame
+                    break;
+                }
+
+                const frame = Frame.decode(&hdr_buf);
+
+                switch (frame.frame_type) {
+                    .data => self.handleData(frame),
+                    .window_update => self.handleWindowUpdate(frame),
+                    .ping => self.handlePing(frame),
+                    .go_away => {
+                        self.close();
+                        return false;
+                    },
+                }
+                did_work = true;
             }
+
+            return did_work;
+        }
+
+        /// Process multiple frames in one poll call.
+        /// Returns number of frames processed.
+        pub fn pollMultiple(self: *Self, max_frames: usize) usize {
+            var count: usize = 0;
+            for (0..max_frames) |_| {
+                if (!self.poll()) break;
+                count += 1;
+            }
+            return count;
+        }
+
+        /// Get the file descriptor for select/poll operations.
+        /// Returns -1 if transport doesn't support select.
+        pub fn getSelectFd(self: *const Self) std.posix.fd_t {
+            if (self.transport_select_fd) |get_fd| {
+                return get_fd(self.transport_ctx);
+            }
+            return -1;
+        }
+
+        /// Optimized poll that processes more data per call.
+        /// This version drives KCP and then processes frames in a tight loop.
+        pub fn pollOptimized(self: *Self, max_frames: usize) usize {
+            if (self.closed) return 0;
+
+            // Poll transport (drive KCP)
+            self.transport_poll(self.transport_ctx);
+
+            // Process multiple frames in batch
+            var count: usize = 0;
+            for (0..max_frames) |_| {
+                var hdr_buf: [frame_header_size]u8 = undefined;
+
+                // Try to read frame header
+                var read_total: usize = 0;
+                while (read_total < frame_header_size) {
+                    const n = self.transport_read(self.transport_ctx, hdr_buf[read_total..]) catch break;
+                    if (n == 0) break;
+                    read_total += n;
+                }
+
+                if (read_total < frame_header_size) break;
+
+                const frame = Frame.decode(&hdr_buf);
+
+                switch (frame.frame_type) {
+                    .data => self.handleData(frame),
+                    .window_update => self.handleWindowUpdate(frame),
+                    .ping => self.handlePing(frame),
+                    .go_away => {
+                        self.close();
+                        return count;
+                    },
+                }
+                count += 1;
+            }
+
+            return count;
+        }
+
+        fn sessionWrite(self: *Self, data: []const u8) !void {
+            if (self.closed) return error.SessionClosed;
+            if (data.len == 0) return;
+            try self.transport_write(self.transport_ctx, data);
         }
 
         fn createStream(self: *Self, id: u32) !*YStream {
             const stream = try self.allocator.create(YStream);
             stream.* = YStream{
                 .id = id,
-                .state = std.atomic.Value(u8).init(@intFromEnum(StreamState.open)),
+                .state = @intFromEnum(StreamState.open),
                 .recv_buf = .{},
                 .recv_window = default_window_size,
-                .send_window = std.atomic.Value(u32).init(default_window_size),
+                .send_window = default_window_size,
                 .mutex = Rt.Mutex.init(),
                 .data_cond = Rt.Condition.init(),
                 .window_cond = Rt.Condition.init(),
                 .allocator = self.allocator,
-                .session_ctx = @ptrCast(self), // Session pointer for coalesced writes
+                .session_ctx = @ptrCast(self),
                 .session_write_fn = @ptrCast(&sessionWriteAdapter),
             };
 
@@ -466,36 +513,9 @@ pub fn Yamux(comptime Rt: type) type {
             return stream;
         }
 
-        /// Adapter function to call sessionWrite from YamuxStream via function pointer
         fn sessionWriteAdapter(session_ctx: *anyopaque, data: []const u8) anyerror!void {
             const session: *Self = @ptrCast(@alignCast(session_ctx));
             return session.sessionWrite(data);
-        }
-
-        fn recvLoop(self: *Self) void {
-            var hdr_buf: [frame_header_size]u8 = undefined;
-
-            while (!self.closed.load(.acquire)) {
-                // Read frame header (12 bytes).
-                var read_total: usize = 0;
-                while (read_total < frame_header_size) {
-                    const n = self.transport_read(self.transport_ctx, hdr_buf[read_total..]) catch {
-                        self.close();
-                        return;
-                    };
-                    if (n == 0) { self.close(); return; }
-                    read_total += n;
-                }
-
-                const frame = Frame.decode(&hdr_buf);
-
-                switch (frame.frame_type) {
-                    .data => self.handleData(frame),
-                    .window_update => self.handleWindowUpdate(frame),
-                    .ping => self.handlePing(frame),
-                    .go_away => { self.close(); return; },
-                }
-            }
         }
 
         fn handleData(self: *Self, frame: Frame) void {
@@ -550,7 +570,6 @@ pub fn Yamux(comptime Rt: type) type {
             // SYN on WindowUpdate: new inbound stream (Go-style open).
             if (frame.hasSyn()) {
                 const stream = self.createStream(frame.stream_id) catch return;
-                // Apply the window delta.
                 stream.addSendWindow(frame.length);
 
                 self.accept_mutex.lock();
@@ -577,10 +596,9 @@ pub fn Yamux(comptime Rt: type) type {
                     .frame_type = .ping,
                     .flags = FrameFlags.ack,
                     .stream_id = 0,
-                    .length = frame.length, // echo opaque value
+                    .length = frame.length,
                 };
                 pong.encode(&hdr);
-                // Use sessionWrite for coalesced response
                 self.sessionWrite(&hdr) catch {};
             }
             // ACK pings are silently consumed.
@@ -620,16 +638,15 @@ test "yamux frame big endian" {
     var buf: [frame_header_size]u8 = undefined;
     frame.encode(&buf);
 
-    // Verify big-endian encoding.
-    try std.testing.expectEqual(buf[0], 0); // version
-    try std.testing.expectEqual(buf[1], 1); // type=window_update
-    try std.testing.expectEqual(buf[2], 0x01); // flags high byte
-    try std.testing.expectEqual(buf[3], 0x02); // flags low byte
-    try std.testing.expectEqual(buf[4], 0x01); // streamID bytes
+    try std.testing.expectEqual(buf[0], 0);
+    try std.testing.expectEqual(buf[1], 1);
+    try std.testing.expectEqual(buf[2], 0x01);
+    try std.testing.expectEqual(buf[3], 0x02);
+    try std.testing.expectEqual(buf[4], 0x01);
     try std.testing.expectEqual(buf[5], 0x02);
     try std.testing.expectEqual(buf[6], 0x03);
     try std.testing.expectEqual(buf[7], 0x04);
-    try std.testing.expectEqual(buf[8], 0x05); // length bytes
+    try std.testing.expectEqual(buf[8], 0x05);
     try std.testing.expectEqual(buf[9], 0x06);
     try std.testing.expectEqual(buf[10], 0x07);
     try std.testing.expectEqual(buf[11], 0x08);
@@ -644,7 +661,7 @@ test "yamux frame flags" {
 }
 
 // ============================================================================
-// Integration tests: yamux over KcpConn
+// Integration tests: yamux over KcpConn (single-threaded)
 // ============================================================================
 
 const conn_mod = @import("conn.zig");
@@ -652,26 +669,40 @@ const conn_mod = @import("conn.zig");
 const TestRt = if (@import("builtin").os.tag != .freestanding) struct {
     pub const Mutex = struct {
         inner: std.Thread.Mutex = .{},
-        pub fn init() Mutex { return .{}; }
+        pub fn init() Mutex {
+            return .{};
+        }
         pub fn deinit(_: *Mutex) void {}
-        pub fn lock(self: *Mutex) void { self.inner.lock(); }
-        pub fn unlock(self: *Mutex) void { self.inner.unlock(); }
+        pub fn lock(self: *Mutex) void {
+            self.inner.lock();
+        }
+        pub fn unlock(self: *Mutex) void {
+            self.inner.unlock();
+        }
     };
     pub const Condition = struct {
         inner: std.Thread.Condition = .{},
-        pub fn init() Condition { return .{}; }
+        pub fn init() Condition {
+            return .{};
+        }
         pub fn deinit(_: *Condition) void {}
-        pub fn wait(self: *Condition, mutex: *Mutex) void { self.inner.wait(&mutex.inner); }
+        pub fn wait(self: *Condition, mutex: *Mutex) void {
+            self.inner.wait(&mutex.inner);
+        }
         pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) bool {
             self.inner.timedWait(&mutex.inner, timeout_ns) catch return true;
             return false;
         }
-        pub fn signal(self: *Condition) void { self.inner.signal(); }
-        pub fn broadcast(self: *Condition) void { self.inner.broadcast(); }
+        pub fn signal(self: *Condition) void {
+            self.inner.signal();
+        }
+        pub fn broadcast(self: *Condition) void {
+            self.inner.broadcast();
+        }
     };
-    pub const Thread = std.Thread;
-    pub fn nowMs() u64 { return @intCast(std.time.milliTimestamp()); }
-    pub fn sleepMs(ms: u32) void { std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms); }
+    pub fn nowMs() u64 {
+        return @intCast(std.time.milliTimestamp());
+    }
 } else struct {};
 
 fn yamuxPair() !struct {
@@ -706,16 +737,24 @@ fn yamuxPair() !struct {
     const TransportAdapter = struct {
         fn readFn(ctx: *anyopaque, buf: []u8) anyerror!usize {
             const kc: *KConn = @ptrCast(@alignCast(ctx));
-            return kc.read(buf);
+            return kc.readNonBlock(buf); // Use non-blocking read
         }
         fn writeFn(ctx: *anyopaque, data: []const u8) anyerror!void {
             const kc: *KConn = @ptrCast(@alignCast(ctx));
             _ = try kc.write(data);
         }
+        fn pollFn(ctx: *anyopaque) void {
+            const kc: *KConn = @ptrCast(@alignCast(ctx));
+            _ = kc.poll();
+        }
+        fn selectFdFn(ctx: *anyopaque) std.posix.fd_t {
+            const kc: *KConn = @ptrCast(@alignCast(ctx));
+            return kc.selectFd();
+        }
     };
 
-    const client = try YMux.init(allocator, .client, @ptrCast(a), TransportAdapter.readFn, TransportAdapter.writeFn);
-    const server = try YMux.init(allocator, .server, @ptrCast(b), TransportAdapter.readFn, TransportAdapter.writeFn);
+    const client = try YMux.init(allocator, .client, @ptrCast(a), TransportAdapter.readFn, TransportAdapter.writeFn, TransportAdapter.pollFn, TransportAdapter.selectFdFn);
+    const server = try YMux.init(allocator, .server, @ptrCast(b), TransportAdapter.readFn, TransportAdapter.writeFn, TransportAdapter.pollFn, TransportAdapter.selectFdFn);
 
     return .{ .client = client, .server = server, .a = a, .b = b };
 }
@@ -729,6 +768,13 @@ test "yamux open close" {
     defer pair.b.deinit();
 
     const s = try pair.client.open();
+
+    // Poll both sides
+    for (0..100) |_| {
+        _ = pair.client.poll();
+        _ = pair.server.poll();
+    }
+
     const accepted = try pair.server.accept();
     _ = accepted;
     s.close();
@@ -744,57 +790,316 @@ test "yamux echo" {
 
     var cs = try pair.client.open();
 
-    // Server accept + echo in thread.
-    const EchoThread = struct {
-        fn run(server: *Yamux(TestRt)) void {
-            var ss = server.accept() catch return;
-            var buf: [4096]u8 = undefined;
-            const n = ss.read(&buf) catch return;
-            _ = ss.write(buf[0..n]) catch return;
-            ss.close();
-        }
-    };
-    const t = std.Thread.spawn(.{}, EchoThread.run, .{pair.server}) catch return;
+    // Poll to process open
+    for (0..10) |_| {
+        _ = pair.client.poll();
+        _ = pair.server.poll();
+    }
+
+    var ss = try pair.server.accept();
 
     _ = try cs.write("hello yamux");
-    var buf: [256]u8 = undefined;
-    const n = try cs.read(&buf);
-    try std.testing.expectEqualStrings("hello yamux", buf[0..n]);
+
+    // Poll to send data
+    for (0..10) |_| {
+        _ = pair.client.poll();
+        _ = pair.server.poll();
+    }
+
+    // Server echo
+    var buf: [4096]u8 = undefined;
+    const n = try ss.read(&buf);
+    _ = try ss.write(buf[0..n]);
+    ss.close();
+
+    // Poll to send response
+    for (0..10) |_| {
+        _ = pair.client.poll();
+        _ = pair.server.poll();
+    }
+
+    var client_buf: [256]u8 = undefined;
+    const rn = try cs.read(&client_buf);
+    try std.testing.expectEqualStrings("hello yamux", client_buf[0..rn]);
     cs.close();
-    t.join();
 }
 
-test "yamux multi stream 10" {
+test "yamux streaming throughput" {
     if (@import("builtin").os.tag == .freestanding) return;
+    const allocator = std.testing.allocator;
     const pair = try yamuxPair();
     defer pair.client.deinit();
     defer pair.server.deinit();
     defer pair.a.deinit();
     defer pair.b.deinit();
 
-    // Server: accept and echo in separate threads.
-    const EchoWorker = struct {
-        fn run(server: *Yamux(TestRt)) void {
-            for (0..10) |_| {
-                var ss = server.accept() catch return;
-                var buf: [4096]u8 = undefined;
-                const n = ss.read(&buf) catch return;
-                _ = ss.write(buf[0..n]) catch return;
-                ss.close();
+    const chunk_size: usize = 8192;
+    const total: usize = 4 * 1024 * 1024;
+
+    var cs = try pair.client.open();
+
+    // Poll to process open
+    for (0..10) |_| {
+        _ = pair.client.poll();
+        _ = pair.server.poll();
+    }
+
+    var ss = try pair.server.accept();
+
+    const chunk = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(chunk);
+    @memset(chunk, 0x58);
+
+    // Sink in main thread
+    const start = std.time.nanoTimestamp();
+    var sent: usize = 0;
+    var received: usize = 0;
+    var sink_buf: [65536]u8 = undefined;
+
+    while (received < total) {
+        // Send
+        if (sent < total) {
+            const n = cs.write(chunk) catch 0;
+            sent += n;
+        }
+
+        // Poll both
+        _ = pair.client.poll();
+        _ = pair.server.poll();
+
+        // Receive
+        const n = ss.read(&sink_buf) catch 0;
+        received += n;
+    }
+
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+    const mbps = @as(f64, @floatFromInt(received)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+    std.debug.print("[yamux streaming] {d:.1} MB/s\n", .{mbps});
+
+    cs.close();
+    ss.close();
+}
+
+// ============================================================================
+// Multi-stream Tests (align with Go/Rust)
+// ============================================================================
+
+test "yamux multi stream 10" {
+    // Equivalent to Go's TestYamux_MultiStream_10
+    if (@import("builtin").os.tag == .freestanding) return;
+    const allocator = std.testing.allocator;
+    const pair = try yamuxPair();
+    defer pair.client.deinit();
+    defer pair.server.deinit();
+    defer pair.a.deinit();
+    defer pair.b.deinit();
+
+    const YStream = YamuxStream(TestRt);
+    const num_streams = 10;
+
+    // Client: open streams
+    var client_streams: [num_streams]*YStream = undefined;
+    for (0..num_streams) |i| {
+        client_streams[i] = try pair.client.open();
+        // Poll to send SYN
+        for (0..5) |_| {
+            _ = pair.client.poll();
+            _ = pair.server.poll();
+        }
+    }
+
+    // Server: accept streams
+    var server_streams: [num_streams]*YStream = undefined;
+    for (0..num_streams) |i| {
+        server_streams[i] = try pair.server.accept();
+    }
+
+    // Exchange data on all streams
+    for (0..num_streams) |i| {
+        const msg = try std.fmt.allocPrint(allocator, "stream-{d:04}", .{i});
+        defer allocator.free(msg);
+
+        _ = try client_streams[i].write(msg);
+
+        // Poll to send
+        for (0..5) |_| {
+            _ = pair.client.poll();
+            _ = pair.server.poll();
+        }
+
+        var buf: [256]u8 = undefined;
+        const n = try server_streams[i].read(&buf);
+
+        // Echo back with prefix
+        const response = try std.fmt.allocPrint(allocator, "echo{s}", .{buf[0..n]});
+        defer allocator.free(response);
+        _ = try server_streams[i].write(response);
+        server_streams[i].close();
+
+        // Poll to send response
+        for (0..5) |_| {
+            _ = pair.client.poll();
+            _ = pair.server.poll();
+        }
+
+        var client_buf: [256]u8 = undefined;
+        const rn = try client_streams[i].read(&client_buf);
+        try std.testing.expectEqualStrings(response, client_buf[0..rn]);
+        client_streams[i].close();
+    }
+}
+
+test "yamux multi stream throughput" {
+    // Equivalent to Go's BenchmarkYamux_Throughput_10
+    if (@import("builtin").os.tag == .freestanding) return;
+    const allocator = std.testing.allocator;
+    const pair = try yamuxPair();
+    defer pair.client.deinit();
+    defer pair.server.deinit();
+    defer pair.a.deinit();
+    defer pair.b.deinit();
+
+    const YStream = YamuxStream(TestRt);
+    const num_streams = 10;
+    const chunk_size: usize = 8192;
+    const total_per_stream: usize = 1 * 1024 * 1024; // 1MB per stream
+
+    // Open streams
+    var client_streams: [num_streams]*YStream = undefined;
+    var server_streams: [num_streams]*YStream = undefined;
+
+    for (0..num_streams) |i| {
+        client_streams[i] = try pair.client.open();
+        for (0..5) |_| {
+            _ = pair.client.poll();
+            _ = pair.server.poll();
+        }
+        server_streams[i] = try pair.server.accept();
+    }
+
+    const chunk = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(chunk);
+    @memset(chunk, 0x58);
+
+    // Send on all streams concurrently (in main thread)
+    const start = std.time.nanoTimestamp();
+    var sent: [num_streams]usize = .{0} ** num_streams;
+    var received: [num_streams]usize = .{0} ** num_streams;
+    var buf: [65536]u8 = undefined;
+
+    var all_done = false;
+    while (!all_done) {
+        all_done = true;
+
+        for (0..num_streams) |i| {
+            // Send
+            if (sent[i] < total_per_stream) {
+                const n = client_streams[i].write(chunk) catch 0;
+                sent[i] += n;
+                all_done = false;
+            }
+
+            // Poll
+            _ = pair.client.poll();
+            _ = pair.server.poll();
+
+            // Receive
+            const n = server_streams[i].read(&buf) catch 0;
+            received[i] += n;
+            if (received[i] < total_per_stream) {
+                all_done = false;
             }
         }
-    };
-    const t = std.Thread.spawn(.{}, EchoWorker.run, .{pair.server}) catch return;
-
-    for (0..10) |i| {
-        var cs = try pair.client.open();
-        var msg_buf: [32]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "stream-{}", .{i}) catch "?";
-        _ = try cs.write(msg);
-        var buf: [256]u8 = undefined;
-        const n = try cs.read(&buf);
-        try std.testing.expectEqualStrings(msg, buf[0..n]);
-        cs.close();
     }
-    t.join();
+
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start);
+    var total_received: usize = 0;
+    for (received) |r| total_received += r;
+    const mbps = @as(f64, @floatFromInt(total_received)) / @as(f64, @floatFromInt(elapsed_ns)) * 1000.0;
+    std.debug.print("[yamux multi {d} streams] {d:.1} MB/s\n", .{ num_streams, mbps });
+
+    for (0..num_streams) |i| {
+        client_streams[i].close();
+        server_streams[i].close();
+    }
+}
+
+// ============================================================================
+// YamuxSelector - Select-based multi-session management
+// ============================================================================
+
+const Selector = platform.selector.Selector;
+
+pub fn YamuxSelector(comptime Rt: type, comptime max_sessions: usize) type {
+    return struct {
+        const Self = @This();
+        const SessionType = Yamux(Rt);
+
+        selector: Selector(max_sessions),
+        sessions: [max_sessions]?*SessionType,
+        num_sessions: usize,
+
+        pub fn init() !Self {
+            return .{
+                .selector = try Selector(max_sessions).init(),
+                .sessions = [_]?*SessionType{null} ** max_sessions,
+                .num_sessions = 0,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.selector.deinit();
+        }
+
+        /// Register a Yamux session with the selector.
+        /// The session must support getSelectFd().
+        pub fn register(self: *Self, session: *SessionType) error{ TooMany, NoSelectFd }!void {
+            if (self.num_sessions >= max_sessions) return error.TooMany;
+
+            const fd = session.getSelectFd();
+            if (fd < 0) return error.NoSelectFd;
+
+            // Use selector's addRecv with the fd
+            _ = try self.selector.addRecvFd(fd);
+            self.sessions[self.num_sessions] = session;
+            self.num_sessions += 1;
+        }
+
+        /// Wait for any session to have pending data, or timeout.
+        /// Returns the index of the ready session, or max_sessions on timeout.
+        pub fn wait(self: *Self, timeout_ms: ?u32) error{Empty}!usize {
+            return self.selector.wait(timeout_ms);
+        }
+
+        /// Poll the session at the given index.
+        /// Returns number of frames processed.
+        pub fn pollAt(self: *Self, idx: usize, max_frames: usize) usize {
+            if (idx >= self.num_sessions) return 0;
+            if (self.sessions[idx]) |session| {
+                return session.pollOptimized(max_frames);
+            }
+            return 0;
+        }
+
+        /// Poll all sessions.
+        /// Returns total frames processed.
+        pub fn pollAll(self: *Self, max_frames: usize) usize {
+            var total: usize = 0;
+            for (0..self.num_sessions) |i| {
+                total += self.pollAt(i, max_frames);
+            }
+            return total;
+        }
+
+        /// Get session at index.
+        pub fn getSession(self: *Self, idx: usize) ?*SessionType {
+            if (idx >= self.num_sessions) return null;
+            return self.sessions[idx];
+        }
+
+        /// Number of registered sessions.
+        pub fn count(self: *const Self) usize {
+            return self.num_sessions;
+        }
+    };
 }

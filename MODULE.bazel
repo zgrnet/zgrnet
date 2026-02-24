@@ -43,11 +43,11 @@ use_repo(
 )
 
 # embed-zig: Bazel-native Zig build rules + Zig toolchain
+# Using selector branch for Channel + Selector support
 bazel_dep(name = "embed_zig", version = "0.1.0")
-git_override(
+local_path_override(
     module_name = "embed_zig",
-    remote = "https://github.com/haivivi/embed-zig.git",
-    commit = "682a5f7e350e9fe3b4864f956dbbaa6da219833c",  # main: unified spawner, complete socket trait, remove legacy thread.zig
+    path = "/Users/idy/Vibing/embed-zig/selector",
 )
 
 # Zig toolchain (provided by embed-zig, needed by //third_party/kcp for zig cc)

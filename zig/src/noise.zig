@@ -132,6 +132,7 @@ pub const Kcp = kcp_mod.Kcp;
 pub const Frame = kcp_mod.Frame;
 pub const Cmd = kcp_mod.Cmd;
 pub const KcpConn = kcp_mod.KcpConn;
+pub const KcpSelector = kcp_mod.KcpSelector;
 pub const Yamux = kcp_mod.Yamux;
 pub const YamuxStream = kcp_mod.YamuxStream;
 pub const ServiceMux = kcp_mod.ServiceMux;

@@ -183,11 +183,19 @@ pub fn ServiceMux(comptime Rt: type) type {
             const TransportAdapter = struct {
                 fn readFn(transport_ctx: *anyopaque, buf: []u8) anyerror!usize {
                     const kc: *KConn = @ptrCast(@alignCast(transport_ctx));
-                    return kc.read(buf);
+                    return kc.readNonBlock(buf); // Use non-blocking read
                 }
                 fn writeFn(transport_ctx: *anyopaque, data: []const u8) anyerror!void {
                     const kc: *KConn = @ptrCast(@alignCast(transport_ctx));
                     _ = try kc.write(data);
+                }
+                fn pollFn(transport_ctx: *anyopaque) void {
+                    const kc: *KConn = @ptrCast(@alignCast(transport_ctx));
+                    _ = kc.poll();
+                }
+                fn selectFdFn(transport_ctx: *anyopaque) std.posix.fd_t {
+                    const kc: *KConn = @ptrCast(@alignCast(transport_ctx));
+                    return kc.selectFd();
                 }
             };
 
@@ -197,6 +205,8 @@ pub fn ServiceMux(comptime Rt: type) type {
                 @ptrCast(kcp_conn),
                 TransportAdapter.readFn,
                 TransportAdapter.writeFn,
+                TransportAdapter.pollFn,
+                TransportAdapter.selectFdFn,
             );
 
             const fwd = try self.allocator.create(ForwardCtxType);
@@ -248,26 +258,44 @@ pub fn ServiceMux(comptime Rt: type) type {
 const TestRt = if (@import("builtin").os.tag != .freestanding) struct {
     pub const Mutex = struct {
         inner: std.Thread.Mutex = .{},
-        pub fn init() Mutex { return .{}; }
+        pub fn init() Mutex {
+            return .{};
+        }
         pub fn deinit(_: *Mutex) void {}
-        pub fn lock(self: *Mutex) void { self.inner.lock(); }
-        pub fn unlock(self: *Mutex) void { self.inner.unlock(); }
+        pub fn lock(self: *Mutex) void {
+            self.inner.lock();
+        }
+        pub fn unlock(self: *Mutex) void {
+            self.inner.unlock();
+        }
     };
     pub const Condition = struct {
         inner: std.Thread.Condition = .{},
-        pub fn init() Condition { return .{}; }
+        pub fn init() Condition {
+            return .{};
+        }
         pub fn deinit(_: *Condition) void {}
-        pub fn wait(self: *Condition, mutex: *Mutex) void { self.inner.wait(&mutex.inner); }
+        pub fn wait(self: *Condition, mutex: *Mutex) void {
+            self.inner.wait(&mutex.inner);
+        }
         pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) bool {
             self.inner.timedWait(&mutex.inner, timeout_ns) catch return true;
             return false;
         }
-        pub fn signal(self: *Condition) void { self.inner.signal(); }
-        pub fn broadcast(self: *Condition) void { self.inner.broadcast(); }
+        pub fn signal(self: *Condition) void {
+            self.inner.signal();
+        }
+        pub fn broadcast(self: *Condition) void {
+            self.inner.broadcast();
+        }
     };
     pub const Thread = std.Thread;
-    pub fn nowMs() u64 { return @intCast(std.time.milliTimestamp()); }
-    pub fn sleepMs(ms: u32) void { std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms); }
+    pub fn nowMs() u64 {
+        return @intCast(std.time.milliTimestamp());
+    }
+    pub fn sleepMs(ms: u32) void {
+        std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
+    }
 } else struct {};
 
 fn smuxPair() !struct {

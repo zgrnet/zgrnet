@@ -26,6 +26,7 @@ pub const FecHeaderSize = fec.HeaderSize;
 pub const RingBuffer = ring_buffer.RingBuffer;
 
 pub const KcpConn = conn_mod.KcpConn;
+pub const KcpSelector = conn_mod.KcpSelector;
 pub const Yamux = yamux_mod.Yamux;
 pub const YamuxStream = yamux_mod.YamuxStream;
 pub const YamuxFrame = yamux_mod.Frame;

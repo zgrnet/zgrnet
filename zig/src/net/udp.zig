@@ -27,7 +27,7 @@ const Atomic = std.atomic.Value;
 const noise = @import("../noise/mod.zig");
 const relay_mod = @import("../relay/mod.zig");
 const kcp_mod = @import("../kcp/mod.zig");
-const channel_pkg = @import("channel");
+const channel_pkg = @import("channel.zig");
 
 const endpoint_mod = @import("endpoint.zig");
 pub const Endpoint = endpoint_mod.Endpoint;
