@@ -210,9 +210,10 @@ impl UDP {
         let socket = UdpSocket::bind(bind_addr)?;
 
         // Apply socket configuration (user-provided or default)
-        let socket_config = opts.socket_config.unwrap_or_default();
-        super::sockopt::apply_socket_options(&socket, &socket_config);
-        drop(socket_config);
+        {
+            let socket_config = opts.socket_config.unwrap_or_default();
+            super::sockopt::apply_socket_options(&socket, &socket_config);
+        }
 
         // Set read timeout for non-blocking behavior in receive loop
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
