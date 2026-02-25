@@ -10,6 +10,14 @@ go_library(
         "listener.go",
         "manager.go",
         "peer.go",
+        "peer_linux.go",
+        "peer_other.go",
+        "sockopt.go",
+        "sockopt_bsd.go",
+        "sockopt_linux.go",
+        "sockopt_other.go",
+        "sockopt_unix.go",
+        "sockopt_windows.go",
         "transport_mock.go",
         "transport_udp.go",
         "udp.go",
@@ -20,7 +28,14 @@ go_library(
         "//go:noise",
         "//go/pkg/kcp",
         "//go/pkg/relay",
-    ],
+    ] + select({
+        "@platforms//os:linux": [
+            "@org_golang_x_net//ipv4",
+            "@org_golang_x_net//ipv6",
+            "@org_golang_x_sys//unix",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 go_test(
@@ -34,6 +49,7 @@ go_test(
         "manager_test.go",
         "peer_test.go",
         "rekey_test.go",
+        "sockopt_test.go",
         "synctest_test.go",
         "throughput_proxy_test.go",
         "throughput_test.go",

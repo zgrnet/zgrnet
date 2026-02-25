@@ -106,6 +106,10 @@ type packet struct {
 	// Atomic because ioLoop writes it while decryptWorker reads it concurrently.
 	inOutput atomic.Bool
 
+	// Release guard: prevents double-release when multiple goroutines
+	// race to release the same packet (e.g., during shutdown).
+	released atomic.Bool
+
 	// Synchronization
 	ready chan struct{} // closed when decryption is complete
 }
@@ -142,12 +146,17 @@ func acquirePacket() *packet {
 	p.payloadN = 0
 	p.err = nil
 	p.inOutput.Store(false)
+	p.released.Store(false)
 	p.ready = make(chan struct{})
 	return p
 }
 
 // releasePacket returns a packet to the pool.
+// Safe to call from multiple goroutines — only the first call takes effect.
 func releasePacket(p *packet) {
+	if !p.released.CompareAndSwap(false, true) {
+		return
+	}
 	outstandingPackets.Add(-1)
 	if p.data != nil {
 		bufferPool.Put(p.data)
@@ -161,6 +170,9 @@ func releasePacket(p *packet) {
 type UDP struct {
 	socket   *net.UDPConn
 	localKey *noise.KeyPair
+
+	// Socket configuration (for GSO/GRO, busy-poll, buffer sizes)
+	socketConfig SocketConfig
 
 	// Options
 	allowUnknown bool
@@ -232,6 +244,7 @@ type options struct {
 	decryptedChanSize int // 0 = use DecryptedChanSize constant
 	routeTable        *relay.RouteTable
 	localMetrics      relay.NodeMetrics
+	socketConfig      SocketConfig
 }
 
 // WithBindAddr sets the local address to bind to.
@@ -298,6 +311,14 @@ func WithDecryptedChanSize(n int) Option {
 	}
 }
 
+// WithSocketConfig sets the socket configuration (GSO, GRO, busy-poll, buffer sizes).
+// Default is DefaultSocketConfig().
+func WithSocketConfig(cfg SocketConfig) Option {
+	return func(o *options) {
+		o.socketConfig = cfg
+	}
+}
+
 // NewUDP creates a new UDP network.
 func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 	if key == nil {
@@ -323,6 +344,10 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 		return nil, err
 	}
 
+	// Apply socket configuration (ApplySocketOptions handles zero values individually)
+	socketConfig := o.socketConfig
+	ApplySocketOptions(socket, socketConfig)
+
 	rawSize := o.rawChanSize
 	if rawSize <= 0 {
 		rawSize = RawChanSize
@@ -335,6 +360,7 @@ func NewUDP(key *noise.KeyPair, opts ...Option) (*UDP, error) {
 	u := &UDP{
 		socket:       socket,
 		localKey:     key,
+		socketConfig: socketConfig,
 		allowUnknown: o.allowUnknown,
 		routeTable:   o.routeTable,
 		localMetrics: o.localMetrics,
@@ -984,18 +1010,80 @@ func (u *UDP) Close() error {
 
 // ioLoop reads packets from the socket and dispatches them.
 // Each packet goes to both decryptChan (for workers) and outputChan (for ReadFrom).
+// On Linux, uses recvmmsg batch reading for reduced syscall overhead.
 // This goroutine only does I/O, no decryption, to maximize throughput.
 func (u *UDP) ioLoop() {
+	bc := newBatchConn(u.socket, DefaultBatchSize)
+	if bc != nil {
+		u.ioLoopBatch(bc)
+	} else {
+		u.ioLoopSingle()
+	}
+}
+
+// ioLoopBatch reads packets using recvmmsg (Linux).
+func (u *UDP) ioLoopBatch(bc *batchConn) {
+	pkts := make([]*packet, DefaultBatchSize)
+	bufs := make([][]byte, DefaultBatchSize)
+
 	for {
-		// Check if closed before acquiring packet
 		if u.closed.Load() {
 			return
 		}
 
-		// Acquire packet from pool
+		// Acquire batch of packets from pool
+		count := 0
+		for count < DefaultBatchSize {
+			pkts[count] = acquirePacket()
+			bufs[count] = pkts[count].data
+			count++
+		}
+
+		// Batch read (blocks until ≥1 packet available)
+		n, err := bc.ReadBatch(bufs[:count])
+		if err != nil {
+			for i := 0; i < count; i++ {
+				releasePacket(pkts[i])
+			}
+			if u.closed.Load() {
+				return
+			}
+			continue
+		}
+
+		// Release unused packets
+		for i := n; i < count; i++ {
+			releasePacket(pkts[i])
+		}
+
+		// Dispatch received packets
+		for i := 0; i < n; i++ {
+			pkt := pkts[i]
+			pkt.n = bc.ReceivedN(i)
+			pkt.from = bc.ReceivedFrom(i)
+
+			if pkt.n < 1 || pkt.from == nil {
+				releasePacket(pkt)
+				continue
+			}
+
+			u.totalRx.Add(uint64(pkt.n))
+			u.lastSeen.Store(time.Now())
+
+			u.dispatchToChannels(pkt)
+		}
+	}
+}
+
+// ioLoopSingle reads packets one at a time (non-Linux fallback).
+func (u *UDP) ioLoopSingle() {
+	for {
+		if u.closed.Load() {
+			return
+		}
+
 		pkt := acquirePacket()
 
-		// Read from socket (blocking)
 		n, from, err := u.socket.ReadFromUDP(pkt.data)
 		if err != nil {
 			releasePacket(pkt)
@@ -1005,7 +1093,6 @@ func (u *UDP) ioLoop() {
 			continue
 		}
 
-		// Check again after blocking read
 		if u.closed.Load() {
 			releasePacket(pkt)
 			return
@@ -1019,50 +1106,44 @@ func (u *UDP) ioLoop() {
 		pkt.n = n
 		pkt.from = from
 
-		// Update stats
 		u.totalRx.Add(uint64(n))
 		u.lastSeen.Store(time.Now())
 
-		// Check if closing before sending to channels
-		select {
-		case <-u.closeChan:
-			releasePacket(pkt)
-			return
-		default:
-		}
+		u.dispatchToChannels(pkt)
+	}
+}
 
-		// Send to both channels (non-blocking).
-		// outputChan first: if it succeeds, ReadFrom owns the release.
-		// decryptChan second: if it fails, we signal ready immediately
-		// so ReadFrom doesn't block, and ReadFrom will release.
-		select {
-		case u.outputChan <- pkt:
-			pkt.inOutput.Store(true)
-		case <-u.closeChan:
-			releasePacket(pkt)
-			return
-		default:
-			// Output queue full, drop for ReadFrom path.
-			// pkt.inOutput stays false — decryptWorker will release.
-		}
+// dispatchToChannels sends a packet to both outputChan and decryptChan.
+func (u *UDP) dispatchToChannels(pkt *packet) {
+	select {
+	case <-u.closeChan:
+		releasePacket(pkt)
+		return
+	default:
+	}
 
-		select {
-		case u.decryptChan <- pkt:
-			// Sent to decrypt worker
-		case <-u.closeChan:
-			if !pkt.inOutput.Load() {
-				releasePacket(pkt)
-			}
-			return
-		default:
-			// Decrypt queue full. If packet is in outputChan,
-			// mark it as error and signal ready so ReadFrom skips it.
-			if pkt.inOutput.Load() {
-				pkt.err = ErrNoData
-				close(pkt.ready)
-			} else {
-				releasePacket(pkt)
-			}
+	select {
+	case u.outputChan <- pkt:
+		pkt.inOutput.Store(true)
+	case <-u.closeChan:
+		releasePacket(pkt)
+		return
+	default:
+	}
+
+	select {
+	case u.decryptChan <- pkt:
+	case <-u.closeChan:
+		if !pkt.inOutput.Load() {
+			releasePacket(pkt)
+		}
+		return
+	default:
+		if pkt.inOutput.Load() {
+			pkt.err = ErrNoData
+			close(pkt.ready)
+		} else {
+			releasePacket(pkt)
 		}
 	}
 }

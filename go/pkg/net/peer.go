@@ -178,6 +178,7 @@ func (u *UDP) sendDirect(peer *peerState, protocol byte, data []byte) error {
 
 	// Build and send transport message
 	msg := noise.BuildTransportMessage(session.RemoteIndex(), counter, ciphertext)
+
 	n, err := u.socket.WriteToUDP(msg, endpoint)
 	if err != nil {
 		return err

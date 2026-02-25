@@ -155,6 +155,9 @@ pub struct UdpOptions {
     pub bind_addr: Option<String>,
     /// Allow connections from unknown peers.
     pub allow_unknown: bool,
+    /// Socket configuration (buffer sizes, GSO, GRO, busy-poll).
+    /// If None, uses default configuration.
+    pub socket_config: Option<super::sockopt::SocketConfig>,
 }
 
 impl UdpOptions {
@@ -180,7 +183,6 @@ pub struct UDP {
     socket: UdpSocket,
     local_key: KeyPair,
     allow_unknown: bool,
-
     // Relay routing and forwarding
     route_table: RwLock<Option<Arc<relay::RouteTable>>>,
     local_metrics: Mutex<relay::NodeMetrics>,
@@ -206,6 +208,12 @@ impl UDP {
     pub fn new(key: KeyPair, opts: UdpOptions) -> Result<Self> {
         let bind_addr = opts.bind_addr.as_deref().unwrap_or("0.0.0.0:0");
         let socket = UdpSocket::bind(bind_addr)?;
+
+        // Apply socket configuration (user-provided or default)
+        {
+            let socket_config = opts.socket_config.unwrap_or_default();
+            super::sockopt::apply_socket_options(&socket, &socket_config);
+        }
 
         // Set read timeout for non-blocking behavior in receive loop
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -372,7 +380,8 @@ impl UDP {
         // Build transport message
         let msg = build_transport_message(session.remote_index(), nonce, &ciphertext);
 
-        // Send
+        // Transport messages are single datagrams at the protocol layer.
+        // Do not GSO-segment a single message into multiple UDP packets.
         let n = self.socket.send_to(&msg, endpoint)?;
 
         // Update stats
