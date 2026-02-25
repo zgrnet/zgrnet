@@ -243,13 +243,14 @@ fn apply_platform_options(fd: i32, cfg: &SocketConfig, report: &mut Optimization
         }
     }
 
-    // UDP_GSO (send segmentation)
+    // UDP_GSO (send segmentation) - reserved for future multi-message batching.
+    // Single Noise transport messages must not be segmented.
     if cfg.gso {
         report.entries.push(OptimizationEntry {
             name: "UDP_GSO",
-            applied: true,
+            applied: false,
             detail: format!(
-                "per-send UDP_SEGMENT={} via sendmsg cmsg",
+                "reserved (segment={}); not applied to avoid fragmenting single datagrams",
                 DEFAULT_GSO_SEGMENT
             ),
             error: None,

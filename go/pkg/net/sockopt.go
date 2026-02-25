@@ -69,6 +69,16 @@ func (r *OptimizationReport) String() string {
 	return b.String()
 }
 
+// firstError returns the first non-nil error from the arguments.
+func firstError(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
 // ApplySocketOptions applies all configured optimizations to a UDP connection.
 // Each optimization is tried independently — failures don't block others.
 func ApplySocketOptions(conn *net.UDPConn, cfg SocketConfig) *OptimizationReport {

@@ -31,12 +31,12 @@ func applyPlatformOptions(conn *net.UDPConn, cfg SocketConfig, report *Optimizat
 
 	if cfg.BusyPollUS > 0 {
 		var setErr error
-		raw.Control(func(fd uintptr) {
+		ctlErr := raw.Control(func(fd uintptr) {
 			setErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, sysSO_BUSY_POLL, cfg.BusyPollUS)
 		})
-		if setErr != nil {
+		if err := firstError(ctlErr, setErr); err != nil {
 			report.Entries = append(report.Entries, OptimizationEntry{
-				Name: "SO_BUSY_POLL", Err: setErr,
+				Name: "SO_BUSY_POLL", Err: err,
 			})
 		} else {
 			report.Entries = append(report.Entries, OptimizationEntry{
@@ -48,12 +48,12 @@ func applyPlatformOptions(conn *net.UDPConn, cfg SocketConfig, report *Optimizat
 
 	if cfg.GRO {
 		var setErr error
-		raw.Control(func(fd uintptr) {
+		ctlErr := raw.Control(func(fd uintptr) {
 			setErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_UDP, sysUDP_GRO, 1)
 		})
-		if setErr != nil {
+		if err := firstError(ctlErr, setErr); err != nil {
 			report.Entries = append(report.Entries, OptimizationEntry{
-				Name: "UDP_GRO", Err: setErr,
+				Name: "UDP_GRO", Err: err,
 			})
 		} else {
 			report.Entries = append(report.Entries, OptimizationEntry{
@@ -64,9 +64,12 @@ func applyPlatformOptions(conn *net.UDPConn, cfg SocketConfig, report *Optimizat
 	}
 
 	if cfg.GSO {
+		// GSO send segmentation is reserved for future multi-message batching.
+		// Single Noise transport messages must not be segmented, so GSO is not
+		// currently applied at the socket or per-send level.
 		report.Entries = append(report.Entries, OptimizationEntry{
-			Name: "UDP_GSO", Applied: true,
-			Detail: fmt.Sprintf("per-send UDP_SEGMENT=%d via sendmsg cmsg", DefaultGSOSegment),
+			Name:   "UDP_GSO",
+			Detail: fmt.Sprintf("reserved (segment=%d); not applied to avoid fragmenting single datagrams", DefaultGSOSegment),
 		})
 	}
 }

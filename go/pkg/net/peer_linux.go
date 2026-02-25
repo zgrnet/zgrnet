@@ -27,17 +27,11 @@ func (u *UDP) sendToGSO(data []byte, addr *net.UDPAddr) (int, error) {
 		// UDP_SEGMENT expects a uint16 segment size
 		cmsgBuf := make([]byte, unix.CmsgSpace(2))
 
-		// Fill cmsghdr using unix.CmsgLen for correct length
+		// Fill cmsghdr — SetLen handles uint32/uint64 difference across architectures
 		cmsg := (*unix.Cmsghdr)(unsafe.Pointer(&cmsgBuf[0]))
 		cmsg.Level = unix.IPPROTO_UDP
 		cmsg.Type = unix.UDP_SEGMENT
-		// Cmsghdr.Len is uint64 on 64-bit Linux, uint32 on 32-bit Linux
-		// Use unsafe.Sizeof to determine the correct type at compile time
-		if unsafe.Sizeof(cmsg.Len) == 8 {
-			*(*uint64)(unsafe.Pointer(&cmsg.Len)) = uint64(unix.CmsgLen(2))
-		} else {
-			*(*uint32)(unsafe.Pointer(&cmsg.Len)) = uint32(unix.CmsgLen(2))
-		}
+		cmsg.SetLen(unix.CmsgLen(2))
 
 		// Write segment size (uint16) into cmsg data area
 		// Use CmsgLen(0) to get the correct offset including alignment padding

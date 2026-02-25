@@ -136,9 +136,9 @@ fn applyLinuxOptions(fd: posix.socket_t, cfg: SocketConfig, report: *Optimizatio
     }
 
     if (cfg.gso) {
-        // Keep GSO as per-send behavior via sendmsg cmsg (UDP_SEGMENT),
-        // not a socket-level setsockopt that affects every send.
-        report.add(.{ .name = "UDP_GSO", .applied = true, .actual_value = default_gso_segment });
+        // GSO send segmentation is reserved for future multi-message batching.
+        // Single Noise transport messages must not be segmented.
+        report.add(.{ .name = "UDP_GSO", .applied = false, .actual_value = default_gso_segment });
     }
 }
 
