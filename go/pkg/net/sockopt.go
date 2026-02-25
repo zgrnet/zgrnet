@@ -62,8 +62,12 @@ func (r *OptimizationReport) String() string {
 	for _, e := range r.Entries {
 		if e.Applied {
 			fmt.Fprintf(&b, "\n  %-40s [ok]", e.Detail)
-		} else {
+		} else if e.Err != nil {
 			fmt.Fprintf(&b, "\n  %-40s [not available: %v]", e.Name, e.Err)
+		} else if e.Detail != "" {
+			fmt.Fprintf(&b, "\n  %-40s [%s]", e.Name, e.Detail)
+		} else {
+			fmt.Fprintf(&b, "\n  %-40s [skipped]", e.Name)
 		}
 	}
 	return b.String()

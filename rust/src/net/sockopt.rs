@@ -70,12 +70,12 @@ impl fmt::Display for OptimizationReport {
         for e in &self.entries {
             if e.applied {
                 writeln!(f, "  {:<40} [ok]", e.detail)?;
+            } else if let Some(ref err) = e.error {
+                writeln!(f, "  {:<40} [not available: {}]", e.name, err)?;
+            } else if !e.detail.is_empty() {
+                writeln!(f, "  {:<40} [{}]", e.name, e.detail)?;
             } else {
-                let err_str = e
-                    .error
-                    .as_ref()
-                    .map_or("unknown".to_string(), |e| e.to_string());
-                writeln!(f, "  {:<40} [not available: {}]", e.name, err_str)?;
+                writeln!(f, "  {:<40} [skipped]", e.name)?;
             }
         }
         Ok(())
