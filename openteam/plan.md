@@ -34,6 +34,51 @@
 
 ## P1: 建议修改
 
-- [ ] 补齐 `openteam/test.md`（或等价 Tester 标准文档）并与实现逐条映射
+- [x] 补齐 `openteam/test.md`（或等价 Tester 标准文档）并与实现逐条映射
   - 问题：当前缺少 Tester 基线，无法形成完整审查闭环。
   - 建议：明确每个验收场景对应测试文件与命令输出。
+
+## Reviewer 复审结论（2026-02-27）
+
+- P0 项已全部清零。
+- 当前仅剩 P1 文档项：`openteam/test.md` 缺失。
+
+---
+
+## P0: Cursor Bugbot Reviews (2026-02-27)
+
+### High Severity
+
+- [ ] HandleTCPProxy 始终失败 with nil metadata
+  - 位置：`go/cmd/smoketest/main.go:188`、`go/cmd/zgrnetd/main.go:424-425`、`e2e/proxy/go/main.go:139-140`
+  - 问题：所有调用者传递 `nil` 作为 `metadata`，但 `HandleTCPProxy` 调用 `noise.DecodeAddress(metadata)` 返回 `ErrInvalidAddress`，导致 TCP 代理功能完全失效
+  - 建议：需要添加带内地址协议或传递正确的 metadata
+
+- [ ] Send on closed channel race in serviceAcceptLoop
+  - 位置：`go/pkg/kcp/service.go:255-276`
+  - 问题：检查 `m.closed` 为 false 后准备发送，但 `Close()` 可能同时关闭 channel 导致 panic
+  - 建议：使用 select + channel 状态检查或改用 sync.Cond
+
+- [ ] UDP.Close 从未关闭 ServiceMux 导致 AcceptStream 死锁
+  - 位置：`go/pkg/net/peer.go:147-172`、`go/pkg/node/node.go:393-395`
+  - 问题：`UDP.Close()` 从未调用 peers' `ServiceMux` 的 `Close()`，导致 `acceptCh` 永不关闭，`AcceptStream` 永久阻塞
+  - 建议：在 UDP.Close 中调用 ServiceMux.Close()
+
+### Medium Severity
+
+- [ ] Batch-drained packets 缺少 KCP Update 和 recv
+  - 位置：`go/pkg/kcp/conn.go:195-206`
+  - 问题：批量输入后没有调用 `Update()` 或 `drainRecv()`，导致延迟增加
+  - 建议：在 drainInputCh 结束后添加 Update() 和 drainRecv()
+
+- [ ] No-op deadlines 破坏 yamux keepalive 和 timeouts
+  - 位置：`go/pkg/kcp/service.go:295-298`
+  - 问题：`kcpPipe` 实现了 no-op 的 SetDeadline，但 yamux 依赖这些进行 keepalive（默认 10s），导致死连接无法检测
+  - 建议：实现真正的 deadline 支持，或禁用 yamux keepalive
+
+### Low Severity
+
+- [ ] AcceptStreamOn 方法从未被调用
+  - 位置：`go/pkg/kcp/service.go:129-143`
+  - 问题：导出的方法在代码库中没有任何调用者，属于死代码
+  - 建议：删除或添加测试/文档说明用途
