@@ -109,11 +109,13 @@ pub fn YamuxStream(comptime Rt: type) type {
 
         pub fn read(self: *Self, buf: []u8) !usize {
             self.mutex.lock();
-            defer self.mutex.unlock();
 
             while (self.recv_buf.items.len == 0) {
                 const st = self.getState();
-                if (st == .half_close_remote or st == .closed) return 0;
+                if (st == .half_close_remote or st == .closed) {
+                    self.mutex.unlock();
+                    return 0;
+                }
                 _ = self.data_cond.timedWait(&self.mutex, 100 * std.time.ns_per_ms);
             }
 
@@ -121,20 +123,35 @@ pub fn YamuxStream(comptime Rt: type) type {
             @memcpy(buf[0..n], self.recv_buf.items[0..n]);
             std.mem.copyForwards(u8, self.recv_buf.items[0..], self.recv_buf.items[n..]);
             self.recv_buf.items.len -= n;
+            const remaining = self.recv_buf.items.len;
+            self.mutex.unlock();
 
-            // Send WindowUpdate if we consumed significant data.
+            // Go yamux-compatible window update strategy:
+            // delta = (max_window - buffered) - advertised_recv_window
+            // send only when delta >= max_window/2.
             if (n > 0) {
-                const delta: u32 = @intCast(n);
-                self.recv_window +|= delta;
-                var hdr: [frame_header_size]u8 = undefined;
-                const frame = Frame{
-                    .frame_type = .window_update,
-                    .flags = 0,
-                    .stream_id = self.id,
-                    .length = delta,
-                };
-                frame.encode(&hdr);
-                self.session_write_fn(self.session_ctx, &hdr) catch {};
+                const max_window: u32 = default_window_size;
+                const remaining_u32: u32 = @intCast(@min(remaining, @as(usize, max_window)));
+                const available: u32 = max_window - remaining_u32;
+
+                if (available > self.recv_window) {
+                    const delta = available - self.recv_window;
+                    if (delta >= (max_window / 2)) {
+                        self.recv_window +|= delta;
+
+                        var hdr: [frame_header_size]u8 = undefined;
+                        const frame = Frame{
+                            .frame_type = .window_update,
+                            .flags = 0,
+                            .stream_id = self.id,
+                            .length = delta,
+                        };
+                        frame.encode(&hdr);
+                        self.session_write_fn(self.session_ctx, &hdr) catch |err| {
+                            std.log.warn("[yamux] stream={d} window_update send failed: {s}", .{ self.id, @errorName(err) });
+                        };
+                    }
+                }
             }
 
             return n;
@@ -157,7 +174,7 @@ pub fn YamuxStream(comptime Rt: type) type {
             self.mutex.unlock();
 
             const avail = self.send_window;
-            const n = @min(data.len, @as(usize, avail));
+            const n = @min(@min(data.len, @as(usize, avail)), @as(usize, 65536));
 
             // Send Data frame.
             var frame_buf: [frame_header_size + 65536]u8 = undefined;
@@ -210,6 +227,14 @@ pub fn YamuxStream(comptime Rt: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.recv_buf.appendSlice(self.allocator, data) catch return;
+
+            const delta: u32 = @intCast(@min(data.len, @as(usize, std.math.maxInt(u32))));
+            if (delta >= self.recv_window) {
+                self.recv_window = 0;
+            } else {
+                self.recv_window -= delta;
+            }
+
             self.data_cond.signal();
         }
 
@@ -258,6 +283,9 @@ pub fn Yamux(comptime Rt: type) type {
         accept_mutex: Rt.Mutex,
         accept_cond: Rt.Condition,
 
+        // Transport RX staging buffer to handle partial frame reads.
+        rx_buf: std.ArrayListUnmanaged(u8),
+
         closed: bool, // No longer atomic
 
         // Transport I/O.
@@ -290,6 +318,7 @@ pub fn Yamux(comptime Rt: type) type {
                 .accept_queue = .{},
                 .accept_mutex = Rt.Mutex.init(),
                 .accept_cond = Rt.Condition.init(),
+                .rx_buf = .{},
                 .closed = false,
                 .transport_ctx = transport_ctx,
                 .transport_read = transport_read,
@@ -316,6 +345,8 @@ pub fn Yamux(comptime Rt: type) type {
             self.accept_mutex.lock();
             self.accept_queue.deinit(self.allocator);
             self.accept_mutex.unlock();
+
+            self.rx_buf.deinit(self.allocator);
 
             self.streams_mutex.deinit();
             self.accept_mutex.deinit();
@@ -389,36 +420,10 @@ pub fn Yamux(comptime Rt: type) type {
 
             // Poll the transport first (drive KCP)
             self.transport_poll(self.transport_ctx);
-            did_work = true;
+            did_work = self.pullTransportData() or did_work;
 
-            // Process all available frames (non-blocking)
-            while (true) {
-                var hdr_buf: [frame_header_size]u8 = undefined;
-
-                // Try to read a frame header (non-blocking)
-                var read_total: usize = 0;
-                while (read_total < frame_header_size) {
-                    const n = self.transport_read(self.transport_ctx, hdr_buf[read_total..]) catch break;
-                    if (n == 0) break; // No more data available
-                    read_total += n;
-                }
-
-                if (read_total < frame_header_size) {
-                    // Not enough data for a complete frame
-                    break;
-                }
-
-                const frame = Frame.decode(&hdr_buf);
-
-                switch (frame.frame_type) {
-                    .data => self.handleData(frame),
-                    .window_update => self.handleWindowUpdate(frame),
-                    .ping => self.handlePing(frame),
-                    .go_away => {
-                        self.close();
-                        return false;
-                    },
-                }
+            // Process all complete buffered frames.
+            while (self.processOneBufferedFrame()) {
                 did_work = true;
             }
 
@@ -452,37 +457,70 @@ pub fn Yamux(comptime Rt: type) type {
 
             // Poll transport (drive KCP)
             self.transport_poll(self.transport_ctx);
+            _ = self.pullTransportData();
 
-            // Process multiple frames in batch
+            // Process complete buffered frames in batch.
             var count: usize = 0;
-            for (0..max_frames) |_| {
-                var hdr_buf: [frame_header_size]u8 = undefined;
-
-                // Try to read frame header
-                var read_total: usize = 0;
-                while (read_total < frame_header_size) {
-                    const n = self.transport_read(self.transport_ctx, hdr_buf[read_total..]) catch break;
-                    if (n == 0) break;
-                    read_total += n;
-                }
-
-                if (read_total < frame_header_size) break;
-
-                const frame = Frame.decode(&hdr_buf);
-
-                switch (frame.frame_type) {
-                    .data => self.handleData(frame),
-                    .window_update => self.handleWindowUpdate(frame),
-                    .ping => self.handlePing(frame),
-                    .go_away => {
-                        self.close();
-                        return count;
-                    },
-                }
+            while (count < max_frames and self.processOneBufferedFrame()) {
                 count += 1;
             }
 
             return count;
+        }
+
+        fn pullTransportData(self: *Self) bool {
+            var did_read = false;
+            var tmp: [4096]u8 = undefined;
+
+            while (true) {
+                const n = self.transport_read(self.transport_ctx, &tmp) catch break;
+                if (n == 0) break;
+
+                self.rx_buf.appendSlice(self.allocator, tmp[0..n]) catch break;
+                did_read = true;
+
+                // Non-full read usually means no more immediate data.
+                if (n < tmp.len) break;
+            }
+
+            return did_read;
+        }
+
+        fn processOneBufferedFrame(self: *Self) bool {
+            if (self.rx_buf.items.len < frame_header_size) return false;
+
+            var hdr_buf: [frame_header_size]u8 = undefined;
+            @memcpy(&hdr_buf, self.rx_buf.items[0..frame_header_size]);
+
+            // Validate frame type byte before enum cast to avoid panic on
+            // malformed/corrupted data from interop peers.
+            if (hdr_buf[1] > @intFromEnum(FrameType.go_away)) {
+                // Drop one byte and try to re-sync.
+                std.mem.copyForwards(u8, self.rx_buf.items[0..], self.rx_buf.items[1..]);
+                self.rx_buf.items.len -= 1;
+                return true;
+            }
+
+            const frame = Frame.decode(&hdr_buf);
+            const payload_len: usize = if (frame.frame_type == .data) @as(usize, frame.length) else 0;
+            const total_len = frame_header_size + payload_len;
+            if (self.rx_buf.items.len < total_len) return false;
+
+            const payload = self.rx_buf.items[frame_header_size..total_len];
+            self.handleFrame(frame, payload);
+
+            std.mem.copyForwards(u8, self.rx_buf.items[0..], self.rx_buf.items[total_len..]);
+            self.rx_buf.items.len -= total_len;
+            return true;
+        }
+
+        fn handleFrame(self: *Self, frame: Frame, payload: []const u8) void {
+            switch (frame.frame_type) {
+                .data => self.handleData(frame, payload),
+                .window_update => self.handleWindowUpdate(frame),
+                .ping => self.handlePing(frame),
+                .go_away => self.close(),
+            }
         }
 
         fn sessionWrite(self: *Self, data: []const u8) !void {
@@ -518,7 +556,7 @@ pub fn Yamux(comptime Rt: type) type {
             return session.sessionWrite(data);
         }
 
-        fn handleData(self: *Self, frame: Frame) void {
+        fn handleData(self: *Self, frame: Frame, payload: []const u8) void {
             // SYN on Data frame: create new inbound stream.
             if (frame.hasSyn()) {
                 const stream = self.createStream(frame.stream_id) catch return;
@@ -526,26 +564,19 @@ pub fn Yamux(comptime Rt: type) type {
                 self.accept_queue.append(self.allocator, stream) catch {};
                 self.accept_mutex.unlock();
                 self.accept_cond.signal();
+
+                // Acknowledge inbound stream creation.
+                self.sendWindowUpdateAck(frame.stream_id);
             }
 
             // Read payload if any.
-            if (frame.length > 0) {
-                const payload = self.allocator.alloc(u8, frame.length) catch return;
-                defer self.allocator.free(payload);
-
-                var total: usize = 0;
-                while (total < frame.length) {
-                    const n = self.transport_read(self.transport_ctx, payload[total..]) catch return;
-                    if (n == 0) return;
-                    total += n;
-                }
-
+            if (frame.length > 0 and payload.len >= frame.length) {
                 self.streams_mutex.lock();
                 const stream = self.streams.get(frame.stream_id);
                 self.streams_mutex.unlock();
 
                 if (stream) |s| {
-                    s.pushData(payload[0..total]);
+                    s.pushData(payload[0..frame.length]);
                 }
             }
 
@@ -576,6 +607,9 @@ pub fn Yamux(comptime Rt: type) type {
                 self.accept_queue.append(self.allocator, stream) catch {};
                 self.accept_mutex.unlock();
                 self.accept_cond.signal();
+
+                // Acknowledge inbound stream creation and advertise our window.
+                self.sendWindowUpdateAck(frame.stream_id);
                 return;
             }
 
@@ -602,6 +636,20 @@ pub fn Yamux(comptime Rt: type) type {
                 self.sessionWrite(&hdr) catch {};
             }
             // ACK pings are silently consumed.
+        }
+
+        fn sendWindowUpdateAck(self: *Self, stream_id: u32) void {
+            var hdr: [frame_header_size]u8 = undefined;
+            const ack = Frame{
+                .frame_type = .window_update,
+                .flags = FrameFlags.ack,
+                .stream_id = stream_id,
+                .length = 0,
+            };
+            ack.encode(&hdr);
+            self.sessionWrite(&hdr) catch |err| {
+                std.log.warn("[yamux] stream={d} open ack send failed: {s}", .{ stream_id, @errorName(err) });
+            };
         }
     };
 }

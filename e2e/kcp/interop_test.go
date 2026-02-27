@@ -135,7 +135,7 @@ func TestInterop_GoRust_MultiStream(t *testing.T) {
 	runInterop(t, goBin(t), rustBin(t), "go", "rust", testParams{
 		Mode:       "multi_stream",
 		NumStreams: 10,
-		ChunkKB:   64,
+		ChunkKB:    64,
 	})
 }
 
@@ -166,10 +166,116 @@ func TestInterop_GoZig(t *testing.T) {
 	})
 }
 
+func TestInterop_GoOpener_ZigAccepter_Streaming(t *testing.T) {
+	runInterop(t, goBin(t), zigBin(t), "go", "zig", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+func TestInterop_GoOpener_ZigAccepter_MultiStream(t *testing.T) {
+	runInterop(t, goBin(t), zigBin(t), "go", "zig", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+func TestInterop_GoOpener_ZigAccepter_DelayedWrite(t *testing.T) {
+	runInterop(t, goBin(t), zigBin(t), "go", "zig", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
+	})
+}
+
+func TestInterop_ZigOpener_GoAccepter_Echo(t *testing.T) {
+	runInterop(t, zigBin(t), goBin(t), "zig", "go", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello Zig-Go!",
+	})
+}
+
+func TestInterop_ZigOpener_GoAccepter_Streaming(t *testing.T) {
+	runInterop(t, zigBin(t), goBin(t), "zig", "go", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+func TestInterop_ZigOpener_GoAccepter_MultiStream(t *testing.T) {
+	runInterop(t, zigBin(t), goBin(t), "zig", "go", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+func TestInterop_ZigOpener_GoAccepter_DelayedWrite(t *testing.T) {
+	runInterop(t, zigBin(t), goBin(t), "zig", "go", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
+	})
+}
+
 func TestInterop_RustZig(t *testing.T) {
 	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
 		Mode:        "echo",
 		EchoMessage: "Hello Rust-Zig!",
+	})
+}
+
+func TestInterop_RustOpener_ZigAccepter_Streaming(t *testing.T) {
+	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+func TestInterop_RustOpener_ZigAccepter_MultiStream(t *testing.T) {
+	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+func TestInterop_RustOpener_ZigAccepter_DelayedWrite(t *testing.T) {
+	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
+	})
+}
+
+func TestInterop_ZigOpener_RustAccepter_Echo(t *testing.T) {
+	runInterop(t, zigBin(t), rustBin(t), "zig", "rust", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello Zig-Rust!",
+	})
+}
+
+func TestInterop_ZigOpener_RustAccepter_Streaming(t *testing.T) {
+	runInterop(t, zigBin(t), rustBin(t), "zig", "rust", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+func TestInterop_ZigOpener_RustAccepter_MultiStream(t *testing.T) {
+	runInterop(t, zigBin(t), rustBin(t), "zig", "rust", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+func TestInterop_ZigOpener_RustAccepter_DelayedWrite(t *testing.T) {
+	runInterop(t, zigBin(t), rustBin(t), "zig", "rust", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
 	})
 }
 

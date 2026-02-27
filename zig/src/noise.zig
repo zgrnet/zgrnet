@@ -83,7 +83,9 @@ pub const Session = N.Session;
 // ============================================================================
 
 const std_impl = @import("std_impl");
-pub const KqueueIO = std_impl.kqueue_io.KqueueIO;
+pub const IOService = std_impl.IOService;
+// Backward-compatible alias (now resolves to kqueue on macOS, epoll on Linux).
+pub const KqueueIO = IOService;
 
 // ============================================================================
 // Socket abstraction
@@ -110,7 +112,7 @@ pub const ListenerConfig = Listener.Config;
 pub const ListenerError = net.ListenerError;
 pub const UdpTransport = net.UdpTransport;
 pub const UdpAddr = net.UdpAddr;
-pub const UDP = net.UDP(StdCrypto, StdRt, KqueueIO, StdUdpSocket);
+pub const UDP = net.UDP(StdCrypto, StdRt, IOService, StdUdpSocket);
 pub const UdpError = net.UdpError;
 pub const UdpOptions = net.UdpOptions;
 pub const ReadResult = net.ReadResult;
@@ -159,7 +161,7 @@ pub const HostEndpoint = host.Endpoint;
 // Node types (embeddable network node, no TUN)
 // ============================================================================
 
-pub const NodeType = node_mod.Node(StdCrypto, StdRt, KqueueIO, StdUdpSocket);
+pub const NodeType = node_mod.Node(StdCrypto, StdRt, IOService, StdUdpSocket);
 pub const NodeConfig = NodeType.Config;
 pub const NodePeerConfig = NodeType.PeerConfig;
 pub const NodeStream = NodeType.NodeStream;

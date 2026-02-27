@@ -195,34 +195,48 @@ func runOpenerTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, test
 	case "streaming":
 		totalBytes := int64(testCfg.ThroughputMB) * 1024 * 1024
 		chunkSize := testCfg.ChunkKB * 1024
-		if chunkSize == 0 { chunkSize = 8192 }
+		if chunkSize == 0 {
+			chunkSize = 8192
+		}
 		chunk := make([]byte, chunkSize)
-		for i := range chunk { chunk[i] = byte(i % 256) }
+		for i := range chunk {
+			chunk[i] = byte(i % 256)
+		}
 
 		var sent int64
 		for sent < totalBytes {
 			n, err := stream.Write(chunk)
-			if err != nil { log.Fatalf("[opener] write: %v", err) }
+			if err != nil {
+				log.Fatalf("[opener] write: %v", err)
+			}
 			sent += int64(n)
 		}
 		log.Printf("[opener] Sent %d bytes", sent)
 
 	case "multi_stream":
 		numStreams := testCfg.NumStreams
-		if numStreams == 0 { numStreams = 10 }
+		if numStreams == 0 {
+			numStreams = 10
+		}
 		chunkSize := testCfg.ChunkKB * 1024
-		if chunkSize == 0 { chunkSize = 8192 }
+		if chunkSize == 0 {
+			chunkSize = 8192
+		}
 
 		// First stream already open — write 100KB
 		data := make([]byte, 100*1024)
-		for i := range data { data[i] = byte(i % 256) }
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
 		stream.Write(data)
 
 		// Open additional streams
 		var wg sync.WaitGroup
 		for i := 1; i < numStreams; i++ {
 			s, err := udp.OpenStream(peerKey, noise.ServiceProxy)
-			if err != nil { log.Fatalf("[opener] open stream %d: %v", i, err) }
+			if err != nil {
+				log.Fatalf("[opener] open stream %d: %v", i, err)
+			}
 			wg.Add(1)
 			go func(idx int, s net.Conn) {
 				defer wg.Done()
@@ -236,7 +250,9 @@ func runOpenerTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, test
 
 	case "delayed_write":
 		delayMs := testCfg.DelayMs
-		if delayMs == 0 { delayMs = 2000 }
+		if delayMs == 0 {
+			delayMs = 2000
+		}
 		log.Printf("[opener] delaying %dms before writing...", delayMs)
 		time.Sleep(time.Duration(delayMs) * time.Millisecond)
 		if _, err := stream.Write([]byte("delayed hello")); err != nil {
@@ -272,12 +288,16 @@ func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, te
 	switch mode {
 	case "echo", "delayed_write":
 		stream, _, err := udp.AcceptStream(peerKey)
-		if err != nil { log.Fatalf("[accepter] accept: %v", err) }
+		if err != nil {
+			log.Fatalf("[accepter] accept: %v", err)
+		}
 		defer stream.Close()
 
 		buf := make([]byte, 4096)
 		n, err := readWithTimeout(stream, buf, 30*time.Second)
-		if err != nil { log.Fatalf("[accepter] read: %v", err) }
+		if err != nil {
+			log.Fatalf("[accepter] read: %v", err)
+		}
 		log.Printf("[accepter] Received: %q", string(buf[:n]))
 
 		response := fmt.Sprintf("Echo: %s", string(buf[:n]))
@@ -286,7 +306,9 @@ func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, te
 
 	case "streaming":
 		stream, _, err := udp.AcceptStream(peerKey)
-		if err != nil { log.Fatalf("[accepter] accept: %v", err) }
+		if err != nil {
+			log.Fatalf("[accepter] accept: %v", err)
+		}
 		defer stream.Close()
 
 		totalBytes := int64(testCfg.ThroughputMB) * 1024 * 1024
@@ -294,7 +316,9 @@ func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, te
 		var recv int64
 		for recv < totalBytes {
 			n, err := stream.Read(buf)
-			if err != nil { break }
+			if err != nil {
+				break
+			}
 			recv += int64(n)
 		}
 		log.Printf("[accepter] Received %d / %d bytes", recv, totalBytes)
@@ -304,12 +328,16 @@ func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, te
 
 	case "multi_stream":
 		numStreams := testCfg.NumStreams
-		if numStreams == 0 { numStreams = 10 }
+		if numStreams == 0 {
+			numStreams = 10
+		}
 
 		var wg sync.WaitGroup
 		for i := 0; i < numStreams; i++ {
 			stream, _, err := udp.AcceptStream(peerKey)
-			if err != nil { log.Fatalf("[accepter] accept %d: %v", i, err) }
+			if err != nil {
+				log.Fatalf("[accepter] accept %d: %v", i, err)
+			}
 			wg.Add(1)
 			go func(idx int, s net.Conn) {
 				defer wg.Done()
@@ -318,7 +346,9 @@ func runAccepterTest(udp *znet.UDP, peerKey noise.PublicKey, peerName string, te
 				var total int64
 				for {
 					n, err := s.Read(buf)
-					if err != nil || n == 0 { break }
+					if err != nil || n == 0 {
+						break
+					}
 					total += int64(n)
 				}
 				log.Printf("[accepter] stream %d: received %d bytes", idx, total)

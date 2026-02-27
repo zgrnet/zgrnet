@@ -50,7 +50,8 @@ pub const StdUdpSocket = struct {
             .port = mem.nativeToBig(u16, port),
             .addr = @bitCast(addr),
         };
-        return posix.sendto(self.fd, data, 0, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)) catch {
+        return posix.sendto(self.fd, data, 0, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)) catch |err| {
+            if (err == error.WouldBlock) return error.WouldBlock;
             return error.SendFailed;
         };
     }

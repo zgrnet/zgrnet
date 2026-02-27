@@ -94,6 +94,11 @@ pub const X25519 = struct {
         public_key: [32]u8,
 
         pub fn generateDeterministic(seed: [32]u8) !@This() {
+            // NOTE: Zig std X25519 on Linux/x86_64 may hit safety traps in
+            // field carry paths under non-release-safe builds.
+            // Keep arithmetic semantics consistent with constant-time code by
+            // disabling runtime safety for this low-level primitive call.
+            @setRuntimeSafety(false);
             const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(seed) catch
                 return error.IdentityElement;
             return .{ .secret_key = kp.secret_key, .public_key = kp.public_key };
@@ -101,6 +106,8 @@ pub const X25519 = struct {
     };
 
     pub fn scalarmult(sk: [32]u8, pk: [32]u8) ![32]u8 {
+        // See note above in generateDeterministic.
+        @setRuntimeSafety(false);
         return std.crypto.dh.X25519.scalarmult(sk, pk) catch
             return error.WeakPublicKey;
     }

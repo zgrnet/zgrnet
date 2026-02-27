@@ -18,8 +18,12 @@ const base = std_impl.runtime;
 
 pub const Mutex = base.Mutex;
 pub const Thread = base.Thread;
-pub const nowMs = base.nowMs;
 pub const getCpuCount = base.getCpuCount;
+
+/// Millisecond timestamp helper kept for backward compatibility.
+pub fn nowMs() u64 {
+    return @intCast(std.time.milliTimestamp());
+}
 
 // ============================================================================
 // Condition — re-wraps base Condition to add timedWait

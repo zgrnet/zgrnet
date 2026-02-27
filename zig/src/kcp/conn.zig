@@ -204,6 +204,7 @@ pub fn KcpConn(comptime Rt: type) type {
             }
 
             var did_work = false;
+            var wrote_data = false;
 
             // Drain input channel
             while (self.input_ch.tryRecv()) |pkt| {
@@ -224,12 +225,17 @@ pub fn KcpConn(comptime Rt: type) type {
                 }
                 self.allocator.free(data);
                 did_work = true;
+                wrote_data = true;
             }
 
             // Update KCP timer
             const now_ms: u32 = @intCast(Rt.nowMs() & 0xFFFFFFFF);
             self.kcp.update(now_ms);
-            self.kcp.flush();
+            if (wrote_data) {
+                // Explicitly flush after local writes; ACK-only traffic is flushed
+                // by KCP update scheduling to avoid excessive tiny packets.
+                self.kcp.flush();
+            }
             self.drainRecv();
 
             return did_work or !self.input_ch.isEmpty() or !self.write_ch.isEmpty();

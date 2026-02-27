@@ -5,6 +5,5 @@ zig_binary(
     main = "src/main.zig",
     srcs = ["src/main.zig"],
     deps = ["//zig:noise"],
-    target_compatible_with = ["@platforms//os:macos"],
     visibility = ["//visibility:public"],
 )

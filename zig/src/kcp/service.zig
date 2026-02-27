@@ -33,6 +33,7 @@ pub fn ServiceMux(comptime Rt: type) type {
             kcp_conn: *KConn,
             yamux: *YMux,
             accept_thread: ?Rt.Thread,
+            poll_thread: ?Rt.Thread,
             output_ctx: ?*anyopaque, // for cleanup
             fwd_ctx: ?*ForwardCtxType, // for cleanup
         };
@@ -80,6 +81,7 @@ pub fn ServiceMux(comptime Rt: type) type {
             while (it.next()) |entry| {
                 const se = entry.value_ptr.*;
                 if (se.accept_thread) |t| t.join();
+                if (se.poll_thread) |t| t.join();
                 se.yamux.deinit();
                 se.kcp_conn.deinit();
                 if (se.output_ctx) |ctx| {
@@ -183,7 +185,9 @@ pub fn ServiceMux(comptime Rt: type) type {
             const TransportAdapter = struct {
                 fn readFn(transport_ctx: *anyopaque, buf: []u8) anyerror!usize {
                     const kc: *KConn = @ptrCast(@alignCast(transport_ctx));
-                    return kc.readNonBlock(buf); // Use non-blocking read
+                    // Non-blocking read; Yamux session keeps an internal RX buffer
+                    // to reassemble complete frames.
+                    return kc.readNonBlock(buf);
                 }
                 fn writeFn(transport_ctx: *anyopaque, data: []const u8) anyerror!void {
                     const kc: *KConn = @ptrCast(@alignCast(transport_ctx));
@@ -217,6 +221,7 @@ pub fn ServiceMux(comptime Rt: type) type {
                 .kcp_conn = kcp_conn,
                 .yamux = yamux,
                 .accept_thread = Rt.Thread.spawn(.{}, acceptForwarder, .{fwd}) catch null,
+                .poll_thread = Rt.Thread.spawn(.{}, pollDriver, .{fwd}) catch null,
                 .output_ctx = @ptrCast(ctx),
                 .fwd_ctx = fwd,
             };
@@ -246,6 +251,19 @@ pub fn ServiceMux(comptime Rt: type) type {
                 }) catch {};
                 ctx.smux.accept_mutex.unlock();
                 ctx.smux.accept_cond.signal();
+            }
+        }
+
+        fn pollDriver(ctx: *ForwardCtxType) void {
+            while (!ctx.smux.closed.load(.acquire)) {
+                const n = ctx.ymux.pollOptimized(64);
+                if (n == 0) {
+                    if (comptime @hasDecl(Rt, "sleepMs")) {
+                        Rt.sleepMs(1);
+                    } else {
+                        std.Thread.sleep(std.time.ns_per_ms);
+                    }
+                }
             }
         }
     };

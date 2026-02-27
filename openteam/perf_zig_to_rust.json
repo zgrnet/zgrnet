@@ -1,0 +1,24 @@
+{
+  "hosts": [
+    {
+      "name": "zig",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "port": 42131,
+      "role": "opener"
+    },
+    {
+      "name": "rust",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "port": 42132,
+      "role": "accepter"
+    }
+  ],
+  "test": {
+    "mode": "streaming",
+    "throughput_mb": 100,
+    "chunk_kb": 64,
+    "num_streams": 0,
+    "delay_ms": 0,
+    "echo_message": ""
+  }
+}

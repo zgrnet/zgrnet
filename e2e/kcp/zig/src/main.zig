@@ -106,7 +106,8 @@ pub fn main() !void {
             std.log.info("[opener] Response: {s}", .{buf[0..n]});
         } else if (std.mem.eql(u8, mode, "streaming")) {
             const total = config.@"test".throughput_mb * 1024 * 1024;
-            const chunk = try allocator.alloc(u8, 8192);
+            const chunk_size = if (config.@"test".chunk_kb > 0) config.@"test".chunk_kb * 1024 else 8192;
+            const chunk = try allocator.alloc(u8, chunk_size);
             defer allocator.free(chunk);
             @memset(chunk, 0x58);
             var sent: usize = 0;
@@ -115,6 +116,36 @@ pub fn main() !void {
                 sent += n;
             }
             std.log.info("[opener] Sent {d} bytes", .{sent});
+        } else if (std.mem.eql(u8, mode, "multi_stream")) {
+            const num_streams = if (config.@"test".num_streams > 0) config.@"test".num_streams else 10;
+            const data = try allocator.alloc(u8, 100 * 1024);
+            defer allocator.free(data);
+            for (data, 0..) |*b, idx| b.* = @intCast(idx % 256);
+
+            // First stream already opened above.
+            _ = try stream.write(data);
+            std.log.info("[opener] stream 0: sent {d} bytes", .{data.len});
+
+            var i_stream: usize = 1;
+            while (i_stream < num_streams) : (i_stream += 1) {
+                var s = try udp.openStream(&peer_kp.public, 1);
+                defer s.close();
+                _ = try s.write(data);
+                std.log.info("[opener] stream {d}: sent {d} bytes", .{ i_stream, data.len });
+            }
+            std.log.info("[opener] all {d} streams done", .{num_streams});
+        } else if (std.mem.eql(u8, mode, "delayed_write")) {
+            const delay_ms = if (config.@"test".delay_ms > 0) config.@"test".delay_ms else 2000;
+            std.log.info("[opener] delaying {d}ms before writing...", .{delay_ms});
+            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            _ = try stream.write("delayed hello");
+
+            var buf: [4096]u8 = undefined;
+            const n = try stream.read(&buf);
+            std.log.info("[opener] delayed response: {s}", .{buf[0..n]});
+        } else {
+            std.log.err("unknown mode: {s}", .{mode});
+            return error.InvalidMode;
         }
 
         std.Thread.sleep(1 * std.time.ns_per_s);
@@ -130,7 +161,7 @@ pub fn main() !void {
 
         std.log.info("[accepter] Accepted stream on service={d}", .{result.service});
 
-        if (std.mem.eql(u8, mode, "echo") or mode.len == 0) {
+        if (std.mem.eql(u8, mode, "echo") or mode.len == 0 or std.mem.eql(u8, mode, "delayed_write")) {
             var buf: [4096]u8 = undefined;
             const n = try stream.read(&buf);
             std.log.info("[accepter] Received: {s}", .{buf[0..n]});
@@ -142,13 +173,53 @@ pub fn main() !void {
             const total = config.@"test".throughput_mb * 1024 * 1024;
             var buf: [65536]u8 = undefined;
             var recv: usize = 0;
+            var last_log: usize = 0;
             while (recv < total) {
                 const n = try stream.read(&buf);
                 if (n == 0) break;
                 recv += n;
+                if (recv - last_log >= 256 * 1024) {
+                    std.log.info("[accepter] progress {d} / {d}", .{ recv, total });
+                    last_log = recv;
+                }
             }
             std.log.info("[accepter] Received {d} / {d} bytes", .{ recv, total });
             if (recv < total) return error.IncompleteTransfer;
+        } else if (std.mem.eql(u8, mode, "multi_stream")) {
+            const num_streams = if (config.@"test".num_streams > 0) config.@"test".num_streams else 10;
+            const expected_per_stream: usize = 100 * 1024;
+
+            // First stream already accepted above.
+            {
+                var buf: [65536]u8 = undefined;
+                var recv: usize = 0;
+                while (recv < expected_per_stream) {
+                    const n = try stream.read(&buf);
+                    if (n == 0) break;
+                    recv += n;
+                }
+                std.log.info("[accepter] stream 0: received {d} bytes", .{recv});
+            }
+
+            var stream_idx: usize = 1;
+            while (stream_idx < num_streams) : (stream_idx += 1) {
+                const r = try udp.acceptStream(&peer_kp.public);
+                var s = r.stream;
+                defer s.close();
+
+                var buf: [65536]u8 = undefined;
+                var recv: usize = 0;
+                while (recv < expected_per_stream) {
+                    const n = try s.read(&buf);
+                    if (n == 0) break;
+                    recv += n;
+                }
+                std.log.info("[accepter] stream {d}: received {d} bytes", .{ stream_idx, recv });
+            }
+            std.log.info("[accepter] all {d} streams done", .{num_streams});
+        } else {
+            std.log.err("unknown mode: {s}", .{mode});
+            return error.InvalidMode;
         }
 
         std.Thread.sleep(1 * std.time.ns_per_s);

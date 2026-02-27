@@ -1,0 +1,24 @@
+{
+  "hosts": [
+    {
+      "name": "go",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000001",
+      "port": 42101,
+      "role": "opener"
+    },
+    {
+      "name": "zig",
+      "private_key": "0000000000000000000000000000000000000000000000000000000000000002",
+      "port": 42102,
+      "role": "accepter"
+    }
+  ],
+  "test": {
+    "mode": "streaming",
+    "throughput_mb": 100,
+    "chunk_kb": 64,
+    "num_streams": 0,
+    "delay_ms": 0,
+    "echo_message": ""
+  }
+}

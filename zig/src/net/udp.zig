@@ -153,6 +153,10 @@ pub fn Packet(comptime Rt: type) type {
         // Synchronization
         ready: SignalT(Rt), // Signaled when decryption is complete
 
+        // Ownership: true if packet is queued in output_chan and will be
+        // released by readFrom/readPacket. false means decryptWorker releases it.
+        in_output: bool,
+
         pub fn init() Self {
             return Self{
                 .data = &[_]u8{},
@@ -165,6 +169,7 @@ pub fn Packet(comptime Rt: type) type {
                 .err = null,
                 .out_buf = undefined,
                 .ready = SignalT(Rt).init(),
+                .in_output = false,
             };
         }
 
@@ -175,6 +180,7 @@ pub fn Packet(comptime Rt: type) type {
             self.payload = &[_]u8{};
             self.payload_len = 0;
             self.err = null;
+            self.in_output = false;
             // Clear signal state (consume any pending signal)
             _ = self.ready.tryWait();
         }
@@ -517,9 +523,6 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             self.decrypt_chan.close();
             self.output_chan.close();
 
-            // Close socket
-            self.socket.close();
-
             // Join threads
             if (self.io_thread) |t| {
                 t.join();
@@ -530,6 +533,10 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             for (self.workers) |w| {
                 w.join();
             }
+
+            // Close socket after threads have exited to avoid races where
+            // background KCP/Yamux output paths still attempt sendTo().
+            self.socket.close();
 
             // Free peers first
             var peer_iter = self.peers.valueIterator();
@@ -765,9 +772,25 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
 
             // Send via socket trait
             const ep = peer.endpoint;
-            const n = self.socket.sendTo(ep.addr, ep.port, msg_buf[0..msg_len]) catch {
-                return UdpError.SendFailed;
-            };
+            var n: usize = 0;
+            var sent = false;
+            var attempts: usize = 0;
+            while (attempts < 2000) : (attempts += 1) {
+                n = self.socket.sendTo(ep.addr, ep.port, msg_buf[0..msg_len]) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        if (comptime @hasDecl(Rt, "sleepMs")) {
+                            Rt.sleepMs(1);
+                        } else {
+                            std.Thread.sleep(std.time.ns_per_ms);
+                        }
+                        continue;
+                    },
+                    else => return UdpError.SendFailed,
+                };
+                sent = true;
+                break;
+            }
+            if (!sent) return UdpError.SendFailed;
 
             _ = self.total_tx.fetchAdd(@intCast(n), .release);
             _ = peer.tx_bytes.fetchAdd(@intCast(n), .release);
@@ -886,13 +909,12 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
 
             fn output(data: []const u8, user_data: ?*anyopaque) anyerror!void {
                 const ctx: *MuxOutputCtx = @ptrCast(@alignCast(user_data.?));
-                try ctx.udp.sendToPeer(ctx.peer, @intFromEnum(message.Protocol.kcp), data);
+                try ctx.udp.sendToPeer(ctx.peer, message.Protocol.kcp, 0, data);
             }
 
             fn serviceOutput(service: u64, data: []const u8, user_data: ?*anyopaque) void {
-                _ = service;
                 const ctx: *MuxOutputCtx = @ptrCast(@alignCast(user_data.?));
-                ctx.udp.sendToPeer(ctx.peer, @intFromEnum(message.Protocol.kcp), data) catch {};
+                ctx.udp.sendToPeer(ctx.peer, message.Protocol.kcp, service, data) catch {};
             }
         };
 
@@ -902,22 +924,23 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
         }
 
         // Send data to a peer with protocol byte.
-        fn sendToPeer(self: *Self, peer: *PeerState, protocol: u8, data: []const u8) UdpError!void {
+        fn sendToPeer(self: *Self, peer: *PeerState, protocol: message.Protocol, service: u64, data: []const u8) UdpError!void {
             const session = peer.session orelse return UdpError.PeerNotFound;
             if (session.getState() != .established) {
                 return UdpError.PeerNotFound;
             }
 
             var msg_buf: [MaxPacketSize]u8 = undefined;
-            var plaintext: [MaxPacketSize]u8 = undefined;
-            plaintext[0] = protocol;
-            @memcpy(plaintext[1 .. data.len + 1], data);
+            const plaintext = message.encodePayload(self.allocator, protocol, service, data) catch {
+                return UdpError.OutOfMemory;
+            };
+            defer self.allocator.free(plaintext);
 
-            const plaintext_len = data.len + 1;
+            const plaintext_len = plaintext.len;
             const ciphertext_len = plaintext_len + noise.tag_size;
 
             const enc2_now_ms: u64 = Rt.nowMs();
-            const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..], enc2_now_ms) catch {
+            const nonce = session.encrypt(plaintext, msg_buf[13..], enc2_now_ms) catch {
                 return UdpError.SendFailed;
             };
 
@@ -928,9 +951,24 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             const msg_len = 13 + ciphertext_len;
             const ep = peer.endpoint;
 
-            _ = self.socket.sendTo(ep.addr, ep.port, msg_buf[0..msg_len]) catch {
-                return UdpError.SendFailed;
-            };
+            var sent = false;
+            var attempts: usize = 0;
+            while (attempts < 2000) : (attempts += 1) {
+                _ = self.socket.sendTo(ep.addr, ep.port, msg_buf[0..msg_len]) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        if (comptime @hasDecl(Rt, "sleepMs")) {
+                            Rt.sleepMs(1);
+                        } else {
+                            std.Thread.sleep(std.time.ns_per_ms);
+                        }
+                        continue;
+                    },
+                    else => return UdpError.SendFailed,
+                };
+                sent = true;
+                break;
+            }
+            if (!sent) return UdpError.SendFailed;
         }
 
         pub fn openStream(self: *Self, pk: *const Key, service: u64) UdpError!*KcpYamuxStream {
@@ -1018,15 +1056,20 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 _ = self.total_rx.fetchAdd(@intCast(recv_result.len), .release);
                 self.last_seen.store(@intCast(Rt.nowMs()), .release);
 
-                // Dual-channel send: packet must be in both channels or neither.
+                // Best-effort queue to output channel; never block/degrade
+                // internal decrypt/KCP path when no readFrom consumer exists.
+                pkt.in_output = true;
                 self.output_chan.trySend(pkt) catch {
-                    self.packet_pool.release(pkt);
-                    continue;
+                    pkt.in_output = false;
                 };
 
                 self.decrypt_chan.trySend(pkt) catch {
-                    pkt.err = UdpError.NoData;
-                    pkt.ready.notify();
+                    if (pkt.in_output) {
+                        pkt.err = UdpError.NoData;
+                        pkt.ready.notify();
+                    } else {
+                        self.packet_pool.release(pkt);
+                    }
                     continue;
                 };
             }
@@ -1060,6 +1103,10 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
 
                 // Signal ready
                 pkt.ready.notify();
+
+                if (!pkt.in_output) {
+                    self.packet_pool.release(pkt);
+                }
             }
         }
 
@@ -1139,8 +1186,12 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
 
             // Route KCP protocol to Mux
             if (protocol_byte == @intFromEnum(message.Protocol.kcp)) {
+                const decoded = message.decodePayload(pkt.out_buf[0..plaintext_len]) catch {
+                    pkt.err = UdpError.MessageTooShort;
+                    return;
+                };
                 if (peer.service_mux) |mux| {
-                    mux.input(0, payload);
+                    mux.input(decoded.service, decoded.payload);
                 }
                 pkt.err = UdpError.NoData; // Handled internally
                 return;
@@ -1211,7 +1262,8 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             self.peers_mutex.unlock();
 
             const peer = peer_opt orelse return;
-            self.sendToPeer(peer, action.protocol, action.data()) catch {};
+            const proto: message.Protocol = @enumFromInt(action.protocol);
+            self.sendToPeer(peer, proto, 0, action.data()) catch {};
         }
 
         // Process a RELAY_2 inner payload.
