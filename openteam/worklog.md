@@ -2,6 +2,21 @@
 
 ## 审查记录
 
+### 2026-02-27 - Developer
+- **处理内容**：按 `openteam/plan.md` 执行 reviewer P0 项并落地代码。
+  1. 已清理 rebase 冲突与冲突标记。
+     - 验证：`git ls-files -u` 空；`git diff --check` 空。
+  2. Relay 路由改为“先 service 再 protocol 处理”。
+     - Go：`go/pkg/net/udp.go` 将 RELAY_0/1/2/PING/PONG 从 protocol 顶层分支迁移为 `service==noise.ServiceRelay` 条件下处理；KCP 保持 `smux.Input(service, payload)`。
+     - Rust：`rust/src/net/udp.rs` 同步改为 `service == message::service::RELAY` 才处理 relay 协议分支；`execute_relay_action` 发送时显式使用 relay service。
+     - Zig：`zig/src/net/udp.zig` 解包统一走 `decodePayload(protocol+service+data)`；relay 分支仅在 `decoded.service == message.Service.relay` 下执行；relay 转发发送时显式 relay service。
+- **验证结果**：
+  - `bazel build //zig:noise` ✅
+  - `bazel test //go/pkg/net:net_test --test_output=errors` ❌（失败项：`TestClosedChanGoroutineLeak`，属于现有 goroutine leak 检查，非本次 relay/service 改动直接引入）
+  - Rust 相关 Bazel 构建当前受 `rules_rust crate_universe` 超时影响，未完成本地编译验证。
+- **备注**：
+  - `openteam/test.md` 仍缺失（P1 未完成），需 Tester 或 Lead 提供基线后补齐映射。
+
 ### 2026-02-27 - Reviewer
 - **审查范围**：
   - `go/pkg/noise/message.go`

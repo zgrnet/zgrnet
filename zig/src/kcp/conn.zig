@@ -280,13 +280,13 @@ pub fn KcpSelector(comptime Rt: type, comptime max_conns: usize) type {
         const Self = @This();
         const ConnType = KcpConn(Rt);
 
-        selector: Selector(max_conns),
+        selector: Selector(max_conns, max_conns),
         conns: [max_conns]?*ConnType,
         num_conns: usize,
 
         pub fn init() !Self {
             return .{
-                .selector = try Selector(max_conns).init(),
+                .selector = try Selector(max_conns, max_conns).init(),
                 .conns = [_]?*ConnType{null} ** max_conns,
                 .num_conns = 0,
             };
@@ -298,7 +298,7 @@ pub fn KcpSelector(comptime Rt: type, comptime max_conns: usize) type {
 
         /// Register a connection with the selector.
         /// Returns error.TooMany if max_conns is reached.
-        pub fn register(self: *Self, conn: *ConnType) error{TooMany}!void {
+        pub fn register(self: *Self, conn: *ConnType) error{ TooMany, PollCtlFailed }!void {
             if (self.num_conns >= max_conns) return error.TooMany;
             _ = try self.selector.addRecv(&conn.input_ch);
             self.conns[self.num_conns] = conn;
@@ -308,8 +308,14 @@ pub fn KcpSelector(comptime Rt: type, comptime max_conns: usize) type {
         /// Wait for any connection to have pending input, or timeout.
         /// Returns the index of the ready connection, or max_conns on timeout.
         /// Returns error.Empty if no connections registered.
-        pub fn wait(self: *Self, timeout_ms: ?u32) error{Empty}!usize {
-            return self.selector.wait(timeout_ms);
+        pub fn wait(self: *Self, timeout_ms: ?u32) error{ Empty, PollWaitFailed }!usize {
+            while (true) {
+                return self.selector.wait(timeout_ms) catch |err| switch (err) {
+                    error.Interrupted => continue,
+                    error.Empty => error.Empty,
+                    error.PollWaitFailed => error.PollWaitFailed,
+                };
+            }
         }
 
         /// Poll all registered connections.
@@ -637,17 +643,30 @@ test "kcpselector basic" {
     // Send data from a to b
     _ = try a.write("hello");
 
-    // Wait for data to arrive at b
-    const ready = sel.wait(100) catch |err| switch (err) {
-        error.Empty => @panic("should not be empty"),
-    };
-
-    // Poll the ready connection
-    _ = sel.pollAt(ready);
-    _ = b.poll();
-
     var buf: [256]u8 = undefined;
-    const n = try b.read(&buf);
+    var n: usize = 0;
+    var got = false;
+    var tries: usize = 0;
+    while (tries < 200 and !got) : (tries += 1) {
+        const ready = sel.wait(10) catch |err| switch (err) {
+            error.Empty => @panic("should not be empty"),
+            error.PollWaitFailed => @panic("selector poll wait failed"),
+        };
+
+        if (ready < sel.count()) {
+            _ = sel.pollAt(ready);
+        } else {
+            _ = sel.pollAll();
+        }
+        _ = b.poll();
+
+        n = b.readNonBlock(&buf) catch |err| switch (err) {
+            error.NoData => 0,
+            else => return err,
+        };
+        got = n > 0;
+    }
+    try std.testing.expect(got);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
 }
 

@@ -1082,15 +1082,23 @@ pub fn YamuxSelector(comptime Rt: type, comptime max_sessions: usize) type {
     return struct {
         const Self = @This();
         const SessionType = Yamux(Rt);
+        const FdSource = struct {
+            fd: i32,
+            pub fn selectFd(self: *const @This()) i32 {
+                return self.fd;
+            }
+        };
 
-        selector: Selector(max_sessions),
+        selector: Selector(max_sessions, max_sessions),
         sessions: [max_sessions]?*SessionType,
+        sources: [max_sessions]FdSource,
         num_sessions: usize,
 
         pub fn init() !Self {
             return .{
-                .selector = try Selector(max_sessions).init(),
+                .selector = try Selector(max_sessions, max_sessions).init(),
                 .sessions = [_]?*SessionType{null} ** max_sessions,
+                .sources = [_]FdSource{.{ .fd = -1 }} ** max_sessions,
                 .num_sessions = 0,
             };
         }
@@ -1101,22 +1109,28 @@ pub fn YamuxSelector(comptime Rt: type, comptime max_sessions: usize) type {
 
         /// Register a Yamux session with the selector.
         /// The session must support getSelectFd().
-        pub fn register(self: *Self, session: *SessionType) error{ TooMany, NoSelectFd }!void {
+        pub fn register(self: *Self, session: *SessionType) error{ TooMany, NoSelectFd, PollCtlFailed }!void {
             if (self.num_sessions >= max_sessions) return error.TooMany;
 
             const fd = session.getSelectFd();
             if (fd < 0) return error.NoSelectFd;
 
-            // Use selector's addRecv with the fd
-            _ = try self.selector.addRecvFd(fd);
+            self.sources[self.num_sessions].fd = fd;
+            _ = try self.selector.addRecv(&self.sources[self.num_sessions]);
             self.sessions[self.num_sessions] = session;
             self.num_sessions += 1;
         }
 
         /// Wait for any session to have pending data, or timeout.
         /// Returns the index of the ready session, or max_sessions on timeout.
-        pub fn wait(self: *Self, timeout_ms: ?u32) error{Empty}!usize {
-            return self.selector.wait(timeout_ms);
+        pub fn wait(self: *Self, timeout_ms: ?u32) error{ Empty, PollWaitFailed }!usize {
+            while (true) {
+                return self.selector.wait(timeout_ms) catch |err| switch (err) {
+                    error.Interrupted => continue,
+                    error.Empty => error.Empty,
+                    error.PollWaitFailed => error.PollWaitFailed,
+                };
+            }
         }
 
         /// Poll the session at the given index.

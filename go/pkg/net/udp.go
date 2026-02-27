@@ -1263,76 +1263,70 @@ func (u *UDP) decryptTransport(pkt *packet, data []byte, from *net.UDPAddr) {
 	pkt.payload = make([]byte, len(payload))
 	copy(pkt.payload, payload)
 	pkt.payloadN = len(payload)
-	_ = service // used below for KCP routing
-
-	// Route based on protocol
-	switch protocol {
-	case noise.ProtocolKCP:
+	// KCP traffic is routed to per-service ServiceMux.
+	if protocol == noise.ProtocolKCP {
 		if smux != nil {
 			smux.Input(service, payload)
 		}
 		pkt.err = ErrNoData
+		return
+	}
 
-	case noise.ProtocolRelay0:
-		if u.routeTable != nil {
-			action, err := relay.HandleRelay0(u.routeTable, pkt.pk, payload)
-			if err == nil {
-				u.executeRelayAction(action)
+	// Relay is treated as a service (service=0) instead of protocol fast-path.
+	if service == noise.ServiceRelay {
+		switch protocol {
+		case noise.ProtocolRelay0:
+			if u.routeTable != nil {
+				action, err := relay.HandleRelay0(u.routeTable, pkt.pk, payload)
+				if err == nil {
+					u.executeRelayAction(action)
+				}
 			}
-		}
-		pkt.err = ErrNoData // Relay packets are not delivered to ReadFrom
-
-	case noise.ProtocolRelay1:
-		if u.routeTable != nil {
-			action, err := relay.HandleRelay1(u.routeTable, payload)
-			if err == nil {
-				u.executeRelayAction(action)
+			pkt.err = ErrNoData
+			return
+		case noise.ProtocolRelay1:
+			if u.routeTable != nil {
+				action, err := relay.HandleRelay1(u.routeTable, payload)
+				if err == nil {
+					u.executeRelayAction(action)
+				}
 			}
-		}
-		pkt.err = ErrNoData
-
-	case noise.ProtocolRelay2:
-		// Last hop: extract src and inner payload.
-		// The inner payload is a complete Type 4 transport message.
-		// We re-process it through the normal decrypt pipeline.
-		src, innerPayload, err := relay.HandleRelay2(payload)
-		if err == nil && len(innerPayload) > 0 {
-			u.processRelayedPacket(pkt, src, innerPayload, from)
-			return // pkt fields already set by processRelayedPacket
-		}
-		pkt.err = ErrNoData
-
-	case noise.ProtocolPing:
-		if u.routeTable != nil {
-			action, err := relay.HandlePing(pkt.pk, payload, u.localMetrics)
-			if err == nil {
-				u.executeRelayAction(action)
+			pkt.err = ErrNoData
+			return
+		case noise.ProtocolRelay2:
+			src, innerPayload, err := relay.HandleRelay2(payload)
+			if err == nil && len(innerPayload) > 0 {
+				u.processRelayedPacket(pkt, src, innerPayload, from)
+				return
 			}
-		}
-		pkt.err = ErrNoData
-
-	case noise.ProtocolPong:
-		// PONG responses are delivered to ReadFrom for upper layer processing.
-		// The caller can decode them with relay.DecodePong().
-		if inboundChan != nil {
-			select {
-			case inboundChan <- protoPacket{protocol: protocol, payload: pkt.payload}:
-			default:
+			pkt.err = ErrNoData
+			return
+		case noise.ProtocolPing:
+			if u.routeTable != nil {
+				action, err := relay.HandlePing(pkt.pk, payload, u.localMetrics)
+				if err == nil {
+					u.executeRelayAction(action)
+				}
 			}
-		}
-
-	default:
-		// Route to inboundChan for Peer.Read() callers (non-blocking)
-		if inboundChan != nil {
-			select {
-			case inboundChan <- protoPacket{protocol: protocol, payload: pkt.payload}:
-				// Delivered to Peer.Read
-			default:
-				// Channel full, drop for Peer.Read path
+			pkt.err = ErrNoData
+			return
+		case noise.ProtocolPong:
+			if inboundChan != nil {
+				select {
+				case inboundChan <- protoPacket{protocol: protocol, payload: pkt.payload}:
+				default:
+				}
 			}
+			return
 		}
-		// Always leave pkt valid for ReadFrom callers
-		// pkt.err remains nil so ReadFrom can deliver it
+	}
+
+	// Non-KCP packets are delivered to caller and Peer.Read path.
+	if inboundChan != nil {
+		select {
+		case inboundChan <- protoPacket{protocol: protocol, payload: pkt.payload}:
+		default:
+		}
 	}
 }
 

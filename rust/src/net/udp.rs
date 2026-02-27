@@ -3,15 +3,13 @@
 //! Provides a single `UDP` type that manages multiple peers, handles
 //! Noise Protocol handshakes, and supports roaming.
 
-use crate::noise::{
-    Key, KeyPair, KEY_SIZE,
-    Config as HandshakeConfig, HandshakeState, Pattern,
-    build_handshake_init, build_handshake_resp, build_transport_message,
-    parse_handshake_init, parse_handshake_resp, parse_transport_message,
-    MAX_PACKET_SIZE, generate_index, Session, SessionConfig,
-    message, encode_payload, decode_payload,
-};
 use crate::kcp::{ServiceMux, ServiceMuxConfig, ServiceOutputFn, SyncStream};
+use crate::noise::{
+    build_handshake_init, build_handshake_resp, build_transport_message, decode_payload,
+    encode_payload, generate_index, message, parse_handshake_init, parse_handshake_resp,
+    parse_transport_message, Config as HandshakeConfig, HandshakeState, Key, KeyPair, Pattern,
+    Session, SessionConfig, KEY_SIZE, MAX_PACKET_SIZE,
+};
 use crate::relay;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -20,8 +18,8 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::time as tokio_time;
 
 /// Peer connection state.
@@ -307,7 +305,10 @@ impl UDP {
 
         HostInfo {
             public_key: self.local_key.public,
-            addr: self.socket.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+            addr: self
+                .socket
+                .local_addr()
+                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
             peer_count: peers.len(),
             rx_bytes: self.total_rx.load(Ordering::SeqCst),
             tx_bytes: self.total_tx.load(Ordering::SeqCst),
@@ -412,9 +413,8 @@ impl UDP {
 
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|_| UdpError::Other("no tokio runtime".into()))?;
-        let stream = tokio::task::block_in_place(|| {
-            rt.block_on(smux.open_stream(service))
-        }).map_err(|e| UdpError::Other(e))?;
+        let stream = tokio::task::block_in_place(|| rt.block_on(smux.open_stream(service)))
+            .map_err(|e| UdpError::Other(e))?;
         Ok(SyncStream::new(stream, rt))
     }
 
@@ -887,7 +887,9 @@ impl UDP {
         // Find peer by receiver index
         let peer_pk = {
             let by_index = self.by_index.read().unwrap();
-            *by_index.get(&msg.receiver_index).ok_or(UdpError::PeerNotFound)?
+            *by_index
+                .get(&msg.receiver_index)
+                .ok_or(UdpError::PeerNotFound)?
         };
 
         // Decrypt and process with peer lock, then release before mux operations
@@ -918,72 +920,70 @@ impl UDP {
         let (protocol, service, payload) = decode_payload(&plaintext)
             .map_err(|_| UdpError::Session("invalid payload".to_string()))?;
 
-        match protocol {
-            message::protocol::KCP => {
-                if let Some(ref sm) = smux {
-                    sm.input(service, payload);
-                }
-                Ok((peer_pk, protocol, 0))
+        if protocol == message::protocol::KCP {
+            if let Some(ref sm) = smux {
+                sm.input(service, payload);
             }
+            return Ok((peer_pk, protocol, 0));
+        }
 
-            message::protocol::RELAY_0 => {
-                let rt_guard = self.route_table.read().unwrap();
-                if let Some(ref rt) = *rt_guard {
-                    if let Ok(action) = relay::handle_relay0(rt.as_ref(), &peer_pk.0, payload) {
+        // Relay is handled as a service (service=0), not as protocol fast-path.
+        if service == message::service::RELAY {
+            match protocol {
+                message::protocol::RELAY_0 => {
+                    let rt_guard = self.route_table.read().unwrap();
+                    if let Some(ref rt) = *rt_guard {
+                        if let Ok(action) = relay::handle_relay0(rt.as_ref(), &peer_pk.0, payload) {
+                            drop(rt_guard);
+                            self.execute_relay_action(&action);
+                        }
+                    }
+                    return Ok((peer_pk, protocol, 0));
+                }
+                message::protocol::RELAY_1 => {
+                    let rt_guard = self.route_table.read().unwrap();
+                    if let Some(ref rt) = *rt_guard {
+                        if let Ok(action) = relay::handle_relay1(rt.as_ref(), payload) {
+                            drop(rt_guard);
+                            self.execute_relay_action(&action);
+                        }
+                    }
+                    return Ok((peer_pk, protocol, 0));
+                }
+                message::protocol::RELAY_2 => {
+                    if let Ok((src, inner_payload)) = relay::handle_relay2(payload) {
+                        if let Ok((inner_pk, inner_proto, n)) =
+                            self.process_relayed_packet(&src, &inner_payload, out_buf)
+                        {
+                            return Ok((inner_pk, inner_proto, n));
+                        }
+                    }
+                    return Ok((peer_pk, protocol, 0));
+                }
+                message::protocol::PING => {
+                    let rt_guard = self.route_table.read().unwrap();
+                    if rt_guard.is_some() {
                         drop(rt_guard);
-                        self.execute_relay_action(&action);
+                        let metrics = *self.local_metrics.lock().unwrap();
+                        if let Ok(action) = relay::handle_ping(&peer_pk.0, payload, &metrics) {
+                            self.execute_relay_action(&action);
+                        }
                     }
+                    return Ok((peer_pk, protocol, 0));
                 }
-                Ok((peer_pk, protocol, 0))
-            }
-
-            message::protocol::RELAY_1 => {
-                let rt_guard = self.route_table.read().unwrap();
-                if let Some(ref rt) = *rt_guard {
-                    if let Ok(action) = relay::handle_relay1(rt.as_ref(), payload) {
-                        drop(rt_guard);
-                        self.execute_relay_action(&action);
-                    }
+                message::protocol::PONG => {
+                    let n = payload.len().min(out_buf.len());
+                    out_buf[..n].copy_from_slice(&payload[..n]);
+                    return Ok((peer_pk, protocol, n));
                 }
-                Ok((peer_pk, protocol, 0))
-            }
-
-            message::protocol::RELAY_2 => {
-                // Last hop: extract src and inner payload, then decrypt
-                if let Ok((src, inner_payload)) = relay::handle_relay2(payload) {
-                    if let Ok((inner_pk, inner_proto, n)) = self.process_relayed_packet(&src, &inner_payload, out_buf) {
-                        return Ok((inner_pk, inner_proto, n));
-                    }
-                }
-                Ok((peer_pk, protocol, 0))
-            }
-
-            message::protocol::PING => {
-                let rt_guard = self.route_table.read().unwrap();
-                if rt_guard.is_some() {
-                    drop(rt_guard);
-                    let metrics = *self.local_metrics.lock().unwrap();
-                    if let Ok(action) = relay::handle_ping(&peer_pk.0, payload, &metrics) {
-                        self.execute_relay_action(&action);
-                    }
-                }
-                Ok((peer_pk, protocol, 0))
-            }
-
-            message::protocol::PONG => {
-                // PONG delivered to caller for upper-layer processing
-                let n = payload.len().min(out_buf.len());
-                out_buf[..n].copy_from_slice(&payload[..n]);
-                Ok((peer_pk, protocol, n))
-            }
-
-            _ => {
-                // Non-KCP protocol, copy to output buffer
-                let n = payload.len().min(out_buf.len());
-                out_buf[..n].copy_from_slice(&payload[..n]);
-                Ok((peer_pk, protocol, n))
+                _ => {}
             }
         }
+
+        // Non-KCP protocol: copy to output buffer.
+        let n = payload.len().min(out_buf.len());
+        out_buf[..n].copy_from_slice(&payload[..n]);
+        Ok((peer_pk, protocol, n))
     }
 
     /// Execute a relay forwarding action by sending to the target peer.
@@ -999,7 +999,8 @@ impl UDP {
 
         let p = peer.lock().unwrap();
         if let (Some(ref session), Some(endpoint)) = (&p.session, p.endpoint) {
-            let payload_buf = encode_payload(action.protocol, 0, &action.data);
+            let payload_buf =
+                encode_payload(action.protocol, message::service::RELAY, &action.data);
             if let Ok((ct, nonce)) = session.encrypt(&payload_buf) {
                 let msg = build_transport_message(session.remote_index(), nonce, &ct);
                 let _ = self.socket.send_to(&msg, endpoint);
@@ -1018,7 +1019,9 @@ impl UDP {
 
         let inner_pk = {
             let by_index = self.by_index.read().unwrap();
-            *by_index.get(&msg.receiver_index).ok_or(UdpError::PeerNotFound)?
+            *by_index
+                .get(&msg.receiver_index)
+                .ok_or(UdpError::PeerNotFound)?
         };
 
         let (plaintext, smux) = {
@@ -1026,7 +1029,8 @@ impl UDP {
             let peer = peers.get(&inner_pk).ok_or(UdpError::PeerNotFound)?;
             let mut p = peer.lock().unwrap();
             let session = p.session.as_mut().ok_or(UdpError::NoSession)?;
-            let plaintext = session.decrypt(msg.ciphertext, msg.counter)
+            let plaintext = session
+                .decrypt(msg.ciphertext, msg.counter)
                 .map_err(|e| UdpError::Session(e.to_string()))?;
             let smux = p.service_mux.clone();
             (plaintext, smux)
@@ -1116,12 +1120,22 @@ mod tests {
         let client_key = KeyPair::generate();
 
         let server = Arc::new(
-            UDP::new(server_key.clone(), UdpOptions::new().bind_addr("127.0.0.1:0").allow_unknown(true))
-                .expect("create server")
+            UDP::new(
+                server_key.clone(),
+                UdpOptions::new()
+                    .bind_addr("127.0.0.1:0")
+                    .allow_unknown(true),
+            )
+            .expect("create server"),
         );
         let client = Arc::new(
-            UDP::new(client_key.clone(), UdpOptions::new().bind_addr("127.0.0.1:0").allow_unknown(true))
-                .expect("create client")
+            UDP::new(
+                client_key.clone(),
+                UdpOptions::new()
+                    .bind_addr("127.0.0.1:0")
+                    .allow_unknown(true),
+            )
+            .expect("create client"),
         );
 
         let server_addr = server.host_info().addr;
@@ -1132,12 +1146,16 @@ mod tests {
         let sc = Arc::clone(&server);
         thread::spawn(move || {
             let mut buf = vec![0u8; 65535];
-            while !sc.is_closed() { let _ = sc.read_from(&mut buf); }
+            while !sc.is_closed() {
+                let _ = sc.read_from(&mut buf);
+            }
         });
         let cc = Arc::clone(&client);
         thread::spawn(move || {
             let mut buf = vec![0u8; 65535];
-            while !cc.is_closed() { let _ = cc.read_from(&mut buf); }
+            while !cc.is_closed() {
+                let _ = cc.read_from(&mut buf);
+            }
         });
 
         client.connect(&server_key.public).expect("connect");
@@ -1145,7 +1163,9 @@ mod tests {
         for _ in 0..20 {
             thread::sleep(Duration::from_millis(50));
             if let Some(info) = client.peer_info(&server_key.public) {
-                if info.state == PeerState::Established { break; }
+                if info.state == PeerState::Established {
+                    break;
+                }
             }
         }
 
@@ -1178,11 +1198,15 @@ mod tests {
             use std::io::Write;
             s.write_all(b"hello").unwrap();
             s
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
-        let (mut ss, svc) = tokio::time::timeout(
-            Duration::from_secs(5), accept
-        ).await.expect("accept timed out").unwrap().expect("accept failed");
+        let (mut ss, svc) = tokio::time::timeout(Duration::from_secs(5), accept)
+            .await
+            .expect("accept timed out")
+            .unwrap()
+            .expect("accept failed");
         assert_eq!(svc, 1);
         let mut buf = [0u8; 256];
         use std::io::Read;
@@ -1211,11 +1235,15 @@ mod tests {
             use std::io::Write;
             s.write_all(b"from client").unwrap();
             s
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
-        let (mut ss, _) = tokio::time::timeout(
-            Duration::from_secs(5), accept
-        ).await.expect("accept timed out").unwrap().expect("accept failed");
+        let (mut ss, _) = tokio::time::timeout(Duration::from_secs(5), accept)
+            .await
+            .expect("accept timed out")
+            .unwrap()
+            .expect("accept failed");
 
         use std::io::{Read, Write};
         let mut buf = vec![0u8; 256];

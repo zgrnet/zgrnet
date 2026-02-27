@@ -28,6 +28,7 @@ pub fn ServiceMux(comptime Rt: type) type {
 
         output_fn: *const fn (u64, []const u8, ?*anyopaque) void,
         output_ctx: ?*anyopaque,
+        thread_stack_size: usize,
 
         const ServiceEntry = struct {
             kcp_conn: *KConn,
@@ -48,6 +49,7 @@ pub fn ServiceMux(comptime Rt: type) type {
             is_client: bool,
             output_fn: *const fn (u64, []const u8, ?*anyopaque) void,
             output_ctx: ?*anyopaque,
+            thread_stack_size: usize,
         ) !*Self {
             const self = try allocator.create(Self);
             self.* = .{
@@ -61,6 +63,7 @@ pub fn ServiceMux(comptime Rt: type) type {
                 .closed = std.atomic.Value(bool).init(false),
                 .output_fn = output_fn,
                 .output_ctx = output_ctx,
+                .thread_stack_size = thread_stack_size,
             };
             return self;
         }
@@ -220,8 +223,8 @@ pub fn ServiceMux(comptime Rt: type) type {
             entry.* = .{
                 .kcp_conn = kcp_conn,
                 .yamux = yamux,
-                .accept_thread = Rt.Thread.spawn(.{}, acceptForwarder, .{fwd}) catch null,
-                .poll_thread = Rt.Thread.spawn(.{}, pollDriver, .{fwd}) catch null,
+                .accept_thread = Rt.Thread.spawn(.{ .stack_size = self.thread_stack_size }, acceptForwarder, .{fwd}) catch null,
+                .poll_thread = Rt.Thread.spawn(.{ .stack_size = self.thread_stack_size }, pollDriver, .{fwd}) catch null,
                 .output_ctx = @ptrCast(ctx),
                 .fwd_ctx = fwd,
             };
@@ -338,8 +341,8 @@ fn smuxPair() !struct {
     Ctx.client_ptr = null;
     Ctx.server_ptr = null;
 
-    const client = try SMux.init(allocator, true, Ctx.clientOutput, null);
-    const server = try SMux.init(allocator, false, Ctx.serverOutput, null);
+    const client = try SMux.init(allocator, true, Ctx.clientOutput, null, 256 * 1024);
+    const server = try SMux.init(allocator, false, Ctx.serverOutput, null, 256 * 1024);
     Ctx.client_ptr = client;
     Ctx.server_ptr = server;
 

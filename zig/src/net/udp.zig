@@ -20,6 +20,7 @@
 //! allowing platform-specific optimizations. No direct std.posix or std.Thread usage.
 
 const std = @import("std");
+const zig_builtin = @import("builtin");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Atomic = std.atomic.Value;
@@ -55,6 +56,14 @@ pub const AcceptQueueCapacity: usize = 16;
 /// Maximum packet size.
 pub const MaxPacketSize: usize = message.max_packet_size;
 
+/// Default thread stack sizes by platform.
+pub const DefaultIoThreadStackSize: usize = if (zig_builtin.os.tag == .freestanding) 24 * 1024 else 256 * 1024;
+pub const DefaultDecryptThreadStackSize: usize = if (zig_builtin.os.tag == .freestanding) 24 * 1024 else 256 * 1024;
+pub const DefaultServiceThreadStackSize: usize = if (zig_builtin.os.tag == .freestanding) 32 * 1024 else 256 * 1024;
+pub const MinThreadStackSize: usize = 16 * 1024;
+pub const MaxThreadStackSize: usize = 2 * 1024 * 1024;
+pub const MaxDecryptWorkers: usize = 64;
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -84,6 +93,10 @@ pub const UdpError = error{
     AcceptQueueFull,
     /// Out of memory.
     OutOfMemory,
+    /// Invalid runtime configuration.
+    InvalidConfig,
+    /// Packet exceeds protocol/transport maximum.
+    PacketTooLarge,
     /// Channel closed.
     ChannelClosed,
 };
@@ -103,6 +116,13 @@ pub const UdpOptions = struct {
     decrypt_chan_size: usize = DecryptChanSize,
     /// Output channel size.
     output_chan_size: usize = OutputChanSize,
+
+    /// Stack size for io/timer threads (0 = platform default).
+    io_thread_stack_size: usize = 0,
+    /// Stack size for each decrypt worker thread (0 = platform default).
+    decrypt_thread_stack_size: usize = 0,
+    /// Stack size for ServiceMux background threads (0 = platform default).
+    service_thread_stack_size: usize = 0,
 };
 
 // ============================================================================
@@ -143,7 +163,7 @@ pub fn Packet(comptime Rt: type) type {
         // Output (set by decryptWorker)
         pk: Key, // Sender's public key
         protocol: u8, // Protocol byte
-        payload: []u8, // Decrypted payload (slice into data or out_buf)
+        payload: []const u8, // Decrypted payload (slice into data or out_buf)
         payload_len: usize, // Payload length
         err: ?UdpError, // Decrypt error (if any)
 
@@ -396,6 +416,9 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
         timer_thread: ?Rt.Thread,
         workers: []Rt.Thread,
         num_workers: usize,
+        io_thread_stack_size: usize,
+        decrypt_thread_stack_size: usize,
+        service_thread_stack_size: usize,
 
         // IO backend (kqueue/epoll)
         io_backend: *IOBackend,
@@ -439,6 +462,14 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             if (num_workers == 0) {
                 num_workers = @max(1, Rt.getCpuCount() catch 4);
             }
+            if (num_workers > MaxDecryptWorkers) return UdpError.InvalidConfig;
+
+            const io_stack = if (options.io_thread_stack_size == 0) DefaultIoThreadStackSize else options.io_thread_stack_size;
+            const decrypt_stack = if (options.decrypt_thread_stack_size == 0) DefaultDecryptThreadStackSize else options.decrypt_thread_stack_size;
+            const service_stack = if (options.service_thread_stack_size == 0) DefaultServiceThreadStackSize else options.service_thread_stack_size;
+            if (io_stack < MinThreadStackSize or io_stack > MaxThreadStackSize) return UdpError.InvalidConfig;
+            if (decrypt_stack < MinThreadStackSize or decrypt_stack > MaxThreadStackSize) return UdpError.InvalidConfig;
+            if (service_stack < MinThreadStackSize or service_stack > MaxThreadStackSize) return UdpError.InvalidConfig;
 
             // Allocate self
             const self = allocator.create(Self) catch return UdpError.OutOfMemory;
@@ -487,6 +518,9 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 .timer_thread = null,
                 .workers = workers,
                 .num_workers = num_workers,
+                .io_thread_stack_size = io_stack,
+                .decrypt_thread_stack_size = decrypt_stack,
+                .service_thread_stack_size = service_stack,
                 .io_backend = io_backend,
                 .closed = Atomic(bool).init(false),
                 .close_signal = CloseSignal.init(),
@@ -497,14 +531,14 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             };
 
             // Start IO thread
-            self.io_thread = Rt.Thread.spawn(.{}, ioLoop, .{self}) catch return UdpError.OutOfMemory;
+            self.io_thread = Rt.Thread.spawn(.{ .stack_size = self.io_thread_stack_size }, ioLoop, .{self}) catch return UdpError.OutOfMemory;
 
             // Start timer thread for KCP updates
-            self.timer_thread = Rt.Thread.spawn(.{}, timerLoop, .{self}) catch return UdpError.OutOfMemory;
+            self.timer_thread = Rt.Thread.spawn(.{ .stack_size = self.io_thread_stack_size }, timerLoop, .{self}) catch return UdpError.OutOfMemory;
 
             // Start decrypt workers
             for (self.workers) |*w| {
-                w.* = Rt.Thread.spawn(.{}, decryptWorker, .{self}) catch return UdpError.OutOfMemory;
+                w.* = Rt.Thread.spawn(.{ .stack_size = self.decrypt_thread_stack_size }, decryptWorker, .{self}) catch return UdpError.OutOfMemory;
             }
 
             return self;
@@ -746,20 +780,30 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 return UdpError.PeerNotFound;
             }
 
-            // Build transport message
-            var msg_buf: [MaxPacketSize]u8 = undefined;
+            const max_plaintext = MaxPacketSize - 13 - noise.tag_size;
+            if (data.len + 1 > max_plaintext) return UdpError.PacketTooLarge;
 
             // Encrypt: protocol(1) + data
-            var plaintext: [MaxPacketSize]u8 = undefined;
-            plaintext[0] = protocol;
-            @memcpy(plaintext[1 .. data.len + 1], data);
-
             const plaintext_len = data.len + 1;
+            var plaintext = self.allocator.alloc(u8, plaintext_len) catch {
+                return UdpError.OutOfMemory;
+            };
+            defer self.allocator.free(plaintext);
+
+            plaintext[0] = protocol;
+            @memcpy(plaintext[1..], data);
+
             const ciphertext_len = plaintext_len + noise.tag_size;
+            const msg_len = 13 + ciphertext_len;
+
+            var msg_buf = self.allocator.alloc(u8, msg_len) catch {
+                return UdpError.OutOfMemory;
+            };
+            defer self.allocator.free(msg_buf);
 
             // encrypt returns nonce, writes ciphertext to msg_buf[13..]
             const enc_now_ms: u64 = Rt.nowMs();
-            const nonce = session.encrypt(plaintext[0..plaintext_len], msg_buf[13..], enc_now_ms) catch {
+            const nonce = session.encrypt(plaintext, msg_buf[13..], enc_now_ms) catch {
                 return UdpError.SendFailed;
             };
 
@@ -768,15 +812,13 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             mem.writeInt(u32, msg_buf[1..5], session.remote_index, .little);
             mem.writeInt(u64, msg_buf[5..13], nonce, .little);
 
-            const msg_len = 13 + ciphertext_len;
-
             // Send via socket trait
             const ep = peer.endpoint;
             var n: usize = 0;
             var sent = false;
             var attempts: usize = 0;
             while (attempts < 2000) : (attempts += 1) {
-                n = self.socket.sendTo(ep.addr, ep.port, msg_buf[0..msg_len]) catch |err| switch (err) {
+                n = self.socket.sendTo(ep.addr, ep.port, msg_buf) catch |err| switch (err) {
                     error.WouldBlock => {
                         if (comptime @hasDecl(Rt, "sleepMs")) {
                             Rt.sleepMs(1);
@@ -873,16 +915,9 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
 
         /// Initialize Mux for a peer. Called when session is established.
         fn initMux(self: *Self, peer: *PeerState) void {
-            // Close existing mux if any
-            if (peer.service_mux) |old_mux| {
-                old_mux.deinit();
-            }
-            // Free old context if any
-            if (peer.service_mux_ctx) |old_ctx| {
-                const ctx_ptr: *MuxOutputCtx = @ptrCast(@alignCast(old_ctx));
-                self.allocator.destroy(ctx_ptr);
-                peer.service_mux_ctx = null;
-            }
+            // ServiceMux is long-lived per peer. Duplicate handshakes/retransmits
+            // must not tear down/recreate it concurrently with active I/O.
+            if (peer.service_mux != null) return;
 
             const is_client = self.isKcpClient(peer.pk);
 
@@ -895,6 +930,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 is_client,
                 MuxOutputCtx.serviceOutput,
                 @ptrCast(output_ctx),
+                self.service_thread_stack_size,
             ) catch {
                 self.allocator.destroy(output_ctx);
                 peer.service_mux_ctx = null;
@@ -930,14 +966,23 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 return UdpError.PeerNotFound;
             }
 
-            var msg_buf: [MaxPacketSize]u8 = undefined;
+            const max_plaintext = MaxPacketSize - 13 - noise.tag_size;
+            if (data.len + 1 > max_plaintext) return UdpError.PacketTooLarge;
+
             const plaintext = message.encodePayload(self.allocator, protocol, service, data) catch {
                 return UdpError.OutOfMemory;
             };
             defer self.allocator.free(plaintext);
 
             const plaintext_len = plaintext.len;
+            if (plaintext_len > max_plaintext) return UdpError.PacketTooLarge;
             const ciphertext_len = plaintext_len + noise.tag_size;
+            const msg_len = 13 + ciphertext_len;
+
+            var msg_buf = self.allocator.alloc(u8, msg_len) catch {
+                return UdpError.OutOfMemory;
+            };
+            defer self.allocator.free(msg_buf);
 
             const enc2_now_ms: u64 = Rt.nowMs();
             const nonce = session.encrypt(plaintext, msg_buf[13..], enc2_now_ms) catch {
@@ -948,13 +993,12 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
             mem.writeInt(u32, msg_buf[1..5], session.remote_index, .little);
             mem.writeInt(u64, msg_buf[5..13], nonce, .little);
 
-            const msg_len = 13 + ciphertext_len;
             const ep = peer.endpoint;
 
             var sent = false;
             var attempts: usize = 0;
             while (attempts < 2000) : (attempts += 1) {
-                _ = self.socket.sendTo(ep.addr, ep.port, msg_buf[0..msg_len]) catch |err| switch (err) {
+                _ = self.socket.sendTo(ep.addr, ep.port, msg_buf) catch |err| switch (err) {
                     error.WouldBlock => {
                         if (comptime @hasDecl(Rt, "sleepMs")) {
                             Rt.sleepMs(1);
@@ -1181,15 +1225,15 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 return;
             }
 
-            const protocol_byte = pkt.out_buf[0];
-            const payload = pkt.out_buf[1..plaintext_len];
+            const decoded = message.decodePayload(pkt.out_buf[0..plaintext_len]) catch {
+                pkt.err = UdpError.MessageTooShort;
+                return;
+            };
+            const protocol_byte = @intFromEnum(decoded.protocol);
+            const payload = decoded.payload;
 
-            // Route KCP protocol to Mux
+            // Route KCP protocol to ServiceMux.
             if (protocol_byte == @intFromEnum(message.Protocol.kcp)) {
-                const decoded = message.decodePayload(pkt.out_buf[0..plaintext_len]) catch {
-                    pkt.err = UdpError.MessageTooShort;
-                    return;
-                };
                 if (peer.service_mux) |mux| {
                     mux.input(decoded.service, decoded.payload);
                 }
@@ -1197,56 +1241,58 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
                 return;
             }
 
-            // Route relay protocols
-            if (protocol_byte == @intFromEnum(message.Protocol.relay_0)) {
-                if (self.router) |router| {
-                    if (relay_mod.handleRelay0(router, &pk.data, payload)) |action| {
-                        self.executeRelayAction(&action);
-                    } else |_| {}
+            // Relay is treated as a service (service=0), not protocol bypass.
+            if (decoded.service == message.Service.relay) {
+                if (protocol_byte == @intFromEnum(message.Protocol.relay_0)) {
+                    if (self.router) |router| {
+                        if (relay_mod.handleRelay0(router, &pk.data, payload)) |action| {
+                            self.executeRelayAction(&action);
+                        } else |_| {}
+                    }
+                    pkt.err = UdpError.NoData;
+                    return;
                 }
-                pkt.err = UdpError.NoData;
-                return;
-            }
 
-            if (protocol_byte == @intFromEnum(message.Protocol.relay_1)) {
-                if (self.router) |router| {
-                    if (relay_mod.handleRelay1(router, payload)) |action| {
-                        self.executeRelayAction(&action);
-                    } else |_| {}
+                if (protocol_byte == @intFromEnum(message.Protocol.relay_1)) {
+                    if (self.router) |router| {
+                        if (relay_mod.handleRelay1(router, payload)) |action| {
+                            self.executeRelayAction(&action);
+                        } else |_| {}
+                    }
+                    pkt.err = UdpError.NoData;
+                    return;
                 }
-                pkt.err = UdpError.NoData;
-                return;
-            }
 
-            if (protocol_byte == @intFromEnum(message.Protocol.relay_2)) {
-                if (relay_mod.handleRelay2(payload)) |result| {
-                    if (result.payload.len > 0) {
-                        self.processRelayedPacket(pkt, &result.src_key, result.payload);
-                    } else {
+                if (protocol_byte == @intFromEnum(message.Protocol.relay_2)) {
+                    if (relay_mod.handleRelay2(payload)) |result| {
+                        if (result.payload.len > 0) {
+                            self.processRelayedPacket(pkt, &result.src_key, result.payload);
+                        } else {
+                            pkt.err = UdpError.NoData;
+                        }
+                    } else |_| {
                         pkt.err = UdpError.NoData;
                     }
-                } else |_| {
-                    pkt.err = UdpError.NoData;
+                    _ = peer.rx_bytes.fetchAdd(@intCast(pkt.len), .release);
+                    return;
                 }
-                _ = peer.rx_bytes.fetchAdd(@intCast(pkt.len), .release);
-                return;
-            }
 
-            if (protocol_byte == @intFromEnum(message.Protocol.ping)) {
-                if (self.router != null) {
-                    if (relay_mod.handlePing(&pk.data, payload, &self.local_metrics)) |action| {
-                        self.executeRelayAction(&action);
-                    } else |_| {}
+                if (protocol_byte == @intFromEnum(message.Protocol.ping)) {
+                    if (self.router != null) {
+                        if (relay_mod.handlePing(&pk.data, payload, &self.local_metrics)) |action| {
+                            self.executeRelayAction(&action);
+                        } else |_| {}
+                    }
+                    pkt.err = UdpError.NoData;
+                    return;
                 }
-                pkt.err = UdpError.NoData;
-                return;
             }
 
             // Extract protocol and payload for other protocols
             pkt.pk = pk;
             pkt.protocol = protocol_byte;
             pkt.payload = payload;
-            pkt.payload_len = plaintext_len - 1;
+            pkt.payload_len = payload.len;
             pkt.err = null;
 
             // Update stats
@@ -1263,7 +1309,7 @@ pub fn UDP(comptime Crypto: type, comptime Rt: type, comptime IOBackend: type, c
 
             const peer = peer_opt orelse return;
             const proto: message.Protocol = @enumFromInt(action.protocol);
-            self.sendToPeer(peer, proto, 0, action.data()) catch {};
+            self.sendToPeer(peer, proto, message.Service.relay, action.data()) catch {};
         }
 
         // Process a RELAY_2 inner payload.
