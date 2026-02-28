@@ -92,14 +92,14 @@
 
 ### P0: 必须修改
 
-- [ ] `KCPConn` 单包输入路径未触发 `Update+drainRecv`，存在延迟/饥饿回归风险
+- [x] `KCPConn` 单包输入路径未触发 `Update+drainRecv`，存在延迟/饥饿回归风险
   - 位置：`go/pkg/kcp/conn.go:277-281,314-330`
   - 问题：`runLoop` 先 `kcp.Input(data)`，后调用 `drainInputChAndProcess()`；该函数仅在 drain 到“额外数据”时才 `Update+drainRecv`。当只有单包时，当前轮不推进 KCP。
   - 建议：保证首包路径也执行一次 `Update+drainRecv`（例如把首包也纳入批处理计数，或在 `runLoop` 的 input case 中无条件补一次）。
 
 ### P1: 建议修改
 
-- [ ] `openteam/test.md` 仍是未跟踪文件，文档闭环尚未真正完成
+- [x] `openteam/test.md` 仍是未跟踪文件，文档闭环尚未真正完成
   - 证据：`git status --short` 显示 `?? openteam/test.md`
   - 建议：将文件纳入变更并同步 `review.md/worklog.md` 结论为最终状态。
 
@@ -120,3 +120,8 @@
   - 位置：`MODULE.bazel:77-81`
   - 问题：`libco` 获取 `master.tar.gz` 但没有 `integrity` hash 或固定的 commit，导致构建不可重现
   - 建议：添加 integrity hash 并固定到特定 commit
+
+## Reviewer 第四轮复审结论（2026-02-27）
+
+- P0/P1 阻塞项已清零，当前可通过。
+- 非阻塞提醒：请清理未跟踪临时文件 `openteam/t2a_*.mp3`，防止误提交。
