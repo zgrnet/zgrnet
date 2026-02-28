@@ -106,5 +106,3 @@ zig_binary(
     link_libc = True,
     visibility = ["//visibility:public"],
 )
-
-

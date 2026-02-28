@@ -61,12 +61,12 @@ func TestUDPStreamThroughput(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Open stream
-	clientStream, err := client.OpenStream(serverKey.Public, noise.ProtocolTCPProxy, nil)
+	clientStream, err := client.OpenStream(serverKey.Public, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	serverStream, err := server.AcceptStream(clientKey.Public)
+	serverStream, _, err := server.AcceptStream(clientKey.Public)
 	if err != nil {
 		t.Fatal(err)
 	}

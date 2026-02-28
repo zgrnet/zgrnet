@@ -35,6 +35,7 @@ go_deps.from_file(go_mod = "//go:go.mod")
 use_repo(
     go_deps,
     "com_github_chromedp_chromedp",
+    "com_github_hashicorp_yamux",
     "in_gopkg_yaml_v3",
     "org_golang_x_crypto",
     "org_golang_x_net",
@@ -42,11 +43,11 @@ use_repo(
 )
 
 # embed-zig: Bazel-native Zig build rules + Zig toolchain
+# Selector support is merged; track local main HEAD.
 bazel_dep(name = "embed_zig", version = "0.1.0")
-git_override(
+local_path_override(
     module_name = "embed_zig",
-    remote = "https://github.com/haivivi/embed-zig.git",
-    commit = "682a5f7e350e9fe3b4864f956dbbaa6da219833c",  # main: unified spawner, complete socket trait, remove legacy thread.zig
+    path = "/Users/idy/Vibing/embed-zig/main",
 )
 
 # Zig toolchain (provided by embed-zig, needed by //third_party/kcp for zig cc)
@@ -72,8 +73,47 @@ bazel_dep(name = "bazel_skylib", version = "1.9.0")
 # BoringSSL
 bazel_dep(name = "boringssl", version = "0.20251124.0")
 
-# Minicoro - single-header coroutine library
+# Tencent libco - production coroutine library
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(
+    name = "libco",
+    urls = ["https://github.com/Tencent/libco/archive/master.tar.gz"],
+    strip_prefix = "libco-master",
+    build_file_content = """
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+# libco core library - full build
+cc_library(
+    name = "libco",
+    srcs = [
+        "co_routine.cpp",
+        "coctx.cpp",
+        "co_epoll.cpp",
+        "coctx_swap.S",
+    ],
+    hdrs = [
+        "co_routine.h",
+        "co_routine_inner.h",
+        "coctx.h",
+        "co_epoll.h",
+        "co_closure.h",
+    ],
+    copts = [
+        "-O3",
+        "-fPIC",
+        "-fno-sanitize=undefined",
+    ],
+    linkopts = select({
+        "@platforms//os:macos": [],
+        "@platforms//os:linux": ["-ldl", "-pthread"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+)
+""",
+)
+
+# Minicoro - single-header coroutine library (backup option)
 http_archive(
     name = "minicoro",
     urls = ["https://github.com/edubart/minicoro/archive/02dad0f8b7cbb12fe6e216ae7a76db15ca55cd7b.tar.gz"],

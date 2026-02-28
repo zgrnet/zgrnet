@@ -1,0 +1,44 @@
+# Bazel build for libco wrapper layer
+# Uses Tencent libco from @libco external repository
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# libco_mini: Simplified wrapper around Tencent libco
+# Provides minimal API for M:N coroutine scheduling
+cc_library(
+    name = "libco_mini",
+    srcs = [
+        "libco_mini_wrapper.cpp",
+    ],
+    hdrs = [
+        "libco_mini.h",
+    ],
+    deps = ["@libco//:libco"],
+    copts = [
+        "-O3",
+        "-fPIC",
+        "-fno-sanitize=undefined",
+    ],
+    linkopts = select({
+        "@platforms//os:macos": [],
+        "@platforms//os:linux": ["-ldl", "-pthread"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+# Test for libco wrapper
+cc_test(
+    name = "libco_mini_test",
+    srcs = ["libco_mini_test.cc"],
+    deps = [":libco_mini"],
+    copts = ["-O2"],
+    timeout = "short",
+)
+
+# Export headers
+exports_files([
+    "libco_mini.h",
+])

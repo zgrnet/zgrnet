@@ -1,6 +1,7 @@
 package net
 
 import (
+	"io"
 	"runtime"
 	"testing"
 	"time"
@@ -208,18 +209,17 @@ func TestClosedChanGoroutineLeak(t *testing.T) {
 	const iterations = 10
 	for i := 0; i < iterations; i++ {
 		// Accept in background
-		accepted := make(chan *Stream, 1)
+		accepted := make(chan io.ReadWriteCloser, 1)
 		go func() {
-			s, err := server.AcceptStream(clientKey.Public)
+			s, _, err := server.AcceptStream(clientKey.Public)
 			if err != nil {
 				return
 			}
 			accepted <- s
 		}()
 
-		// Open stream from client to trigger accept
 		time.Sleep(20 * time.Millisecond)
-		cs, err := client.OpenStream(serverKey.Public, 0, nil)
+		cs, err := client.OpenStream(serverKey.Public, 0)
 		if err != nil {
 			t.Fatalf("OpenStream %d: %v", i, err)
 		}

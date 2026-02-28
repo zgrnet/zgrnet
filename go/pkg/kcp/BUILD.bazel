@@ -3,27 +3,28 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "kcp",
     srcs = [
+        "conn.go",
         "fec.go",
-        "frame.go",
         "kcp.go",
-        "mux.go",
-        "stream.go",
+        "service.go",
         # Use centralized patched KCP source from //third_party/kcp
         "//third_party/kcp:srcs",
     ],
     cgo = True,
     importpath = "github.com/vibing/zgrnet/pkg/kcp",
     visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_hashicorp_yamux//:yamux",
+    ],
 )
 
 go_test(
     name = "kcp_test",
     srcs = [
+        "conn_test.go",
         "fec_test.go",
-        "frame_test.go",
         "kcp_test.go",
-        "mux_test.go",
-        "throughput_test.go",
+        "service_test.go",
     ],
     args = ["-test.short"],
     embed = [":kcp"],

@@ -83,7 +83,9 @@ pub const Session = N.Session;
 // ============================================================================
 
 const std_impl = @import("std_impl");
-pub const KqueueIO = std_impl.kqueue_io.KqueueIO;
+pub const IOService = std_impl.IOService;
+// Backward-compatible alias (now resolves to kqueue on macOS, epoll on Linux).
+pub const KqueueIO = IOService;
 
 // ============================================================================
 // Socket abstraction
@@ -110,7 +112,7 @@ pub const ListenerConfig = Listener.Config;
 pub const ListenerError = net.ListenerError;
 pub const UdpTransport = net.UdpTransport;
 pub const UdpAddr = net.UdpAddr;
-pub const UDP = net.UDP(StdCrypto, StdRt, KqueueIO, StdUdpSocket);
+pub const UDP = net.UDP(StdCrypto, StdRt, IOService, StdUdpSocket);
 pub const UdpError = net.UdpError;
 pub const UdpOptions = net.UdpOptions;
 pub const ReadResult = net.ReadResult;
@@ -128,15 +130,14 @@ pub fn dial(opts: DialOptions) DialError!*Conn {
 // ============================================================================
 
 pub const kcp = kcp_mod.kcp;
-pub const stream = kcp_mod.stream_mod;
 pub const Kcp = kcp_mod.Kcp;
 pub const Frame = kcp_mod.Frame;
 pub const Cmd = kcp_mod.Cmd;
-pub const Stream = kcp_mod.Stream;
-pub const StreamState = kcp_mod.StreamState;
-pub const StreamError = kcp_mod.StreamError;
-pub const Mux = kcp_mod.Mux;
-pub const MuxConfig = kcp_mod.MuxConfig;
+pub const KcpConn = kcp_mod.KcpConn;
+pub const KcpSelector = kcp_mod.KcpSelector;
+pub const Yamux = kcp_mod.Yamux;
+pub const YamuxStream = kcp_mod.YamuxStream;
+pub const ServiceMux = kcp_mod.ServiceMux;
 
 // ============================================================================
 // Relay types
@@ -160,7 +161,7 @@ pub const HostEndpoint = host.Endpoint;
 // Node types (embeddable network node, no TUN)
 // ============================================================================
 
-pub const NodeType = node_mod.Node(StdCrypto, StdRt, KqueueIO, StdUdpSocket);
+pub const NodeType = node_mod.Node(StdCrypto, StdRt, IOService, StdUdpSocket);
 pub const NodeConfig = NodeType.Config;
 pub const NodePeerConfig = NodeType.PeerConfig;
 pub const NodeStream = NodeType.NodeStream;
@@ -186,6 +187,9 @@ test {
     _ = noise;
     _ = net;
     _ = kcp_mod;
+    _ = kcp_mod.conn_mod;
+    _ = kcp_mod.yamux_mod;
+    _ = kcp_mod.service_mod;
     _ = relay_mod;
     _ = host;
     _ = node_mod;

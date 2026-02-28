@@ -14,7 +14,7 @@
 //! - **Identity**: Injected via `IdentityFn` callback — no host dependency.
 
 const std = @import("std");
-const channel_mod = @import("channel");
+const channel_mod = @import("../net/channel.zig");
 const noise = @import("../noise/mod.zig");
 const Key = noise.Key;
 

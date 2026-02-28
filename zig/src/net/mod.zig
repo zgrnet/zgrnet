@@ -69,8 +69,8 @@ pub const RecvFromResult = socket_mod.RecvFromResult;
 pub const StdUdpSocket = std_socket.StdUdpSocket;
 
 // KCP types (convenience re-exports from udp module, for backward compat)
-pub const KcpMux = udp.StdKcpMux;
-pub const KcpStream = udp.StdKcpStream;
+pub const ServiceMux = udp.StdServiceMux;
+pub const YamuxStream = udp.StdYamuxStream;
 
 // Channel sizes
 pub const DecryptChanSize = udp.DecryptChanSize;

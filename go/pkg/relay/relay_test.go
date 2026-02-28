@@ -437,7 +437,7 @@ func TestRelayChainWithNoiseSession(t *testing.T) {
 
 	// Step 1: A encrypts data with A-C session
 	originalData := []byte("hello through relay!")
-	payload := noise.EncodePayload(noise.ProtocolChat, originalData)
+	payload := noise.EncodePayload(noise.ProtocolChat, 0, originalData)
 	ciphertext, nonce, err := sessionA.Encrypt(payload)
 	if err != nil {
 		t.Fatal("encrypt:", err)
@@ -490,7 +490,7 @@ func TestRelayChainWithNoiseSession(t *testing.T) {
 		t.Fatal("decrypt:", err)
 	}
 
-	protocol, data, err := noise.DecodePayload(plaintext)
+	protocol, _, data, err := noise.DecodePayload(plaintext)
 	if err != nil {
 		t.Fatal("DecodePayload:", err)
 	}
@@ -535,7 +535,7 @@ func TestRelayMultiHopWithNoiseSession(t *testing.T) {
 
 	// Step 1: A encrypts data
 	originalData := []byte("multi-hop relay with real encryption!")
-	payload := noise.EncodePayload(noise.ProtocolRaw, originalData)
+	payload := noise.EncodePayload(noise.ProtocolRaw, 0, originalData)
 	ciphertext, nonce, err := sessionA.Encrypt(payload)
 	if err != nil {
 		t.Fatal("encrypt:", err)
@@ -593,7 +593,7 @@ func TestRelayMultiHopWithNoiseSession(t *testing.T) {
 		t.Fatal("decrypt:", err)
 	}
 
-	protocol, data, err := noise.DecodePayload(plaintext)
+	protocol, _, data, err := noise.DecodePayload(plaintext)
 	if err != nil {
 		t.Fatal("DecodePayload:", err)
 	}

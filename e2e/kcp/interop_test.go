@@ -1,8 +1,8 @@
 // Cross-language KCP stream interop test.
 //
-// Discovers Go/Rust/Zig binaries from Bazel runfiles and runs them in
-// opener/accepter pairs. Validates echo round-trip and bidirectional
-// throughput for each language combination.
+// Tests Go ↔ Rust KCP+yamux interoperability using real UDP communication.
+// Each test launches two independent binaries (opener + accepter) and
+// validates that they complete successfully.
 //
 // Usage:
 //
@@ -34,79 +34,254 @@ type hostEntry struct {
 }
 
 type testParams struct {
+	Mode         string `json:"mode"` // "echo", "streaming", "multi_stream", "delayed_write"
 	EchoMessage  string `json:"echo_message"`
 	ThroughputMB int    `json:"throughput_mb"`
 	ChunkKB      int    `json:"chunk_kb"`
+	NumStreams   int    `json:"num_streams"`
+	DelayMs      int    `json:"delay_ms"`
 }
 
 var portCounter int
 
+func init() {
+	portCounter = int(time.Now().UnixNano() % 20000)
+}
+
 func nextPorts() (int, int) {
-	portCounter++
-	return 10000 + portCounter*10, 11000 + portCounter*10
+	portCounter += 2
+	base := 40000 + portCounter
+	return base, base + 1
 }
 
 func findBinary(t *testing.T, relPath string) string {
 	t.Helper()
-
 	if srcdir := os.Getenv("TEST_SRCDIR"); srcdir != "" {
 		p := filepath.Join(srcdir, "_main", relPath)
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-
 	if _, err := os.Stat(relPath); err == nil {
 		abs, _ := filepath.Abs(relPath)
 		return abs
 	}
-
 	return ""
 }
 
-func TestGoRustInterop(t *testing.T) {
-	goBin := findBinary(t, "e2e/kcp/go/kcp_test_/kcp_test")
-	rustBin := findBinary(t, "e2e/kcp/rust/kcp_test")
-
-	if goBin == "" {
+func goBin(t *testing.T) string {
+	t.Helper()
+	b := findBinary(t, "e2e/kcp/go/kcp_test_/kcp_test")
+	if b == "" {
 		t.Fatal("Go binary not found")
 	}
-	if rustBin == "" {
+	return b
+}
+
+func rustBin(t *testing.T) string {
+	t.Helper()
+	b := findBinary(t, "e2e/kcp/rust/kcp_test")
+	if b == "" {
 		t.Fatal("Rust binary not found")
 	}
-
-	runPairTest(t, goBin, rustBin, "go", "rust")
+	return b
 }
 
-func TestGoZigInterop(t *testing.T) {
-	goBin := findBinary(t, "e2e/kcp/go/kcp_test_/kcp_test")
-	zigBin := findBinary(t, "e2e/kcp/zig/kcp_test")
+// === Go opener → Rust accepter ===
 
-	if goBin == "" {
-		t.Fatal("Go binary not found")
-	}
-	if zigBin == "" {
-		t.Skip("Zig binary not available on this platform")
-	}
-
-	runPairTest(t, goBin, zigBin, "go", "zig")
+func TestInterop_GoOpener_RustAccepter_Echo(t *testing.T) {
+	runInterop(t, goBin(t), rustBin(t), "go", "rust", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello KCP Interop!",
+	})
 }
 
-func TestRustZigInterop(t *testing.T) {
-	rustBin := findBinary(t, "e2e/kcp/rust/kcp_test")
-	zigBin := findBinary(t, "e2e/kcp/zig/kcp_test")
-
-	if rustBin == "" {
-		t.Fatal("Rust binary not found")
-	}
-	if zigBin == "" {
-		t.Skip("Zig binary not available on this platform")
-	}
-
-	runPairTest(t, rustBin, zigBin, "rust", "zig")
+func TestInterop_GoOpener_RustAccepter_Streaming(t *testing.T) {
+	runInterop(t, goBin(t), rustBin(t), "go", "rust", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
 }
 
-func runPairTest(t *testing.T, openerBin, accepterBin, openerName, accepterName string) {
+func TestInterop_GoOpener_RustAccepter_100MB(t *testing.T) {
+	runInterop(t, goBin(t), rustBin(t), "go", "rust", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 100,
+		ChunkKB:      64,
+	})
+}
+
+// === Rust opener → Go accepter ===
+
+func TestInterop_RustOpener_GoAccepter_Echo(t *testing.T) {
+	runInterop(t, rustBin(t), goBin(t), "rust", "go", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello from Rust!",
+	})
+}
+
+func TestInterop_RustOpener_GoAccepter_Streaming(t *testing.T) {
+	runInterop(t, rustBin(t), goBin(t), "rust", "go", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+// === Multi-stream ===
+
+func TestInterop_GoRust_MultiStream(t *testing.T) {
+	runInterop(t, goBin(t), rustBin(t), "go", "rust", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+// === SYN delay edge case ===
+
+func TestInterop_RustOpener_NoImmediateWrite(t *testing.T) {
+	runInterop(t, rustBin(t), goBin(t), "rust", "go", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
+	})
+}
+
+// === Go ↔ Zig ===
+
+func zigBin(t *testing.T) string {
+	t.Helper()
+	b := findBinary(t, "e2e/kcp/zig/kcp_test")
+	if b == "" {
+		t.Skip("Zig binary not found")
+	}
+	return b
+}
+
+func TestInterop_GoZig(t *testing.T) {
+	runInterop(t, goBin(t), zigBin(t), "go", "zig", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello Go-Zig!",
+	})
+}
+
+func TestInterop_GoOpener_ZigAccepter_Streaming(t *testing.T) {
+	runInterop(t, goBin(t), zigBin(t), "go", "zig", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+func TestInterop_GoOpener_ZigAccepter_MultiStream(t *testing.T) {
+	runInterop(t, goBin(t), zigBin(t), "go", "zig", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+func TestInterop_GoOpener_ZigAccepter_DelayedWrite(t *testing.T) {
+	runInterop(t, goBin(t), zigBin(t), "go", "zig", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
+	})
+}
+
+func TestInterop_ZigOpener_GoAccepter_Echo(t *testing.T) {
+	runInterop(t, zigBin(t), goBin(t), "zig", "go", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello Zig-Go!",
+	})
+}
+
+func TestInterop_ZigOpener_GoAccepter_Streaming(t *testing.T) {
+	runInterop(t, zigBin(t), goBin(t), "zig", "go", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+func TestInterop_ZigOpener_GoAccepter_MultiStream(t *testing.T) {
+	runInterop(t, zigBin(t), goBin(t), "zig", "go", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+func TestInterop_ZigOpener_GoAccepter_DelayedWrite(t *testing.T) {
+	runInterop(t, zigBin(t), goBin(t), "zig", "go", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
+	})
+}
+
+func TestInterop_RustZig(t *testing.T) {
+	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello Rust-Zig!",
+	})
+}
+
+func TestInterop_RustOpener_ZigAccepter_Streaming(t *testing.T) {
+	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+func TestInterop_RustOpener_ZigAccepter_MultiStream(t *testing.T) {
+	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+func TestInterop_RustOpener_ZigAccepter_DelayedWrite(t *testing.T) {
+	runInterop(t, rustBin(t), zigBin(t), "rust", "zig", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
+	})
+}
+
+func TestInterop_ZigOpener_RustAccepter_Echo(t *testing.T) {
+	runInterop(t, zigBin(t), rustBin(t), "zig", "rust", testParams{
+		Mode:        "echo",
+		EchoMessage: "Hello Zig-Rust!",
+	})
+}
+
+func TestInterop_ZigOpener_RustAccepter_Streaming(t *testing.T) {
+	runInterop(t, zigBin(t), rustBin(t), "zig", "rust", testParams{
+		Mode:         "streaming",
+		ThroughputMB: 10,
+		ChunkKB:      64,
+	})
+}
+
+func TestInterop_ZigOpener_RustAccepter_MultiStream(t *testing.T) {
+	runInterop(t, zigBin(t), rustBin(t), "zig", "rust", testParams{
+		Mode:       "multi_stream",
+		NumStreams: 10,
+		ChunkKB:    64,
+	})
+}
+
+func TestInterop_ZigOpener_RustAccepter_DelayedWrite(t *testing.T) {
+	runInterop(t, zigBin(t), rustBin(t), "zig", "rust", testParams{
+		Mode:    "delayed_write",
+		DelayMs: 2000,
+	})
+}
+
+// === Infrastructure ===
+
+func runInterop(t *testing.T, openerBin, accepterBin, openerName, accepterName string, params testParams) {
 	t.Helper()
 
 	openerPort, accepterPort := nextPorts()
@@ -116,11 +291,7 @@ func runPairTest(t *testing.T, openerBin, accepterBin, openerName, accepterName 
 			{Name: openerName, PrivateKey: "0000000000000000000000000000000000000000000000000000000000000001", Port: openerPort, Role: "opener"},
 			{Name: accepterName, PrivateKey: "0000000000000000000000000000000000000000000000000000000000000002", Port: accepterPort, Role: "accepter"},
 		},
-		Test: testParams{
-			EchoMessage:  "Hello KCP Interop!",
-			ThroughputMB: 10,
-			ChunkKB:      64,
-		},
+		Test: params,
 	}
 	cfgData, _ := json.Marshal(cfg)
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
@@ -146,41 +317,29 @@ func runPairTest(t *testing.T, openerBin, accepterBin, openerName, accepterName 
 		t.Fatalf("start opener: %v", err)
 	}
 
-	timeout := 60 * time.Second
+	timeout := 120 * time.Second
 	var openerErr, accepterErr error
 	var wg sync.WaitGroup
 
 	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		openerErr = waitTimeout(openerCmd, timeout)
-	}()
-	go func() {
-		defer wg.Done()
-		accepterErr = waitTimeout(accepterCmd, timeout)
-	}()
+	go func() { defer wg.Done(); openerErr = waitTimeout(openerCmd, timeout) }()
+	go func() { defer wg.Done(); accepterErr = waitTimeout(accepterCmd, timeout) }()
 	wg.Wait()
 
 	if openerErr != nil {
-		t.Errorf("opener (%s) failed: %v", openerName, openerErr)
-		t.Logf("opener output:\n%s", indent(openerOut.String()))
+		t.Errorf("opener (%s) failed: %v\n%s", openerName, openerErr, indent(openerOut.String()))
 	}
 	if accepterErr != nil {
-		t.Errorf("accepter (%s) failed: %v", accepterName, accepterErr)
-		t.Logf("accepter output:\n%s", indent(accepterOut.String()))
+		t.Errorf("accepter (%s) failed: %v\n%s", accepterName, accepterErr, indent(accepterOut.String()))
 	}
-
 	if openerErr == nil && accepterErr == nil {
-		t.Logf("%s ↔ %s: PASS", openerName, accepterName)
+		t.Logf("%s → %s [%s]: PASS", openerName, accepterName, params.Mode)
 	}
 }
 
 func waitTimeout(cmd *exec.Cmd, timeout time.Duration) error {
 	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-
+	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
 		return err

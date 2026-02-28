@@ -18,8 +18,12 @@ const base = std_impl.runtime;
 
 pub const Mutex = base.Mutex;
 pub const Thread = base.Thread;
-pub const nowMs = base.nowMs;
 pub const getCpuCount = base.getCpuCount;
+
+/// Millisecond timestamp helper kept for backward compatibility.
+pub fn nowMs() u64 {
+    return @intCast(std.time.milliTimestamp());
+}
 
 // ============================================================================
 // Condition — re-wraps base Condition to add timedWait
@@ -30,8 +34,6 @@ pub const getCpuCount = base.getCpuCount;
 /// This wrapper adds timedWait using std.Thread.Condition.timedWait.
 pub const Condition = struct {
     inner: std.Thread.Condition,
-
-    pub const TimedWaitResult = enum { signaled, timed_out };
 
     pub fn init() Condition {
         return .{ .inner = .{} };
@@ -45,11 +47,9 @@ pub const Condition = struct {
         self.inner.wait(&mutex.inner);
     }
 
-    pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) TimedWaitResult {
-        self.inner.timedWait(&mutex.inner, timeout_ns) catch {
-            return .timed_out;
-        };
-        return .signaled;
+    pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) bool {
+        self.inner.timedWait(&mutex.inner, timeout_ns) catch return true;
+        return false;
     }
 
     pub fn signal(self: *Condition) void {

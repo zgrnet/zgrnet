@@ -16,14 +16,15 @@
 //! let stream = node.dial(&remote_pk, 8080)?;
 //! ```
 
-use crate::kcp::Stream as KcpStream;
+use crate::kcp::SyncStream;
 use crate::net::{PeerInfo, PeerState, UdpError, UdpOptions, UDP};
-use crate::noise::{self, Address, Key, KeyPair, ATYP_IPV4};
+use crate::noise::{Key, KeyPair};
 use crate::relay::RouteTable;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::collections::HashMap;
 use std::fmt;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -111,46 +112,30 @@ pub struct PeerConfig {
     pub endpoint: Option<String>,
 }
 
-/// A KCP stream with the remote peer's public key attached.
+/// A yamux stream with the remote peer's public key and service ID attached.
 pub struct NodeStream {
-    pub stream: Arc<KcpStream>,
+    pub stream: SyncStream,
     pub remote_pk: Key,
+    pub service: u64,
 }
 
 impl NodeStream {
-    /// Returns the remote peer's public key.
     pub fn remote_pubkey(&self) -> Key {
         self.remote_pk
     }
 
-    /// Returns the stream's protocol type.
-    pub fn proto(&self) -> u8 {
-        self.stream.proto()
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut s = self.stream.clone();
+        io::Read::read(&mut s, buf)
     }
 
-    /// Returns the stream's metadata.
-    pub fn metadata(&self) -> &[u8] {
-        self.stream.metadata()
+    pub fn write(&self, data: &[u8]) -> io::Result<usize> {
+        let mut s = self.stream.clone();
+        io::Write::write(&mut s, data)
     }
 
-    /// Reads data from the stream (non-blocking, returns 0 if no data).
-    pub fn read(&self, buf: &mut [u8]) -> std::result::Result<usize, crate::kcp::StreamError> {
-        self.stream.read_data(buf)
-    }
-
-    /// Reads data from the stream (blocking, waits for data).
-    pub fn read_blocking(&self, buf: &mut [u8]) -> std::result::Result<usize, crate::kcp::StreamError> {
-        self.stream.read_blocking(buf)
-    }
-
-    /// Writes data to the stream.
-    pub fn write(&self, data: &[u8]) -> std::result::Result<usize, crate::kcp::StreamError> {
-        self.stream.write_data(data)
-    }
-
-    /// Closes the stream (sends FIN to remote).
     pub fn close(&self) {
-        self.stream.shutdown();
+        self.stream.close();
     }
 }
 
@@ -293,42 +278,8 @@ impl Node {
         self.udp.connect(pk).map_err(NodeError::from)
     }
 
-    /// Connects to a peer and opens a KCP stream.
-    ///
-    /// If the peer is not yet connected, Dial automatically initiates a handshake.
-    /// The stream carries proto=TCP_PROXY with target address 127.0.0.1:port.
-    pub fn dial(&self, pk: &Key, port: u16) -> Result<NodeStream> {
-        if self.state() != State::Running {
-            return Err(NodeError::NotRunning);
-        }
-
-        // Ensure peer is connected.
-        let info = self.udp.peer_info(pk).ok_or(NodeError::PeerNotFound)?;
-        if info.state != PeerState::Established {
-            self.udp.connect(pk).map_err(NodeError::from)?;
-        }
-
-        // Build target address metadata.
-        let addr = Address {
-            atyp: ATYP_IPV4,
-            host: "127.0.0.1".to_string(),
-            port,
-        };
-        let metadata = addr.encode().map_err(|e| NodeError::Other(format!("{}", e)))?;
-
-        let raw = self
-            .udp
-            .open_stream(pk, noise::message::protocol::TCP_PROXY, &metadata)
-            .map_err(NodeError::from)?;
-
-        Ok(NodeStream {
-            stream: raw,
-            remote_pk: *pk,
-        })
-    }
-
-    /// Opens a raw KCP stream with custom proto and metadata.
-    pub fn open_stream(&self, pk: &Key, proto: u8, metadata: &[u8]) -> Result<NodeStream> {
+    /// Connects to a peer and opens a yamux stream on the given service.
+    pub fn dial(&self, pk: &Key, service: u64) -> Result<NodeStream> {
         if self.state() != State::Running {
             return Err(NodeError::NotRunning);
         }
@@ -338,22 +289,12 @@ impl Node {
             self.udp.connect(pk).map_err(NodeError::from)?;
         }
 
-        let raw = self
-            .udp
-            .open_stream(pk, proto, metadata)
-            .map_err(NodeError::from)?;
-
-        Ok(NodeStream {
-            stream: raw,
-            remote_pk: *pk,
-        })
+        let stream = self.udp.open_stream(pk, service).map_err(NodeError::from)?;
+        Ok(NodeStream { stream, remote_pk: *pk, service })
     }
 
-    /// Connects to a remote peer through a relay and opens a KCP stream.
-    ///
-    /// `relay_pk` is the public key of the relay node. Both this node and
-    /// the relay must have established sessions.
-    pub fn dial_relay(&self, dst: &Key, relay_pk: &Key, port: u16) -> Result<NodeStream> {
+    /// Connects to a remote peer through a relay and opens a yamux stream.
+    pub fn dial_relay(&self, dst: &Key, relay_pk: &Key, service: u64) -> Result<NodeStream> {
         if self.state() != State::Running {
             return Err(NodeError::NotRunning);
         }
@@ -363,8 +304,7 @@ impl Node {
         }
 
         self.add_peer(PeerConfig { public_key: *dst, endpoint: None })?;
-
-        self.dial(dst, port)
+        self.dial(dst, service)
     }
 
     /// Returns the node's relay route table.
@@ -372,7 +312,7 @@ impl Node {
         self.udp.route_table()
     }
 
-    /// Waits for an incoming KCP stream from any peer.
+    /// Waits for an incoming yamux stream from any peer.
     pub fn accept_stream(&self) -> Result<NodeStream> {
         self.accept_rx
             .recv()
@@ -455,13 +395,10 @@ impl Node {
                 }
 
                 match udp.accept_stream(&pk) {
-                    Ok(raw) => {
-                        let ns = NodeStream {
-                            stream: raw,
-                            remote_pk: pk,
-                        };
+                    Ok((stream, service)) => {
+                        let ns = NodeStream { stream, remote_pk: pk, service };
                         if accept_tx.send(ns).is_err() {
-                            return; // global channel closed
+                            return;
                         }
                     }
                     Err(UdpError::Closed) | Err(UdpError::PeerNotFound) => return,
@@ -566,76 +503,6 @@ mod tests {
     }
 
     #[test]
-    fn test_two_nodes_echo() {
-        let kp1 = gen_key(1);
-        let kp2 = gen_key(2);
-
-        let n1 = Node::new(NodeConfig {
-            key: kp1.clone(),
-            listen_port: 0,
-            allow_unknown: true,
-        })
-        .unwrap();
-
-        let n2 = Node::new(NodeConfig {
-            key: kp2.clone(),
-            listen_port: 0,
-            allow_unknown: true,
-        })
-        .unwrap();
-
-        // Add each other as peers.
-        let n2_addr = n2.local_addr().to_string();
-        let n1_addr = n1.local_addr().to_string();
-        n1.add_peer(PeerConfig {
-            public_key: kp2.public,
-            endpoint: Some(n2_addr),
-        })
-        .unwrap();
-        n2.add_peer(PeerConfig {
-            public_key: kp1.public,
-            endpoint: Some(n1_addr),
-        })
-        .unwrap();
-
-        // n1 connects to n2.
-        n1.connect(&kp2.public).unwrap();
-        thread::sleep(Duration::from_millis(50));
-
-        // n1 dials n2.
-        let s1 = n1.dial(&kp2.public, 8080).unwrap();
-        assert_eq!(s1.proto(), noise::message::protocol::TCP_PROXY);
-        assert_eq!(s1.remote_pubkey(), kp2.public);
-
-        // n2 accepts.
-        let s2 = n2.accept_stream().unwrap();
-        assert_eq!(s2.proto(), noise::message::protocol::TCP_PROXY);
-        assert_eq!(s2.remote_pubkey(), kp1.public);
-
-        // Echo: n1 writes, n2 reads.
-        let msg = b"hello from rust node1";
-        s1.write(msg).unwrap();
-
-        let mut buf = [0u8; 256];
-        let n = read_timeout(&s2, &mut buf, Duration::from_secs(5))
-            .expect("read timeout");
-        assert_eq!(&buf[..n], msg);
-
-        // Echo back.
-        let reply = b"echo: hello from rust node1";
-        s2.write(reply).unwrap();
-
-        let n = read_timeout(&s1, &mut buf, Duration::from_secs(5))
-            .expect("read reply timeout");
-        assert_eq!(&buf[..n], reply);
-
-        s1.close();
-        s2.close();
-        n1.stop();
-        n2.stop();
-    }
-
-    #[test]
     fn test_operations_on_stopped_node() {
         let kp = KeyPair::generate();
         let node = Node::new(NodeConfig {
@@ -651,22 +518,7 @@ mod tests {
             endpoint: None,
         }).is_err());
         assert!(node.connect(&Key::default()).is_err());
-        assert!(node.dial(&Key::default(), 80).is_err());
+        assert!(node.dial(&Key::default(), 1).is_err());
         assert!(node.write_to(&[], 0, &Key::default()).is_err());
-    }
-
-    /// Reads from a NodeStream with a polling timeout.
-    fn read_timeout(s: &NodeStream, buf: &mut [u8], timeout: Duration) -> Option<usize> {
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() > timeout {
-                return None;
-            }
-            match s.read(buf) {
-                Ok(0) => thread::sleep(Duration::from_millis(1)),
-                Ok(n) => return Some(n),
-                Err(_) => return None,
-            }
-        }
     }
 }
